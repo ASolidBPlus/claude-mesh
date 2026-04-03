@@ -7,6 +7,7 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import { Database } from 'bun:sqlite';
+import { listAgents } from './db.ts';
 
 export interface McpServerHandle {
   server: Server;
@@ -149,6 +150,36 @@ export async function startMcpServer(db: Database): Promise<McpServerHandle> {
     if (!KNOWN_TOOL_NAMES.has(toolName)) {
       throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
     }
+
+    if (toolName === 'mesh_discover') {
+      const args = (request.params.arguments ?? {}) as Record<string, unknown>;
+      const onlineOnly = args.filter_online === true;
+      let agents = listAgents(db, onlineOnly);
+
+      if (typeof args.capability === 'string' && args.capability.length > 0) {
+        const cap = args.capability;
+        agents = agents.filter(agent => {
+          const caps: unknown = JSON.parse(agent.capabilities);
+          return Array.isArray(caps) && caps.includes(cap);
+        });
+      }
+
+      const result = agents.map(agent => ({
+        id: agent.id,
+        hostname: agent.hostname,
+        online: agent.online === 1,
+        capabilities: JSON.parse(agent.capabilities) as string[],
+        metadata: JSON.parse(agent.metadata) as Record<string, unknown>,
+        last_seen: agent.last_seen,
+        registered_at: agent.registered_at,
+      }));
+
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+        isError: false,
+      };
+    }
+
     return NOT_IMPLEMENTED_RESPONSE;
   });
 

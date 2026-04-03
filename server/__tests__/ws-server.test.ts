@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { openDb } from '../db.ts';
+import { openDb, registerAgent, getAgentById, insertMessage } from '../db.ts';
+import { generateToken, hashToken } from '../auth.ts';
 import { startWsServer, WsServerHandle } from '../ws-server.ts';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
@@ -97,21 +98,6 @@ describe('startWsServer', () => {
     expect(close.code).toBe(1008);
   });
 
-  it('sends NOT_IMPLEMENTED and closes with 1011 when auth frame is sent', async () => {
-    const ws = await connectWs(port);
-    const msgPromise = waitForMessage(ws);
-    const closePromise = waitForClose(ws);
-
-    ws.send(JSON.stringify({ type: 'auth', agent_id: 'x', token: 'y' }));
-
-    const msg = JSON.parse(await msgPromise);
-    expect(msg.type).toBe('error');
-    expect(msg.code).toBe('NOT_IMPLEMENTED');
-
-    const close = await closePromise;
-    expect(close.code).toBe(1011);
-  });
-
   it('sends close code 1001 to idle connected client on shutdown', async () => {
     // Use a raw TCP socket to capture the actual close frame bytes
     const closeCode = await new Promise<number>((resolve) => {
@@ -181,4 +167,291 @@ describe('startWsServer', () => {
     await handle.shutdown();
     await expect(handle.shutdown()).resolves.toBeUndefined();
   });
+
+  // ──────────────────────────────────────────────
+  // Sprint 4: Auth success flow
+  // ──────────────────────────────────────────────
+
+  it('valid auth frame receives auth_ok and connection stays open', async () => {
+    const rawToken = generateToken();
+    const hash = hashToken(rawToken);
+    registerAgent(db, { id: 'agent-auth-ok', token_hash: hash, hostname: 'host1' });
+
+    const ws = await connectWs(port);
+    const msgPromise = waitForMessage(ws);
+
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'agent-auth-ok', token: rawToken }));
+
+    const msg = JSON.parse(await msgPromise);
+    expect(msg.type).toBe('auth_ok');
+    expect(msg.agent_id).toBe('agent-auth-ok');
+    expect(msg.queued).toBe(0);
+
+    // Connection should still be open
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  }, 10000);
+
+  it('auth frame with unknown agent_id receives AUTH_FAILED and connection closes with 1008', async () => {
+    const ws = await connectWs(port);
+    const msgPromise = waitForMessage(ws);
+    const closePromise = waitForClose(ws);
+
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'no-such-agent', token: 'deadbeef' }));
+
+    const msg = JSON.parse(await msgPromise);
+    expect(msg.type).toBe('error');
+    expect(msg.code).toBe('AUTH_FAILED');
+
+    const close = await closePromise;
+    expect(close.code).toBe(1008);
+  }, 10000);
+
+  it('auth frame with wrong token receives AUTH_FAILED and connection closes with 1008', async () => {
+    const rawToken = generateToken();
+    const hash = hashToken(rawToken);
+    registerAgent(db, { id: 'agent-wrong-tok', token_hash: hash, hostname: 'host1' });
+
+    const ws = await connectWs(port);
+    const msgPromise = waitForMessage(ws);
+    const closePromise = waitForClose(ws);
+
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'agent-wrong-tok', token: 'wrongtoken' }));
+
+    const msg = JSON.parse(await msgPromise);
+    expect(msg.type).toBe('error');
+    expect(msg.code).toBe('AUTH_FAILED');
+
+    const close = await closePromise;
+    expect(close.code).toBe(1008);
+  }, 10000);
+
+  it('after successful auth, agent is online=1 in DB', async () => {
+    const rawToken = generateToken();
+    registerAgent(db, { id: 'agent-online', token_hash: hashToken(rawToken), hostname: 'host1' });
+
+    const ws = await connectWs(port);
+    const msgPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'agent-online', token: rawToken }));
+    await msgPromise;
+
+    const agent = getAgentById(db, 'agent-online');
+    expect(agent!.online).toBe(1);
+    ws.close();
+  }, 10000);
+
+  it('after authed client disconnects, agent is online=0 in DB', async () => {
+    const rawToken = generateToken();
+    registerAgent(db, { id: 'agent-offline', token_hash: hashToken(rawToken), hostname: 'host1' });
+
+    const ws = await connectWs(port);
+    const msgPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'agent-offline', token: rawToken }));
+    await msgPromise;
+
+    const closePromise = waitForClose(ws);
+    ws.close();
+    await closePromise;
+
+    // Give server a moment to process the close event
+    await new Promise(r => setTimeout(r, 50));
+
+    const agent = getAgentById(db, 'agent-offline');
+    expect(agent!.online).toBe(0);
+  }, 10000);
+
+  it('queued count in auth_ok reflects pending messages', async () => {
+    const rawToken = generateToken();
+    registerAgent(db, { id: 'agent-queued', token_hash: hashToken(rawToken), hostname: 'host1' });
+
+    // Insert two pending direct messages
+    insertMessage(db, {
+      id: 'msg-1',
+      kind: 'direct',
+      from_agent: 'agent-queued',
+      to_agent: 'agent-queued',
+      payload: 'hello',
+      sent_at: Date.now(),
+      expires_at: null,
+    });
+    insertMessage(db, {
+      id: 'msg-2',
+      kind: 'direct',
+      from_agent: 'agent-queued',
+      to_agent: 'agent-queued',
+      payload: 'world',
+      sent_at: Date.now(),
+      expires_at: null,
+    });
+
+    const ws = await connectWs(port);
+    const msgPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'agent-queued', token: rawToken }));
+
+    const msg = JSON.parse(await msgPromise);
+    expect(msg.type).toBe('auth_ok');
+    expect(msg.queued).toBe(2);
+    ws.close();
+  }, 10000);
+
+  // ──────────────────────────────────────────────
+  // Sprint 4: Ping/pong
+  // ──────────────────────────────────────────────
+
+  it('authenticated client sending ping receives pong with matching ts and positive server_ts', async () => {
+    const rawToken = generateToken();
+    registerAgent(db, { id: 'agent-ping', token_hash: hashToken(rawToken), hostname: 'host1' });
+
+    const ws = await connectWs(port);
+
+    // Auth first
+    const authMsgPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'agent-ping', token: rawToken }));
+    await authMsgPromise;
+
+    // Send ping
+    const pongPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'ping', ts: 12345 }));
+
+    const pong = JSON.parse(await pongPromise);
+    expect(pong.type).toBe('pong');
+    expect(pong.ts).toBe(12345);
+    expect(typeof pong.server_ts).toBe('number');
+    expect(pong.server_ts).toBeGreaterThan(0);
+    ws.close();
+  }, 10000);
+
+  it('after ping, last_seen in DB is >= value after auth_ok', async () => {
+    const rawToken = generateToken();
+    registerAgent(db, { id: 'agent-ping-ls', token_hash: hashToken(rawToken), hostname: 'host1' });
+
+    const ws = await connectWs(port);
+
+    const authMsgPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'agent-ping-ls', token: rawToken }));
+    await authMsgPromise;
+
+    const lastSeenAfterAuth = getAgentById(db, 'agent-ping-ls')!.last_seen;
+
+    const pongPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+    await pongPromise;
+
+    const lastSeenAfterPing = getAgentById(db, 'agent-ping-ls')!.last_seen;
+    expect(lastSeenAfterPing).toBeGreaterThanOrEqual(lastSeenAfterAuth);
+    ws.close();
+  }, 10000);
+
+  // ──────────────────────────────────────────────
+  // Sprint 4: agent_status broadcast
+  // ──────────────────────────────────────────────
+
+  it('when agent A connects, agent B receives agent_status online=true for A', async () => {
+    const tokenA = generateToken();
+    const tokenB = generateToken();
+    registerAgent(db, { id: 'agent-A-status', token_hash: hashToken(tokenA), hostname: 'hostA' });
+    registerAgent(db, { id: 'agent-B-status', token_hash: hashToken(tokenB), hostname: 'hostB' });
+
+    // Connect B first and auth
+    const wsB = await connectWs(port);
+    const authBPromise = waitForMessage(wsB);
+    wsB.send(JSON.stringify({ type: 'auth', agent_id: 'agent-B-status', token: tokenB }));
+    await authBPromise;
+
+    // Now connect A — B should receive agent_status
+    const statusForB = waitForMessage(wsB);
+    const wsA = await connectWs(port);
+    const authAPromise = waitForMessage(wsA);
+    wsA.send(JSON.stringify({ type: 'auth', agent_id: 'agent-A-status', token: tokenA }));
+    await authAPromise;
+
+    const statusMsg = JSON.parse(await statusForB);
+    expect(statusMsg.type).toBe('agent_status');
+    expect(statusMsg.agent_id).toBe('agent-A-status');
+    expect(statusMsg.online).toBe(true);
+    expect(typeof statusMsg.last_seen).toBe('number');
+
+    wsA.close();
+    wsB.close();
+  }, 10000);
+
+  it('when agent A disconnects, agent B receives agent_status online=false for A', async () => {
+    const tokenA = generateToken();
+    const tokenB = generateToken();
+    registerAgent(db, { id: 'agent-A-disc', token_hash: hashToken(tokenA), hostname: 'hostA' });
+    registerAgent(db, { id: 'agent-B-disc', token_hash: hashToken(tokenB), hostname: 'hostB' });
+
+    // Connect and auth both
+    const wsB = await connectWs(port);
+    const authBPromise = waitForMessage(wsB);
+    wsB.send(JSON.stringify({ type: 'auth', agent_id: 'agent-B-disc', token: tokenB }));
+    await authBPromise;
+
+    const wsA = await connectWs(port);
+    // B gets the online notification for A — consume it
+    const onlineNotifPromise = waitForMessage(wsB);
+    const authAPromise = waitForMessage(wsA);
+    wsA.send(JSON.stringify({ type: 'auth', agent_id: 'agent-A-disc', token: tokenA }));
+    await authAPromise;
+    await onlineNotifPromise;
+
+    // Now disconnect A — B should get offline notification
+    const offlineNotifPromise = waitForMessage(wsB);
+    wsA.close();
+
+    const offlineMsg = JSON.parse(await offlineNotifPromise);
+    expect(offlineMsg.type).toBe('agent_status');
+    expect(offlineMsg.agent_id).toBe('agent-A-disc');
+    expect(offlineMsg.online).toBe(false);
+    expect(typeof offlineMsg.last_seen).toBe('number');
+
+    wsB.close();
+  }, 10000);
+
+  it('agent A does NOT receive its own agent_status notification when it connects', async () => {
+    const tokenA = generateToken();
+    registerAgent(db, { id: 'agent-A-noself', token_hash: hashToken(tokenA), hostname: 'hostA' });
+
+    const wsA = await connectWs(port);
+    const authAPromise = waitForMessage(wsA);
+    wsA.send(JSON.stringify({ type: 'auth', agent_id: 'agent-A-noself', token: tokenA }));
+
+    const authMsg = JSON.parse(await authAPromise);
+    // Should be auth_ok, not agent_status
+    expect(authMsg.type).toBe('auth_ok');
+
+    // Give a moment to ensure no extra message arrives
+    const extraMsg = await Promise.race([
+      waitForMessage(wsA),
+      new Promise<null>(r => setTimeout(() => r(null), 200)),
+    ]);
+    expect(extraMsg).toBeNull();
+
+    wsA.close();
+  }, 10000);
+
+  // ──────────────────────────────────────────────
+  // Sprint 4: Post-auth non-ping frames
+  // ──────────────────────────────────────────────
+
+  it('authenticated client sending unknown frame type receives NOT_IMPLEMENTED and connection stays open', async () => {
+    const rawToken = generateToken();
+    registerAgent(db, { id: 'agent-ni', token_hash: hashToken(rawToken), hostname: 'host1' });
+
+    const ws = await connectWs(port);
+    const authMsgPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'agent-ni', token: rawToken }));
+    await authMsgPromise;
+
+    const replyPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'send', msg_id: 'x', to: 'y', payload: 'z' }));
+
+    const reply = JSON.parse(await replyPromise);
+    expect(reply.type).toBe('error');
+    expect(reply.code).toBe('NOT_IMPLEMENTED');
+
+    // Connection should still be open
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  }, 10000);
 });

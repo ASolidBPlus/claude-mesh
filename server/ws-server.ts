@@ -2,10 +2,18 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as net from 'net';
+import { getAgentById, setOnline, touchAgent, getPendingMessages } from './db.ts';
+import { validateToken } from './auth.ts';
 
 export interface WsServerHandle {
   wss: WebSocketServer;
   shutdown(): Promise<void>;
+}
+
+interface ConnState {
+  ws: WebSocket;
+  agentId: string | null;
+  authed: boolean;
 }
 
 export function startWsServer(port: number, db: Database): Promise<WsServerHandle> {
@@ -15,6 +23,10 @@ export function startWsServer(port: number, db: Database): Promise<WsServerHandl
     const wss = new WebSocketServer({ server: httpServer });
     const connections = new Set<WebSocket>();
     const sockets = new Set<net.Socket>();
+    // Connection registry: ws -> state
+    const registry = new Map<WebSocket, ConnState>();
+    // Reverse index: agentId -> ws
+    const agentIndex = new Map<string, WebSocket>();
     let shutdownStarted = false;
 
     // Track all raw TCP sockets so we can destroy them on shutdown
@@ -30,6 +42,9 @@ export function startWsServer(port: number, db: Database): Promise<WsServerHandl
       wss.on('connection', (ws: WebSocket) => {
         connections.add(ws);
 
+        const state: ConnState = { ws, agentId: null, authed: false };
+        registry.set(ws, state);
+
         let authed = false;
         let messageHandled = false;
 
@@ -43,43 +58,146 @@ export function startWsServer(port: number, db: Database): Promise<WsServerHandl
         }, 5000);
 
         ws.on('message', (data) => {
-          if (messageHandled) return;
-          messageHandled = true;
-          clearTimeout(authTimer);
-
           let parsed: unknown;
           try {
             parsed = JSON.parse(data.toString());
           } catch (_) {
-            try {
-              ws.send(JSON.stringify({ type: 'error', code: 'AUTH_REQUIRED', message: 'first frame must be auth' }));
-            } catch (_) { /* ignore */ }
-            ws.close(1008, 'auth required');
+            if (!authed) {
+              if (messageHandled) return;
+              messageHandled = true;
+              clearTimeout(authTimer);
+              try {
+                ws.send(JSON.stringify({ type: 'error', code: 'AUTH_REQUIRED', message: 'first frame must be auth' }));
+              } catch (_) { /* ignore */ }
+              ws.close(1008, 'auth required');
+            }
             return;
           }
 
-          if (
-            typeof parsed !== 'object' ||
-            parsed === null ||
-            (parsed as Record<string, unknown>).type !== 'auth'
-          ) {
+          const frame = parsed as Record<string, unknown>;
+
+          if (!authed) {
+            // Pre-auth: only process first frame
+            if (messageHandled) return;
+            messageHandled = true;
+            clearTimeout(authTimer);
+
+            if (typeof parsed !== 'object' || parsed === null || frame.type !== 'auth') {
+              try {
+                ws.send(JSON.stringify({ type: 'error', code: 'AUTH_REQUIRED', message: 'first frame must be auth' }));
+              } catch (_) { /* ignore */ }
+              ws.close(1008, 'auth required');
+              return;
+            }
+
+            // Auth frame handling
+            const agentId = frame.agent_id;
+            const token = frame.token;
+
+            if (typeof agentId !== 'string' || typeof token !== 'string') {
+              try {
+                ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'missing agent_id or token' }));
+              } catch (_) { /* ignore */ }
+              ws.close(1008, 'auth failed');
+              return;
+            }
+
+            const agent = getAgentById(db, agentId);
+            if (agent === null) {
+              try {
+                ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
+              } catch (_) { /* ignore */ }
+              ws.close(1008, 'auth failed');
+              return;
+            }
+
+            if (!validateToken(token, agent.token_hash)) {
+              try {
+                ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'invalid token' }));
+              } catch (_) { /* ignore */ }
+              ws.close(1008, 'auth failed');
+              return;
+            }
+
+            const connectTime = Date.now();
+            setOnline(db, agentId, true);
+
+            authed = true;
+            state.authed = true;
+            state.agentId = agentId;
+            agentIndex.set(agentId, ws);
+
+            const queued = getPendingMessages(db, agentId).length;
+
             try {
-              ws.send(JSON.stringify({ type: 'error', code: 'AUTH_REQUIRED', message: 'first frame must be auth' }));
+              ws.send(JSON.stringify({ type: 'auth_ok', agent_id: agentId, queued }));
             } catch (_) { /* ignore */ }
-            ws.close(1008, 'auth required');
+
+            // Broadcast agent_status to all other authenticated connections
+            const statusMsg = JSON.stringify({
+              type: 'agent_status',
+              agent_id: agentId,
+              online: true,
+              last_seen: connectTime,
+            });
+            for (const [otherWs, otherState] of registry) {
+              if (otherWs !== ws && otherState.authed) {
+                try {
+                  otherWs.send(statusMsg);
+                } catch (_) { /* ignore */ }
+              }
+            }
+
             return;
           }
 
-          authed = true;
+          // Post-auth frame dispatch
+          const frameType = frame.type;
+
+          if (frameType === 'ping') {
+            const ts = frame.ts;
+            const serverTs = Date.now();
+            try {
+              ws.send(JSON.stringify({ type: 'pong', ts, server_ts: serverTs }));
+            } catch (_) { /* ignore */ }
+            if (state.agentId !== null) {
+              touchAgent(db, state.agentId);
+            }
+            return;
+          }
+
+          // Unknown frame type after auth
           try {
-            ws.send(JSON.stringify({ type: 'error', code: 'NOT_IMPLEMENTED', message: 'agent registration not implemented until sprint 4' }));
+            ws.send(JSON.stringify({ type: 'error', code: 'NOT_IMPLEMENTED', message: 'frame type not implemented' }));
           } catch (_) { /* ignore */ }
-          ws.close(1011, 'not implemented');
         });
 
         ws.on('close', () => {
           clearTimeout(authTimer);
           connections.delete(ws);
+          const connState = registry.get(ws);
+          registry.delete(ws);
+
+          if (connState && connState.authed && connState.agentId !== null) {
+            const agentId = connState.agentId;
+            setOnline(db, agentId, false);
+            agentIndex.delete(agentId);
+
+            const disconnectTime = Date.now();
+            const statusMsg = JSON.stringify({
+              type: 'agent_status',
+              agent_id: agentId,
+              online: false,
+              last_seen: disconnectTime,
+            });
+            for (const [otherWs, otherState] of registry) {
+              if (otherState.authed) {
+                try {
+                  otherWs.send(statusMsg);
+                } catch (_) { /* ignore */ }
+              }
+            }
+          }
         });
       });
 
@@ -90,6 +208,15 @@ export function startWsServer(port: number, db: Database): Promise<WsServerHandl
             return Promise.resolve();
           }
           shutdownStarted = true;
+
+          // Mark all authenticated agents offline before closing
+          for (const [, state] of registry) {
+            if (state.authed && state.agentId !== null) {
+              try {
+                setOnline(db, state.agentId, false);
+              } catch (_) { /* ignore */ }
+            }
+          }
 
           return new Promise((res) => {
             // Send close code 1001 to all connected WebSocket clients
