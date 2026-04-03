@@ -6,6 +6,10 @@ import {
   insertMessage,
   markDelivered,
   getPendingMessages,
+  getOrCreateTopic,
+  getTopicSubscribers,
+  subscribe as dbSubscribe,
+  unsubscribe as dbUnsubscribe,
   Message,
 } from './db.ts';
 
@@ -16,6 +20,25 @@ export interface SendFrame {
   payload: string;
   content_type?: string;
   ttl_ms?: number;
+}
+
+export interface PublishFrame {
+  type: 'publish';
+  msg_id: string;
+  topic: string;
+  payload: string;
+  content_type?: string;
+  ttl_ms?: number;
+}
+
+export interface SubscribeFrame {
+  type: 'subscribe';
+  topic: string;
+}
+
+export interface UnsubscribeFrame {
+  type: 'unsubscribe';
+  topic: string;
 }
 
 export interface RouterResult {
@@ -137,4 +160,115 @@ export function drainQueue(
     markDelivered(db, msg.id);
   }
   return pending.length;
+}
+
+export function routePublish(
+  db: Database,
+  agentIndex: Map<string, WebSocket>,
+  from_agent: string,
+  frame: PublishFrame
+): RouterResult {
+  // 1. Payload size check
+  const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
+  if (payloadBytes > 1_048_576) {
+    return { ok: false, error_code: 'MESSAGE_TOO_LARGE', error_message: 'payload exceeds 1 MB limit' };
+  }
+
+  // 2. Ensure topic exists
+  getOrCreateTopic(db, frame.topic, from_agent);
+
+  // 3. Get subscribers, remove publisher
+  const subscribers = getTopicSubscribers(db, frame.topic).filter(id => id !== from_agent);
+
+  // 4. Compute expires_at
+  let ttl: number;
+  if (frame.ttl_ms === 0) {
+    ttl = 0;
+  } else {
+    ttl = frame.ttl_ms ?? 300_000;
+  }
+  const expires_at = ttl === 0 ? null : Date.now() + ttl;
+
+  const content_type = frame.content_type ?? 'text/plain';
+  const sent_at = Date.now();
+
+  // 5. Fan out to each subscriber
+  for (const subscriber_id of subscribers) {
+    // 5a. ACL check
+    if (!aclCheck(db, from_agent, subscriber_id)) {
+      continue;
+    }
+
+    // 5b. Unique msg_id per subscriber copy
+    const msgId = crypto.randomUUID();
+
+    // 5c. Online
+    const recipientWs = agentIndex.get(subscriber_id);
+    if (recipientWs !== undefined) {
+      insertMessage(db, {
+        id: msgId,
+        kind: 'topic',
+        from_agent,
+        to_agent: subscriber_id,
+        topic: frame.topic,
+        payload: frame.payload,
+        content_type,
+        sent_at,
+        expires_at,
+      });
+      recipientWs.send(buildDeliverFrame({
+        id: msgId,
+        kind: 'topic',
+        from_agent,
+        to_agent: null,
+        topic: frame.topic,
+        correlation_id: null,
+        payload: frame.payload,
+        content_type,
+        sent_at,
+      }));
+      markDelivered(db, msgId);
+    } else {
+      // 5d. Offline
+      if (ttl === 0) {
+        continue;
+      }
+      insertMessage(db, {
+        id: msgId,
+        kind: 'topic',
+        from_agent,
+        to_agent: subscriber_id,
+        topic: frame.topic,
+        payload: frame.payload,
+        content_type,
+        sent_at,
+        expires_at,
+      });
+    }
+  }
+
+  return { ok: true, msg_id: frame.msg_id };
+}
+
+export function routeSubscribe(
+  db: Database,
+  agent_id: string,
+  frame: SubscribeFrame
+): RouterResult {
+  getOrCreateTopic(db, frame.topic, agent_id);
+  dbSubscribe(db, agent_id, frame.topic);
+  return { ok: true };
+}
+
+export function routeUnsubscribe(
+  db: Database,
+  agent_id: string,
+  frame: UnsubscribeFrame
+): RouterResult {
+  const existing = db.prepare('SELECT 1 FROM topics WHERE name = ?').get(frame.topic);
+  if (existing === null) {
+    return { ok: false, error_code: 'TOPIC_NOT_FOUND', error_message: `topic ${frame.topic} does not exist` };
+  }
+  dbUnsubscribe(db, agent_id, frame.topic);
+  return { ok: true };
 }

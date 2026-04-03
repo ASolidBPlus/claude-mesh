@@ -8,8 +8,8 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
-import { listAgents, aclGrant, aclRevoke } from './db.ts';
-import { routeDirect } from './router.ts';
+import { listAgents, aclGrant, aclRevoke, getAgentSubscriptions } from './db.ts';
+import { routeDirect, routePublish, routeSubscribe, routeUnsubscribe } from './router.ts';
 
 export interface McpServerHandle {
   server: Server;
@@ -40,8 +40,9 @@ const TOOLS = [
         topic: { type: 'string' },
         message: { type: 'string' },
         ttl_seconds: { type: 'number' },
+        as_agent: { type: 'string', description: 'Agent ID acting as the publisher' },
       },
-      required: ['topic', 'message'],
+      required: ['topic', 'message', 'as_agent'],
     },
   },
   {
@@ -51,8 +52,9 @@ const TOOLS = [
       type: 'object',
       properties: {
         topic: { type: 'string' },
+        as_agent: { type: 'string', description: 'Agent ID subscribing' },
       },
-      required: ['topic'],
+      required: ['topic', 'as_agent'],
     },
   },
   {
@@ -62,8 +64,9 @@ const TOOLS = [
       type: 'object',
       properties: {
         topic: { type: 'string' },
+        as_agent: { type: 'string', description: 'Agent ID unsubscribing' },
       },
-      required: ['topic'],
+      required: ['topic', 'as_agent'],
     },
   },
   {
@@ -206,6 +209,58 @@ export async function startMcpServer(db: Database, agentIndex: Map<string, WebSo
       const { agent_id, as_agent } = args as { agent_id: string; as_agent: string };
       const row = aclGrant(db, agent_id, as_agent, as_agent);
       return { content: [{ type: 'text' as const, text: JSON.stringify(row) }], isError: false };
+    }
+
+    if (toolName === 'mesh_broadcast') {
+      const { topic, message, ttl_seconds, as_agent } = args as {
+        topic: string; message: string; ttl_seconds?: number; as_agent: string;
+      };
+      const msgId = crypto.randomUUID();
+      const ttl_ms = ttl_seconds !== undefined ? ttl_seconds * 1000 : 300_000;
+      const result = routePublish(db, agentIndex, as_agent, {
+        type: 'publish', msg_id: msgId, topic, payload: message,
+        content_type: 'text/plain', ttl_ms,
+      });
+      if (result.ok) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, msg_id: msgId }) }],
+          isError: false,
+        };
+      }
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],
+        isError: true,
+      };
+    }
+
+    if (toolName === 'mesh_subscribe') {
+      const { topic, as_agent } = args as { topic: string; as_agent: string };
+      const result = routeSubscribe(db, as_agent, { type: 'subscribe', topic });
+      if (result.ok) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, topic }) }],
+          isError: false,
+        };
+      }
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],
+        isError: true,
+      };
+    }
+
+    if (toolName === 'mesh_unsubscribe') {
+      const { topic, as_agent } = args as { topic: string; as_agent: string };
+      const result = routeUnsubscribe(db, as_agent, { type: 'unsubscribe', topic });
+      if (result.ok) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, topic }) }],
+          isError: false,
+        };
+      }
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],
+        isError: true,
+      };
     }
 
     if (toolName === 'mesh_acl_deny') {

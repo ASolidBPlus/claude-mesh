@@ -8,6 +8,8 @@ import {
   aclCheck,
   listInboundAcl,
   listOutboundAcl,
+  getOrCreateTopic,
+  listTopics,
 } from './db.ts';
 
 export interface HttpAdminHandle {
@@ -149,6 +151,54 @@ export function startHttpAdmin(
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ inbound, outbound }));
+        return;
+      }
+
+      if (pathname === '/topics' && method === 'POST') {
+        const raw = await readBody(req);
+        let body: Record<string, unknown>;
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid JSON' }));
+          return;
+        }
+
+        const name = body.name;
+        const created_by = body.created_by;
+
+        if (typeof name !== 'string' || !name) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'name is required' }));
+          return;
+        }
+
+        if (typeof created_by !== 'string' || !created_by) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'created_by is required' }));
+          return;
+        }
+
+        if (getAgentById(db, created_by) === null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'created_by agent not found' }));
+          return;
+        }
+
+        const description = typeof body.description === 'string' ? body.description : '';
+        const metadata = body.metadata !== undefined ? JSON.stringify(body.metadata) : '{}';
+        const topic = getOrCreateTopic(db, name, created_by, description, metadata);
+
+        res.writeHead(201, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(topic));
+        return;
+      }
+
+      if (pathname === '/topics' && method === 'GET') {
+        const topics = listTopics(db);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(topics));
         return;
       }
 

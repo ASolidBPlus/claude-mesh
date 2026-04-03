@@ -4,7 +4,11 @@ import * as http from 'http';
 import * as net from 'net';
 import { getAgentById, setOnline, touchAgent, getPendingMessages, markAcked } from './db.ts';
 import { validateToken } from './auth.ts';
-import { routeDirect, drainQueue, SendFrame } from './router.ts';
+import {
+  routeDirect, drainQueue, SendFrame,
+  routePublish, routeSubscribe, routeUnsubscribe,
+  PublishFrame, SubscribeFrame, UnsubscribeFrame,
+} from './router.ts';
 
 export interface WsServerHandle {
   wss: WebSocketServer;
@@ -194,6 +198,66 @@ export function startWsServer(port: number, db: Database): Promise<WsServerHandl
             const msgId = (parsed as Record<string, unknown>).msg_id;
             if (typeof msgId === 'string') {
               markAcked(db, msgId);
+            }
+            return;
+          }
+
+          if (frameType === 'publish') {
+            const f = parsed as PublishFrame;
+            const result = routePublish(db, agentIndex, state.agentId!, f);
+            if (result.ok) {
+              try {
+                ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
+              } catch (_) { /* ignore */ }
+            } else {
+              try {
+                ws.send(JSON.stringify({
+                  type: 'error',
+                  ref: f.msg_id,
+                  code: result.error_code,
+                  message: result.error_message,
+                }));
+              } catch (_) { /* ignore */ }
+            }
+            return;
+          }
+
+          if (frameType === 'subscribe') {
+            const f = parsed as SubscribeFrame;
+            const result = routeSubscribe(db, state.agentId!, f);
+            if (result.ok) {
+              try {
+                ws.send(JSON.stringify({ type: 'ack', ref: f.topic, ok: true }));
+              } catch (_) { /* ignore */ }
+            } else {
+              try {
+                ws.send(JSON.stringify({
+                  type: 'error',
+                  ref: f.topic,
+                  code: result.error_code,
+                  message: result.error_message,
+                }));
+              } catch (_) { /* ignore */ }
+            }
+            return;
+          }
+
+          if (frameType === 'unsubscribe') {
+            const f = parsed as UnsubscribeFrame;
+            const result = routeUnsubscribe(db, state.agentId!, f);
+            if (result.ok) {
+              try {
+                ws.send(JSON.stringify({ type: 'ack', ref: f.topic, ok: true }));
+              } catch (_) { /* ignore */ }
+            } else {
+              try {
+                ws.send(JSON.stringify({
+                  type: 'error',
+                  ref: f.topic,
+                  code: result.error_code,
+                  message: result.error_message,
+                }));
+              } catch (_) { /* ignore */ }
             }
             return;
           }

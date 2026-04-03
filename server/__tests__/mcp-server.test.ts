@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { openDb, registerAgent, setOnline, aclGrant } from '../db.ts';
+import { openDb, registerAgent, setOnline, aclGrant, getAgentSubscriptions } from '../db.ts';
 import { startMcpServer, McpServerHandle } from '../mcp-server.ts';
 import { Database } from 'bun:sqlite';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -20,9 +20,9 @@ const EXPECTED_TOOLS = [
 
 const REQUIRED_FIELDS: Record<string, string[]> = {
   mesh_send: ['to', 'message', 'as_agent'],
-  mesh_broadcast: ['topic', 'message'],
-  mesh_subscribe: ['topic'],
-  mesh_unsubscribe: ['topic'],
+  mesh_broadcast: ['topic', 'message', 'as_agent'],
+  mesh_subscribe: ['topic', 'as_agent'],
+  mesh_unsubscribe: ['topic', 'as_agent'],
   mesh_discover: [],
   mesh_status: [],
   mesh_acl_allow: ['agent_id', 'as_agent'],
@@ -230,18 +230,53 @@ describe('startMcpServer', () => {
     expect(parsed[0].id).toBe('disc-both-online-cap');
   });
 
-  it('remaining stub tools still return isError:true with not implemented text', async () => {
-    const stubTools = [
-      { name: 'mesh_broadcast', arguments: { topic: 't', message: 'm' } },
-      { name: 'mesh_subscribe', arguments: { topic: 't' } },
-      { name: 'mesh_unsubscribe', arguments: { topic: 't' } },
-    ];
+  it('mesh_broadcast with valid as_agent and topic returns ok:true with msg_id', async () => {
+    registerAgent(db, { id: 'broadcast-agent', token_hash: 'b'.repeat(64), hostname: 'host1' });
+    const result = await client.callTool({
+      name: 'mesh_broadcast',
+      arguments: { topic: 'test-topic', message: 'hello world', as_agent: 'broadcast-agent' },
+    });
+    expect(result.isError).toBe(false);
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const parsed = JSON.parse(text);
+    expect(parsed.ok).toBe(true);
+    expect(typeof parsed.msg_id).toBe('string');
+  });
 
-    for (const tool of stubTools) {
-      const result = await client.callTool(tool);
-      expect(result.isError).toBe(true);
-      expect((result.content as Array<{ type: string; text: string }>)[0].text).toBe('{"error": "not implemented"}');
-    }
+  it('mesh_subscribe with valid as_agent subscribes to topic', async () => {
+    registerAgent(db, { id: 'sub-agent', token_hash: 's'.repeat(64), hostname: 'host1' });
+    const result = await client.callTool({
+      name: 'mesh_subscribe',
+      arguments: { topic: 'my-topic', as_agent: 'sub-agent' },
+    });
+    expect(result.isError).toBe(false);
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const parsed = JSON.parse(text);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.topic).toBe('my-topic');
+    const subs = getAgentSubscriptions(db, 'sub-agent');
+    expect(subs).toContain('my-topic');
+  });
+
+  it('mesh_unsubscribe with valid as_agent removes subscription', async () => {
+    registerAgent(db, { id: 'unsub-agent', token_hash: 'u'.repeat(64), hostname: 'host1' });
+    // Subscribe first
+    await client.callTool({
+      name: 'mesh_subscribe',
+      arguments: { topic: 'my-topic', as_agent: 'unsub-agent' },
+    });
+    // Then unsubscribe
+    const result = await client.callTool({
+      name: 'mesh_unsubscribe',
+      arguments: { topic: 'my-topic', as_agent: 'unsub-agent' },
+    });
+    expect(result.isError).toBe(false);
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const parsed = JSON.parse(text);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.topic).toBe('my-topic');
+    const subs = getAgentSubscriptions(db, 'unsub-agent');
+    expect(subs).not.toContain('my-topic');
   });
 
   it('CallTool mesh_acl_allow grants ACL permission', async () => {
