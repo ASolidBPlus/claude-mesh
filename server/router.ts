@@ -10,6 +10,7 @@ import {
   getTopicSubscribers,
   subscribe as dbSubscribe,
   unsubscribe as dbUnsubscribe,
+  getMessageByCorrelationId,
   Message,
 } from './db.ts';
 
@@ -271,4 +272,173 @@ export function routeUnsubscribe(
   }
   dbUnsubscribe(db, agent_id, frame.topic);
   return { ok: true };
+}
+
+// ──────────────────────────────────────────────
+// Sprint 7: Request/Response types and routing
+// ──────────────────────────────────────────────
+
+export interface RequestFrame {
+  type: 'request';
+  msg_id: string;
+  to: string;
+  payload: string;
+  content_type?: string;
+  ttl_ms?: number;
+  correlation_id: string;
+}
+
+export interface ResponseFrame {
+  type: 'response';
+  msg_id: string;
+  correlation_id: string;
+  payload: string;
+  content_type?: string;
+}
+
+export interface PendingRequest {
+  correlationId: string;
+  fromAgent: string;
+  expiresAt: number;
+  msgId: string;
+  timer: ReturnType<typeof setTimeout>;
+  ws?: WebSocket;
+  resolve?: (payload: string) => void;
+  reject?: (err: Error) => void;
+}
+
+export function routeRequest(
+  db: Database,
+  agentIndex: Map<string, WebSocket>,
+  from_agent: string,
+  frame: RequestFrame
+): RouterResult {
+  // 1. Payload size check
+  const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
+  if (payloadBytes > 1_048_576) {
+    return { ok: false, error_code: 'MESSAGE_TOO_LARGE', error_message: 'payload exceeds 1 MB limit' };
+  }
+
+  // 2. Recipient exists check
+  if (getAgentById(db, frame.to) === null) {
+    return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
+  }
+
+  // 3. ACL check
+  if (!aclCheck(db, from_agent, frame.to)) {
+    return { ok: false, error_code: 'ACL_DENIED', error_message: `${from_agent} is not permitted to send to ${frame.to}` };
+  }
+
+  // 4. Compute expires_at
+  const ttl = frame.ttl_ms === undefined ? 300_000 : frame.ttl_ms;
+  const expires_at = ttl === 0 ? null : Date.now() + ttl;
+
+  const content_type = frame.content_type ?? 'text/plain';
+  const sent_at = Date.now();
+
+  // 5. Recipient online
+  const recipientWs = agentIndex.get(frame.to);
+  if (recipientWs !== undefined) {
+    insertMessage(db, {
+      id: frame.msg_id,
+      kind: 'request',
+      from_agent,
+      to_agent: frame.to,
+      correlation_id: frame.correlation_id,
+      payload: frame.payload,
+      content_type,
+      sent_at,
+      expires_at,
+    });
+    const deliverFrame = buildDeliverFrame({
+      id: frame.msg_id,
+      kind: 'request',
+      from_agent,
+      to_agent: frame.to,
+      topic: null,
+      correlation_id: frame.correlation_id,
+      payload: frame.payload,
+      content_type,
+      sent_at,
+    });
+    recipientWs.send(deliverFrame);
+    markDelivered(db, frame.msg_id);
+  } else {
+    // 6. Recipient offline
+    if (ttl === 0) {
+      return { ok: true, msg_id: frame.msg_id };
+    }
+    insertMessage(db, {
+      id: frame.msg_id,
+      kind: 'request',
+      from_agent,
+      to_agent: frame.to,
+      correlation_id: frame.correlation_id,
+      payload: frame.payload,
+      content_type,
+      sent_at,
+      expires_at,
+    });
+  }
+
+  return { ok: true, msg_id: frame.msg_id };
+}
+
+export function routeResponse(
+  db: Database,
+  agentIndex: Map<string, WebSocket>,
+  from_agent: string,
+  frame: ResponseFrame,
+  pendingRequests: Map<string, PendingRequest>
+): RouterResult & { deliverFrame?: string } {
+  // 1. Look up pending request
+  const pending = pendingRequests.get(frame.correlation_id);
+  if (pending === undefined) {
+    return { ok: false, error_code: 'CORRELATION_NOT_FOUND', error_message: `no pending request for correlation_id: ${frame.correlation_id}` };
+  }
+
+  // 2. Validate responder identity
+  const originalMsg = getMessageByCorrelationId(db, frame.correlation_id);
+  if (originalMsg === null || originalMsg.to_agent !== from_agent) {
+    return { ok: false, error_code: 'ACL_DENIED', error_message: 'only the original recipient may respond' };
+  }
+
+  // 3. Payload size check
+  const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
+  if (payloadBytes > 1_048_576) {
+    return { ok: false, error_code: 'MESSAGE_TOO_LARGE', error_message: 'payload exceeds 1 MB limit' };
+  }
+
+  const content_type = frame.content_type ?? 'text/plain';
+  const sent_at = Date.now();
+
+  // 4. Store the response
+  const responseMsg = insertMessage(db, {
+    id: frame.msg_id,
+    kind: 'response',
+    from_agent,
+    to_agent: pending.fromAgent,
+    correlation_id: frame.correlation_id,
+    payload: frame.payload,
+    content_type,
+    sent_at,
+  });
+
+  // 5. Mark response delivered immediately
+  markDelivered(db, frame.msg_id);
+
+  // 6. Build the deliver frame for the requester
+  const deliverFrame = buildDeliverFrame({
+    id: frame.msg_id,
+    kind: 'response',
+    from_agent,
+    to_agent: pending.fromAgent,
+    topic: null,
+    correlation_id: frame.correlation_id,
+    payload: frame.payload,
+    content_type,
+    sent_at,
+  });
+
+  return { ok: true, deliverFrame };
 }

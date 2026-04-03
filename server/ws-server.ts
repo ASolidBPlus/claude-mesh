@@ -7,12 +7,15 @@ import { validateToken } from './auth.ts';
 import {
   routeDirect, drainQueue, SendFrame,
   routePublish, routeSubscribe, routeUnsubscribe,
+  routeRequest, routeResponse,
   PublishFrame, SubscribeFrame, UnsubscribeFrame,
+  RequestFrame, ResponseFrame, PendingRequest,
 } from './router.ts';
 
 export interface WsServerHandle {
   wss: WebSocketServer;
   agentIndex: Map<string, WebSocket>;
+  pendingRequests: Map<string, PendingRequest>;
   shutdown(): Promise<void>;
 }
 
@@ -33,6 +36,7 @@ export function startWsServer(port: number, db: Database): Promise<WsServerHandl
     const registry = new Map<WebSocket, ConnState>();
     // Reverse index: agentId -> ws
     const agentIndex = new Map<string, WebSocket>();
+    const pendingRequests = new Map<string, PendingRequest>();
     let shutdownStarted = false;
 
     // Track all raw TCP sockets so we can destroy them on shutdown
@@ -262,6 +266,96 @@ export function startWsServer(port: number, db: Database): Promise<WsServerHandl
             return;
           }
 
+          if (frameType === 'request') {
+            const f = parsed as RequestFrame;
+            // Validate required fields
+            if (typeof f.msg_id !== 'string' || typeof f.to !== 'string' || typeof f.payload !== 'string' || typeof f.correlation_id !== 'string') {
+              try {
+                ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: 'INVALID_REQUEST', message: 'msg_id, to, payload, and correlation_id are required strings' }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+            // Validate ttl_ms
+            const ttl_ms = f.ttl_ms === undefined ? 30_000 : f.ttl_ms;
+            if (ttl_ms === 0 || ttl_ms > 300_000) {
+              try {
+                ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: 'INVALID_REQUEST', message: 'ttl_ms must be between 1 and 300000' }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+            // Check for duplicate correlation_id
+            if (pendingRequests.has(f.correlation_id)) {
+              try {
+                ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: 'INVALID_REQUEST', message: `duplicate correlation_id: ${f.correlation_id}` }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+            const result = routeRequest(db, agentIndex, state.agentId!, { ...f, ttl_ms });
+            if (!result.ok) {
+              try {
+                ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: result.error_code, message: result.error_message }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+            // Register pending request
+            const correlationId = f.correlation_id;
+            const timer = setTimeout(() => {
+              pendingRequests.delete(correlationId);
+              try {
+                ws.send(JSON.stringify({
+                  type: 'error',
+                  ref: correlationId,
+                  code: 'REQUEST_TIMEOUT',
+                  message: `no response received within ${ttl_ms}ms`,
+                }));
+              } catch (_) { /* ignore: socket may be closed */ }
+            }, ttl_ms);
+            pendingRequests.set(correlationId, {
+              correlationId,
+              fromAgent: state.agentId!,
+              expiresAt: Date.now() + ttl_ms,
+              msgId: f.msg_id,
+              timer,
+              ws,
+            });
+            try {
+              ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
+            } catch (_) { /* ignore */ }
+            return;
+          }
+
+          if (frameType === 'response') {
+            const f = parsed as ResponseFrame;
+            // Validate required fields
+            if (typeof f.msg_id !== 'string' || typeof f.correlation_id !== 'string' || typeof f.payload !== 'string') {
+              try {
+                ws.send(JSON.stringify({ type: 'error', ref: (f as Record<string, unknown>).msg_id, code: 'INVALID_REQUEST', message: 'msg_id, correlation_id, and payload are required strings' }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+            const result = routeResponse(db, agentIndex, state.agentId!, f, pendingRequests);
+            if (!result.ok) {
+              try {
+                ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: result.error_code, message: result.error_message }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+            // Retrieve pending entry
+            const pending = pendingRequests.get(f.correlation_id)!;
+            clearTimeout(pending.timer);
+            pendingRequests.delete(f.correlation_id);
+            if (pending.ws) {
+              try { pending.ws.send(result.deliverFrame!); } catch (_) { /* ignore */ }
+            }
+            if (pending.resolve) {
+              pending.resolve(JSON.parse(result.deliverFrame!).payload);
+            }
+            try {
+              ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
+            } catch (_) { /* ignore */ }
+            return;
+          }
+
           // Unknown frame type after auth
           try {
             ws.send(JSON.stringify({ type: 'error', code: 'NOT_IMPLEMENTED', message: 'frame type not implemented' }));
@@ -300,11 +394,21 @@ export function startWsServer(port: number, db: Database): Promise<WsServerHandl
       const handle: WsServerHandle = {
         wss,
         agentIndex,
+        pendingRequests,
         shutdown(): Promise<void> {
           if (shutdownStarted) {
             return Promise.resolve();
           }
           shutdownStarted = true;
+
+          // Clear all pending request timers and reject MCP waiters
+          for (const [, pending] of pendingRequests) {
+            clearTimeout(pending.timer);
+            if (pending.reject) {
+              pending.reject(new Error('SERVER_SHUTDOWN'));
+            }
+          }
+          pendingRequests.clear();
 
           // Mark all authenticated agents offline before closing
           for (const [, state] of registry) {

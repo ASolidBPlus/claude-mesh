@@ -65,11 +65,11 @@ async function main() {
     process.exit(1);
   }
 
-  const { agentIndex } = wsHandle;
+  const { agentIndex, pendingRequests } = wsHandle;
 
   const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken);
 
-  const mcpHandle = await startMcpServer(db, agentIndex);
+  const mcpHandle = await startMcpServer(db, agentIndex, pendingRequests);
   const transport = new StdioServerTransport();
   await mcpHandle.server.connect(transport);
 

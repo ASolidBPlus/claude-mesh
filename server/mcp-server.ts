@@ -9,7 +9,7 @@ import {
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import { listAgents, aclGrant, aclRevoke, getAgentSubscriptions } from './db.ts';
-import { routeDirect, routePublish, routeSubscribe, routeUnsubscribe } from './router.ts';
+import { routeDirect, routePublish, routeSubscribe, routeUnsubscribe, routeRequest, PendingRequest } from './router.ts';
 
 export interface McpServerHandle {
   server: Server;
@@ -136,7 +136,11 @@ const NOT_IMPLEMENTED_RESPONSE = {
   isError: true,
 };
 
-export async function startMcpServer(db: Database, agentIndex: Map<string, WebSocket> = new Map()): Promise<McpServerHandle> {
+export async function startMcpServer(
+  db: Database,
+  agentIndex: Map<string, WebSocket> = new Map(),
+  pendingRequests: Map<string, PendingRequest> = new Map()
+): Promise<McpServerHandle> {
   const server = new Server(
     { name: 'mesh', version: '0.1.0' },
     {
@@ -267,6 +271,77 @@ export async function startMcpServer(db: Database, agentIndex: Map<string, WebSo
       const { agent_id, as_agent } = args as { agent_id: string; as_agent: string };
       aclRevoke(db, agent_id, as_agent);
       return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true }) }], isError: false };
+    }
+
+    if (toolName === 'mesh_request') {
+      const { to, message, as_agent, timeout_seconds } = args as {
+        to?: string; message?: string; as_agent?: string; timeout_seconds?: number;
+      };
+      // Validate required fields
+      if (typeof to !== 'string' || typeof message !== 'string' || typeof as_agent !== 'string') {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ error: 'INVALID_REQUEST', message: 'to, message, and as_agent are required' }) }],
+          isError: true,
+        };
+      }
+      const timeoutSecs = timeout_seconds === undefined ? 30 : timeout_seconds;
+      if (timeoutSecs <= 0 || timeoutSecs > 300) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ error: 'INVALID_REQUEST', message: 'timeout_seconds must be between 1 and 300' }) }],
+          isError: true,
+        };
+      }
+      const ttl_ms = timeoutSecs * 1000;
+      const msgId = crypto.randomUUID();
+      const correlationId = crypto.randomUUID();
+      const result = routeRequest(db, agentIndex, as_agent, {
+        type: 'request',
+        msg_id: msgId,
+        to,
+        payload: message,
+        content_type: 'text/plain',
+        ttl_ms,
+        correlation_id: correlationId,
+      });
+      if (!result.ok) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],
+          isError: true,
+        };
+      }
+      // Create a promise that resolves when the response arrives
+      const responsePayload = await new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingRequests.delete(correlationId);
+          reject(new Error('REQUEST_TIMEOUT'));
+        }, ttl_ms);
+        pendingRequests.set(correlationId, {
+          correlationId,
+          fromAgent: as_agent,
+          expiresAt: Date.now() + ttl_ms,
+          msgId,
+          timer,
+          resolve,
+          reject,
+        });
+      }).catch((err: Error) => {
+        if (err.message === 'REQUEST_TIMEOUT') {
+          return null;
+        }
+        throw err;
+      });
+
+      if (responsePayload === null) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ error: 'REQUEST_TIMEOUT' }) }],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, response: responsePayload }) }],
+        isError: false,
+      };
     }
 
     return NOT_IMPLEMENTED_RESPONSE;

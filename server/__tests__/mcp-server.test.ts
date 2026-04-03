@@ -101,10 +101,11 @@ describe('startMcpServer', () => {
     expect(typeof parsed.msg_id).toBe('string');
   });
 
-  it('CallTool mesh_request returns isError true and not implemented text', async () => {
+  it('CallTool mesh_request without as_agent returns isError true with INVALID_REQUEST', async () => {
     const result = await client.callTool({ name: 'mesh_request', arguments: { to: 'a', message: 'b' } });
     expect(result.isError).toBe(true);
-    expect((result.content as Array<{ type: string; text: string }>)[0].text).toBe('{"error": "not implemented"}');
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text);
+    expect(parsed.error).toBe('INVALID_REQUEST');
   });
 
   it('CallTool mesh_status with empty input returns isError true and not implemented text', async () => {
