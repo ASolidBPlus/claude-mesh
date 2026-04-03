@@ -2,6 +2,7 @@ import { openDb } from './db.ts';
 import { startWsServer, WsServerHandle } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
+import { startCleanup, CleanupHandle } from './cleanup.ts';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Database } from 'bun:sqlite';
 
@@ -10,6 +11,7 @@ export interface Config {
   wsPort: number;
   adminPort: number;
   adminToken: string;
+  cleanupIntervalMs: number;
 }
 
 export function loadConfig(): Config {
@@ -43,7 +45,18 @@ export function loadConfig(): Config {
     adminPort = parsed;
   }
 
-  return { dbPath, wsPort, adminPort, adminToken };
+  let cleanupIntervalMs = 60_000;
+  const cleanupStr = process.env.MESH_CLEANUP_INTERVAL_MS;
+  if (cleanupStr !== undefined) {
+    const parsed = parseInt(cleanupStr, 10);
+    if (isNaN(parsed) || parsed <= 0 || parsed > 3_600_000) {
+      process.stderr.write(`MESH_CLEANUP_INTERVAL_MS must be an integer between 1 and 3600000, got: ${cleanupStr}\n`);
+      process.exit(1);
+    }
+    cleanupIntervalMs = parsed;
+  }
+
+  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs };
 }
 
 async function main() {
@@ -69,9 +82,7 @@ async function main() {
 
   const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken);
 
-  const mcpHandle = await startMcpServer(db, agentIndex, pendingRequests);
-  const transport = new StdioServerTransport();
-  await mcpHandle.server.connect(transport);
+  let cleanupHandle: CleanupHandle | null = null;
 
   let shutdownStarted = false;
 
@@ -84,6 +95,7 @@ async function main() {
     }, 3000);
 
     try {
+      cleanupHandle?.stop();
       await wsHandle.shutdown();
       await httpHandle.shutdown();
       await mcpHandle.shutdown();
@@ -94,6 +106,12 @@ async function main() {
     }
     process.exit(0);
   }
+
+  const mcpHandle = await startMcpServer(db, agentIndex, pendingRequests);
+  const transport = new StdioServerTransport();
+  await mcpHandle.server.connect(transport);
+
+  cleanupHandle = startCleanup(db, pendingRequests, agentIndex, config.cleanupIntervalMs);
 
   process.stdin.on('end', shutdown);
   process.stdin.on('close', shutdown);

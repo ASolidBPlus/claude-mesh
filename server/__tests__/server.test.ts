@@ -63,7 +63,7 @@ describe('loadConfig', () => {
   it('returns defaults when only MESH_ADMIN_TOKEN is set', async () => {
     const { config, exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok' });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, adminToken: 'tok' });
+    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, adminToken: 'tok', cleanupIntervalMs: 60000 });
   });
 
   it('returns correct values when all valid env vars are set', async () => {
@@ -73,7 +73,7 @@ describe('loadConfig', () => {
       MESH_WS_PORT: '8080',
     });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, adminToken: 'secret' });
+    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, adminToken: 'secret', cleanupIntervalMs: 60000 });
   });
 
   it('exits with code 1 when MESH_WS_PORT is not a number', async () => {

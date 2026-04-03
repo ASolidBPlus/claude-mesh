@@ -24,7 +24,7 @@ const REQUIRED_FIELDS: Record<string, string[]> = {
   mesh_subscribe: ['topic', 'as_agent'],
   mesh_unsubscribe: ['topic', 'as_agent'],
   mesh_discover: [],
-  mesh_status: [],
+  mesh_status: ['as_agent'],
   mesh_acl_allow: ['agent_id', 'as_agent'],
   mesh_acl_deny: ['agent_id', 'as_agent'],
   mesh_request: ['to', 'message'],
@@ -108,10 +108,59 @@ describe('startMcpServer', () => {
     expect(parsed.error).toBe('INVALID_REQUEST');
   });
 
-  it('CallTool mesh_status with empty input returns isError true and not implemented text', async () => {
+  it('CallTool mesh_status with empty input returns isError true with INVALID_REQUEST', async () => {
     const result = await client.callTool({ name: 'mesh_status', arguments: {} });
     expect(result.isError).toBe(true);
-    expect((result.content as Array<{ type: string; text: string }>)[0].text).toBe('{"error": "not implemented"}');
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text);
+    expect(parsed.error).toBe('INVALID_REQUEST');
+  });
+
+  it('mesh_status returns all five fields for a known agent', async () => {
+    registerAgent(db, { id: 'status-agent', token_hash: 's'.repeat(64), hostname: 'host1' });
+    setOnline(db, 'status-agent', true);
+    // Subscribe to a topic
+    const agentIndex = new Map();
+    const pendingRequests = new Map();
+    const localHandle = await startMcpServer(db, agentIndex, pendingRequests);
+    const [clientTransport2, serverTransport2] = InMemoryTransport.createLinkedPair();
+    await localHandle.server.connect(serverTransport2);
+    const client2 = new Client({ name: 'test2', version: '0.0.0' }, { capabilities: {} });
+    await client2.connect(clientTransport2);
+
+    // Subscribe the agent to a topic
+    await client2.callTool({ name: 'mesh_subscribe', arguments: { topic: 'test-topic', as_agent: 'status-agent' } });
+
+    // Insert a pending message for the agent
+    const { insertMessage } = await import('../db.ts');
+    insertMessage(db, {
+      id: 'pending-msg-1',
+      kind: 'direct',
+      from_agent: 'status-agent',
+      to_agent: 'status-agent',
+      payload: 'queued',
+      sent_at: Date.now(),
+    });
+
+    const result = await client2.callTool({ name: 'mesh_status', arguments: { as_agent: 'status-agent' } });
+    expect(result.isError).toBe(false);
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text);
+    expect(parsed.agent_id).toBe('status-agent');
+    expect(typeof parsed.online).toBe('boolean');
+    expect(Array.isArray(parsed.subscriptions)).toBe(true);
+    expect(typeof parsed.queued_messages).toBe('number');
+    expect(parsed.queued_messages).toBe(1);
+    expect(typeof parsed.server_uptime_ms).toBe('number');
+    expect(parsed.server_uptime_ms).toBeGreaterThanOrEqual(0);
+
+    await client2.close().catch(() => {});
+    await localHandle.shutdown().catch(() => {});
+  });
+
+  it('mesh_status returns AGENT_NOT_FOUND for unknown agent', async () => {
+    const result = await client.callTool({ name: 'mesh_status', arguments: { as_agent: 'nonexistent-agent' } });
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text);
+    expect(parsed.error).toBe('AGENT_NOT_FOUND');
   });
 
   it('CallTool for unknown tool name returns MCP error and does not crash', async () => {

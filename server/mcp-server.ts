@@ -8,7 +8,9 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
-import { listAgents, aclGrant, aclRevoke, getAgentSubscriptions } from './db.ts';
+import { listAgents, aclGrant, aclRevoke, getAgentSubscriptions, getAgentById, getPendingMessages } from './db.ts';
+
+const SERVER_START_MS = Date.now();
 import { routeDirect, routePublish, routeSubscribe, routeUnsubscribe, routeRequest, PendingRequest } from './router.ts';
 
 export interface McpServerHandle {
@@ -83,11 +85,16 @@ const TOOLS = [
   },
   {
     name: 'mesh_status',
-    description: 'Get mesh status',
+    description: "Get this agent's current mesh connection state: agent_id, online status, active topic subscriptions, pending undelivered message count, and server uptime.",
     inputSchema: {
       type: 'object',
-      properties: {},
-      required: [],
+      properties: {
+        as_agent: {
+          type: 'string',
+          description: 'Agent ID to inspect',
+        },
+      },
+      required: ['as_agent'],
     },
   },
   {
@@ -271,6 +278,36 @@ export async function startMcpServer(
       const { agent_id, as_agent } = args as { agent_id: string; as_agent: string };
       aclRevoke(db, agent_id, as_agent);
       return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true }) }], isError: false };
+    }
+
+    if (toolName === 'mesh_status') {
+      const { as_agent } = args as { as_agent?: string };
+      if (typeof as_agent !== 'string' || as_agent.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ error: 'INVALID_REQUEST', message: 'as_agent is required' }) }],
+          isError: true,
+        };
+      }
+      const agent = getAgentById(db, as_agent);
+      if (agent === null) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ error: 'AGENT_NOT_FOUND', message: 'agent not found' }) }],
+          isError: true,
+        };
+      }
+      const subscriptions = getAgentSubscriptions(db, as_agent);
+      const queued_messages = getPendingMessages(db, as_agent).length;
+      const server_uptime_ms = Date.now() - SERVER_START_MS;
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({
+          agent_id: as_agent,
+          online: agent.online === 1,
+          subscriptions,
+          queued_messages,
+          server_uptime_ms,
+        }) }],
+        isError: false,
+      };
     }
 
     if (toolName === 'mesh_request') {

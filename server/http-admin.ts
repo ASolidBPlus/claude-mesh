@@ -10,6 +10,8 @@ import {
   listOutboundAcl,
   getOrCreateTopic,
   listTopics,
+  listAgents,
+  Agent,
 } from './db.ts';
 
 export interface HttpAdminHandle {
@@ -37,6 +39,18 @@ function requireAdmin(
   res.writeHead(401, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'unauthorized' }));
   return false;
+}
+
+function formatAgent(agent: Agent): Record<string, unknown> {
+  return {
+    id: agent.id,
+    hostname: agent.hostname,
+    online: agent.online === 1,
+    capabilities: JSON.parse(agent.capabilities) as unknown[],
+    metadata: JSON.parse(agent.metadata) as Record<string, unknown>,
+    registered_at: agent.registered_at,
+    last_seen: agent.last_seen,
+  };
 }
 
 export function startHttpAdmin(
@@ -199,6 +213,28 @@ export function startHttpAdmin(
         const topics = listTopics(db);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(topics));
+        return;
+      }
+
+      if (pathname === '/agents' && method === 'GET') {
+        const onlineOnly = url.searchParams.get('online') === 'true';
+        const agents = listAgents(db, onlineOnly);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(agents.map(formatAgent)));
+        return;
+      }
+
+      const agentByIdMatch = pathname.match(/^\/agents\/([^/]+)$/);
+      if (agentByIdMatch && method === 'GET') {
+        const id = agentByIdMatch[1];
+        const agent = getAgentById(db, id);
+        if (agent === null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'agent not found' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(formatAgent(agent)));
         return;
       }
 

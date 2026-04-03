@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { openDb, registerAgent, aclGrant, aclCheck } from '../db.ts';
+import { openDb, registerAgent, aclGrant, aclCheck, setOnline } from '../db.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
 import { Database } from 'bun:sqlite';
 import * as net from 'net';
@@ -162,6 +162,72 @@ describe('http-admin', () => {
 
   it('GET /acl — 404 if agent not in registry', async () => {
     const res = await fetch(`${base}/acl?agent=ghost`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.error).toBe('agent not found');
+  });
+
+  // GET /agents
+  it('GET /agents — 401 without Authorization header', async () => {
+    const res = await fetch(`${base}/agents`);
+    expect(res.status).toBe(401);
+  });
+
+  it('GET /agents/:id — 401 without Authorization header', async () => {
+    const res = await fetch(`${base}/agents/some-agent`);
+    expect(res.status).toBe(401);
+  });
+
+  it('GET /agents — 200 returns all agents with correct shape', async () => {
+    registerAgent(db, { id: 'list-agent-a', token_hash: 'a'.repeat(64), hostname: 'host1', capabilities: '["file-transfer"]', metadata: '{"region":"eu"}' });
+    registerAgent(db, { id: 'list-agent-b', token_hash: 'b'.repeat(64), hostname: 'host2' });
+    setOnline(db, 'list-agent-a', true);
+
+    const res = await fetch(`${base}/agents`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>[];
+    expect(body).toHaveLength(2);
+    for (const agent of body) {
+      expect(typeof agent.online).toBe('boolean');
+      expect(Array.isArray(agent.capabilities)).toBe(true);
+      expect(typeof agent.metadata).toBe('object');
+    }
+  });
+
+  it('GET /agents?online=true — 200 returns only online agents', async () => {
+    registerAgent(db, { id: 'online-agent', token_hash: 'a'.repeat(64), hostname: 'host1' });
+    registerAgent(db, { id: 'offline-agent', token_hash: 'b'.repeat(64), hostname: 'host2' });
+    setOnline(db, 'online-agent', true);
+
+    const res = await fetch(`${base}/agents?online=true`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>[];
+    expect(body).toHaveLength(1);
+    expect(body[0].id).toBe('online-agent');
+  });
+
+  it('GET /agents/:id — 200 returns the agent', async () => {
+    registerAgent(db, { id: 'lookup-agent', token_hash: 'l'.repeat(64), hostname: 'hosta' });
+
+    const res = await fetch(`${base}/agents/lookup-agent`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.id).toBe('lookup-agent');
+    expect(typeof body.online).toBe('boolean');
+    expect(Array.isArray(body.capabilities)).toBe(true);
+    expect(typeof body.metadata).toBe('object');
+  });
+
+  it('GET /agents/:id — 404 for unknown agent', async () => {
+    const res = await fetch(`${base}/agents/nonexistent`, {
       headers: { 'Authorization': `Bearer ${token}` },
     });
     expect(res.status).toBe(404);
