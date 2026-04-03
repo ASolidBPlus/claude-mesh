@@ -7,7 +7,9 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import { Database } from 'bun:sqlite';
-import { listAgents } from './db.ts';
+import { WebSocket } from 'ws';
+import { listAgents, aclGrant, aclRevoke } from './db.ts';
+import { routeDirect } from './router.ts';
 
 export interface McpServerHandle {
   server: Server;
@@ -24,8 +26,9 @@ const TOOLS = [
         to: { type: 'string' },
         message: { type: 'string' },
         ttl_seconds: { type: 'number' },
+        as_agent: { type: 'string', description: 'Agent ID acting as the sender' },
       },
-      required: ['to', 'message'],
+      required: ['to', 'message', 'as_agent'],
     },
   },
   {
@@ -91,8 +94,9 @@ const TOOLS = [
       type: 'object',
       properties: {
         agent_id: { type: 'string' },
+        as_agent: { type: 'string', description: 'Agent ID whose ACL is being modified' },
       },
-      required: ['agent_id'],
+      required: ['agent_id', 'as_agent'],
     },
   },
   {
@@ -102,8 +106,9 @@ const TOOLS = [
       type: 'object',
       properties: {
         agent_id: { type: 'string' },
+        as_agent: { type: 'string', description: 'Agent ID whose ACL is being modified' },
       },
-      required: ['agent_id'],
+      required: ['agent_id', 'as_agent'],
     },
   },
   {
@@ -128,7 +133,7 @@ const NOT_IMPLEMENTED_RESPONSE = {
   isError: true,
 };
 
-export async function startMcpServer(db: Database): Promise<McpServerHandle> {
+export async function startMcpServer(db: Database, agentIndex: Map<string, WebSocket> = new Map()): Promise<McpServerHandle> {
   const server = new Server(
     { name: 'mesh', version: '0.1.0' },
     {
@@ -151,8 +156,9 @@ export async function startMcpServer(db: Database): Promise<McpServerHandle> {
       throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${toolName}`);
     }
 
+    const args = (request.params.arguments ?? {}) as Record<string, unknown>;
+
     if (toolName === 'mesh_discover') {
-      const args = (request.params.arguments ?? {}) as Record<string, unknown>;
       const onlineOnly = args.filter_online === true;
       let agents = listAgents(db, onlineOnly);
 
@@ -178,6 +184,34 @@ export async function startMcpServer(db: Database): Promise<McpServerHandle> {
         content: [{ type: 'text' as const, text: JSON.stringify(result) }],
         isError: false,
       };
+    }
+
+    if (toolName === 'mesh_send') {
+      const { to, message, ttl_seconds, as_agent } = args as {
+        to: string; message: string; ttl_seconds?: number; as_agent: string;
+      };
+      const msgId = crypto.randomUUID();
+      const ttl_ms = ttl_seconds !== undefined ? ttl_seconds * 1000 : 300_000;
+      const result = routeDirect(db, agentIndex, as_agent, {
+        type: 'send', msg_id: msgId, to, payload: message,
+        content_type: 'text/plain', ttl_ms,
+      });
+      if (result.ok) {
+        return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, msg_id: result.msg_id }) }], isError: false };
+      }
+      return { content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }], isError: true };
+    }
+
+    if (toolName === 'mesh_acl_allow') {
+      const { agent_id, as_agent } = args as { agent_id: string; as_agent: string };
+      const row = aclGrant(db, agent_id, as_agent, as_agent);
+      return { content: [{ type: 'text' as const, text: JSON.stringify(row) }], isError: false };
+    }
+
+    if (toolName === 'mesh_acl_deny') {
+      const { agent_id, as_agent } = args as { agent_id: string; as_agent: string };
+      aclRevoke(db, agent_id, as_agent);
+      return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true }) }], isError: false };
     }
 
     return NOT_IMPLEMENTED_RESPONSE;

@@ -2,11 +2,13 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as net from 'net';
-import { getAgentById, setOnline, touchAgent, getPendingMessages } from './db.ts';
+import { getAgentById, setOnline, touchAgent, getPendingMessages, markAcked } from './db.ts';
 import { validateToken } from './auth.ts';
+import { routeDirect, drainQueue, SendFrame } from './router.ts';
 
 export interface WsServerHandle {
   wss: WebSocketServer;
+  agentIndex: Map<string, WebSocket>;
   shutdown(): Promise<void>;
 }
 
@@ -127,11 +129,13 @@ export function startWsServer(port: number, db: Database): Promise<WsServerHandl
             state.agentId = agentId;
             agentIndex.set(agentId, ws);
 
-            const queued = getPendingMessages(db, agentId).length;
+            const pending = getPendingMessages(db, agentId);
+            const queued = pending.length;
 
             try {
               ws.send(JSON.stringify({ type: 'auth_ok', agent_id: agentId, queued }));
             } catch (_) { /* ignore */ }
+            drainQueue(db, agentId, ws);
 
             // Broadcast agent_status to all other authenticated connections
             const statusMsg = JSON.stringify({
@@ -162,6 +166,34 @@ export function startWsServer(port: number, db: Database): Promise<WsServerHandl
             } catch (_) { /* ignore */ }
             if (state.agentId !== null) {
               touchAgent(db, state.agentId);
+            }
+            return;
+          }
+
+          if (frameType === 'send') {
+            const f = parsed as SendFrame;
+            const result = routeDirect(db, agentIndex, state.agentId!, f);
+            if (result.ok) {
+              try {
+                ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
+              } catch (_) { /* ignore */ }
+            } else {
+              try {
+                ws.send(JSON.stringify({
+                  type: 'error',
+                  ref: f.msg_id,
+                  code: result.error_code,
+                  message: result.error_message,
+                }));
+              } catch (_) { /* ignore */ }
+            }
+            return;
+          }
+
+          if (frameType === 'ack') {
+            const msgId = (parsed as Record<string, unknown>).msg_id;
+            if (typeof msgId === 'string') {
+              markAcked(db, msgId);
             }
             return;
           }
@@ -203,6 +235,7 @@ export function startWsServer(port: number, db: Database): Promise<WsServerHandl
 
       const handle: WsServerHandle = {
         wss,
+        agentIndex,
         shutdown(): Promise<void> {
           if (shutdownStarted) {
             return Promise.resolve();

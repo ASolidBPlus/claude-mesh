@@ -444,11 +444,33 @@ describe('startWsServer', () => {
     await authMsgPromise;
 
     const replyPromise = waitForMessage(ws);
-    ws.send(JSON.stringify({ type: 'send', msg_id: 'x', to: 'y', payload: 'z' }));
+    ws.send(JSON.stringify({ type: 'unknown_frame_type_xyz' }));
 
     const reply = JSON.parse(await replyPromise);
     expect(reply.type).toBe('error');
     expect(reply.code).toBe('NOT_IMPLEMENTED');
+
+    // Connection should still be open
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  }, 10000);
+
+  it('authenticated client sending send frame with unknown recipient receives error', async () => {
+    const rawToken = generateToken();
+    registerAgent(db, { id: 'agent-send-err', token_hash: hashToken(rawToken), hostname: 'host1' });
+
+    const ws = await connectWs(port);
+    const authMsgPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'agent-send-err', token: rawToken }));
+    await authMsgPromise;
+
+    const replyPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'send', msg_id: 'test-msg-id', to: 'unknown-recipient', payload: 'hello' }));
+
+    const reply = JSON.parse(await replyPromise);
+    expect(reply.type).toBe('error');
+    expect(reply.code).toBe('AGENT_NOT_FOUND');
+    expect(reply.ref).toBe('test-msg-id');
 
     // Connection should still be open
     expect(ws.readyState).toBe(WebSocket.OPEN);

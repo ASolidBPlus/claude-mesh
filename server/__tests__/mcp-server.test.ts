@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { openDb, registerAgent, setOnline } from '../db.ts';
+import { openDb, registerAgent, setOnline, aclGrant } from '../db.ts';
 import { startMcpServer, McpServerHandle } from '../mcp-server.ts';
 import { Database } from 'bun:sqlite';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -19,14 +19,14 @@ const EXPECTED_TOOLS = [
 ];
 
 const REQUIRED_FIELDS: Record<string, string[]> = {
-  mesh_send: ['to', 'message'],
+  mesh_send: ['to', 'message', 'as_agent'],
   mesh_broadcast: ['topic', 'message'],
   mesh_subscribe: ['topic'],
   mesh_unsubscribe: ['topic'],
   mesh_discover: [],
   mesh_status: [],
-  mesh_acl_allow: ['agent_id'],
-  mesh_acl_deny: ['agent_id'],
+  mesh_acl_allow: ['agent_id', 'as_agent'],
+  mesh_acl_deny: ['agent_id', 'as_agent'],
   mesh_request: ['to', 'message'],
 };
 
@@ -80,10 +80,25 @@ describe('startMcpServer', () => {
     }
   });
 
-  it('CallTool mesh_send returns isError true and not implemented text', async () => {
-    const result = await client.callTool({ name: 'mesh_send', arguments: { to: 'a', message: 'b' } });
+  it('CallTool mesh_send with valid args routes message (AGENT_NOT_FOUND when recipient missing)', async () => {
+    registerAgent(db, { id: 'sender-agent', token_hash: 'a'.repeat(64), hostname: 'host1' });
+    const result = await client.callTool({ name: 'mesh_send', arguments: { to: 'ghost', message: 'hello', as_agent: 'sender-agent' } });
     expect(result.isError).toBe(true);
-    expect((result.content as Array<{ type: string; text: string }>)[0].text).toBe('{"error": "not implemented"}');
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const parsed = JSON.parse(text);
+    expect(parsed.error).toBe('AGENT_NOT_FOUND');
+  });
+
+  it('CallTool mesh_send with valid agents and ACL returns ok:true', async () => {
+    registerAgent(db, { id: 'mcp-sender', token_hash: 'a'.repeat(64), hostname: 'host1' });
+    registerAgent(db, { id: 'mcp-recip', token_hash: 'b'.repeat(64), hostname: 'host2' });
+    aclGrant(db, 'mcp-sender', 'mcp-recip', 'system');
+    const result = await client.callTool({ name: 'mesh_send', arguments: { to: 'mcp-recip', message: 'hello', as_agent: 'mcp-sender' } });
+    expect(result.isError).toBe(false);
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const parsed = JSON.parse(text);
+    expect(parsed.ok).toBe(true);
+    expect(typeof parsed.msg_id).toBe('string');
   });
 
   it('CallTool mesh_request returns isError true and not implemented text', async () => {
@@ -220,8 +235,6 @@ describe('startMcpServer', () => {
       { name: 'mesh_broadcast', arguments: { topic: 't', message: 'm' } },
       { name: 'mesh_subscribe', arguments: { topic: 't' } },
       { name: 'mesh_unsubscribe', arguments: { topic: 't' } },
-      { name: 'mesh_acl_allow', arguments: { agent_id: 'a' } },
-      { name: 'mesh_acl_deny', arguments: { agent_id: 'a' } },
     ];
 
     for (const tool of stubTools) {
@@ -229,5 +242,28 @@ describe('startMcpServer', () => {
       expect(result.isError).toBe(true);
       expect((result.content as Array<{ type: string; text: string }>)[0].text).toBe('{"error": "not implemented"}');
     }
+  });
+
+  it('CallTool mesh_acl_allow grants ACL permission', async () => {
+    registerAgent(db, { id: 'acl-agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
+    registerAgent(db, { id: 'acl-agent-b', token_hash: 'b'.repeat(64), hostname: 'host2' });
+    // as_agent='acl-agent-b' allows agent_id='acl-agent-a' to send to acl-agent-b
+    const result = await client.callTool({ name: 'mesh_acl_allow', arguments: { agent_id: 'acl-agent-a', as_agent: 'acl-agent-b' } });
+    expect(result.isError).toBe(false);
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const parsed = JSON.parse(text);
+    expect(parsed.from_agent).toBe('acl-agent-a');
+    expect(parsed.to_agent).toBe('acl-agent-b');
+  });
+
+  it('CallTool mesh_acl_deny revokes ACL permission', async () => {
+    registerAgent(db, { id: 'deny-agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
+    registerAgent(db, { id: 'deny-agent-b', token_hash: 'b'.repeat(64), hostname: 'host2' });
+    aclGrant(db, 'deny-agent-a', 'deny-agent-b', 'system');
+    const result = await client.callTool({ name: 'mesh_acl_deny', arguments: { agent_id: 'deny-agent-a', as_agent: 'deny-agent-b' } });
+    expect(result.isError).toBe(false);
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const parsed = JSON.parse(text);
+    expect(parsed.ok).toBe(true);
   });
 });

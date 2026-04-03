@@ -1,12 +1,14 @@
 import { openDb } from './db.ts';
 import { startWsServer, WsServerHandle } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
+import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Database } from 'bun:sqlite';
 
 export interface Config {
   dbPath: string;
   wsPort: number;
+  adminPort: number;
   adminToken: string;
 }
 
@@ -30,7 +32,18 @@ export function loadConfig(): Config {
     wsPort = parsed;
   }
 
-  return { dbPath, wsPort, adminToken };
+  let adminPort = 7385;
+  const adminPortStr = process.env.MESH_ADMIN_PORT;
+  if (adminPortStr !== undefined) {
+    const parsed = parseInt(adminPortStr, 10);
+    if (isNaN(parsed) || parsed < 1 || parsed > 65535 || String(parsed) !== adminPortStr.trim()) {
+      process.stderr.write(`MESH_ADMIN_PORT must be an integer between 1 and 65535, got: ${adminPortStr}\n`);
+      process.exit(1);
+    }
+    adminPort = parsed;
+  }
+
+  return { dbPath, wsPort, adminPort, adminToken };
 }
 
 async function main() {
@@ -52,7 +65,11 @@ async function main() {
     process.exit(1);
   }
 
-  const mcpHandle = await startMcpServer(db);
+  const { agentIndex } = wsHandle;
+
+  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken);
+
+  const mcpHandle = await startMcpServer(db, agentIndex);
   const transport = new StdioServerTransport();
   await mcpHandle.server.connect(transport);
 
@@ -68,6 +85,7 @@ async function main() {
 
     try {
       await wsHandle.shutdown();
+      await httpHandle.shutdown();
       await mcpHandle.shutdown();
       db.close();
       process.stdout.write('mesh-server stopped\n');
