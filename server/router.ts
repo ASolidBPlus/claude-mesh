@@ -12,6 +12,10 @@ import {
   unsubscribe as dbUnsubscribe,
   getMessageByCorrelationId,
   Message,
+  insertFile,
+  getFile,
+  markFileDelivered,
+  FileRecord,
 } from './db.ts';
 
 export interface SendFrame {
@@ -382,6 +386,137 @@ export function routeRequest(
   }
 
   return { ok: true, msg_id: frame.msg_id };
+}
+
+// ──────────────────────────────────────────────
+// Sprint 9: File Transfer
+// ──────────────────────────────────────────────
+
+export interface FileSendFrame {
+  type: 'file_send';
+  msg_id: string;
+  to: string;
+  filename: string;
+  content_type?: string;
+  data: string;       // base64
+  ttl_ms?: number;
+}
+
+export function routeFile(
+  db: Database,
+  agentIndex: Map<string, WebSocket>,
+  from_agent: string,
+  frame: FileSendFrame,
+  maxFileBytes: number
+): RouterResult {
+  // 1. Validate base64 — attempt decode and check round-trip
+  let decoded: Buffer;
+  try {
+    decoded = Buffer.from(frame.data, 'base64');
+    // Round-trip check: re-encoding must match original (no garbage accepted)
+    if (decoded.toString('base64') !== frame.data) {
+      return { ok: false, error_code: 'INVALID_BASE64', error_message: 'data is not valid base64' };
+    }
+  } catch {
+    return { ok: false, error_code: 'INVALID_BASE64', error_message: 'data is not valid base64' };
+  }
+
+  // 2. Check decoded byte count
+  if (decoded.byteLength > maxFileBytes) {
+    return { ok: false, error_code: 'FILE_TOO_LARGE', error_message: `file exceeds ${maxFileBytes} byte limit` };
+  }
+
+  // 3. Recipient exists check
+  if (getAgentById(db, frame.to) === null) {
+    return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
+  }
+
+  // 4. ACL check
+  if (!aclCheck(db, from_agent, frame.to)) {
+    return { ok: false, error_code: 'ACL_DENIED', error_message: `${from_agent} is not permitted to send to ${frame.to}` };
+  }
+
+  // 5. Generate file_id
+  const file_id = crypto.randomUUID();
+
+  // 6. Compute expires_at (same logic as routeDirect: 0 -> null, default 300_000)
+  const ttl = frame.ttl_ms === undefined ? 300_000 : frame.ttl_ms;
+  const expires_at = ttl === 0 ? null : Date.now() + ttl;
+
+  const content_type = frame.content_type ?? 'application/octet-stream';
+  const size_bytes = decoded.byteLength;
+  const sent_at = Date.now();
+
+  // 7. If recipient offline and ttl_ms === 0: discard entirely
+  const recipientWs = agentIndex.get(frame.to);
+  if (recipientWs === undefined && ttl === 0) {
+    return { ok: true, msg_id: frame.msg_id };
+  }
+
+  // 8. Store the file
+  insertFile(db, {
+    id: file_id,
+    from_agent,
+    to_agent: frame.to,
+    filename: frame.filename,
+    content_type,
+    size_bytes,
+    data: frame.data,
+    sent_at,
+    expires_at,
+  });
+
+  // 9. Deliver if recipient online
+  if (recipientWs !== undefined) {
+    const deliverFrame = JSON.stringify({
+      type: 'file_deliver',
+      file_id,
+      from: from_agent,
+      to: frame.to,
+      filename: frame.filename,
+      content_type,
+      size_bytes,
+      sent_at,
+      fetch_url: `/files/${file_id}`,
+    });
+    recipientWs.send(deliverFrame);
+    markFileDelivered(db, file_id);
+  }
+
+  return { ok: true, msg_id: frame.msg_id };
+}
+
+export function drainFileQueue(
+  db: Database,
+  agentId: string,
+  ws: WebSocket
+): number {
+  const now = Date.now();
+  const pendingFiles = db.prepare(`
+    SELECT * FROM files
+    WHERE to_agent = ?
+      AND delivered_at IS NULL
+      AND (expires_at IS NULL OR expires_at >= ?)
+    ORDER BY sent_at ASC
+  `).all(agentId, now) as FileRecord[];
+
+  for (const file of pendingFiles) {
+    const deliverFrame = JSON.stringify({
+      type: 'file_deliver',
+      file_id: file.id,
+      from: file.from_agent,
+      to: file.to_agent,
+      filename: file.filename,
+      content_type: file.content_type,
+      size_bytes: file.size_bytes,
+      sent_at: file.sent_at,
+      fetch_url: `/files/${file.id}`,
+    });
+    ws.send(deliverFrame);
+    markFileDelivered(db, file.id);
+  }
+
+  return pendingFiles.length;
 }
 
 export function routeResponse(

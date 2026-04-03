@@ -8,6 +8,7 @@ import {
   routeDirect, drainQueue, SendFrame,
   routePublish, routeSubscribe, routeUnsubscribe,
   routeRequest, routeResponse,
+  routeFile, drainFileQueue, FileSendFrame,
   PublishFrame, SubscribeFrame, UnsubscribeFrame,
   RequestFrame, ResponseFrame, PendingRequest,
 } from './router.ts';
@@ -25,7 +26,7 @@ interface ConnState {
   authed: boolean;
 }
 
-export function startWsServer(port: number, db: Database): Promise<WsServerHandle> {
+export function startWsServer(port: number, db: Database, maxFileBytes: number = 10_485_760): Promise<WsServerHandle> {
   return new Promise((resolve, reject) => {
     // Create an HTTP server explicitly so we can track and destroy its sockets
     const httpServer = http.createServer();
@@ -140,10 +141,21 @@ export function startWsServer(port: number, db: Database): Promise<WsServerHandl
             const pending = getPendingMessages(db, agentId);
             const queued = pending.length;
 
+            // Count pending files without delivering yet (for auth_ok payload)
+            const now = Date.now();
+            const pendingFileRows = db.prepare(`
+              SELECT COUNT(*) as cnt FROM files
+              WHERE to_agent = ?
+                AND delivered_at IS NULL
+                AND (expires_at IS NULL OR expires_at >= ?)
+            `).get(agentId, now) as { cnt: number };
+            const queued_files = pendingFileRows.cnt;
+
             try {
-              ws.send(JSON.stringify({ type: 'auth_ok', agent_id: agentId, queued }));
+              ws.send(JSON.stringify({ type: 'auth_ok', agent_id: agentId, queued, queued_files }));
             } catch (_) { /* ignore */ }
             drainQueue(db, agentId, ws);
+            drainFileQueue(db, agentId, ws);
 
             // Broadcast agent_status to all other authenticated connections
             const statusMsg = JSON.stringify({
@@ -353,6 +365,31 @@ export function startWsServer(port: number, db: Database): Promise<WsServerHandl
             try {
               ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
             } catch (_) { /* ignore */ }
+            return;
+          }
+
+          if (frameType === 'file_send') {
+            const f = parsed as FileSendFrame;
+            // Validate required string fields: msg_id, to, filename, data
+            if (typeof f.msg_id !== 'string' || typeof f.to !== 'string' ||
+                typeof f.filename !== 'string' || typeof f.data !== 'string') {
+              ws.send(JSON.stringify({
+                type: 'error', ref: f.msg_id,
+                code: 'INVALID_REQUEST',
+                message: 'msg_id, to, filename, and data are required strings',
+              }));
+              return;
+            }
+            const result = routeFile(db, agentIndex, state.agentId!, f, maxFileBytes);
+            if (result.ok) {
+              ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
+            } else {
+              ws.send(JSON.stringify({
+                type: 'error', ref: f.msg_id,
+                code: result.error_code,
+                message: result.error_message,
+              }));
+            }
             return;
           }
 

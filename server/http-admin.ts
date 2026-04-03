@@ -12,6 +12,7 @@ import {
   listTopics,
   listAgents,
   Agent,
+  getFile,
 } from './db.ts';
 
 export interface HttpAdminHandle {
@@ -56,7 +57,8 @@ function formatAgent(agent: Agent): Record<string, unknown> {
 export function startHttpAdmin(
   port: number,
   db: Database,
-  adminToken: string
+  adminToken: string,
+  _maxFileBytes: number = 10_485_760
 ): Promise<HttpAdminHandle> {
   return new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
@@ -235,6 +237,25 @@ export function startHttpAdmin(
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(formatAgent(agent)));
+        return;
+      }
+
+      const fileByIdMatch = pathname.match(/^\/files\/([^/]+)$/);
+      if (fileByIdMatch && method === 'GET') {
+        const id = fileByIdMatch[1];
+        const file = getFile(db, id);
+        if (file === null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'file not found' }));
+          return;
+        }
+        const content = Buffer.from(file.data, 'base64');
+        res.writeHead(200, {
+          'Content-Type': file.content_type,
+          'Content-Disposition': `attachment; filename="${file.filename}"`,
+          'Content-Length': String(content.byteLength),
+        });
+        res.end(content);
         return;
       }
 

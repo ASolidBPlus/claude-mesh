@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { openDb, registerAgent, aclGrant, aclCheck, setOnline } from '../db.ts';
+import { openDb, registerAgent, aclGrant, aclCheck, setOnline, insertFile } from '../db.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
 import { Database } from 'bun:sqlite';
 import * as net from 'net';
@@ -261,5 +261,69 @@ describe('http-admin', () => {
     expect(body.inbound).toHaveLength(1);
     expect((body.inbound[0] as Record<string, unknown>).from_agent).toBe('agent-c');
     expect((body.inbound[0] as Record<string, unknown>).to_agent).toBe('agent-a');
+  });
+});
+
+// ──────────────────────────────────────────────
+// GET /files/:id
+// ──────────────────────────────────────────────
+
+describe('GET /files/:id', () => {
+  let db2: Database;
+  let handle2: HttpAdminHandle;
+  let port2: number;
+  let base2: string;
+  const token2 = 'file-admin-token';
+
+  beforeEach(async () => {
+    db2 = openDb(':memory:');
+    handle2 = await startHttpAdmin(0, db2, token2);
+    port2 = (handle2.server.address() as net.AddressInfo).port;
+    base2 = `http://localhost:${port2}`;
+  });
+
+  afterEach(async () => {
+    await handle2.shutdown().catch(() => {});
+    db2.close();
+  });
+
+  it('returns raw binary with correct Content-Type and Content-Disposition headers', async () => {
+    const content = 'hello from file transfer';
+    const data = Buffer.from(content).toString('base64');
+    insertFile(db2, {
+      id: 'test-file-id',
+      from_agent: 'a',
+      to_agent: 'b',
+      filename: 'hello.txt',
+      content_type: 'text/plain',
+      size_bytes: content.length,
+      data,
+      sent_at: Date.now(),
+      expires_at: null,
+    });
+
+    const res = await fetch(`${base2}/files/test-file-id`, {
+      headers: { 'Authorization': `Bearer ${token2}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('text/plain');
+    expect(res.headers.get('content-disposition')).toBe('attachment; filename="hello.txt"');
+
+    const body = await res.text();
+    expect(body).toBe(content);
+  });
+
+  it('returns 404 for unknown file id', async () => {
+    const res = await fetch(`${base2}/files/no-such-file`, {
+      headers: { 'Authorization': `Bearer ${token2}` },
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.error).toBe('file not found');
+  });
+
+  it('returns 401 without admin token', async () => {
+    const res = await fetch(`${base2}/files/any-id`);
+    expect(res.status).toBe(401);
   });
 });

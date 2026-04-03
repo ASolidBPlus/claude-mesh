@@ -51,6 +51,19 @@ export interface Subscription {
   subscribed_at: number;   // unix ms
 }
 
+export interface FileRecord {
+  id: string;
+  from_agent: string;
+  to_agent: string;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  data: string;           // base64
+  sent_at: number;        // unix ms
+  expires_at: number | null;
+  delivered_at: number | null;
+}
+
 // ──────────────────────────────────────────────
 // 5.1 Database initialization
 // ──────────────────────────────────────────────
@@ -116,6 +129,23 @@ export function openDb(path: string): Database {
     CREATE INDEX IF NOT EXISTS idx_messages_correlation ON messages(correlation_id);
     CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at) WHERE expires_at IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_agents_last_seen ON agents(last_seen);
+
+    CREATE TABLE IF NOT EXISTS files (
+      id           TEXT PRIMARY KEY,
+      from_agent   TEXT NOT NULL,
+      to_agent     TEXT NOT NULL,
+      filename     TEXT NOT NULL,
+      content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+      size_bytes   INTEGER NOT NULL,
+      data         TEXT NOT NULL,
+      sent_at      INTEGER NOT NULL,
+      expires_at   INTEGER,
+      delivered_at INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_files_to_agent   ON files(to_agent, delivered_at);
+    CREATE INDEX IF NOT EXISTS idx_files_expires    ON files(expires_at) WHERE expires_at IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_files_from_agent ON files(from_agent);
   `);
 
   return db;
@@ -403,6 +433,46 @@ export function getTopicSubscribers(db: Database, topic: string): string[] {
 export function getAgentSubscriptions(db: Database, agent_id: string): string[] {
   const rows = db.prepare('SELECT topic FROM subscriptions WHERE agent_id = ?').all(agent_id) as { topic: string }[];
   return rows.map(r => r.topic);
+}
+
+// ──────────────────────────────────────────────
+// 5.7 Files
+// ──────────────────────────────────────────────
+
+export function insertFile(
+  db: Database,
+  file: {
+    id: string;
+    from_agent: string;
+    to_agent: string;
+    filename: string;
+    content_type: string;
+    size_bytes: number;
+    data: string;
+    sent_at: number;
+    expires_at: number | null;
+  }
+): FileRecord {
+  db.prepare(`
+    INSERT INTO files (id, from_agent, to_agent, filename, content_type, size_bytes, data, sent_at, expires_at, delivered_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+  `).run(file.id, file.from_agent, file.to_agent, file.filename, file.content_type, file.size_bytes, file.data, file.sent_at, file.expires_at);
+
+  return getFile(db, file.id) as FileRecord;
+}
+
+export function getFile(db: Database, id: string): FileRecord | null {
+  return db.prepare('SELECT * FROM files WHERE id = ?').get(id) as FileRecord | null;
+}
+
+export function markFileDelivered(db: Database, id: string): void {
+  db.prepare('UPDATE files SET delivered_at = ? WHERE id = ?').run(Date.now(), id);
+}
+
+export function deleteExpiredFiles(db: Database): number {
+  const now = Date.now();
+  const result = db.prepare('DELETE FROM files WHERE expires_at IS NOT NULL AND expires_at < ?').run(now);
+  return result.changes;
 }
 
 // ──────────────────────────────────────────────

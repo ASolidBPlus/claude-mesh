@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { openDb, registerAgent, getAgentById, insertMessage } from '../db.ts';
+import { openDb, registerAgent, getAgentById, insertMessage, insertFile } from '../db.ts';
 import { generateToken, hashToken } from '../auth.ts';
 import { startWsServer, WsServerHandle } from '../ws-server.ts';
 import { Database } from 'bun:sqlite';
@@ -474,6 +474,116 @@ describe('startWsServer', () => {
 
     // Connection should still be open
     expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  }, 10000);
+
+  // ──────────────────────────────────────────────
+  // Sprint 9: file_send frame dispatch
+  // ──────────────────────────────────────────────
+
+  it('file_send frame is dispatched to routeFile and acked on success', async () => {
+    const tokenA = generateToken();
+    const tokenB = generateToken();
+    registerAgent(db, { id: 'ws-file-sender', token_hash: hashToken(tokenA), hostname: 'host1' });
+    registerAgent(db, { id: 'ws-file-recv', token_hash: hashToken(tokenB), hostname: 'host2' });
+
+    // Grant ACL
+    const { aclGrant } = await import('../db.ts');
+    aclGrant(db, 'ws-file-sender', 'ws-file-recv', 'system');
+
+    const wsA = await connectWs(port);
+    const authMsgA = waitForMessage(wsA);
+    wsA.send(JSON.stringify({ type: 'auth', agent_id: 'ws-file-sender', token: tokenA }));
+    await authMsgA;
+
+    const wsB = await connectWs(port);
+    const authMsgB = waitForMessage(wsB);
+    wsB.send(JSON.stringify({ type: 'auth', agent_id: 'ws-file-recv', token: tokenB }));
+    await authMsgB;
+
+    const data = Buffer.from('file content for ws test').toString('base64');
+    const msgId = crypto.randomUUID();
+
+    // wsB will receive file_deliver; wsA will receive ack
+    const bPromise = waitForMessage(wsB);
+    const aPromise = waitForMessage(wsA);
+
+    wsA.send(JSON.stringify({
+      type: 'file_send',
+      msg_id: msgId,
+      to: 'ws-file-recv',
+      filename: 'ws-test.txt',
+      content_type: 'text/plain',
+      data,
+    }));
+
+    const ack = JSON.parse(await aPromise);
+    expect(ack.type).toBe('ack');
+    expect(ack.ref).toBe(msgId);
+    expect(ack.ok).toBe(true);
+
+    const deliver = JSON.parse(await bPromise);
+    expect(deliver.type).toBe('file_deliver');
+    expect(deliver.filename).toBe('ws-test.txt');
+    expect(deliver.from).toBe('ws-file-sender');
+
+    wsA.close();
+    wsB.close();
+  }, 10000);
+
+  it('file_send with AGENT_NOT_FOUND returns error', async () => {
+    const rawToken = generateToken();
+    registerAgent(db, { id: 'ws-file-err-sender', token_hash: hashToken(rawToken), hostname: 'host1' });
+
+    const ws = await connectWs(port);
+    const authMsg = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'ws-file-err-sender', token: rawToken }));
+    await authMsg;
+
+    const replyPromise = waitForMessage(ws);
+    const data = Buffer.from('x').toString('base64');
+    ws.send(JSON.stringify({
+      type: 'file_send',
+      msg_id: 'err-msg-id',
+      to: 'ghost-agent',
+      filename: 'x.txt',
+      data,
+    }));
+
+    const reply = JSON.parse(await replyPromise);
+    expect(reply.type).toBe('error');
+    expect(reply.code).toBe('AGENT_NOT_FOUND');
+    expect(reply.ref).toBe('err-msg-id');
+    ws.close();
+  }, 10000);
+
+  it('auth_ok includes queued_files count', async () => {
+    const rawToken = generateToken();
+    registerAgent(db, { id: 'ws-qf-agent', token_hash: hashToken(rawToken), hostname: 'host1' });
+
+    // Insert a queued file for this agent (offline delivery scenario)
+    const data = Buffer.from('queued file').toString('base64');
+    insertFile(db, {
+      id: 'queued-file-id',
+      from_agent: 'some-sender',
+      to_agent: 'ws-qf-agent',
+      filename: 'queued.txt',
+      content_type: 'text/plain',
+      size_bytes: 11,
+      data,
+      sent_at: Date.now(),
+      expires_at: Date.now() + 300_000,
+    });
+
+    const ws = await connectWs(port);
+    const authMsgPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'ws-qf-agent', token: rawToken }));
+    const authMsgRaw = await authMsgPromise;
+    const authMsg = JSON.parse(authMsgRaw);
+
+    expect(authMsg.type).toBe('auth_ok');
+    expect(authMsg.queued_files).toBe(1);
+
     ws.close();
   }, 10000);
 });

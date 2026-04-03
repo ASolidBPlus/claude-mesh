@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { openDb, registerAgent, aclGrant, insertMessage, getMessage } from '../db.ts';
+import { openDb, registerAgent, aclGrant, insertMessage, getMessage, insertFile, getFile } from '../db.ts';
 import { startCleanup } from '../cleanup.ts';
 import { WebSocket } from 'ws';
 import { PendingRequest } from '../router.ts';
@@ -160,6 +160,34 @@ describe('cleanup', () => {
     await wait(100);
 
     expect(getMessage(db, msg.id)).not.toBeNull();
+
+    db.close();
+  });
+
+  it('cleanup tick calls deleteExpiredFiles — expired file is removed', async () => {
+    const db = openDb(':memory:');
+    const pendingRequests = new Map<string, PendingRequest>();
+    const agentIndex = new Map<string, WebSocket>();
+
+    const data = Buffer.from('x').toString('base64');
+    const fileId = 'cleanup-expired-file';
+    insertFile(db, {
+      id: fileId,
+      from_agent: 'a',
+      to_agent: 'b',
+      filename: 'old.txt',
+      content_type: 'text/plain',
+      size_bytes: 1,
+      data,
+      sent_at: Date.now() - 10000,
+      expires_at: Date.now() - 5000,
+    });
+
+    const handle = startCleanup(db, pendingRequests, agentIndex, 50);
+    await wait(100);
+    handle.stop();
+
+    expect(getFile(db, fileId)).toBeNull();
 
     db.close();
   });

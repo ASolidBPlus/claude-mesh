@@ -12,6 +12,7 @@ export interface Config {
   adminPort: number;
   adminToken: string;
   cleanupIntervalMs: number;
+  maxFileBytes: number;
 }
 
 export function loadConfig(): Config {
@@ -56,7 +57,18 @@ export function loadConfig(): Config {
     cleanupIntervalMs = parsed;
   }
 
-  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs };
+  let maxFileBytes = 10_485_760;
+  const maxFileBytesStr = process.env.MESH_MAX_FILE_BYTES;
+  if (maxFileBytesStr !== undefined) {
+    const parsed = parseInt(maxFileBytesStr, 10);
+    if (isNaN(parsed) || parsed <= 0) {
+      process.stderr.write(`MESH_MAX_FILE_BYTES must be a positive integer, got: ${maxFileBytesStr}\n`);
+      process.exit(1);
+    }
+    maxFileBytes = parsed;
+  }
+
+  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes };
 }
 
 async function main() {
@@ -72,7 +84,7 @@ async function main() {
 
   let wsHandle: WsServerHandle;
   try {
-    wsHandle = await startWsServer(config.wsPort, db);
+    wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes);
   } catch (err) {
     process.stderr.write(`Failed to start WebSocket server: ${err}\n`);
     process.exit(1);
@@ -80,7 +92,7 @@ async function main() {
 
   const { agentIndex, pendingRequests } = wsHandle;
 
-  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken);
+  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes);
 
   let cleanupHandle: CleanupHandle | null = null;
 

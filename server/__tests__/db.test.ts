@@ -30,6 +30,10 @@ import {
   unsubscribe,
   getTopicSubscribers,
   getAgentSubscriptions,
+  insertFile,
+  getFile,
+  markFileDelivered,
+  deleteExpiredFiles,
 } from '../db';
 
 // ──────────────────────────────────────────────
@@ -836,5 +840,126 @@ describe('Referential integrity (FK enforcement)', () => {
       db.prepare('INSERT INTO topics (name, created_at, created_by, description, metadata) VALUES (?, ?, ?, ?, ?)')
         .run('new-topic', Date.now(), 'ghost-creator', '', '{}');
     }).toThrow();
+  });
+});
+
+// ──────────────────────────────────────────────
+// Files
+// ──────────────────────────────────────────────
+
+describe('insertFile / getFile', () => {
+  it('insertFile stores a row and getFile retrieves it with correct fields', () => {
+    const db = freshDb();
+    const data = Buffer.from('hello file content').toString('base64');
+    const now = Date.now();
+    const file = insertFile(db, {
+      id: 'file-1',
+      from_agent: 'agent-a',
+      to_agent: 'agent-b',
+      filename: 'output.log',
+      content_type: 'text/plain',
+      size_bytes: 18,
+      data,
+      sent_at: now,
+      expires_at: now + 300_000,
+    });
+    expect(file.id).toBe('file-1');
+    expect(file.from_agent).toBe('agent-a');
+    expect(file.to_agent).toBe('agent-b');
+    expect(file.filename).toBe('output.log');
+    expect(file.content_type).toBe('text/plain');
+    expect(file.size_bytes).toBe(18);
+    expect(file.data).toBe(data);
+    expect(file.delivered_at).toBeNull();
+
+    const fetched = getFile(db, 'file-1');
+    expect(fetched).not.toBeNull();
+    expect(fetched!.filename).toBe('output.log');
+  });
+
+  it('getFile returns null for unknown id', () => {
+    const db = freshDb();
+    expect(getFile(db, 'no-such-file')).toBeNull();
+  });
+});
+
+describe('markFileDelivered', () => {
+  it('sets delivered_at on the file record', () => {
+    const db = freshDb();
+    const data = Buffer.from('x').toString('base64');
+    insertFile(db, {
+      id: 'file-del',
+      from_agent: 'a',
+      to_agent: 'b',
+      filename: 'x.txt',
+      content_type: 'text/plain',
+      size_bytes: 1,
+      data,
+      sent_at: Date.now(),
+      expires_at: null,
+    });
+    expect(getFile(db, 'file-del')!.delivered_at).toBeNull();
+    markFileDelivered(db, 'file-del');
+    expect(getFile(db, 'file-del')!.delivered_at).not.toBeNull();
+  });
+});
+
+describe('deleteExpiredFiles', () => {
+  it('removes expired files only; unexpired file still present', () => {
+    const db = freshDb();
+    const data = Buffer.from('x').toString('base64');
+    const past = Date.now() - 5000;
+    const future = Date.now() + 60_000;
+
+    insertFile(db, {
+      id: 'file-expired',
+      from_agent: 'a',
+      to_agent: 'b',
+      filename: 'exp.txt',
+      content_type: 'text/plain',
+      size_bytes: 1,
+      data,
+      sent_at: Date.now() - 10000,
+      expires_at: past,
+    });
+
+    insertFile(db, {
+      id: 'file-live',
+      from_agent: 'a',
+      to_agent: 'b',
+      filename: 'live.txt',
+      content_type: 'text/plain',
+      size_bytes: 1,
+      data,
+      sent_at: Date.now(),
+      expires_at: future,
+    });
+
+    const count = deleteExpiredFiles(db);
+    expect(count).toBe(1);
+    expect(getFile(db, 'file-expired')).toBeNull();
+    expect(getFile(db, 'file-live')).not.toBeNull();
+  });
+
+  it('returns correct count when one file is expired', () => {
+    const db = freshDb();
+    const data = Buffer.from('x').toString('base64');
+    insertFile(db, {
+      id: 'file-only-expired',
+      from_agent: 'a',
+      to_agent: 'b',
+      filename: 'e.txt',
+      content_type: 'text/plain',
+      size_bytes: 1,
+      data,
+      sent_at: 1,
+      expires_at: Date.now() - 1000,
+    });
+    expect(deleteExpiredFiles(db)).toBe(1);
+  });
+
+  it('returns 0 when no files are expired', () => {
+    const db = freshDb();
+    expect(deleteExpiredFiles(db)).toBe(0);
   });
 });
