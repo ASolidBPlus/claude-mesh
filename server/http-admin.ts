@@ -294,7 +294,14 @@ export function startHttpAdmin(
           res.end(JSON.stringify({ error: 'agent not found' }));
           return;
         }
-        deleteAgent(db, id);
+        try {
+          deleteAgent(db, id);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'delete failed', detail: msg }));
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
         return;

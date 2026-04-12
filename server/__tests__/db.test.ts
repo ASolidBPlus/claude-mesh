@@ -292,6 +292,17 @@ describe('deleteAgent', () => {
     expect(getTopicSubscribers(db, 'test-topic')).toEqual([]);
   });
 
+  it('deleteAgent cleans up topics created by that agent', () => {
+    const db = freshDb();
+    makeAgent(db, 'creator');
+    makeAgent(db, 'other');
+    getOrCreateTopic(db, 'creator-topic', 'creator');
+    subscribe(db, 'other', 'creator-topic');
+    deleteAgent(db, 'creator');
+    expect(listTopics(db)).toEqual([]);
+    expect(getTopicSubscribers(db, 'creator-topic')).toEqual([]);
+  });
+
   it('deleteAgent with a non-existent id does not throw', () => {
     const db = freshDb();
     expect(() => deleteAgent(db, 'nonexistent')).not.toThrow();

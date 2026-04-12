@@ -248,6 +248,7 @@ export function updateAgent(
 }
 
 export function deleteAgent(db: Database, id: string): void {
+  db.prepare('DELETE FROM topics WHERE created_by = ?').run(id);
   db.prepare('DELETE FROM agents WHERE id = ?').run(id);
 }
 
