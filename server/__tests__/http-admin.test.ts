@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { openDb, registerAgent, aclGrant, aclCheck, setOnline, insertFile } from '../db.ts';
+import { openDb, registerAgent, aclGrant, aclCheck, setOnline, insertFile, getAgentById, insertMessage, subscribe, getOrCreateTopic } from '../db.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
+import { hashToken } from '../auth.ts';
 import { Database } from 'bun:sqlite';
 import * as net from 'net';
 
@@ -324,6 +325,275 @@ describe('GET /files/:id', () => {
 
   it('returns 401 without admin token', async () => {
     const res = await fetch(`${base2}/files/any-id`);
+    expect(res.status).toBe(401);
+  });
+});
+
+// ──────────────────────────────────────────────
+// POST /agents
+// ──────────────────────────────────────────────
+
+describe('POST /agents', () => {
+  let db: Database;
+  let handle: HttpAdminHandle;
+  let port: number;
+  let base: string;
+  const token = 'post-agents-token';
+
+  beforeEach(async () => {
+    db = openDb(':memory:');
+    handle = await startHttpAdmin(0, db, token);
+    port = (handle.server.address() as net.AddressInfo).port;
+    base = `http://localhost:${port}`;
+  });
+
+  afterEach(async () => {
+    await handle.shutdown().catch(() => {});
+    db.close();
+  });
+
+  const headers = () => ({ 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' });
+
+  it('201 — creates agent with correct response shape', async () => {
+    const res = await fetch(`${base}/agents`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ id: 'new-agent', hostname: 'host-1' }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.id).toBe('new-agent');
+    expect(body.hostname).toBe('host-1');
+    expect(typeof body.token).toBe('string');
+    expect((body.token as string).length).toBe(64);
+    expect(body.online).toBe(false);
+  });
+
+  it('201 — returned token validates against stored hash', async () => {
+    const res = await fetch(`${base}/agents`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ id: 'token-check', hostname: 'host-1' }),
+    });
+    const body = await res.json() as Record<string, unknown>;
+    const rawToken = body.token as string;
+    const agent = getAgentById(db, 'token-check');
+    expect(agent).not.toBeNull();
+    expect(hashToken(rawToken)).toBe(agent!.token_hash);
+  });
+
+  it('201 — agent appears in GET /agents list after creation', async () => {
+    await fetch(`${base}/agents`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ id: 'listed-agent', hostname: 'host-1' }),
+    });
+    const res = await fetch(`${base}/agents`, { headers: headers() });
+    const body = await res.json() as Record<string, unknown>[];
+    expect(body.some(a => a.id === 'listed-agent')).toBe(true);
+  });
+
+  it('400 — missing id field', async () => {
+    const res = await fetch(`${base}/agents`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ hostname: 'host-1' }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('400 — missing hostname field', async () => {
+    const res = await fetch(`${base}/agents`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ id: 'no-host' }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('400 — id is empty string', async () => {
+    const res = await fetch(`${base}/agents`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ id: '', hostname: 'host-1' }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('409 — duplicate agent id', async () => {
+    registerAgent(db, { id: 'dup-agent', token_hash: 'x'.repeat(64), hostname: 'host-1' });
+    const res = await fetch(`${base}/agents`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ id: 'dup-agent', hostname: 'host-2' }),
+    });
+    expect(res.status).toBe(409);
+  });
+
+  it('401 — no admin token', async () => {
+    const res = await fetch(`${base}/agents`, {
+      method: 'POST',
+      body: JSON.stringify({ id: 'a', hostname: 'h' }),
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
+// ──────────────────────────────────────────────
+// DELETE /agents/:id
+// ──────────────────────────────────────────────
+
+describe('DELETE /agents/:id', () => {
+  let db: Database;
+  let handle: HttpAdminHandle;
+  let port: number;
+  let base: string;
+  const token = 'delete-agents-token';
+
+  beforeEach(async () => {
+    db = openDb(':memory:');
+    handle = await startHttpAdmin(0, db, token);
+    port = (handle.server.address() as net.AddressInfo).port;
+    base = `http://localhost:${port}`;
+  });
+
+  afterEach(async () => {
+    await handle.shutdown().catch(() => {});
+    db.close();
+  });
+
+  const headers = () => ({ 'Authorization': `Bearer ${token}` });
+
+  it('200 — deletes agent, getAgentById returns null after', async () => {
+    registerAgent(db, { id: 'del-agent', token_hash: 'd'.repeat(64), hostname: 'host-1' });
+    const res = await fetch(`${base}/agents/del-agent`, { method: 'DELETE', headers: headers() });
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(getAgentById(db, 'del-agent')).toBeNull();
+  });
+
+  it('200 — cascades: ACL entries for this agent are also removed', async () => {
+    registerAgent(db, { id: 'a1', token_hash: 'a'.repeat(64), hostname: 'h1' });
+    registerAgent(db, { id: 'a2', token_hash: 'b'.repeat(64), hostname: 'h2' });
+    aclGrant(db, 'a1', 'a2', 'system');
+    await fetch(`${base}/agents/a1`, { method: 'DELETE', headers: headers() });
+    expect(aclCheck(db, 'a1', 'a2')).toBe(false);
+  });
+
+  it('200 — cascades: subscriptions for this agent are also removed', async () => {
+    registerAgent(db, { id: 'topic-owner', token_hash: 't'.repeat(64), hostname: 'h0' });
+    registerAgent(db, { id: 'sub-agent', token_hash: 's'.repeat(64), hostname: 'h1' });
+    getOrCreateTopic(db, 'test-topic', 'topic-owner');
+    subscribe(db, 'sub-agent', 'test-topic');
+    await fetch(`${base}/agents/sub-agent`, { method: 'DELETE', headers: headers() });
+    const rows = db.prepare('SELECT * FROM subscriptions WHERE agent_id = ?').all('sub-agent');
+    expect(rows).toHaveLength(0);
+  });
+
+  it('404 — agent not found', async () => {
+    const res = await fetch(`${base}/agents/ghost`, { method: 'DELETE', headers: headers() });
+    expect(res.status).toBe(404);
+  });
+
+  it('401 — no admin token', async () => {
+    const res = await fetch(`${base}/agents/any`, { method: 'DELETE' });
+    expect(res.status).toBe(401);
+  });
+});
+
+// ──────────────────────────────────────────────
+// GET /messages
+// ──────────────────────────────────────────────
+
+describe('GET /messages', () => {
+  let db: Database;
+  let handle: HttpAdminHandle;
+  let port: number;
+  let base: string;
+  const token = 'messages-admin-token';
+
+  beforeEach(async () => {
+    db = openDb(':memory:');
+    handle = await startHttpAdmin(0, db, token);
+    port = (handle.server.address() as net.AddressInfo).port;
+    base = `http://localhost:${port}`;
+  });
+
+  afterEach(async () => {
+    await handle.shutdown().catch(() => {});
+    db.close();
+  });
+
+  const headers = () => ({ 'Authorization': `Bearer ${token}` });
+
+  it('200 — returns messages (no filters), array response', async () => {
+    insertMessage(db, { id: 'm1', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'hi', sent_at: 1000 });
+    const res = await fetch(`${base}/messages`, { headers: headers() });
+    expect(res.status).toBe(200);
+    const body = await res.json() as unknown[];
+    expect(Array.isArray(body)).toBe(true);
+    expect(body).toHaveLength(1);
+  });
+
+  it('200 — agent filter returns messages where agent is sender OR recipient', async () => {
+    insertMessage(db, { id: 'm-sent', kind: 'direct', from_agent: 'alice', to_agent: 'bob', payload: 'hi', sent_at: 1000 });
+    insertMessage(db, { id: 'm-recv', kind: 'direct', from_agent: 'bob', to_agent: 'alice', payload: 'hey', sent_at: 2000 });
+    insertMessage(db, { id: 'm-other', kind: 'direct', from_agent: 'bob', to_agent: 'charlie', payload: 'x', sent_at: 3000 });
+    const res = await fetch(`${base}/messages?agent=alice`, { headers: headers() });
+    const body = await res.json() as Record<string, unknown>[];
+    expect(body).toHaveLength(2);
+  });
+
+  it('200 — topic filter returns only topic messages matching that topic', async () => {
+    insertMessage(db, { id: 'm-t1', kind: 'topic', from_agent: 'a', topic: 'news', payload: 'x', sent_at: 1000 });
+    insertMessage(db, { id: 'm-t2', kind: 'topic', from_agent: 'a', topic: 'sports', payload: 'y', sent_at: 2000 });
+    const res = await fetch(`${base}/messages?topic=news`, { headers: headers() });
+    const body = await res.json() as Record<string, unknown>[];
+    expect(body).toHaveLength(1);
+    expect((body[0] as Record<string, unknown>).topic).toBe('news');
+  });
+
+  it('200 — since filter returns only messages with sent_at >= since', async () => {
+    insertMessage(db, { id: 'm-old', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'old', sent_at: 1000 });
+    insertMessage(db, { id: 'm-new', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'new', sent_at: 5000 });
+    const res = await fetch(`${base}/messages?since=3000`, { headers: headers() });
+    const body = await res.json() as Record<string, unknown>[];
+    expect(body).toHaveLength(1);
+    expect((body[0] as Record<string, unknown>).id).toBe('m-new');
+  });
+
+  it('200 — limit param caps results', async () => {
+    for (let i = 0; i < 10; i++) {
+      insertMessage(db, { id: `m-lim-${i}`, kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'x', sent_at: i });
+    }
+    const res = await fetch(`${base}/messages?limit=3`, { headers: headers() });
+    const body = await res.json() as unknown[];
+    expect(body).toHaveLength(3);
+  });
+
+  it('200 — default limit is 100', async () => {
+    for (let i = 0; i < 105; i++) {
+      insertMessage(db, { id: `m-def-${i}`, kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'x', sent_at: i });
+    }
+    const res = await fetch(`${base}/messages`, { headers: headers() });
+    const body = await res.json() as unknown[];
+    expect(body).toHaveLength(100);
+  });
+
+  it('200 — results sorted by sent_at DESC', async () => {
+    insertMessage(db, { id: 'm-first', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'x', sent_at: 100 });
+    insertMessage(db, { id: 'm-second', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'y', sent_at: 200 });
+    insertMessage(db, { id: 'm-third', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'z', sent_at: 300 });
+    const res = await fetch(`${base}/messages`, { headers: headers() });
+    const body = await res.json() as Record<string, unknown>[];
+    expect(body[0].id).toBe('m-third');
+    expect(body[1].id).toBe('m-second');
+    expect(body[2].id).toBe('m-first');
+  });
+
+  it('401 — no admin token', async () => {
+    const res = await fetch(`${base}/messages`);
     expect(res.status).toBe(401);
   });
 });

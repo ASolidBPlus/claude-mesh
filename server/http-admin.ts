@@ -13,7 +13,11 @@ import {
   listAgents,
   Agent,
   getFile,
+  deleteAgent,
+  registerAgent,
+  queryMessages,
 } from './db.ts';
+import { generateToken, hashToken } from './auth.ts';
 
 export interface HttpAdminHandle {
   server: http.Server;
@@ -218,6 +222,47 @@ export function startHttpAdmin(
         return;
       }
 
+      if (pathname === '/agents' && method === 'POST') {
+        const raw = await readBody(req);
+        let body: Record<string, unknown>;
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid JSON' }));
+          return;
+        }
+
+        const id = body.id;
+        const hostname = body.hostname;
+
+        if (typeof id !== 'string' || !id) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'id is required' }));
+          return;
+        }
+
+        if (typeof hostname !== 'string' || !hostname) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'hostname is required' }));
+          return;
+        }
+
+        if (getAgentById(db, id) !== null) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'agent already exists' }));
+          return;
+        }
+
+        const rawToken = generateToken();
+        const token_hash = hashToken(rawToken);
+        const agent = registerAgent(db, { id, token_hash, hostname });
+
+        res.writeHead(201, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ...formatAgent(agent), token: rawToken }));
+        return;
+      }
+
       if (pathname === '/agents' && method === 'GET') {
         const onlineOnly = url.searchParams.get('online') === 'true';
         const agents = listAgents(db, onlineOnly);
@@ -237,6 +282,42 @@ export function startHttpAdmin(
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(formatAgent(agent)));
+        return;
+      }
+
+      const agentDeleteMatch = pathname.match(/^\/agents\/([^/]+)$/);
+      if (agentDeleteMatch && method === 'DELETE') {
+        const id = agentDeleteMatch[1];
+        const agent = getAgentById(db, id);
+        if (agent === null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'agent not found' }));
+          return;
+        }
+        deleteAgent(db, id);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (pathname === '/messages' && method === 'GET') {
+        const agentParam = url.searchParams.get('agent') || undefined;
+        const topicParam = url.searchParams.get('topic') || undefined;
+        const sinceRaw = url.searchParams.get('since');
+        const limitRaw = url.searchParams.get('limit');
+
+        const since = sinceRaw !== null ? parseInt(sinceRaw, 10) : undefined;
+        const limit = limitRaw !== null ? parseInt(limitRaw, 10) : undefined;
+
+        const messages = queryMessages(db, {
+          agent: agentParam,
+          topic: topicParam,
+          since: Number.isNaN(since) ? undefined : since,
+          limit: Number.isNaN(limit) ? undefined : limit,
+        });
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(messages));
         return;
       }
 

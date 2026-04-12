@@ -34,6 +34,7 @@ import {
   getFile,
   markFileDelivered,
   deleteExpiredFiles,
+  queryMessages,
 } from '../db';
 
 // ──────────────────────────────────────────────
@@ -961,5 +962,46 @@ describe('deleteExpiredFiles', () => {
   it('returns 0 when no files are expired', () => {
     const db = freshDb();
     expect(deleteExpiredFiles(db)).toBe(0);
+  });
+});
+
+// ──────────────────────────────────────────────
+// queryMessages
+// ──────────────────────────────────────────────
+
+describe('queryMessages', () => {
+  it('with no filters returns all messages', () => {
+    const db = freshDb();
+    insertMessage(db, { id: 'q1', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'x', sent_at: 1000 });
+    insertMessage(db, { id: 'q2', kind: 'direct', from_agent: 'b', to_agent: 'a', payload: 'y', sent_at: 2000 });
+    const msgs = queryMessages(db, {});
+    expect(msgs).toHaveLength(2);
+  });
+
+  it('with agent filter returns messages where agent is sender or recipient', () => {
+    const db = freshDb();
+    insertMessage(db, { id: 'qa1', kind: 'direct', from_agent: 'alice', to_agent: 'bob', payload: 'x', sent_at: 1000 });
+    insertMessage(db, { id: 'qa2', kind: 'direct', from_agent: 'bob', to_agent: 'alice', payload: 'y', sent_at: 2000 });
+    insertMessage(db, { id: 'qa3', kind: 'direct', from_agent: 'bob', to_agent: 'charlie', payload: 'z', sent_at: 3000 });
+    const msgs = queryMessages(db, { agent: 'alice' });
+    expect(msgs).toHaveLength(2);
+  });
+
+  it('with since filter returns only messages with sent_at >= since', () => {
+    const db = freshDb();
+    insertMessage(db, { id: 'qs1', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'old', sent_at: 1000 });
+    insertMessage(db, { id: 'qs2', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'new', sent_at: 5000 });
+    const msgs = queryMessages(db, { since: 3000 });
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].id).toBe('qs2');
+  });
+
+  it('with limit clamped to 1000', () => {
+    const db = freshDb();
+    for (let i = 0; i < 5; i++) {
+      insertMessage(db, { id: `ql${i}`, kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'x', sent_at: i });
+    }
+    const msgs = queryMessages(db, { limit: 9999 });
+    expect(msgs).toHaveLength(5);
   });
 });

@@ -363,6 +363,41 @@ export function getMessageByCorrelationId(db: Database, correlationId: string): 
   `).get(correlationId) as Message | null;
 }
 
+export function queryMessages(
+  db: Database,
+  opts: {
+    agent?: string;
+    topic?: string;
+    since?: number;
+    limit?: number;
+  }
+): Message[] {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+
+  if (opts.agent) {
+    clauses.push('(from_agent = ? OR to_agent = ?)');
+    params.push(opts.agent, opts.agent);
+  }
+  if (opts.topic) {
+    clauses.push('topic = ?');
+    params.push(opts.topic);
+  }
+  if (opts.since !== undefined) {
+    clauses.push('sent_at >= ?');
+    params.push(opts.since);
+  }
+
+  let limit = opts.limit ?? 100;
+  if (limit > 1000) limit = 1000;
+
+  const where = clauses.length > 0 ? 'WHERE ' + clauses.join(' AND ') : '';
+  const sql = `SELECT * FROM messages ${where} ORDER BY sent_at DESC LIMIT ?`;
+  params.push(limit);
+
+  return db.prepare(sql).all(...params) as Message[];
+}
+
 export function expireMessages(db: Database): number {
   const now = Date.now();
   const result = db.prepare('DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < ?')
