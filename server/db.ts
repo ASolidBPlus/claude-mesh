@@ -62,6 +62,8 @@ export interface FileRecord {
   sent_at: number;        // unix ms
   expires_at: number | null;
   delivered_at: number | null;
+  caption: string | null;
+  reply_to_msg_id: string | null;
 }
 
 // ──────────────────────────────────────────────
@@ -131,22 +133,28 @@ export function openDb(path: string): Database {
     CREATE INDEX IF NOT EXISTS idx_agents_last_seen ON agents(last_seen);
 
     CREATE TABLE IF NOT EXISTS files (
-      id           TEXT PRIMARY KEY,
-      from_agent   TEXT NOT NULL,
-      to_agent     TEXT NOT NULL,
-      filename     TEXT NOT NULL,
-      content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-      size_bytes   INTEGER NOT NULL,
-      data         TEXT NOT NULL,
-      sent_at      INTEGER NOT NULL,
-      expires_at   INTEGER,
-      delivered_at INTEGER
+      id              TEXT PRIMARY KEY,
+      from_agent      TEXT NOT NULL,
+      to_agent        TEXT NOT NULL,
+      filename        TEXT NOT NULL,
+      content_type    TEXT NOT NULL DEFAULT 'application/octet-stream',
+      size_bytes      INTEGER NOT NULL,
+      data            TEXT NOT NULL,
+      sent_at         INTEGER NOT NULL,
+      expires_at      INTEGER,
+      delivered_at    INTEGER,
+      caption         TEXT,
+      reply_to_msg_id TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_files_to_agent   ON files(to_agent, delivered_at);
     CREATE INDEX IF NOT EXISTS idx_files_expires    ON files(expires_at) WHERE expires_at IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_files_from_agent ON files(from_agent);
   `);
+
+  // Migration for existing databases: add new columns if they don't exist yet
+  try { db.exec('ALTER TABLE files ADD COLUMN caption TEXT'); } catch {}
+  try { db.exec('ALTER TABLE files ADD COLUMN reply_to_msg_id TEXT'); } catch {}
 
   return db;
 }
@@ -487,12 +495,17 @@ export function insertFile(
     data: string;
     sent_at: number;
     expires_at: number | null;
+    caption?: string | null;
+    reply_to_msg_id?: string | null;
   }
 ): FileRecord {
+  const caption = file.caption ?? null;
+  const reply_to_msg_id = file.reply_to_msg_id ?? null;
+
   db.prepare(`
-    INSERT INTO files (id, from_agent, to_agent, filename, content_type, size_bytes, data, sent_at, expires_at, delivered_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-  `).run(file.id, file.from_agent, file.to_agent, file.filename, file.content_type, file.size_bytes, file.data, file.sent_at, file.expires_at);
+    INSERT INTO files (id, from_agent, to_agent, filename, content_type, size_bytes, data, sent_at, expires_at, delivered_at, caption, reply_to_msg_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+  `).run(file.id, file.from_agent, file.to_agent, file.filename, file.content_type, file.size_bytes, file.data, file.sent_at, file.expires_at, caption, reply_to_msg_id);
 
   return getFile(db, file.id) as FileRecord;
 }

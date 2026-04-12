@@ -368,6 +368,80 @@ describe('routeFile', () => {
     const storedFile = db.prepare('SELECT * FROM files WHERE from_agent = ?').get('ttl-sender');
     expect(storedFile).toBeNull();
   });
+
+  it('routeFile with caption — caption appears in file_deliver frame', () => {
+    registerAgent(db, { id: 'cap-sender', token_hash: 'a'.repeat(64), hostname: 'h1' });
+    registerAgent(db, { id: 'cap-recv', token_hash: 'b'.repeat(64), hostname: 'h2' });
+    aclGrant(db, 'cap-sender', 'cap-recv', 'system');
+
+    const calls: string[] = [];
+    const ws = { send: (d: string) => calls.push(d) } as unknown as WebSocket;
+    const agentIndex = new Map<string, WebSocket>();
+    agentIndex.set('cap-recv', ws);
+
+    const frame = makeFileSendFrame({ to: 'cap-recv', caption: 'my caption' });
+    const result = routeFile(db, agentIndex, 'cap-sender', frame, 10_485_760);
+
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    const delivered = JSON.parse(calls[0]);
+    expect(delivered.type).toBe('file_deliver');
+    expect(delivered.caption).toBe('my caption');
+  });
+
+  it('routeFile with reply_to_msg_id — reply_to_msg_id appears in file_deliver frame', () => {
+    registerAgent(db, { id: 'rpl-sender', token_hash: 'c'.repeat(64), hostname: 'h3' });
+    registerAgent(db, { id: 'rpl-recv', token_hash: 'd'.repeat(64), hostname: 'h4' });
+    aclGrant(db, 'rpl-sender', 'rpl-recv', 'system');
+
+    const calls: string[] = [];
+    const ws = { send: (d: string) => calls.push(d) } as unknown as WebSocket;
+    const agentIndex = new Map<string, WebSocket>();
+    agentIndex.set('rpl-recv', ws);
+
+    const replyId = crypto.randomUUID();
+    const frame = makeFileSendFrame({ to: 'rpl-recv', reply_to_msg_id: replyId });
+    const result = routeFile(db, agentIndex, 'rpl-sender', frame, 10_485_760);
+
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    const delivered = JSON.parse(calls[0]);
+    expect(delivered.type).toBe('file_deliver');
+    expect(delivered.reply_to_msg_id).toBe(replyId);
+  });
+
+  it('routeFile with caption exceeding 4096 bytes — returns CAPTION_TOO_LARGE', () => {
+    registerAgent(db, { id: 'bigcap-sender', token_hash: 'e'.repeat(64), hostname: 'h5' });
+    registerAgent(db, { id: 'bigcap-recv', token_hash: 'f'.repeat(64), hostname: 'h6' });
+    aclGrant(db, 'bigcap-sender', 'bigcap-recv', 'system');
+
+    const frame = makeFileSendFrame({ to: 'bigcap-recv', caption: 'x'.repeat(4097) });
+    const result = routeFile(db, new Map(), 'bigcap-sender', frame, 10_485_760);
+
+    expect(result.ok).toBe(false);
+    expect(result.error_code).toBe('CAPTION_TOO_LARGE');
+  });
+
+  it('routeFile without caption — caption is null in file_deliver and DB', () => {
+    registerAgent(db, { id: 'nocap-sender', token_hash: 'g'.repeat(64), hostname: 'h7' });
+    registerAgent(db, { id: 'nocap-recv', token_hash: 'h'.repeat(64), hostname: 'h8' });
+    aclGrant(db, 'nocap-sender', 'nocap-recv', 'system');
+
+    const calls: string[] = [];
+    const ws = { send: (d: string) => calls.push(d) } as unknown as WebSocket;
+    const agentIndex = new Map<string, WebSocket>();
+    agentIndex.set('nocap-recv', ws);
+
+    const frame = makeFileSendFrame({ to: 'nocap-recv' });
+    const result = routeFile(db, agentIndex, 'nocap-sender', frame, 10_485_760);
+
+    expect(result.ok).toBe(true);
+    const delivered = JSON.parse(calls[0]);
+    expect(delivered.caption).toBeNull();
+
+    const storedFile = db.prepare('SELECT caption FROM files WHERE from_agent = ?').get('nocap-sender') as { caption: string | null };
+    expect(storedFile.caption).toBeNull();
+  });
 });
 
 describe('drainFileQueue', () => {
@@ -397,5 +471,24 @@ describe('drainFileQueue', () => {
     // delivered_at now set
     const updated = getFile(db, stored.id);
     expect(updated!.delivered_at).not.toBeNull();
+  });
+
+  it('drainFileQueue includes caption and reply_to_msg_id from stored files', () => {
+    registerAgent(db, { id: 'drain2-sender', token_hash: 'p'.repeat(64), hostname: 'h16' });
+    registerAgent(db, { id: 'drain2-recv', token_hash: 'q'.repeat(64), hostname: 'h17' });
+    aclGrant(db, 'drain2-sender', 'drain2-recv', 'system');
+
+    const replyId = crypto.randomUUID();
+    const frame = makeFileSendFrame({ to: 'drain2-recv', caption: 'drain caption', reply_to_msg_id: replyId });
+    routeFile(db, new Map(), 'drain2-sender', frame, 10_485_760);
+
+    const calls: string[] = [];
+    const ws = { send: (d: string) => calls.push(d) } as unknown as WebSocket;
+    const count = drainFileQueue(db, 'drain2-recv', ws);
+
+    expect(count).toBe(1);
+    const delivered = JSON.parse(calls[0]);
+    expect(delivered.caption).toBe('drain caption');
+    expect(delivered.reply_to_msg_id).toBe(replyId);
   });
 });

@@ -400,6 +400,8 @@ export interface FileSendFrame {
   content_type?: string;
   data: string;       // base64
   ttl_ms?: number;
+  caption?: string;
+  reply_to_msg_id?: string;
 }
 
 export function routeFile(
@@ -436,6 +438,11 @@ export function routeFile(
     return { ok: false, error_code: 'ACL_DENIED', error_message: `${from_agent} is not permitted to send to ${frame.to}` };
   }
 
+  // 4b. Caption size validation
+  if (frame.caption !== undefined && Buffer.byteLength(frame.caption, 'utf8') > 4096) {
+    return { ok: false, error_code: 'CAPTION_TOO_LARGE', error_message: 'caption exceeds 4096 byte limit' };
+  }
+
   // 5. Generate file_id
   const file_id = crypto.randomUUID();
 
@@ -464,6 +471,8 @@ export function routeFile(
     data: frame.data,
     sent_at,
     expires_at,
+    caption: frame.caption ?? null,
+    reply_to_msg_id: frame.reply_to_msg_id ?? null,
   });
 
   // 9. Deliver if recipient online
@@ -478,6 +487,8 @@ export function routeFile(
       size_bytes,
       sent_at,
       fetch_url: `/files/${file_id}`,
+      caption: frame.caption ?? null,
+      reply_to_msg_id: frame.reply_to_msg_id ?? null,
     });
     recipientWs.send(deliverFrame);
     markFileDelivered(db, file_id);
@@ -511,6 +522,8 @@ export function drainFileQueue(
       size_bytes: file.size_bytes,
       sent_at: file.sent_at,
       fetch_url: `/files/${file.id}`,
+      caption: file.caption,
+      reply_to_msg_id: file.reply_to_msg_id,
     });
     ws.send(deliverFrame);
     markFileDelivered(db, file.id);

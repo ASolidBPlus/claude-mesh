@@ -893,6 +893,54 @@ describe('insertFile / getFile', () => {
     const db = freshDb();
     expect(getFile(db, 'no-such-file')).toBeNull();
   });
+
+  it('insertFile with caption and reply_to_msg_id stores them; getFile returns them', () => {
+    const db = freshDb();
+    const data = Buffer.from('caption file').toString('base64');
+    const now = Date.now();
+    const file = insertFile(db, {
+      id: 'file-cap',
+      from_agent: 'agent-a',
+      to_agent: 'agent-b',
+      filename: 'cap.txt',
+      content_type: 'text/plain',
+      size_bytes: 12,
+      data,
+      sent_at: now,
+      expires_at: null,
+      caption: 'hello caption',
+      reply_to_msg_id: 'msg-123',
+    });
+    expect(file.caption).toBe('hello caption');
+    expect(file.reply_to_msg_id).toBe('msg-123');
+
+    const fetched = getFile(db, 'file-cap');
+    expect(fetched!.caption).toBe('hello caption');
+    expect(fetched!.reply_to_msg_id).toBe('msg-123');
+  });
+
+  it('insertFile without caption/reply_to_msg_id defaults to null', () => {
+    const db = freshDb();
+    const data = Buffer.from('no caption').toString('base64');
+    const now = Date.now();
+    const file = insertFile(db, {
+      id: 'file-nocap',
+      from_agent: 'agent-a',
+      to_agent: 'agent-b',
+      filename: 'nocap.txt',
+      content_type: 'text/plain',
+      size_bytes: 10,
+      data,
+      sent_at: now,
+      expires_at: null,
+    });
+    expect(file.caption).toBeNull();
+    expect(file.reply_to_msg_id).toBeNull();
+
+    const fetched = getFile(db, 'file-nocap');
+    expect(fetched!.caption).toBeNull();
+    expect(fetched!.reply_to_msg_id).toBeNull();
+  });
 });
 
 describe('markFileDelivered', () => {
