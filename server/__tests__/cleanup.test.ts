@@ -3,6 +3,9 @@ import { openDb, registerAgent, aclGrant, insertMessage, getMessage, insertFile,
 import { startCleanup } from '../cleanup.ts';
 import { WebSocket } from 'ws';
 import { PendingRequest } from '../router.ts';
+import { mkdtempSync, writeFileSync, existsSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 
 function wait(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -164,12 +167,15 @@ describe('cleanup', () => {
     db.close();
   });
 
-  it('cleanup tick calls deleteExpiredFiles — expired file is removed', async () => {
+  it('cleanup tick calls deleteExpiredFiles — expired file is removed from DB and disk', async () => {
     const db = openDb(':memory:');
     const pendingRequests = new Map<string, PendingRequest>();
     const agentIndex = new Map<string, WebSocket>();
 
-    const data = Buffer.from('x').toString('base64');
+    const tempDir = mkdtempSync(join(tmpdir(), 'mesh-test-'));
+    const filePath = join(tempDir, 'cleanup-expired-file');
+    writeFileSync(filePath, 'x');
+
     const fileId = 'cleanup-expired-file';
     insertFile(db, {
       id: fileId,
@@ -178,16 +184,19 @@ describe('cleanup', () => {
       filename: 'old.txt',
       content_type: 'text/plain',
       size_bytes: 1,
-      data,
+      file_path: filePath,
       sent_at: Date.now() - 10000,
       expires_at: Date.now() - 5000,
     });
+
+    expect(existsSync(filePath)).toBe(true);
 
     const handle = startCleanup(db, pendingRequests, agentIndex, 50);
     await wait(100);
     handle.stop();
 
     expect(getFile(db, fileId)).toBeNull();
+    expect(existsSync(filePath)).toBe(false);
 
     db.close();
   });

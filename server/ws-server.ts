@@ -26,7 +26,7 @@ interface ConnState {
   authed: boolean;
 }
 
-export function startWsServer(port: number, db: Database, maxFileBytes: number = 10_485_760): Promise<WsServerHandle> {
+export function startWsServer(port: number, db: Database, maxFileBytes: number = 10_485_760, filesDir: string = '/data/files'): Promise<WsServerHandle> {
   return new Promise((resolve, reject) => {
     // Create an HTTP server explicitly so we can track and destroy its sockets
     const httpServer = http.createServer();
@@ -380,7 +380,7 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
               }));
               return;
             }
-            const result = routeFile(db, agentIndex, state.agentId!, f, maxFileBytes);
+            const result = routeFile(db, agentIndex, state.agentId!, f, maxFileBytes, filesDir);
             if (result.ok) {
               ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
             } else {

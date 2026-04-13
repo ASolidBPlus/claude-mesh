@@ -1,5 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
+import { writeFileSync } from 'fs';
+import { join } from 'path';
 import {
   getAgentById,
   aclCheck,
@@ -409,7 +411,8 @@ export function routeFile(
   agentIndex: Map<string, WebSocket>,
   from_agent: string,
   frame: FileSendFrame,
-  maxFileBytes: number
+  maxFileBytes: number,
+  filesDir: string
 ): RouterResult {
   // 1. Validate base64 — attempt decode and check round-trip
   let decoded: Buffer;
@@ -460,7 +463,11 @@ export function routeFile(
     return { ok: true, msg_id: frame.msg_id };
   }
 
-  // 8. Store the file
+  // 8. Write file to disk
+  const filePath = join(filesDir, file_id);
+  writeFileSync(filePath, decoded);
+
+  // 9. Store metadata in DB
   insertFile(db, {
     id: file_id,
     from_agent,
@@ -468,7 +475,7 @@ export function routeFile(
     filename: frame.filename,
     content_type,
     size_bytes,
-    data: frame.data,
+    file_path: filePath,
     sent_at,
     expires_at,
     caption: frame.caption ?? null,
@@ -504,7 +511,7 @@ export function drainFileQueue(
 ): number {
   const now = Date.now();
   const pendingFiles = db.prepare(`
-    SELECT * FROM files
+    SELECT id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at, caption, reply_to_msg_id FROM files
     WHERE to_agent = ?
       AND delivered_at IS NULL
       AND (expires_at IS NULL OR expires_at >= ?)

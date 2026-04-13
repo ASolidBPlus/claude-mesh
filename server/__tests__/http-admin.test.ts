@@ -1,9 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { openDb, registerAgent, aclGrant, aclCheck, setOnline, insertFile, getAgentById, insertMessage, subscribe, getOrCreateTopic } from '../db.ts';
+import { openDb, registerAgent, aclGrant, aclCheck, setOnline, insertFile, getAgentById, getFile, insertMessage, subscribe, getOrCreateTopic } from '../db.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
 import { hashToken } from '../auth.ts';
 import { Database } from 'bun:sqlite';
+import { WebSocket } from 'ws';
 import * as net from 'net';
+import { mkdtempSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 
 describe('http-admin', () => {
   let db: Database;
@@ -11,10 +15,12 @@ describe('http-admin', () => {
   let port: number;
   let base: string;
   const token = 'test-admin-token';
+  let filesDir: string;
 
   beforeEach(async () => {
     db = openDb(':memory:');
-    handle = await startHttpAdmin(0, db, token);
+    filesDir = mkdtempSync(join(tmpdir(), 'mesh-test-'));
+    handle = await startHttpAdmin(0, db, token, 10_485_760, filesDir, new Map());
     port = (handle.server.address() as net.AddressInfo).port;
     base = `http://localhost:${port}`;
   });
@@ -275,10 +281,12 @@ describe('GET /files/:id', () => {
   let port2: number;
   let base2: string;
   const token2 = 'file-admin-token';
+  let filesDir2: string;
 
   beforeEach(async () => {
     db2 = openDb(':memory:');
-    handle2 = await startHttpAdmin(0, db2, token2);
+    filesDir2 = mkdtempSync(join(tmpdir(), 'mesh-test-'));
+    handle2 = await startHttpAdmin(0, db2, token2, 10_485_760, filesDir2, new Map());
     port2 = (handle2.server.address() as net.AddressInfo).port;
     base2 = `http://localhost:${port2}`;
   });
@@ -290,7 +298,8 @@ describe('GET /files/:id', () => {
 
   it('returns raw binary with correct Content-Type and Content-Disposition headers', async () => {
     const content = 'hello from file transfer';
-    const data = Buffer.from(content).toString('base64');
+    const filePath = join(filesDir2, 'test-file-id');
+    writeFileSync(filePath, content);
     insertFile(db2, {
       id: 'test-file-id',
       from_agent: 'a',
@@ -298,7 +307,7 @@ describe('GET /files/:id', () => {
       filename: 'hello.txt',
       content_type: 'text/plain',
       size_bytes: content.length,
-      data,
+      file_path: filePath,
       sent_at: Date.now(),
       expires_at: null,
     });
@@ -330,6 +339,140 @@ describe('GET /files/:id', () => {
 });
 
 // ──────────────────────────────────────────────
+// POST /files
+// ──────────────────────────────────────────────
+
+describe('POST /files', () => {
+  let db: Database;
+  let handle: HttpAdminHandle;
+  let port: number;
+  let base: string;
+  const token = 'files-upload-token';
+  let filesDir: string;
+  let agentIndex: Map<string, WebSocket>;
+
+  beforeEach(async () => {
+    db = openDb(':memory:');
+    filesDir = mkdtempSync(join(tmpdir(), 'mesh-test-'));
+    agentIndex = new Map();
+    handle = await startHttpAdmin(0, db, token, 10_485_760, filesDir, agentIndex);
+    port = (handle.server.address() as net.AddressInfo).port;
+    base = `http://localhost:${port}`;
+
+    registerAgent(db, { id: 'alice', token_hash: 'a'.repeat(64), hostname: 'h1' });
+    registerAgent(db, { id: 'bob', token_hash: 'b'.repeat(64), hostname: 'h2' });
+    aclGrant(db, 'alice', 'bob', 'system');
+  });
+
+  afterEach(async () => {
+    await handle.shutdown().catch(() => {});
+    db.close();
+  });
+
+  const headers = () => ({ 'Authorization': `Bearer ${token}` });
+
+  it('201 — file stored on disk, metadata in DB, correct response shape', async () => {
+    const formData = new FormData();
+    formData.append('file', new File(['hello world'], 'report.txt', { type: 'text/plain' }));
+    formData.append('from_agent', 'alice');
+    formData.append('to_agent', 'bob');
+    formData.append('caption', 'Here is the report');
+
+    const res = await fetch(`${base}/files`, {
+      method: 'POST',
+      headers: headers(),
+      body: formData,
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.file_id).toBeDefined();
+    expect(body.from_agent).toBe('alice');
+    expect(body.to_agent).toBe('bob');
+    expect(body.filename).toBe('report.txt');
+    expect((body.content_type as string).startsWith('text/plain')).toBe(true);
+    expect(body.size_bytes).toBe(11);
+    expect(body.caption).toBe('Here is the report');
+    expect(typeof body.sent_at).toBe('number');
+
+    // Verify file on disk
+    const fileId = body.file_id as string;
+    const bunFile = Bun.file(join(filesDir, fileId));
+    expect(await bunFile.exists()).toBe(true);
+    expect(await bunFile.text()).toBe('hello world');
+
+    // Verify DB record
+    const record = getFile(db, fileId);
+    expect(record).not.toBeNull();
+    expect(record!.from_agent).toBe('alice');
+    expect(record!.file_path).toContain(filesDir);
+  });
+
+  it('400 — missing required fields (no file, no from_agent)', async () => {
+    const formData = new FormData();
+    formData.append('to_agent', 'bob');
+
+    const res = await fetch(`${base}/files`, {
+      method: 'POST',
+      headers: headers(),
+      body: formData,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('413 — file too large', async () => {
+    // Create a server with tiny max
+    const tinyHandle = await startHttpAdmin(0, db, token, 10, filesDir, agentIndex);
+    const tinyPort = (tinyHandle.server.address() as net.AddressInfo).port;
+    const tinyBase = `http://localhost:${tinyPort}`;
+
+    const formData = new FormData();
+    formData.append('file', new File(['x'.repeat(100)], 'big.bin', { type: 'application/octet-stream' }));
+    formData.append('from_agent', 'alice');
+    formData.append('to_agent', 'bob');
+
+    const res = await fetch(`${tinyBase}/files`, {
+      method: 'POST',
+      headers: headers(),
+      body: formData,
+    });
+    expect(res.status).toBe(413);
+
+    await tinyHandle.shutdown().catch(() => {});
+  });
+
+  it('403 — ACL denied', async () => {
+    registerAgent(db, { id: 'charlie', token_hash: 'c'.repeat(64), hostname: 'h3' });
+    // No ACL from charlie to bob
+
+    const formData = new FormData();
+    formData.append('file', new File(['test'], 'f.txt', { type: 'text/plain' }));
+    formData.append('from_agent', 'charlie');
+    formData.append('to_agent', 'bob');
+
+    const res = await fetch(`${base}/files`, {
+      method: 'POST',
+      headers: headers(),
+      body: formData,
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('404 — unknown agent', async () => {
+    const formData = new FormData();
+    formData.append('file', new File(['test'], 'f.txt', { type: 'text/plain' }));
+    formData.append('from_agent', 'ghost');
+    formData.append('to_agent', 'bob');
+
+    const res = await fetch(`${base}/files`, {
+      method: 'POST',
+      headers: headers(),
+      body: formData,
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+// ──────────────────────────────────────────────
 // POST /agents
 // ──────────────────────────────────────────────
 
@@ -342,7 +485,8 @@ describe('POST /agents', () => {
 
   beforeEach(async () => {
     db = openDb(':memory:');
-    handle = await startHttpAdmin(0, db, token);
+    const fd = mkdtempSync(join(tmpdir(), 'mesh-test-'));
+    handle = await startHttpAdmin(0, db, token, 10_485_760, fd, new Map());
     port = (handle.server.address() as net.AddressInfo).port;
     base = `http://localhost:${port}`;
   });
@@ -452,7 +596,8 @@ describe('DELETE /agents/:id', () => {
 
   beforeEach(async () => {
     db = openDb(':memory:');
-    handle = await startHttpAdmin(0, db, token);
+    const fd = mkdtempSync(join(tmpdir(), 'mesh-test-'));
+    handle = await startHttpAdmin(0, db, token, 10_485_760, fd, new Map());
     port = (handle.server.address() as net.AddressInfo).port;
     base = `http://localhost:${port}`;
   });
@@ -515,7 +660,8 @@ describe('GET /messages', () => {
 
   beforeEach(async () => {
     db = openDb(':memory:');
-    handle = await startHttpAdmin(0, db, token);
+    const fd = mkdtempSync(join(tmpdir(), 'mesh-test-'));
+    handle = await startHttpAdmin(0, db, token, 10_485_760, fd, new Map());
     port = (handle.server.address() as net.AddressInfo).port;
     base = `http://localhost:${port}`;
   });

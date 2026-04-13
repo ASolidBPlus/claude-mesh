@@ -1,6 +1,7 @@
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as net from 'net';
+import { WebSocket } from 'ws';
 import {
   getAgentById,
   aclGrant,
@@ -13,6 +14,8 @@ import {
   listAgents,
   Agent,
   getFile,
+  insertFile,
+  markFileDelivered,
   deleteAgent,
   registerAgent,
   queryMessages,
@@ -62,7 +65,9 @@ export function startHttpAdmin(
   port: number,
   db: Database,
   adminToken: string,
-  _maxFileBytes: number = 10_485_760
+  maxFileBytes: number = 10_485_760,
+  filesDir: string = '/data/files',
+  agentIndex: Map<string, WebSocket> = new Map()
 ): Promise<HttpAdminHandle> {
   return new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
@@ -337,7 +342,15 @@ export function startHttpAdmin(
           res.end(JSON.stringify({ error: 'file not found' }));
           return;
         }
-        const content = Buffer.from(file.data, 'base64');
+
+        const bunFile = Bun.file(file.file_path);
+        if (!await bunFile.exists()) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'file not found' }));
+          return;
+        }
+
+        const content = Buffer.from(await bunFile.arrayBuffer());
         res.writeHead(200, {
           'Content-Type': file.content_type,
           'Content-Disposition': `attachment; filename="${file.filename}"`,
@@ -345,6 +358,148 @@ export function startHttpAdmin(
         });
         res.end(content);
         return;
+      }
+
+      if (pathname === '/files' && method === 'POST') {
+        try {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+          const rawBody = Buffer.concat(chunks);
+
+          const bunReq = new Request(`http://localhost${req.url}`, {
+            method: 'POST',
+            headers: req.headers as Record<string, string>,
+            body: rawBody,
+          });
+
+          let formData: FormData;
+          try {
+            formData = await bunReq.formData();
+          } catch {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid form data' }));
+            return;
+          }
+
+          const fileBlob = formData.get('file');
+          const from_agent = formData.get('from_agent');
+          const to_agent = formData.get('to_agent');
+          const caption = formData.get('caption');
+          const reply_to_msg_id = formData.get('reply_to_msg_id');
+          const ttl_ms_str = formData.get('ttl_ms');
+
+          if (!fileBlob || typeof fileBlob === 'string') {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'file is required and must be a file upload' }));
+            return;
+          }
+
+          if (typeof from_agent !== 'string' || !from_agent) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'from_agent is required' }));
+            return;
+          }
+
+          if (typeof to_agent !== 'string' || !to_agent) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'to_agent is required' }));
+            return;
+          }
+
+          if (getAgentById(db, from_agent) === null) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'from_agent not found' }));
+            return;
+          }
+
+          if (getAgentById(db, to_agent) === null) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'to_agent not found' }));
+            return;
+          }
+
+          if (!aclCheck(db, from_agent, to_agent)) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'ACL denied' }));
+            return;
+          }
+
+          const fileBlobObj = fileBlob as File;
+          const size_bytes = fileBlobObj.size;
+          if (size_bytes > maxFileBytes) {
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `file exceeds ${maxFileBytes} byte limit` }));
+            return;
+          }
+
+          if (caption !== null && typeof caption === 'string' && Buffer.byteLength(caption, 'utf8') > 4096) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'caption exceeds 4096 byte limit' }));
+            return;
+          }
+
+          const file_id = crypto.randomUUID();
+          const filePath = `${filesDir}/${file_id}`;
+          await Bun.write(filePath, fileBlobObj);
+
+          const ttl_ms_val = ttl_ms_str ? parseInt(ttl_ms_str as string, 10) : 300_000;
+          const ttl = isNaN(ttl_ms_val) ? 300_000 : ttl_ms_val;
+          const expires_at = ttl === 0 ? null : Date.now() + ttl;
+
+          const filename = fileBlobObj.name || 'upload';
+          const content_type = fileBlobObj.type || 'application/octet-stream';
+          const sent_at = Date.now();
+
+          insertFile(db, {
+            id: file_id,
+            from_agent,
+            to_agent,
+            filename,
+            content_type,
+            size_bytes,
+            file_path: filePath,
+            sent_at,
+            expires_at,
+            caption: (caption as string) ?? null,
+            reply_to_msg_id: (reply_to_msg_id as string) ?? null,
+          });
+
+          const recipientWs = agentIndex.get(to_agent);
+          if (recipientWs !== undefined) {
+            const deliverFrame = JSON.stringify({
+              type: 'file_deliver',
+              file_id,
+              from: from_agent,
+              to: to_agent,
+              filename,
+              content_type,
+              size_bytes,
+              sent_at,
+              fetch_url: `/files/${file_id}`,
+              caption: (caption as string) ?? null,
+              reply_to_msg_id: (reply_to_msg_id as string) ?? null,
+            });
+            recipientWs.send(deliverFrame);
+            markFileDelivered(db, file_id);
+          }
+
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            file_id,
+            from_agent,
+            to_agent,
+            filename,
+            content_type,
+            size_bytes,
+            caption: (caption as string) ?? null,
+            sent_at,
+          }));
+          return;
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid form data' }));
+          return;
+        }
       }
 
       res.writeHead(404, { 'Content-Type': 'application/json' });

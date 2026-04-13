@@ -5,6 +5,7 @@ import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
 import { startCleanup, CleanupHandle } from './cleanup.ts';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Database } from 'bun:sqlite';
+import { mkdirSync } from 'fs';
 
 export interface Config {
   dbPath: string;
@@ -13,6 +14,7 @@ export interface Config {
   adminToken: string;
   cleanupIntervalMs: number;
   maxFileBytes: number;
+  filesDir: string;
 }
 
 export function loadConfig(): Config {
@@ -68,11 +70,15 @@ export function loadConfig(): Config {
     maxFileBytes = parsed;
   }
 
-  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes };
+  const filesDir = process.env.MESH_FILES_DIR ?? '/data/files';
+
+  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir };
 }
 
 async function main() {
   const config = loadConfig();
+
+  mkdirSync(config.filesDir, { recursive: true });
 
   let db: Database;
   try {
@@ -84,7 +90,7 @@ async function main() {
 
   let wsHandle: WsServerHandle;
   try {
-    wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes);
+    wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes, config.filesDir);
   } catch (err) {
     process.stderr.write(`Failed to start WebSocket server: ${err}\n`);
     process.exit(1);
@@ -92,7 +98,7 @@ async function main() {
 
   const { agentIndex, pendingRequests } = wsHandle;
 
-  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes);
+  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex);
 
   let cleanupHandle: CleanupHandle | null = null;
 

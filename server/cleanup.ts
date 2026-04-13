@@ -1,5 +1,6 @@
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
+import { unlinkSync } from 'fs';
 import { expireMessages, deleteExpiredFiles } from './db.ts';
 import { PendingRequest } from './router.ts';
 
@@ -25,8 +26,11 @@ export function startCleanup(
       const expired = expireMessages(db);
       process.stdout.write(`[cleanup] expired ${expired} message(s)\n`);
 
-      const expiredFiles = deleteExpiredFiles(db);
-      process.stdout.write(`[cleanup] expired ${expiredFiles} file(s)\n`);
+      const expiredPaths = deleteExpiredFiles(db);
+      for (const p of expiredPaths) {
+        try { unlinkSync(p); } catch {}
+      }
+      process.stdout.write(`[cleanup] expired ${expiredPaths.length} file(s)\n`);
 
       let expiredRequests = 0;
       for (const [correlationId, entry] of pendingRequests) {

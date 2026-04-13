@@ -6,6 +6,9 @@ import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import * as net from 'net';
 import * as crypto from 'crypto';
+import { mkdtempSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 
 // Use a port range that won't conflict
 let portCounter = 19100;
@@ -36,11 +39,13 @@ describe('startWsServer', () => {
   let db: Database;
   let handle: WsServerHandle;
   let port: number;
+  let filesDir: string;
 
   beforeEach(async () => {
     db = openDb(':memory:');
     port = nextPort();
-    handle = await startWsServer(port, db);
+    filesDir = mkdtempSync(join(tmpdir(), 'mesh-test-'));
+    handle = await startWsServer(port, db, 10_485_760, filesDir);
   });
 
   afterEach(async () => {
@@ -562,7 +567,8 @@ describe('startWsServer', () => {
     registerAgent(db, { id: 'ws-qf-agent', token_hash: hashToken(rawToken), hostname: 'host1' });
 
     // Insert a queued file for this agent (offline delivery scenario)
-    const data = Buffer.from('queued file').toString('base64');
+    const filePath = join(filesDir, 'queued-file-id');
+    require('fs').writeFileSync(filePath, 'queued file');
     insertFile(db, {
       id: 'queued-file-id',
       from_agent: 'some-sender',
@@ -570,7 +576,7 @@ describe('startWsServer', () => {
       filename: 'queued.txt',
       content_type: 'text/plain',
       size_bytes: 11,
-      data,
+      file_path: filePath,
       sent_at: Date.now(),
       expires_at: Date.now() + 300_000,
     });

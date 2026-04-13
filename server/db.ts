@@ -58,7 +58,7 @@ export interface FileRecord {
   filename: string;
   content_type: string;
   size_bytes: number;
-  data: string;           // base64
+  file_path: string;
   sent_at: number;        // unix ms
   expires_at: number | null;
   delivered_at: number | null;
@@ -139,7 +139,7 @@ export function openDb(path: string): Database {
       filename        TEXT NOT NULL,
       content_type    TEXT NOT NULL DEFAULT 'application/octet-stream',
       size_bytes      INTEGER NOT NULL,
-      data            TEXT NOT NULL,
+      file_path       TEXT NOT NULL,
       sent_at         INTEGER NOT NULL,
       expires_at      INTEGER,
       delivered_at    INTEGER,
@@ -155,6 +155,7 @@ export function openDb(path: string): Database {
   // Migration for existing databases: add new columns if they don't exist yet
   try { db.exec('ALTER TABLE files ADD COLUMN caption TEXT'); } catch {}
   try { db.exec('ALTER TABLE files ADD COLUMN reply_to_msg_id TEXT'); } catch {}
+  try { db.exec('ALTER TABLE files ADD COLUMN file_path TEXT'); } catch {}
 
   return db;
 }
@@ -492,7 +493,7 @@ export function insertFile(
     filename: string;
     content_type: string;
     size_bytes: number;
-    data: string;
+    file_path: string;
     sent_at: number;
     expires_at: number | null;
     caption?: string | null;
@@ -503,25 +504,28 @@ export function insertFile(
   const reply_to_msg_id = file.reply_to_msg_id ?? null;
 
   db.prepare(`
-    INSERT INTO files (id, from_agent, to_agent, filename, content_type, size_bytes, data, sent_at, expires_at, delivered_at, caption, reply_to_msg_id)
+    INSERT INTO files (id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at, caption, reply_to_msg_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-  `).run(file.id, file.from_agent, file.to_agent, file.filename, file.content_type, file.size_bytes, file.data, file.sent_at, file.expires_at, caption, reply_to_msg_id);
+  `).run(file.id, file.from_agent, file.to_agent, file.filename, file.content_type, file.size_bytes, file.file_path, file.sent_at, file.expires_at, caption, reply_to_msg_id);
 
   return getFile(db, file.id) as FileRecord;
 }
 
 export function getFile(db: Database, id: string): FileRecord | null {
-  return db.prepare('SELECT * FROM files WHERE id = ?').get(id) as FileRecord | null;
+  return db.prepare('SELECT id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at, caption, reply_to_msg_id FROM files WHERE id = ?').get(id) as FileRecord | null;
 }
 
 export function markFileDelivered(db: Database, id: string): void {
   db.prepare('UPDATE files SET delivered_at = ? WHERE id = ?').run(Date.now(), id);
 }
 
-export function deleteExpiredFiles(db: Database): number {
-  const now = Date.now();
-  const result = db.prepare('DELETE FROM files WHERE expires_at IS NOT NULL AND expires_at < ?').run(now);
-  return result.changes;
+export function deleteExpiredFiles(db: Database): string[] {
+  const rows = db.prepare(`
+    DELETE FROM files
+    WHERE expires_at IS NOT NULL AND expires_at < ?
+    RETURNING file_path
+  `).all(Date.now()) as { file_path: string }[];
+  return rows.map(r => r.file_path);
 }
 
 // ──────────────────────────────────────────────

@@ -4,6 +4,9 @@ import { routeDirect, drainQueue, buildDeliverFrame, routeFile, drainFileQueue, 
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import * as crypto from 'crypto';
+import { mkdtempSync, readFileSync, existsSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 
 function mockWs(): WebSocket {
   return { send: (..._args: unknown[]) => {} } as unknown as WebSocket;
@@ -268,6 +271,11 @@ function makeFileSendFrame(overrides: Partial<FileSendFrame> = {}): FileSendFram
 }
 
 describe('routeFile', () => {
+  let filesDir: string;
+  beforeEach(() => {
+    filesDir = mkdtempSync(join(tmpdir(), 'mesh-test-'));
+  });
+
   it('happy path — recipient online: file_deliver pushed to WS and delivered_at set', () => {
     registerAgent(db, { id: 'file-sender', token_hash: 'a'.repeat(64), hostname: 'h1' });
     registerAgent(db, { id: 'file-recv', token_hash: 'b'.repeat(64), hostname: 'h2' });
@@ -279,7 +287,7 @@ describe('routeFile', () => {
     agentIndex.set('file-recv', mockWs);
 
     const frame = makeFileSendFrame({ to: 'file-recv' });
-    const result = routeFile(db, agentIndex, 'file-sender', frame, 10_485_760);
+    const result = routeFile(db, agentIndex, 'file-sender', frame, 10_485_760, filesDir);
 
     expect(result.ok).toBe(true);
     expect(calls).toHaveLength(1);
@@ -290,7 +298,7 @@ describe('routeFile', () => {
     expect(delivered.to).toBe('file-recv');
 
     // delivered_at should be set
-    const storedFile = db.prepare('SELECT * FROM files WHERE from_agent = ?').get('file-sender') as { id: string; delivered_at: number | null } | null;
+    const storedFile = db.prepare('SELECT id, file_path, delivered_at FROM files WHERE from_agent = ?').get('file-sender') as { id: string; file_path: string; delivered_at: number | null } | null;
     expect(storedFile).not.toBeNull();
     expect(storedFile!.delivered_at).not.toBeNull();
   });
@@ -301,10 +309,10 @@ describe('routeFile', () => {
     aclGrant(db, 'off-sender', 'off-recv', 'system');
 
     const frame = makeFileSendFrame({ to: 'off-recv' });
-    const result = routeFile(db, new Map(), 'off-sender', frame, 10_485_760);
+    const result = routeFile(db, new Map(), 'off-sender', frame, 10_485_760, filesDir);
 
     expect(result.ok).toBe(true);
-    const storedFile = db.prepare('SELECT * FROM files WHERE from_agent = ?').get('off-sender') as { delivered_at: number | null } | null;
+    const storedFile = db.prepare('SELECT id, file_path, delivered_at FROM files WHERE from_agent = ?').get('off-sender') as { file_path: string; delivered_at: number | null } | null;
     expect(storedFile).not.toBeNull();
     expect(storedFile!.delivered_at).toBeNull();
   });
@@ -314,7 +322,7 @@ describe('routeFile', () => {
     registerAgent(db, { id: 'acl-recv', token_hash: 'f'.repeat(64), hostname: 'h6' });
 
     const frame = makeFileSendFrame({ to: 'acl-recv' });
-    const result = routeFile(db, new Map(), 'acl-sender', frame, 10_485_760);
+    const result = routeFile(db, new Map(), 'acl-sender', frame, 10_485_760, filesDir);
 
     expect(result.ok).toBe(false);
     expect(result.error_code).toBe('ACL_DENIED');
@@ -324,7 +332,7 @@ describe('routeFile', () => {
     registerAgent(db, { id: 'anf-sender', token_hash: 'g'.repeat(64), hostname: 'h7' });
 
     const frame = makeFileSendFrame({ to: 'ghost-agent' });
-    const result = routeFile(db, new Map(), 'anf-sender', frame, 10_485_760);
+    const result = routeFile(db, new Map(), 'anf-sender', frame, 10_485_760, filesDir);
 
     expect(result.ok).toBe(false);
     expect(result.error_code).toBe('AGENT_NOT_FOUND');
@@ -338,7 +346,7 @@ describe('routeFile', () => {
     // Create data that decodes to > 10 bytes
     const bigData = Buffer.alloc(100, 'x').toString('base64');
     const frame = makeFileSendFrame({ to: 'big-recv', data: bigData });
-    const result = routeFile(db, new Map(), 'big-sender', frame, 10);
+    const result = routeFile(db, new Map(), 'big-sender', frame, 10, filesDir);
 
     expect(result.ok).toBe(false);
     expect(result.error_code).toBe('FILE_TOO_LARGE');
@@ -350,7 +358,7 @@ describe('routeFile', () => {
     aclGrant(db, 'inv-sender', 'inv-recv', 'system');
 
     const frame = makeFileSendFrame({ to: 'inv-recv', data: 'not!valid@base64#' });
-    const result = routeFile(db, new Map(), 'inv-sender', frame, 10_485_760);
+    const result = routeFile(db, new Map(), 'inv-sender', frame, 10_485_760, filesDir);
 
     expect(result.ok).toBe(false);
     expect(result.error_code).toBe('INVALID_BASE64');
@@ -362,10 +370,10 @@ describe('routeFile', () => {
     aclGrant(db, 'ttl-sender', 'ttl-recv', 'system');
 
     const frame = makeFileSendFrame({ to: 'ttl-recv', ttl_ms: 0 });
-    const result = routeFile(db, new Map(), 'ttl-sender', frame, 10_485_760);
+    const result = routeFile(db, new Map(), 'ttl-sender', frame, 10_485_760, filesDir);
 
     expect(result.ok).toBe(true);
-    const storedFile = db.prepare('SELECT * FROM files WHERE from_agent = ?').get('ttl-sender');
+    const storedFile = db.prepare('SELECT id FROM files WHERE from_agent = ?').get('ttl-sender');
     expect(storedFile).toBeNull();
   });
 
@@ -380,7 +388,7 @@ describe('routeFile', () => {
     agentIndex.set('cap-recv', ws);
 
     const frame = makeFileSendFrame({ to: 'cap-recv', caption: 'my caption' });
-    const result = routeFile(db, agentIndex, 'cap-sender', frame, 10_485_760);
+    const result = routeFile(db, agentIndex, 'cap-sender', frame, 10_485_760, filesDir);
 
     expect(result.ok).toBe(true);
     expect(calls).toHaveLength(1);
@@ -401,7 +409,7 @@ describe('routeFile', () => {
 
     const replyId = crypto.randomUUID();
     const frame = makeFileSendFrame({ to: 'rpl-recv', reply_to_msg_id: replyId });
-    const result = routeFile(db, agentIndex, 'rpl-sender', frame, 10_485_760);
+    const result = routeFile(db, agentIndex, 'rpl-sender', frame, 10_485_760, filesDir);
 
     expect(result.ok).toBe(true);
     expect(calls).toHaveLength(1);
@@ -416,7 +424,7 @@ describe('routeFile', () => {
     aclGrant(db, 'bigcap-sender', 'bigcap-recv', 'system');
 
     const frame = makeFileSendFrame({ to: 'bigcap-recv', caption: 'x'.repeat(4097) });
-    const result = routeFile(db, new Map(), 'bigcap-sender', frame, 10_485_760);
+    const result = routeFile(db, new Map(), 'bigcap-sender', frame, 10_485_760, filesDir);
 
     expect(result.ok).toBe(false);
     expect(result.error_code).toBe('CAPTION_TOO_LARGE');
@@ -433,7 +441,7 @@ describe('routeFile', () => {
     agentIndex.set('nocap-recv', ws);
 
     const frame = makeFileSendFrame({ to: 'nocap-recv' });
-    const result = routeFile(db, agentIndex, 'nocap-sender', frame, 10_485_760);
+    const result = routeFile(db, agentIndex, 'nocap-sender', frame, 10_485_760, filesDir);
 
     expect(result.ok).toBe(true);
     const delivered = JSON.parse(calls[0]);
@@ -442,9 +450,46 @@ describe('routeFile', () => {
     const storedFile = db.prepare('SELECT caption FROM files WHERE from_agent = ?').get('nocap-sender') as { caption: string | null };
     expect(storedFile.caption).toBeNull();
   });
+
+  it('routeFile writes decoded file bytes to <filesDir>/<file_id> on disk', () => {
+    registerAgent(db, { id: 'disk-sender', token_hash: 'a'.repeat(64), hostname: 'h1' });
+    registerAgent(db, { id: 'disk-recv', token_hash: 'b'.repeat(64), hostname: 'h2' });
+    aclGrant(db, 'disk-sender', 'disk-recv', 'system');
+
+    const content = 'test file content';
+    const data = Buffer.from(content).toString('base64');
+    const frame = makeFileSendFrame({ to: 'disk-recv', data });
+    routeFile(db, new Map(), 'disk-sender', frame, 10_485_760, filesDir);
+
+    const storedFile = db.prepare('SELECT id, file_path FROM files WHERE from_agent = ?').get('disk-sender') as { id: string; file_path: string };
+    expect(storedFile).not.toBeNull();
+    expect(storedFile.file_path).toContain(filesDir);
+    expect(existsSync(storedFile.file_path)).toBe(true);
+    const diskContent = readFileSync(storedFile.file_path);
+    expect(diskContent.toString()).toBe(content);
+  });
+
+  it('routeFile stores file_path in DB record (not data)', () => {
+    registerAgent(db, { id: 'fp-sender', token_hash: 'c'.repeat(64), hostname: 'h3' });
+    registerAgent(db, { id: 'fp-recv', token_hash: 'd'.repeat(64), hostname: 'h4' });
+    aclGrant(db, 'fp-sender', 'fp-recv', 'system');
+
+    const frame = makeFileSendFrame({ to: 'fp-recv' });
+    routeFile(db, new Map(), 'fp-sender', frame, 10_485_760, filesDir);
+
+    const record = getFile(db, (db.prepare('SELECT id FROM files WHERE from_agent = ?').get('fp-sender') as { id: string }).id);
+    expect(record).not.toBeNull();
+    expect(record!.file_path).toBeDefined();
+    expect(record!.file_path).toContain(filesDir);
+  });
 });
 
 describe('drainFileQueue', () => {
+  let filesDir: string;
+  beforeEach(() => {
+    filesDir = mkdtempSync(join(tmpdir(), 'mesh-test-'));
+  });
+
   it('delivers queued files on reconnect and sets delivered_at', () => {
     registerAgent(db, { id: 'drain-sender', token_hash: 'n'.repeat(64), hostname: 'h14' });
     registerAgent(db, { id: 'drain-recv', token_hash: 'o'.repeat(64), hostname: 'h15' });
@@ -452,10 +497,10 @@ describe('drainFileQueue', () => {
 
     // Store file while offline
     const frame = makeFileSendFrame({ to: 'drain-recv' });
-    routeFile(db, new Map(), 'drain-sender', frame, 10_485_760);
+    routeFile(db, new Map(), 'drain-sender', frame, 10_485_760, filesDir);
 
     // Confirm not delivered yet
-    const stored = db.prepare('SELECT * FROM files WHERE from_agent = ?').get('drain-sender') as { id: string; delivered_at: number | null };
+    const stored = db.prepare('SELECT id, delivered_at FROM files WHERE from_agent = ?').get('drain-sender') as { id: string; delivered_at: number | null };
     expect(stored.delivered_at).toBeNull();
 
     // Now drain
@@ -480,7 +525,7 @@ describe('drainFileQueue', () => {
 
     const replyId = crypto.randomUUID();
     const frame = makeFileSendFrame({ to: 'drain2-recv', caption: 'drain caption', reply_to_msg_id: replyId });
-    routeFile(db, new Map(), 'drain2-sender', frame, 10_485_760);
+    routeFile(db, new Map(), 'drain2-sender', frame, 10_485_760, filesDir);
 
     const calls: string[] = [];
     const ws = { send: (d: string) => calls.push(d) } as unknown as WebSocket;

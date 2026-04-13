@@ -862,7 +862,6 @@ describe('Referential integrity (FK enforcement)', () => {
 describe('insertFile / getFile', () => {
   it('insertFile stores a row and getFile retrieves it with correct fields', () => {
     const db = freshDb();
-    const data = Buffer.from('hello file content').toString('base64');
     const now = Date.now();
     const file = insertFile(db, {
       id: 'file-1',
@@ -871,7 +870,7 @@ describe('insertFile / getFile', () => {
       filename: 'output.log',
       content_type: 'text/plain',
       size_bytes: 18,
-      data,
+      file_path: '/tmp/test-file-1',
       sent_at: now,
       expires_at: now + 300_000,
     });
@@ -881,7 +880,7 @@ describe('insertFile / getFile', () => {
     expect(file.filename).toBe('output.log');
     expect(file.content_type).toBe('text/plain');
     expect(file.size_bytes).toBe(18);
-    expect(file.data).toBe(data);
+    expect(file.file_path).toBe('/tmp/test-file-1');
     expect(file.delivered_at).toBeNull();
 
     const fetched = getFile(db, 'file-1');
@@ -896,7 +895,6 @@ describe('insertFile / getFile', () => {
 
   it('insertFile with caption and reply_to_msg_id stores them; getFile returns them', () => {
     const db = freshDb();
-    const data = Buffer.from('caption file').toString('base64');
     const now = Date.now();
     const file = insertFile(db, {
       id: 'file-cap',
@@ -905,7 +903,7 @@ describe('insertFile / getFile', () => {
       filename: 'cap.txt',
       content_type: 'text/plain',
       size_bytes: 12,
-      data,
+      file_path: '/tmp/test-file-cap',
       sent_at: now,
       expires_at: null,
       caption: 'hello caption',
@@ -921,7 +919,6 @@ describe('insertFile / getFile', () => {
 
   it('insertFile without caption/reply_to_msg_id defaults to null', () => {
     const db = freshDb();
-    const data = Buffer.from('no caption').toString('base64');
     const now = Date.now();
     const file = insertFile(db, {
       id: 'file-nocap',
@@ -930,7 +927,7 @@ describe('insertFile / getFile', () => {
       filename: 'nocap.txt',
       content_type: 'text/plain',
       size_bytes: 10,
-      data,
+      file_path: '/tmp/test-file-nocap',
       sent_at: now,
       expires_at: null,
     });
@@ -946,7 +943,6 @@ describe('insertFile / getFile', () => {
 describe('markFileDelivered', () => {
   it('sets delivered_at on the file record', () => {
     const db = freshDb();
-    const data = Buffer.from('x').toString('base64');
     insertFile(db, {
       id: 'file-del',
       from_agent: 'a',
@@ -954,7 +950,7 @@ describe('markFileDelivered', () => {
       filename: 'x.txt',
       content_type: 'text/plain',
       size_bytes: 1,
-      data,
+      file_path: '/tmp/test-file-del',
       sent_at: Date.now(),
       expires_at: null,
     });
@@ -965,9 +961,8 @@ describe('markFileDelivered', () => {
 });
 
 describe('deleteExpiredFiles', () => {
-  it('removes expired files only; unexpired file still present', () => {
+  it('removes expired files only; unexpired file still present; returns paths', () => {
     const db = freshDb();
-    const data = Buffer.from('x').toString('base64');
     const past = Date.now() - 5000;
     const future = Date.now() + 60_000;
 
@@ -978,7 +973,7 @@ describe('deleteExpiredFiles', () => {
       filename: 'exp.txt',
       content_type: 'text/plain',
       size_bytes: 1,
-      data,
+      file_path: '/tmp/test-expired',
       sent_at: Date.now() - 10000,
       expires_at: past,
     });
@@ -990,20 +985,20 @@ describe('deleteExpiredFiles', () => {
       filename: 'live.txt',
       content_type: 'text/plain',
       size_bytes: 1,
-      data,
+      file_path: '/tmp/test-live',
       sent_at: Date.now(),
       expires_at: future,
     });
 
-    const count = deleteExpiredFiles(db);
-    expect(count).toBe(1);
+    const paths = deleteExpiredFiles(db);
+    expect(paths).toHaveLength(1);
+    expect(paths[0]).toBe('/tmp/test-expired');
     expect(getFile(db, 'file-expired')).toBeNull();
     expect(getFile(db, 'file-live')).not.toBeNull();
   });
 
   it('returns correct count when one file is expired', () => {
     const db = freshDb();
-    const data = Buffer.from('x').toString('base64');
     insertFile(db, {
       id: 'file-only-expired',
       from_agent: 'a',
@@ -1011,16 +1006,18 @@ describe('deleteExpiredFiles', () => {
       filename: 'e.txt',
       content_type: 'text/plain',
       size_bytes: 1,
-      data,
+      file_path: '/tmp/test-only-expired',
       sent_at: 1,
       expires_at: Date.now() - 1000,
     });
-    expect(deleteExpiredFiles(db)).toBe(1);
+    const paths = deleteExpiredFiles(db);
+    expect(paths).toHaveLength(1);
   });
 
-  it('returns 0 when no files are expired', () => {
+  it('returns empty array when no files are expired', () => {
     const db = freshDb();
-    expect(deleteExpiredFiles(db)).toBe(0);
+    const paths = deleteExpiredFiles(db);
+    expect(paths).toHaveLength(0);
   });
 });
 
