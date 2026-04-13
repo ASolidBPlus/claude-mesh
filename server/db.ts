@@ -157,6 +157,17 @@ export function openDb(path: string): Database {
   try { db.exec('ALTER TABLE files ADD COLUMN reply_to_msg_id TEXT'); } catch {}
   try { db.exec('ALTER TABLE files ADD COLUMN file_path TEXT'); } catch {}
 
+  // Sprint 12 migration: drop the deprecated `data` column (base64 blob in
+  // SQLite) if it still exists from pre-Sprint-12 databases. It was declared
+  // NOT NULL, so insertFile would otherwise fail with a NOT NULL constraint
+  // violation on every upload to an upgraded database.
+  try {
+    const cols = db.prepare('PRAGMA table_info(files)').all() as { name: string }[];
+    if (cols.some((c) => c.name === 'data')) {
+      db.exec('ALTER TABLE files DROP COLUMN data');
+    }
+  } catch {}
+
   return db;
 }
 
