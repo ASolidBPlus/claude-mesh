@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { openDb, registerAgent, getAgentById, insertMessage, insertFile } from '../db.ts';
+import { openDb, registerAgent, getAgentById, insertMessage, insertFile, aclGrant } from '../db.ts';
 import { generateToken, hashToken } from '../auth.ts';
 import { startWsServer, WsServerHandle } from '../ws-server.ts';
 import { Database } from 'bun:sqlite';
@@ -356,6 +356,7 @@ describe('startWsServer', () => {
     const tokenB = generateToken();
     registerAgent(db, { id: 'agent-A-status', token_hash: hashToken(tokenA), hostname: 'hostA' });
     registerAgent(db, { id: 'agent-B-status', token_hash: hashToken(tokenB), hostname: 'hostB' });
+    aclGrant(db, 'agent-A-status', 'agent-B-status', 'system');
 
     // Connect B first and auth
     const wsB = await connectWs(port);
@@ -385,6 +386,7 @@ describe('startWsServer', () => {
     const tokenB = generateToken();
     registerAgent(db, { id: 'agent-A-disc', token_hash: hashToken(tokenA), hostname: 'hostA' });
     registerAgent(db, { id: 'agent-B-disc', token_hash: hashToken(tokenB), hostname: 'hostB' });
+    aclGrant(db, 'agent-A-disc', 'agent-B-disc', 'system');
 
     // Connect and auth both
     const wsB = await connectWs(port);

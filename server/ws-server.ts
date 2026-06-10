@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as net from 'net';
-import { getAgentById, setOnline, touchAgent, getPendingMessages, markAcked } from './db.ts';
+import { getAgentById, setOnline, touchAgent, getPendingMessages, markAcked, aclRelated } from './db.ts';
 import { validateToken } from './auth.ts';
 import {
   routeDirect, drainQueue, SendFrame,
@@ -157,7 +157,7 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
             drainQueue(db, agentId, ws);
             drainFileQueue(db, agentId, ws);
 
-            // Broadcast agent_status to all other authenticated connections
+            // Broadcast agent_status to ACL-related agents only
             const statusMsg = JSON.stringify({
               type: 'agent_status',
               agent_id: agentId,
@@ -165,7 +165,7 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
               last_seen: connectTime,
             });
             for (const [otherWs, otherState] of registry) {
-              if (otherWs !== ws && otherState.authed) {
+              if (otherWs !== ws && otherState.authed && otherState.agentId !== null && aclRelated(db, agentId, otherState.agentId)) {
                 try {
                   otherWs.send(statusMsg);
                 } catch (_) { /* ignore */ }
@@ -418,7 +418,7 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
               last_seen: disconnectTime,
             });
             for (const [otherWs, otherState] of registry) {
-              if (otherState.authed) {
+              if (otherState.authed && otherState.agentId !== null && aclRelated(db, agentId, otherState.agentId)) {
                 try {
                   otherWs.send(statusMsg);
                 } catch (_) { /* ignore */ }

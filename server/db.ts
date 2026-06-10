@@ -303,6 +303,13 @@ export function aclCheck(db: Database, from_agent: string, to_agent: string): bo
   return row !== null;
 }
 
+export function aclRelated(db: Database, agentA: string, agentB: string): boolean {
+  const row = db.prepare(
+    'SELECT 1 FROM acl WHERE (from_agent = ? AND to_agent = ?) OR (from_agent = ? AND to_agent = ?)'
+  ).get(agentA, agentB, agentB, agentA);
+  return row !== null;
+}
+
 export function listInboundAcl(db: Database, id: string): AclRow[] {
   return db.prepare('SELECT * FROM acl WHERE to_agent = ?').all(id) as AclRow[];
 }
