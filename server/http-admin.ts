@@ -19,8 +19,15 @@ import {
   deleteAgent,
   registerAgent,
   queryMessages,
+  insertReminder,
+  listAgentReminders,
+  getReminder,
+  cancelReminder as dbCancelReminder,
+  Reminder,
 } from './db.ts';
 import { generateToken, hashToken } from './auth.ts';
+import { parseDuration } from './duration.ts';
+import { cronValidate, cronNext } from './cron.ts';
 
 export interface HttpAdminHandle {
   server: http.Server;
@@ -500,6 +507,139 @@ export function startHttpAdmin(
           res.end(JSON.stringify({ error: 'invalid form data' }));
           return;
         }
+      }
+
+      if (pathname === '/reminders' && method === 'POST') {
+        const raw = await readBody(req);
+        let body: Record<string, unknown>;
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid JSON' }));
+          return;
+        }
+
+        const agent_id = body.agent_id;
+        const payload = body.payload;
+
+        if (typeof agent_id !== 'string' || !agent_id || getAgentById(db, agent_id) === null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'agent not found' }));
+          return;
+        }
+
+        if (typeof payload !== 'string' || payload.length === 0) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'payload is required and must be a non-empty string' }));
+          return;
+        }
+        if (Buffer.byteLength(payload, 'utf8') > 4096) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'payload exceeds 4096 bytes' }));
+          return;
+        }
+
+        const hasSchedule = body.schedule !== undefined;
+        const hasDueAt = body.due_at !== undefined;
+        const hasDuration = body.duration !== undefined;
+        const timingCount = (hasSchedule ? 1 : 0) + (hasDueAt ? 1 : 0) + (hasDuration ? 1 : 0);
+
+        if (timingCount !== 1) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'exactly one of schedule, due_at, or duration is required' }));
+          return;
+        }
+
+        let due_at: number;
+        let schedule: string | null;
+
+        if (hasSchedule) {
+          const sched = body.schedule;
+          if (typeof sched !== 'string' || !cronValidate(sched)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid cron expression' }));
+            return;
+          }
+          const next = cronNext(sched, Date.now());
+          if (next === null) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'cron has no future occurrence within 366 days' }));
+            return;
+          }
+          due_at = next;
+          schedule = sched;
+        } else if (hasDueAt) {
+          const dueAtVal = body.due_at;
+          if (typeof dueAtVal !== 'number' || !Number.isFinite(dueAtVal) || dueAtVal <= Date.now()) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'due_at must be a future unix ms timestamp' }));
+            return;
+          }
+          due_at = dueAtVal;
+          schedule = null;
+        } else {
+          const durVal = body.duration;
+          const parsed = typeof durVal === 'string' ? parseDuration(durVal) : null;
+          if (parsed === null) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'duration is unparseable or zero' }));
+            return;
+          }
+          due_at = Date.now() + parsed;
+          schedule = null;
+        }
+
+        const rem = insertReminder(db, {
+          id: crypto.randomUUID(),
+          agent_id,
+          due_at,
+          schedule,
+          payload,
+          created_at: Date.now(),
+        });
+
+        res.writeHead(201, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(rem));
+        return;
+      }
+
+      if (pathname === '/reminders' && method === 'GET') {
+        const agent_id = url.searchParams.get('agent_id');
+        if (!agent_id) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'agent_id query param required' }));
+          return;
+        }
+        if (getAgentById(db, agent_id) === null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'agent not found' }));
+          return;
+        }
+        const reminders = listAgentReminders(db, agent_id);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(reminders));
+        return;
+      }
+
+      const reminderDeleteMatch = pathname.match(/^\/reminders\/([^/]+)$/);
+      if (reminderDeleteMatch && method === 'DELETE') {
+        const id = reminderDeleteMatch[1];
+        const rem = getReminder(db, id);
+        if (rem === null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'reminder not found' }));
+          return;
+        }
+        const cancelled = dbCancelReminder(db, id);
+        if (!cancelled) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'reminder not found' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
       }
 
       res.writeHead(404, { 'Content-Type': 'application/json' });

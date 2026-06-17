@@ -2,8 +2,10 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as net from 'net';
-import { getAgentById, setOnline, touchAgent, getPendingMessages, markAcked, aclRelated } from './db.ts';
+import { getAgentById, setOnline, touchAgent, getPendingMessages, markAcked, aclRelated, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder } from './db.ts';
 import { validateToken } from './auth.ts';
+import { parseDuration } from './duration.ts';
+import { cronValidate, cronNext } from './cron.ts';
 import {
   routeDirect, drainQueue, SendFrame,
   routePublish, routeSubscribe, routeUnsubscribe,
@@ -390,6 +392,134 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
                 message: result.error_message,
               }));
             }
+            return;
+          }
+
+          if (frameType === 'remind') {
+            const text = frame.text;
+            const when = frame.when;
+            const recurring = frame.recurring === true;
+
+            if (typeof text !== 'string' || text.length === 0) {
+              try {
+                ws.send(JSON.stringify({ type: 'error', code: 'INVALID_WHEN', message: 'text is required' }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+            if (Buffer.byteLength(text, 'utf8') > 4096) {
+              try {
+                ws.send(JSON.stringify({ type: 'error', code: 'PAYLOAD_TOO_LARGE', message: 'text exceeds 4096 bytes' }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+            if (typeof when !== 'string' || when.length === 0) {
+              try {
+                ws.send(JSON.stringify({ type: 'error', code: 'INVALID_WHEN', message: 'when is required' }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+
+            let due_at: number;
+            let schedule: string | null;
+
+            if (recurring) {
+              if (!cronValidate(when)) {
+                try {
+                  ws.send(JSON.stringify({ type: 'error', code: 'INVALID_CRON', message: 'invalid cron expression' }));
+                } catch (_) { /* ignore */ }
+                return;
+              }
+              const next = cronNext(when, Date.now());
+              if (next === null) {
+                try {
+                  ws.send(JSON.stringify({ type: 'error', code: 'INVALID_CRON', message: 'no future occurrence found' }));
+                } catch (_) { /* ignore */ }
+                return;
+              }
+              due_at = next;
+              schedule = when;
+            } else {
+              const dur = parseDuration(when);
+              if (dur !== null) {
+                due_at = Date.now() + dur;
+                schedule = null;
+              } else {
+                const parsedTime = new Date(when).getTime();
+                if (Number.isFinite(parsedTime)) {
+                  if (parsedTime <= Date.now()) {
+                    try {
+                      ws.send(JSON.stringify({ type: 'error', code: 'INVALID_WHEN', message: 'due time is in the past' }));
+                    } catch (_) { /* ignore */ }
+                    return;
+                  }
+                  due_at = parsedTime;
+                  schedule = null;
+                } else {
+                  try {
+                    ws.send(JSON.stringify({ type: 'error', code: 'INVALID_WHEN', message: 'when must be a duration (e.g. "90s"), ISO datetime, or cron expression with recurring=true' }));
+                  } catch (_) { /* ignore */ }
+                  return;
+                }
+              }
+            }
+
+            const rem = insertReminder(db, {
+              id: crypto.randomUUID(),
+              agent_id: state.agentId!,
+              due_at,
+              schedule,
+              payload: text,
+              created_at: Date.now(),
+            });
+            try {
+              ws.send(JSON.stringify({ type: 'ack', ref: rem.id, ok: true, reminder_id: rem.id, due_at: rem.due_at }));
+            } catch (_) { /* ignore */ }
+            return;
+          }
+
+          if (frameType === 'list_reminders') {
+            const reminders = listAgentReminders(db, state.agentId!);
+            try {
+              ws.send(JSON.stringify({
+                type: 'reminders_list',
+                reminders: reminders.map(r => ({
+                  id: r.id,
+                  due_at: r.due_at,
+                  schedule: r.schedule,
+                  payload: r.payload,
+                  created_at: r.created_at,
+                  last_fired_at: r.last_fired_at,
+                })),
+              }));
+            } catch (_) { /* ignore */ }
+            return;
+          }
+
+          if (frameType === 'cancel_reminder') {
+            const id = frame.id;
+            if (typeof id !== 'string' || id.length === 0) {
+              try {
+                ws.send(JSON.stringify({ type: 'error', code: 'REMINDER_NOT_FOUND', message: 'reminder not found' }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+            const rem = getReminder(db, id);
+            if (rem === null || rem.agent_id !== state.agentId!) {
+              try {
+                ws.send(JSON.stringify({ type: 'error', code: 'REMINDER_NOT_FOUND', message: 'reminder not found' }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+            const cancelled = dbCancelReminder(db, id);
+            if (!cancelled) {
+              try {
+                ws.send(JSON.stringify({ type: 'error', code: 'REMINDER_NOT_FOUND', message: 'reminder not found or already cancelled' }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+            try {
+              ws.send(JSON.stringify({ type: 'ack', ref: id, ok: true }));
+            } catch (_) { /* ignore */ }
             return;
           }
 

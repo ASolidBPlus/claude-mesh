@@ -66,6 +66,17 @@ export interface FileRecord {
   reply_to_msg_id: string | null;
 }
 
+export interface Reminder {
+  id: string;
+  agent_id: string;
+  due_at: number;
+  schedule: string | null;
+  payload: string;
+  created_at: number;
+  status: string;
+  last_fired_at: number | null;
+}
+
 // ──────────────────────────────────────────────
 // 5.1 Database initialization
 // ──────────────────────────────────────────────
@@ -150,6 +161,22 @@ export function openDb(path: string): Database {
     CREATE INDEX IF NOT EXISTS idx_files_to_agent   ON files(to_agent, delivered_at);
     CREATE INDEX IF NOT EXISTS idx_files_expires    ON files(expires_at) WHERE expires_at IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_files_from_agent ON files(from_agent);
+
+    CREATE TABLE IF NOT EXISTS reminders (
+      id            TEXT PRIMARY KEY,
+      agent_id      TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      due_at        INTEGER NOT NULL,
+      schedule      TEXT,
+      payload       TEXT NOT NULL,
+      created_at    INTEGER NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'pending',
+      last_fired_at INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_reminders_due
+      ON reminders(status, due_at) WHERE status = 'pending';
+    CREATE INDEX IF NOT EXISTS idx_reminders_agent
+      ON reminders(agent_id, status);
   `);
 
   // Migration for existing databases: add new columns if they don't exist yet
@@ -544,6 +571,72 @@ export function deleteExpiredFiles(db: Database): string[] {
     RETURNING file_path
   `).all(Date.now()) as { file_path: string }[];
   return rows.map(r => r.file_path);
+}
+
+// ──────────────────────────────────────────────
+// 5.8 Reminders
+// ──────────────────────────────────────────────
+
+export function insertReminder(
+  db: Database,
+  reminder: {
+    id: string;
+    agent_id: string;
+    due_at: number;
+    schedule?: string | null;
+    payload: string;
+    created_at: number;
+  }
+): Reminder {
+  const schedule = reminder.schedule ?? null;
+  db.prepare(`
+    INSERT INTO reminders (id, agent_id, due_at, schedule, payload, created_at, status, last_fired_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL)
+  `).run(reminder.id, reminder.agent_id, reminder.due_at, schedule, reminder.payload, reminder.created_at);
+
+  return getReminder(db, reminder.id) as Reminder;
+}
+
+export function getReminder(db: Database, id: string): Reminder | null {
+  return db.prepare('SELECT * FROM reminders WHERE id = ?').get(id) as Reminder | null;
+}
+
+export function getDueReminders(db: Database, now: number): Reminder[] {
+  return db.prepare(`
+    SELECT * FROM reminders WHERE status = 'pending' AND due_at <= ? ORDER BY due_at ASC
+  `).all(now) as Reminder[];
+}
+
+export function listAgentReminders(db: Database, agentId: string): Reminder[] {
+  return db.prepare(`
+    SELECT * FROM reminders WHERE agent_id = ? AND status = 'pending' ORDER BY due_at ASC
+  `).all(agentId) as Reminder[];
+}
+
+export function cancelReminder(db: Database, id: string): boolean {
+  const result = db.prepare(`
+    UPDATE reminders SET status = 'cancelled' WHERE id = ? AND status = 'pending'
+  `).run(id);
+  return result.changes > 0;
+}
+
+export function markReminderDelivered(db: Database, id: string, firedAt: number): void {
+  db.prepare(`
+    UPDATE reminders SET status = 'delivered', last_fired_at = ? WHERE id = ?
+  `).run(firedAt, id);
+}
+
+export function updateReminderDueAt(db: Database, id: string, nextDue: number, firedAt: number): void {
+  db.prepare(`
+    UPDATE reminders SET due_at = ?, last_fired_at = ? WHERE id = ?
+  `).run(nextDue, firedAt, id);
+}
+
+export function deleteDeliveredOneShots(db: Database, olderThanMs: number): number {
+  const result = db.prepare(`
+    DELETE FROM reminders WHERE status = 'delivered' AND schedule IS NULL AND last_fired_at < ?
+  `).run(olderThanMs);
+  return result.changes;
 }
 
 // ──────────────────────────────────────────────

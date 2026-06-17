@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import { unlinkSync } from 'fs';
-import { expireMessages, deleteExpiredFiles } from './db.ts';
+import { expireMessages, deleteExpiredFiles, deleteDeliveredOneShots } from './db.ts';
 import { PendingRequest } from './router.ts';
 
 export interface CleanupHandle {
@@ -56,6 +56,9 @@ export function startCleanup(
       }
 
       process.stdout.write(`[cleanup] expired ${expiredRequests} pending request(s)\n`);
+
+      const deletedReminders = deleteDeliveredOneShots(db, Date.now() - 86_400_000);
+      process.stdout.write(`[cleanup] cleaned ${deletedReminders} old delivered reminder(s)\n`);
     } catch (err) {
       process.stderr.write(`[cleanup] error during cleanup tick: ${err}\n`);
     }

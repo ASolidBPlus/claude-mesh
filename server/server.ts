@@ -3,6 +3,7 @@ import { startWsServer, WsServerHandle } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
 import { startCleanup, CleanupHandle } from './cleanup.ts';
+import { startReminderScheduler, ReminderSchedulerHandle } from './reminder-scheduler.ts';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Database } from 'bun:sqlite';
 import { mkdirSync } from 'fs';
@@ -15,6 +16,7 @@ export interface Config {
   cleanupIntervalMs: number;
   maxFileBytes: number;
   filesDir: string;
+  reminderIntervalMs: number;
 }
 
 export function loadConfig(): Config {
@@ -72,7 +74,18 @@ export function loadConfig(): Config {
 
   const filesDir = process.env.MESH_FILES_DIR ?? '/data/files';
 
-  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir };
+  let reminderIntervalMs = 10_000;
+  const reminderStr = process.env.MESH_REMINDER_INTERVAL_MS;
+  if (reminderStr !== undefined) {
+    const parsed = parseInt(reminderStr, 10);
+    if (isNaN(parsed) || parsed <= 0 || parsed > 3_600_000) {
+      process.stderr.write(`MESH_REMINDER_INTERVAL_MS must be an integer between 1 and 3600000, got: ${reminderStr}\n`);
+      process.exit(1);
+    }
+    reminderIntervalMs = parsed;
+  }
+
+  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs };
 }
 
 async function main() {
@@ -101,6 +114,7 @@ async function main() {
   const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex);
 
   let cleanupHandle: CleanupHandle | null = null;
+  let reminderHandle: ReminderSchedulerHandle | null = null;
 
   let shutdownStarted = false;
 
@@ -114,6 +128,7 @@ async function main() {
 
     try {
       cleanupHandle?.stop();
+      reminderHandle?.stop();
       await wsHandle.shutdown();
       await httpHandle.shutdown();
       await mcpHandle.shutdown();
@@ -130,6 +145,7 @@ async function main() {
   await mcpHandle.server.connect(transport);
 
   cleanupHandle = startCleanup(db, pendingRequests, agentIndex, config.cleanupIntervalMs);
+  reminderHandle = startReminderScheduler(db, wsHandle.agentIndex, config.reminderIntervalMs);
 
   process.stdin.on('end', shutdown);
   process.stdin.on('close', shutdown);
