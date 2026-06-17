@@ -8,7 +8,7 @@ import {
   updateReminderDueAt,
 } from './db.ts';
 import { buildDeliverFrame } from './router.ts';
-import { cronNext } from './cron.ts';
+import { cronNext, cronNextTz } from './cron.ts';
 
 export interface ReminderSchedulerHandle {
   stop(): void;
@@ -63,7 +63,9 @@ export function startReminderScheduler(
         // recurring periods while offline, each tick inserts at most one
         // message and jumps past `now`, so all missed periods collapse into a
         // single delivery rather than a backlog storm on reconnect.
-        const nextDue = cronNext(reminder.schedule, Date.now());
+        const nextDue = reminder.tz
+          ? cronNextTz(reminder.schedule, Date.now(), reminder.tz)
+          : cronNext(reminder.schedule, Date.now());
         if (nextDue !== null) {
           updateReminderDueAt(db, reminder.id, nextDue, Date.now());
         } else {

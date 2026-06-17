@@ -27,7 +27,7 @@ import {
 } from './db.ts';
 import { generateToken, hashToken } from './auth.ts';
 import { parseDuration } from './duration.ts';
-import { cronValidate, cronNext } from './cron.ts';
+import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
 
 export interface HttpAdminHandle {
   server: http.Server;
@@ -551,6 +551,15 @@ export function startHttpAdmin(
           return;
         }
 
+        // Optional per-reminder IANA timezone (mirrors WS remind).
+        const tzRaw = body.tz;
+        if (tzRaw !== undefined && (typeof tzRaw !== 'string' || !tzValidate(tzRaw))) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid IANA timezone' }));
+          return;
+        }
+        const tz = (typeof tzRaw === 'string') ? tzRaw : null;
+
         let due_at: number;
         let schedule: string | null;
 
@@ -561,7 +570,7 @@ export function startHttpAdmin(
             res.end(JSON.stringify({ error: 'invalid cron expression' }));
             return;
           }
-          const next = cronNext(sched, Date.now());
+          const next = tz !== null ? cronNextTz(sched, Date.now(), tz) : cronNext(sched, Date.now());
           if (next === null) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'cron has no future occurrence within 366 days' }));
@@ -571,13 +580,18 @@ export function startHttpAdmin(
           schedule = sched;
         } else if (hasDueAt) {
           const dueAtVal = body.due_at;
-          if (typeof dueAtVal !== 'number' || !Number.isFinite(dueAtVal) || dueAtVal <= Date.now()) {
+          if (tz !== null && typeof dueAtVal === 'string' && isBareIso(dueAtVal)) {
+            // Bare offset-less ISO + tz → interpret as wall-clock in tz.
+            due_at = bareIsoToUtc(dueAtVal, tz);
+            schedule = null;
+          } else if (typeof dueAtVal === 'number' && Number.isFinite(dueAtVal) && dueAtVal > Date.now()) {
+            due_at = dueAtVal;
+            schedule = null;
+          } else {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'due_at must be a future unix ms timestamp' }));
             return;
           }
-          due_at = dueAtVal;
-          schedule = null;
         } else {
           const durVal = body.duration;
           const parsed = typeof durVal === 'string' ? parseDuration(durVal) : null;
@@ -597,6 +611,7 @@ export function startHttpAdmin(
           schedule,
           payload,
           created_at: Date.now(),
+          tz,
         });
 
         res.writeHead(201, { 'Content-Type': 'application/json' });

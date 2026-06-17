@@ -17,6 +17,7 @@ export interface Config {
   maxFileBytes: number;
   filesDir: string;
   reminderIntervalMs: number;
+  presenceDebounceMs: number;
 }
 
 export function loadConfig(): Config {
@@ -85,7 +86,18 @@ export function loadConfig(): Config {
     reminderIntervalMs = parsed;
   }
 
-  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs };
+  let presenceDebounceMs = 12_000;
+  const presenceStr = process.env.MESH_PRESENCE_DEBOUNCE_MS;
+  if (presenceStr !== undefined) {
+    const parsed = parseInt(presenceStr, 10);
+    if (isNaN(parsed) || parsed < 0 || parsed > 600_000 || String(parsed) !== presenceStr.trim()) {
+      process.stderr.write(`MESH_PRESENCE_DEBOUNCE_MS must be an integer between 0 and 600000, got: ${presenceStr}\n`);
+      process.exit(1);
+    }
+    presenceDebounceMs = parsed;
+  }
+
+  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs };
 }
 
 async function main() {
@@ -103,7 +115,7 @@ async function main() {
 
   let wsHandle: WsServerHandle;
   try {
-    wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes, config.filesDir);
+    wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes, config.filesDir, config.presenceDebounceMs);
   } catch (err) {
     process.stderr.write(`Failed to start WebSocket server: ${err}\n`);
     process.exit(1);

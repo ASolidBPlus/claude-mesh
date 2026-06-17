@@ -2,10 +2,10 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as net from 'net';
-import { getAgentById, setOnline, touchAgent, getPendingMessages, markAcked, aclRelated, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder } from './db.ts';
+import { getAgentById, setOnline, touchAgent, getPendingMessages, markAcked, aclRelated, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents } from './db.ts';
 import { validateToken } from './auth.ts';
 import { parseDuration } from './duration.ts';
-import { cronValidate, cronNext } from './cron.ts';
+import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
 import {
   routeDirect, drainQueue, SendFrame,
   routePublish, routeSubscribe, routeUnsubscribe,
@@ -28,7 +28,18 @@ interface ConnState {
   authed: boolean;
 }
 
-export function startWsServer(port: number, db: Database, maxFileBytes: number = 10_485_760, filesDir: string = '/data/files'): Promise<WsServerHandle> {
+interface PresenceState {
+  pendingOfflineTimer: ReturnType<typeof setTimeout> | null; // armed offline-broadcast timer, or null
+  onlineBroadcast: boolean; // true while peers currently believe this agent is online
+}
+
+export function startWsServer(
+  port: number,
+  db: Database,
+  maxFileBytes: number = 10_485_760,
+  filesDir: string = '/data/files',
+  presenceDebounceMs: number = 0,   // 0 = immediate (legacy). Production passes config value.
+): Promise<WsServerHandle> {
   return new Promise((resolve, reject) => {
     // Create an HTTP server explicitly so we can track and destroy its sockets
     const httpServer = http.createServer();
@@ -40,7 +51,23 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
     // Reverse index: agentId -> ws
     const agentIndex = new Map<string, WebSocket>();
     const pendingRequests = new Map<string, PendingRequest>();
+    // Per-agent presence debounce state (Sprint 15). Keyed by agentId.
+    const presenceState = new Map<string, PresenceState>();
     let shutdownStarted = false;
+
+    // Broadcast an agent_status frame to all currently-connected, authed peers
+    // that are ACL-related to `agentId`. ACL is re-checked LIVE at fire time.
+    // Pass the connecting ws as `excludeWs` on connect; null on disconnect (the
+    // disconnecting ws is already removed from `registry`).
+    function broadcastStatus(agentId: string, online: boolean, lastSeen: number, excludeWs: WebSocket | null) {
+      const statusMsg = JSON.stringify({ type: 'agent_status', agent_id: agentId, online, last_seen: lastSeen });
+      for (const [otherWs, otherState] of registry) {
+        if (otherWs === excludeWs) continue;
+        if (otherState.authed && otherState.agentId !== null && aclRelated(db, agentId, otherState.agentId)) {
+          try { otherWs.send(statusMsg); } catch (_) { /* ignore */ }
+        }
+      }
+    }
 
     // Track all raw TCP sockets so we can destroy them on shutdown
     httpServer.on('connection', (socket) => {
@@ -159,19 +186,21 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
             drainQueue(db, agentId, ws);
             drainFileQueue(db, agentId, ws);
 
-            // Broadcast agent_status to ACL-related agents only
-            const statusMsg = JSON.stringify({
-              type: 'agent_status',
-              agent_id: agentId,
-              online: true,
-              last_seen: connectTime,
-            });
-            for (const [otherWs, otherState] of registry) {
-              if (otherWs !== ws && otherState.authed && otherState.agentId !== null && aclRelated(db, agentId, otherState.agentId)) {
-                try {
-                  otherWs.send(statusMsg);
-                } catch (_) { /* ignore */ }
-              }
+            // Presence-debounce-aware online broadcast. Keys purely off
+            // presenceState (NOT the ws object): `close` removes the old ws from
+            // registry/agentIndex synchronously before any reconnect's auth runs
+            // (single-threaded event loop), so a flap-back is detected here.
+            const existing = presenceState.get(agentId);
+            if (existing && existing.pendingOfflineTimer !== null) {
+              // Flapped back inside the debounce window. Peers never saw offline
+              // (timer hadn't fired). Cancel the pending offline AND suppress the
+              // re-online broadcast — net zero churn. onlineBroadcast stays true.
+              clearTimeout(existing.pendingOfflineTimer);
+              existing.pendingOfflineTimer = null;
+            } else {
+              // Genuinely fresh / long-offline connect: broadcast online as today.
+              broadcastStatus(agentId, true, connectTime, ws);
+              presenceState.set(agentId, { pendingOfflineTimer: null, onlineBroadcast: true });
             }
 
             return;
@@ -399,25 +428,41 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
             const text = frame.text;
             const when = frame.when;
             const recurring = frame.recurring === true;
+            // ref-correlation: echo the REQUEST's msg_id on every reply when present.
+            const reqMsgId = (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) ? frame.msg_id : undefined;
+            const refPart = reqMsgId ? { ref: reqMsgId } : {};
 
             if (typeof text !== 'string' || text.length === 0) {
               try {
-                ws.send(JSON.stringify({ type: 'error', code: 'INVALID_WHEN', message: 'text is required' }));
+                ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_WHEN', message: 'text is required' }));
               } catch (_) { /* ignore */ }
               return;
             }
             if (Buffer.byteLength(text, 'utf8') > 4096) {
               try {
-                ws.send(JSON.stringify({ type: 'error', code: 'PAYLOAD_TOO_LARGE', message: 'text exceeds 4096 bytes' }));
+                ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'PAYLOAD_TOO_LARGE', message: 'text exceeds 4096 bytes' }));
               } catch (_) { /* ignore */ }
               return;
             }
             if (typeof when !== 'string' || when.length === 0) {
               try {
-                ws.send(JSON.stringify({ type: 'error', code: 'INVALID_WHEN', message: 'when is required' }));
+                ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_WHEN', message: 'when is required' }));
               } catch (_) { /* ignore */ }
               return;
             }
+
+            // Optional per-reminder IANA timezone. When present, cron fields and
+            // bare offset-less ISO one-shots are interpreted as wall-clock in tz.
+            const tzRaw = frame.tz;
+            if (tzRaw !== undefined) {
+              if (typeof tzRaw !== 'string' || !tzValidate(tzRaw)) {
+                try {
+                  ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_TZ', message: 'invalid IANA timezone' }));
+                } catch (_) { /* ignore */ }
+                return;
+              }
+            }
+            const tz = (typeof tzRaw === 'string') ? tzRaw : null;
 
             let due_at: number;
             let schedule: string | null;
@@ -425,14 +470,14 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
             if (recurring) {
               if (!cronValidate(when)) {
                 try {
-                  ws.send(JSON.stringify({ type: 'error', code: 'INVALID_CRON', message: 'invalid cron expression' }));
+                  ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_CRON', message: 'invalid cron expression' }));
                 } catch (_) { /* ignore */ }
                 return;
               }
-              const next = cronNext(when, Date.now());
+              const next = tz !== null ? cronNextTz(when, Date.now(), tz) : cronNext(when, Date.now());
               if (next === null) {
                 try {
-                  ws.send(JSON.stringify({ type: 'error', code: 'INVALID_CRON', message: 'no future occurrence found' }));
+                  ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_CRON', message: 'no future occurrence found' }));
                 } catch (_) { /* ignore */ }
                 return;
               }
@@ -441,14 +486,19 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
             } else {
               const dur = parseDuration(when);
               if (dur !== null) {
+                // Duration → absolute (tz is a no-op, still recorded).
                 due_at = Date.now() + dur;
+                schedule = null;
+              } else if (tz !== null && isBareIso(when)) {
+                // Bare offset-less ISO + tz → interpret as wall-clock in tz.
+                due_at = bareIsoToUtc(when, tz);
                 schedule = null;
               } else {
                 const parsedTime = new Date(when).getTime();
                 if (Number.isFinite(parsedTime)) {
                   if (parsedTime <= Date.now()) {
                     try {
-                      ws.send(JSON.stringify({ type: 'error', code: 'INVALID_WHEN', message: 'due time is in the past' }));
+                      ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_WHEN', message: 'due time is in the past' }));
                     } catch (_) { /* ignore */ }
                     return;
                   }
@@ -456,7 +506,7 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
                   schedule = null;
                 } else {
                   try {
-                    ws.send(JSON.stringify({ type: 'error', code: 'INVALID_WHEN', message: 'when must be a duration (e.g. "90s"), ISO datetime, or cron expression with recurring=true' }));
+                    ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_WHEN', message: 'when must be a duration (e.g. "90s"), ISO datetime, or cron expression with recurring=true' }));
                   } catch (_) { /* ignore */ }
                   return;
                 }
@@ -470,55 +520,79 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
               schedule,
               payload: text,
               created_at: Date.now(),
+              tz,
             });
             try {
-              ws.send(JSON.stringify({ type: 'ack', ref: rem.id, ok: true, reminder_id: rem.id, due_at: rem.due_at }));
+              ws.send(JSON.stringify({ type: 'ack', ...refPart, ok: true, reminder_id: rem.id, due_at: rem.due_at }));
             } catch (_) { /* ignore */ }
             return;
           }
 
           if (frameType === 'list_reminders') {
             const reminders = listAgentReminders(db, state.agentId!);
+            const resp: { type: string; ref?: string; reminders: unknown[] } = {
+              type: 'reminders_list',
+              reminders: reminders.map(r => ({
+                id: r.id,
+                due_at: r.due_at,
+                schedule: r.schedule,
+                payload: r.payload,
+                created_at: r.created_at,
+                last_fired_at: r.last_fired_at,
+              })),
+            };
+            if (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) resp.ref = frame.msg_id;
             try {
-              ws.send(JSON.stringify({
-                type: 'reminders_list',
-                reminders: reminders.map(r => ({
-                  id: r.id,
-                  due_at: r.due_at,
-                  schedule: r.schedule,
-                  payload: r.payload,
-                  created_at: r.created_at,
-                  last_fired_at: r.last_fired_at,
-                })),
-              }));
+              ws.send(JSON.stringify(resp));
             } catch (_) { /* ignore */ }
             return;
           }
 
           if (frameType === 'cancel_reminder') {
             const id = frame.id;
+            // ref-correlation: echo the REQUEST's msg_id when present.
+            const reqMsgId = (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) ? frame.msg_id : undefined;
+            const refPart = reqMsgId ? { ref: reqMsgId } : {};
             if (typeof id !== 'string' || id.length === 0) {
               try {
-                ws.send(JSON.stringify({ type: 'error', code: 'REMINDER_NOT_FOUND', message: 'reminder not found' }));
+                ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'REMINDER_NOT_FOUND', message: 'reminder not found' }));
               } catch (_) { /* ignore */ }
               return;
             }
             const rem = getReminder(db, id);
             if (rem === null || rem.agent_id !== state.agentId!) {
               try {
-                ws.send(JSON.stringify({ type: 'error', code: 'REMINDER_NOT_FOUND', message: 'reminder not found' }));
+                ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'REMINDER_NOT_FOUND', message: 'reminder not found' }));
               } catch (_) { /* ignore */ }
               return;
             }
             const cancelled = dbCancelReminder(db, id);
             if (!cancelled) {
               try {
-                ws.send(JSON.stringify({ type: 'error', code: 'REMINDER_NOT_FOUND', message: 'reminder not found or already cancelled' }));
+                ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'REMINDER_NOT_FOUND', message: 'reminder not found or already cancelled' }));
               } catch (_) { /* ignore */ }
               return;
             }
             try {
-              ws.send(JSON.stringify({ type: 'ack', ref: id, ok: true }));
+              ws.send(JSON.stringify({ type: 'ack', ...refPart, ok: true }));
+            } catch (_) { /* ignore */ }
+            return;
+          }
+
+          if (frameType === 'list_presence') {
+            // Self-authed: post-auth dispatch only runs after authed===true, so
+            // state.agentId is non-null here (the first-frame gate rejects an
+            // unauthed list_presence with AUTH_REQUIRED + close 1008).
+            const caller = state.agentId!;
+            const all = listAgents(db);
+            // ACL-filtered roster: agents the caller is ACL-related to, plus self.
+            const result = all
+              .filter(a => a.id === caller || aclRelated(db, caller, a.id))
+              .map(a => ({ id: a.id, online: a.online === 1, last_seen: a.last_seen }));
+            const resp: { type: string; ref?: string; agents: typeof result } = { type: 'presence_list', agents: result };
+            if (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) resp.ref = frame.msg_id;
+            try {
+              ws.send(JSON.stringify(resp));
             } catch (_) { /* ignore */ }
             return;
           }
@@ -541,17 +615,26 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
             agentIndex.delete(agentId);
 
             const disconnectTime = Date.now();
-            const statusMsg = JSON.stringify({
-              type: 'agent_status',
-              agent_id: agentId,
-              online: false,
-              last_seen: disconnectTime,
-            });
-            for (const [otherWs, otherState] of registry) {
-              if (otherState.authed && otherState.agentId !== null && aclRelated(db, agentId, otherState.agentId)) {
-                try {
-                  otherWs.send(statusMsg);
-                } catch (_) { /* ignore */ }
+            const ps = presenceState.get(agentId);
+            // Only schedule/emit offline if peers currently believe this agent
+            // is online. (ps undefined is not reachable in the normal flow, but
+            // the guard is conservatively safe.)
+            if (ps && ps.onlineBroadcast) {
+              if (presenceDebounceMs === 0) {
+                // Legacy / debounce-disabled: broadcast offline immediately.
+                broadcastStatus(agentId, false, disconnectTime, null);
+                presenceState.delete(agentId);
+              } else {
+                // Debounced: arm a timer. If the agent reconnects before it
+                // fires, the connect handler cancels it. If it fires, the agent
+                // is still gone → offline.
+                if (ps.pendingOfflineTimer !== null) clearTimeout(ps.pendingOfflineTimer);
+                ps.pendingOfflineTimer = setTimeout(() => {
+                  // Reaching here means the connect handler did NOT cancel us →
+                  // still offline.
+                  broadcastStatus(agentId, false, Date.now(), null);
+                  presenceState.delete(agentId);
+                }, presenceDebounceMs);
               }
             }
           }
@@ -576,6 +659,16 @@ export function startWsServer(port: number, db: Database, maxFileBytes: number =
             }
           }
           pendingRequests.clear();
+
+          // Clear all pending offline-broadcast timers so they don't leak or
+          // fire post-shutdown.
+          for (const [, ps] of presenceState) {
+            if (ps.pendingOfflineTimer !== null) {
+              clearTimeout(ps.pendingOfflineTimer);
+              ps.pendingOfflineTimer = null;
+            }
+          }
+          presenceState.clear();
 
           // Mark all authenticated agents offline before closing
           for (const [, state] of registry) {

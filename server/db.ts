@@ -75,6 +75,7 @@ export interface Reminder {
   created_at: number;
   status: string;
   last_fired_at: number | null;
+  tz: string | null;   // IANA tz; null = UTC
 }
 
 // ──────────────────────────────────────────────
@@ -170,7 +171,8 @@ export function openDb(path: string): Database {
       payload       TEXT NOT NULL,
       created_at    INTEGER NOT NULL,
       status        TEXT NOT NULL DEFAULT 'pending',
-      last_fired_at INTEGER
+      last_fired_at INTEGER,
+      tz            TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_reminders_due
@@ -183,6 +185,10 @@ export function openDb(path: string): Database {
   try { db.exec('ALTER TABLE files ADD COLUMN caption TEXT'); } catch {}
   try { db.exec('ALTER TABLE files ADD COLUMN reply_to_msg_id TEXT'); } catch {}
   try { db.exec('ALTER TABLE files ADD COLUMN file_path TEXT'); } catch {}
+
+  // Sprint 15 migration: per-reminder IANA timezone (null = UTC). Existing rows
+  // get tz=NULL and keep behaving exactly as before (UTC cron).
+  try { db.exec('ALTER TABLE reminders ADD COLUMN tz TEXT'); } catch {}
 
   // Sprint 12 migration: drop the deprecated `data` column (base64 blob in
   // SQLite) if it still exists from pre-Sprint-12 databases. It was declared
@@ -586,13 +592,15 @@ export function insertReminder(
     schedule?: string | null;
     payload: string;
     created_at: number;
+    tz?: string | null;
   }
 ): Reminder {
   const schedule = reminder.schedule ?? null;
+  const tz = reminder.tz ?? null;
   db.prepare(`
-    INSERT INTO reminders (id, agent_id, due_at, schedule, payload, created_at, status, last_fired_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL)
-  `).run(reminder.id, reminder.agent_id, reminder.due_at, schedule, reminder.payload, reminder.created_at);
+    INSERT INTO reminders (id, agent_id, due_at, schedule, payload, created_at, status, last_fired_at, tz)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?)
+  `).run(reminder.id, reminder.agent_id, reminder.due_at, schedule, reminder.payload, reminder.created_at, tz);
 
   return getReminder(db, reminder.id) as Reminder;
 }

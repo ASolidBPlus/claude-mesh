@@ -16,7 +16,7 @@ import { startReminderScheduler } from '../reminder-scheduler.ts';
 import { startWsServer, WsServerHandle } from '../ws-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
 import { generateToken, hashToken } from '../auth.ts';
-import { cronNext } from '../cron.ts';
+import { cronNext, cronNextTz, wallTimeToUtc } from '../cron.ts';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import * as net from 'net';
@@ -149,6 +149,20 @@ describe('reminder DB helpers', () => {
     deleteAgent(db, 'agentA');
     expect(getReminder(db, 'r1')).toBe(null);
   });
+
+  it('test 18: insertReminder + getReminder tz round-trip', () => {
+    const now = Date.now();
+    insertReminder(db, { id: 'r1', agent_id: 'agentA', due_at: now + 1000, payload: 'p', created_at: now, tz: 'Australia/Adelaide' });
+    expect(getReminder(db, 'r1')!.tz).toBe('Australia/Adelaide');
+    insertReminder(db, { id: 'r2', agent_id: 'agentA', due_at: now + 1000, payload: 'p', created_at: now });
+    expect(getReminder(db, 'r2')!.tz).toBe(null);
+  });
+
+  it('test 19: migration / default null tz preserves UTC semantics', () => {
+    const now = Date.now();
+    insertReminder(db, { id: 'r1', agent_id: 'agentA', due_at: now + 1000, payload: 'p', created_at: now });
+    expect(getReminder(db, 'r1')!.tz).toBe(null);
+  });
 });
 
 // ──────────────────────────────────────────────
@@ -274,6 +288,24 @@ describe('reminder scheduler', () => {
     const r = getReminder(db, 'r1')!;
     expect(r.status).toBe('pending');
     expect(r.due_at).toBeGreaterThan(Date.now());
+  });
+
+  it('test 20: scheduler recurring-advance uses stored tz', () => {
+    const now = Date.now();
+    insertReminder(db, { id: 'r1', agent_id: 'agentA', due_at: now - 60_000, schedule: '0 9 * * 1', payload: 'p', created_at: now, tz: 'Australia/Adelaide' });
+    const index = new Map<string, any>(); // offline
+    const sched = startReminderScheduler(db, index as any, 999999);
+    sched.tick();
+    sched.stop();
+
+    expect(countMessagesFor(db, 'agentA')).toBe(1);
+    const r = getReminder(db, 'r1')!;
+    expect(r.status).toBe('pending');
+    const expectedTz = cronNextTz('0 9 * * 1', Date.now(), 'Australia/Adelaide');
+    const plainUtc = cronNext('0 9 * * 1', Date.now());
+    expect(r.due_at).toBe(expectedTz);
+    // Meaningful: the tz-aware advance differs from the plain UTC advance.
+    expect(expectedTz).not.toBe(plainUtc);
   });
 });
 
@@ -447,8 +479,8 @@ describe('reminder WS frame handlers', () => {
     ws.send(JSON.stringify({ type: 'remind', text: 'two', when: '2h' }));
     await col.wait(m => m.type === 'ack');
 
-    ws.send(JSON.stringify({ type: 'cancel_reminder', id: ack1.reminder_id }));
-    const cancelAck = await col.wait(m => m.type === 'ack' && m.ref === ack1.reminder_id);
+    ws.send(JSON.stringify({ type: 'cancel_reminder', msg_id: 'cx-1', id: ack1.reminder_id }));
+    const cancelAck = await col.wait(m => m.type === 'ack' && m.ref === 'cx-1');
     expect(cancelAck.ok).toBe(true);
 
     ws.send(JSON.stringify({ type: 'list_reminders' }));
@@ -475,6 +507,107 @@ describe('reminder WS frame handlers', () => {
     ws.send(JSON.stringify({ type: 'cancel_reminder', id: 'no-such-id' }));
     const err = await col.wait(m => m.type === 'error');
     expect(err.code).toBe('REMINDER_NOT_FOUND');
+    ws.close();
+  });
+
+  it('test 21: WS remind recurring with tz', async () => {
+    const { ws, col } = await authConnect(port, db, 'a1');
+    const before = Date.now();
+    ws.send(JSON.stringify({ type: 'remind', text: 'standup', when: '0 9 * * 1', recurring: true, tz: 'Australia/Adelaide' }));
+    const ack = await col.wait(m => m.type === 'ack');
+    const expected = cronNextTz('0 9 * * 1', before, 'Australia/Adelaide')!;
+    expect(Math.abs(ack.due_at - expected)).toBeLessThanOrEqual(60_000);
+    const rem = getReminder(db, ack.reminder_id)!;
+    expect(rem.tz).toBe('Australia/Adelaide');
+    ws.close();
+  });
+
+  it('test 22: WS remind invalid tz → INVALID_TZ, no reminder inserted', async () => {
+    const { ws, col } = await authConnect(port, db, 'a1');
+    ws.send(JSON.stringify({ type: 'remind', text: 'x', when: '0 9 * * 1', recurring: true, tz: 'Bogus/Zone' }));
+    const err = await col.wait(m => m.type === 'error');
+    expect(err.code).toBe('INVALID_TZ');
+    expect(listAgentReminders(db, 'a1').length).toBe(0);
+    ws.close();
+  });
+
+  it('test 23: WS remind one-shot DURATION + tz → absolute (no-op)', async () => {
+    const { ws, col } = await authConnect(port, db, 'a1');
+    const before = Date.now();
+    ws.send(JSON.stringify({ type: 'remind', text: 'x', when: '2s', tz: 'Australia/Adelaide' }));
+    const ack = await col.wait(m => m.type === 'ack');
+    expect(ack.due_at).toBeGreaterThanOrEqual(before + 1900);
+    expect(ack.due_at).toBeLessThanOrEqual(Date.now() + 2100);
+    expect(getReminder(db, ack.reminder_id)!.tz).toBe('Australia/Adelaide');
+    ws.close();
+  });
+
+  it('test 24: WS remind one-shot BARE-ISO + tz → wall-clock in tz', async () => {
+    const { ws, col } = await authConnect(port, db, 'a1');
+    ws.send(JSON.stringify({ type: 'remind', text: 'x', when: '2026-06-22T09:00:00', tz: 'Australia/Adelaide' }));
+    const ack = await col.wait(m => m.type === 'ack');
+    expect(ack.due_at).toBe(wallTimeToUtc(2026, 5, 22, 9, 0, 'Australia/Adelaide'));
+    expect(ack.due_at).toBe(Date.UTC(2026, 5, 21, 23, 30, 0));
+    expect(ack.due_at).not.toBe(Date.parse('2026-06-22T09:00:00'));
+    expect(getReminder(db, ack.reminder_id)!.tz).toBe('Australia/Adelaide');
+    ws.close();
+  });
+
+  it('test 25: WS remind one-shot ZONED-ISO + tz → absolute (no-op)', async () => {
+    const { ws, col } = await authConnect(port, db, 'a1');
+    ws.send(JSON.stringify({ type: 'remind', text: 'x', when: '2026-06-22T09:00:00Z', tz: 'Australia/Adelaide' }));
+    const ack = await col.wait(m => m.type === 'ack');
+    expect(ack.due_at).toBe(Date.parse('2026-06-22T09:00:00Z'));
+    expect(getReminder(db, ack.reminder_id)!.tz).toBe('Australia/Adelaide');
+    ws.close();
+  });
+
+  it('test 38: remind WITH msg_id → ack ref === msg_id, body intact', async () => {
+    const { ws, col } = await authConnect(port, db, 'a1');
+    const before = Date.now();
+    ws.send(JSON.stringify({ type: 'remind', msg_id: 'm-1', text: 'x', when: '2s' }));
+    const ack = await col.wait(m => m.type === 'ack');
+    expect(ack.ref).toBe('m-1');
+    expect(ack.ok).toBe(true);
+    expect(typeof ack.reminder_id).toBe('string');
+    expect(ack.due_at).toBeGreaterThanOrEqual(before + 1900);
+    expect(ack.due_at).toBeLessThanOrEqual(Date.now() + 2100);
+    ws.close();
+  });
+
+  it('test 39: remind WITHOUT msg_id → ack omits ref, body intact', async () => {
+    const { ws, col } = await authConnect(port, db, 'a1');
+    ws.send(JSON.stringify({ type: 'remind', text: 'x', when: '2s' }));
+    const ack = await col.wait(m => m.type === 'ack');
+    expect('ref' in ack).toBe(false);
+    expect(typeof ack.reminder_id).toBe('string');
+    expect(typeof ack.due_at).toBe('number');
+    ws.close();
+  });
+
+  it('test 40: cancel_reminder WITH msg_id → ack ref === msg_id', async () => {
+    const { ws, col } = await authConnect(port, db, 'a1');
+    ws.send(JSON.stringify({ type: 'remind', text: 'x', when: '1h' }));
+    const ack = await col.wait(m => m.type === 'ack');
+    ws.send(JSON.stringify({ type: 'cancel_reminder', msg_id: 'c-7', id: ack.reminder_id }));
+    const cancelAck = await col.wait(m => m.type === 'ack' && m.ref === 'c-7');
+    expect(cancelAck.ok).toBe(true);
+    ws.send(JSON.stringify({ type: 'list_reminders' }));
+    const list = await col.wait(m => m.type === 'reminders_list');
+    expect(list.reminders.find((r: any) => r.id === ack.reminder_id)).toBeUndefined();
+    ws.close();
+  });
+
+  it('test 41: error frames carry ref === msg_id (remind + cancel)', async () => {
+    const { ws, col } = await authConnect(port, db, 'a1');
+    ws.send(JSON.stringify({ type: 'remind', msg_id: 'e-3', text: 'x', when: 'not-a-time' }));
+    const err1 = await col.wait(m => m.type === 'error');
+    expect(err1.code).toBe('INVALID_WHEN');
+    expect(err1.ref).toBe('e-3');
+
+    ws.send(JSON.stringify({ type: 'cancel_reminder', msg_id: 'e-4', id: 'nonexistent' }));
+    const err2 = await col.wait(m => m.type === 'error' && m.ref === 'e-4');
+    expect(err2.code).toBe('REMINDER_NOT_FOUND');
     ws.close();
   });
 });
@@ -636,6 +769,42 @@ describe('reminder HTTP admin endpoints', () => {
     });
     expect(res.status).toBe(404);
   });
+
+  it('test 26: POST recurring with tz → 201, tz set, due_at = cronNextTz', async () => {
+    const before = Date.now();
+    const res = await post({ agent_id: 'agentA', payload: 'weekly', schedule: '0 9 * * 1', tz: 'Australia/Adelaide' });
+    expect(res.status).toBe(201);
+    const r = await res.json() as any;
+    expect(r.tz).toBe('Australia/Adelaide');
+    const expected = cronNextTz('0 9 * * 1', before, 'Australia/Adelaide')!;
+    expect(Math.abs(r.due_at - expected)).toBeLessThanOrEqual(60_000);
+  });
+
+  it('test 27: POST invalid tz → 400', async () => {
+    const res = await post({ agent_id: 'agentA', payload: 'x', schedule: '0 9 * * 1', tz: 'Bogus/Zone' });
+    expect(res.status).toBe(400);
+    const r = await res.json() as any;
+    expect(r.error).toBe('invalid IANA timezone');
+  });
+
+  it('test 28: POST no tz == UTC (regression)', async () => {
+    const before = Date.now();
+    const res = await post({ agent_id: 'agentA', payload: 'weekly', schedule: '0 9 * * 1' });
+    expect(res.status).toBe(201);
+    const r = await res.json() as any;
+    expect(r.tz).toBe(null);
+    const expected = cronNext('0 9 * * 1', before)!;
+    expect(Math.abs(r.due_at - expected)).toBeLessThanOrEqual(60_000);
+  });
+
+  it('test 29: POST one-shot BARE-ISO due_at + tz → wall-clock in tz', async () => {
+    const res = await post({ agent_id: 'agentA', payload: 'x', due_at: '2026-06-22T09:00:00', tz: 'Australia/Adelaide' });
+    expect(res.status).toBe(201);
+    const r = await res.json() as any;
+    expect(r.tz).toBe('Australia/Adelaide');
+    expect(r.due_at).toBe(Date.UTC(2026, 5, 21, 23, 30, 0));
+    expect(r.due_at).not.toBe(Date.parse('2026-06-22T09:00:00'));
+  });
 });
 
 // ──────────────────────────────────────────────
@@ -774,8 +943,8 @@ describe('reminder integration / success criteria', () => {
     const list1 = await col.wait(m => m.type === 'reminders_list');
     expect(list1.reminders.length).toBe(3);
 
-    ws.send(JSON.stringify({ type: 'cancel_reminder', id: a1.reminder_id }));
-    await col.wait(m => m.type === 'ack' && m.ref === a1.reminder_id);
+    ws.send(JSON.stringify({ type: 'cancel_reminder', msg_id: 'cx-F', id: a1.reminder_id }));
+    await col.wait(m => m.type === 'ack' && m.ref === 'cx-F');
 
     ws.send(JSON.stringify({ type: 'list_reminders' }));
     const list2 = await col.wait(m => m.type === 'reminders_list');
