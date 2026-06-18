@@ -21,6 +21,7 @@ import {
   queryMessages,
   insertReminder,
   listAgentReminders,
+  listAllReminders,
   getReminder,
   cancelReminder as dbCancelReminder,
   Reminder,
@@ -621,17 +622,20 @@ export function startHttpAdmin(
 
       if (pathname === '/reminders' && method === 'GET') {
         const agent_id = url.searchParams.get('agent_id');
-        if (!agent_id) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'agent_id query param required' }));
+        if (agent_id) {
+          // Optional filter: pending reminders for a single agent (back-compat).
+          if (getAgentById(db, agent_id) === null) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'agent not found' }));
+            return;
+          }
+          const reminders = listAgentReminders(db, agent_id);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(reminders));
           return;
         }
-        if (getAgentById(db, agent_id) === null) {
-          res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'agent not found' }));
-          return;
-        }
-        const reminders = listAgentReminders(db, agent_id);
+        // No agent_id: all pending reminders across the fleet (dashboard view).
+        const reminders = listAllReminders(db);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(reminders));
         return;

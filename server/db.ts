@@ -621,6 +621,12 @@ export function listAgentReminders(db: Database, agentId: string): Reminder[] {
   `).all(agentId) as Reminder[];
 }
 
+export function listAllReminders(db: Database): Reminder[] {
+  return db.prepare(`
+    SELECT * FROM reminders WHERE status = 'pending' ORDER BY due_at ASC
+  `).all() as Reminder[];
+}
+
 export function cancelReminder(db: Database, id: string): boolean {
   const result = db.prepare(`
     UPDATE reminders SET status = 'cancelled' WHERE id = ? AND status = 'pending'

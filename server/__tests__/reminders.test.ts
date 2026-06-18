@@ -744,11 +744,29 @@ describe('reminder HTTP admin endpoints', () => {
     expect(res.status).toBe(404);
   });
 
-  it('GET /reminders with no agent_id: 400', async () => {
+  it('GET /reminders with no agent_id: 200 + all pending reminders across agents', async () => {
+    registerAgent(db, { id: 'agentB', token_hash: 'b'.repeat(64), hostname: 'h2' });
+    await post({ agent_id: 'agentA', payload: 'from A', duration: '1h' });
+    await post({ agent_id: 'agentB', payload: 'from B', duration: '2h' });
     const res = await fetch(`${base}/reminders`, {
       headers: { 'Authorization': `Bearer ${token}` },
     });
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(200);
+    const list = await res.json() as any[];
+    expect(list.length).toBe(2);
+    // Each row carries agent_id + the dashboard fields, ordered by due_at.
+    const byAgent = Object.fromEntries(list.map((r) => [r.agent_id, r]));
+    expect(byAgent['agentA'].payload).toBe('from A');
+    expect(byAgent['agentB'].payload).toBe('from B');
+    for (const r of list) {
+      expect(r).toHaveProperty('id');
+      expect(r).toHaveProperty('due_at');
+      expect(r).toHaveProperty('schedule');
+      expect(r).toHaveProperty('status');
+      expect(r).toHaveProperty('created_at');
+      expect(r).toHaveProperty('last_fired_at');
+      expect(r).toHaveProperty('tz');
+    }
   });
 
   it('DELETE /reminders/:id: 200 + reminder no longer listed', async () => {
