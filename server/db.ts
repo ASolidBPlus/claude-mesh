@@ -627,6 +627,17 @@ export function listAllReminders(db: Database): Reminder[] {
   `).all() as Reminder[];
 }
 
+export function updateReminder(
+  db: Database,
+  id: string,
+  fields: { payload: string; schedule: string | null; due_at: number; tz: string | null }
+): Reminder | null {
+  db.prepare(`
+    UPDATE reminders SET payload = ?, schedule = ?, due_at = ?, tz = ? WHERE id = ?
+  `).run(fields.payload, fields.schedule, fields.due_at, fields.tz, id);
+  return getReminder(db, id);
+}
+
 export function cancelReminder(db: Database, id: string): boolean {
   const result = db.prepare(`
     UPDATE reminders SET status = 'cancelled' WHERE id = ? AND status = 'pending'

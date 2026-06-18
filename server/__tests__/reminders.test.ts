@@ -645,6 +645,14 @@ describe('reminder HTTP admin endpoints', () => {
     });
   }
 
+  function patch(id: string, body: unknown) {
+    return fetch(`${base}/reminders/${id}`, {
+      method: 'PATCH',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }
+
   it('POST with duration "2s": 201 + full Reminder, one-shot, due_at ~ now+2000', async () => {
     const before = Date.now();
     const res = await post({ agent_id: 'agentA', payload: 'hi', duration: '2s' });
@@ -785,6 +793,86 @@ describe('reminder HTTP admin endpoints', () => {
       method: 'DELETE',
       headers: { 'Authorization': `Bearer ${token}` },
     });
+    expect(res.status).toBe(404);
+  });
+
+  it('PATCH payload only: updates payload, leaves schedule/due_at unchanged', async () => {
+    const created = await (await post({ agent_id: 'agentA', payload: 'orig', duration: '1h' })).json() as any;
+    const res = await patch(created.id, { payload: 'edited' });
+    expect(res.status).toBe(200);
+    const updated = await res.json() as any;
+    expect(updated.payload).toBe('edited');
+    expect(updated.schedule).toBe(null);
+    expect(updated.due_at).toBe(created.due_at);
+    expect(updated.status).toBe('pending');
+  });
+
+  it('PATCH duration: recomputes due_at, becomes one-shot', async () => {
+    const created = await (await post({ agent_id: 'agentA', payload: 'hi', schedule: '0 9 * * 1' })).json() as any;
+    const before = Date.now();
+    const res = await patch(created.id, { duration: '30m' });
+    expect(res.status).toBe(200);
+    const updated = await res.json() as any;
+    expect(updated.schedule).toBe(null);
+    expect(updated.due_at).toBeGreaterThanOrEqual(before + 30 * 60_000 - 1000);
+    expect(updated.due_at).toBeLessThanOrEqual(Date.now() + 30 * 60_000 + 1000);
+  });
+
+  it('PATCH schedule on a one-shot: becomes recurring, due_at recomputed', async () => {
+    const created = await (await post({ agent_id: 'agentA', payload: 'hi', duration: '1h' })).json() as any;
+    expect(created.schedule).toBe(null);
+    const res = await patch(created.id, { schedule: '0 9 * * 1' });
+    expect(res.status).toBe(200);
+    const updated = await res.json() as any;
+    expect(updated.schedule).toBe('0 9 * * 1');
+    // next Monday 09:00 UTC, strictly in the future
+    expect(updated.due_at).toBeGreaterThan(Date.now());
+  });
+
+  it('PATCH tz on a cron reminder: recomputes due_at in the new tz', async () => {
+    // create a weekly cron in UTC, then switch to Adelaide → due_at must shift
+    const created = await (await post({ agent_id: 'agentA', payload: 'hi', schedule: '0 9 * * 1' })).json() as any;
+    expect(created.tz).toBe(null);
+    const res = await patch(created.id, { tz: 'Australia/Adelaide' });
+    expect(res.status).toBe(200);
+    const updated = await res.json() as any;
+    expect(updated.tz).toBe('Australia/Adelaide');
+    expect(updated.schedule).toBe('0 9 * * 1');
+    // Adelaide 09:00 != UTC 09:00, so the recomputed instant differs from the UTC one
+    expect(updated.due_at).not.toBe(created.due_at);
+    expect(updated.due_at).toBeGreaterThan(Date.now());
+  });
+
+  it('PATCH due_at to convert a cron reminder to a one-shot', async () => {
+    const created = await (await post({ agent_id: 'agentA', payload: 'hi', schedule: '0 9 * * 1' })).json() as any;
+    const future = Date.now() + 3_600_000;
+    const res = await patch(created.id, { due_at: future });
+    expect(res.status).toBe(200);
+    const updated = await res.json() as any;
+    expect(updated.schedule).toBe(null);
+    expect(updated.due_at).toBe(future);
+  });
+
+  it('PATCH with more than one when-field: 400', async () => {
+    const created = await (await post({ agent_id: 'agentA', payload: 'hi', duration: '1h' })).json() as any;
+    const res = await patch(created.id, { duration: '2h', due_at: Date.now() + 100000 });
+    expect(res.status).toBe(400);
+  });
+
+  it('PATCH with past due_at: 400', async () => {
+    const created = await (await post({ agent_id: 'agentA', payload: 'hi', duration: '1h' })).json() as any;
+    const res = await patch(created.id, { due_at: Date.now() - 1000 });
+    expect(res.status).toBe(400);
+  });
+
+  it('PATCH with invalid tz: 400', async () => {
+    const created = await (await post({ agent_id: 'agentA', payload: 'hi', duration: '1h' })).json() as any;
+    const res = await patch(created.id, { tz: 'Mars/Olympus' });
+    expect(res.status).toBe(400);
+  });
+
+  it('PATCH nonexistent id: 404', async () => {
+    const res = await patch('no-such', { payload: 'x' });
     expect(res.status).toBe(404);
   });
 

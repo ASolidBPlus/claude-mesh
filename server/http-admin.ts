@@ -23,6 +23,7 @@ import {
   listAgentReminders,
   listAllReminders,
   getReminder,
+  updateReminder,
   cancelReminder as dbCancelReminder,
   Reminder,
 } from './db.ts';
@@ -638,6 +639,129 @@ export function startHttpAdmin(
         const reminders = listAllReminders(db);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(reminders));
+        return;
+      }
+
+      const reminderPatchMatch = pathname.match(/^\/reminders\/([^/]+)$/);
+      if (reminderPatchMatch && method === 'PATCH') {
+        const id = reminderPatchMatch[1];
+        const existing = getReminder(db, id);
+        if (existing === null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'reminder not found' }));
+          return;
+        }
+
+        const raw = await readBody(req);
+        let body: Record<string, unknown>;
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid JSON' }));
+          return;
+        }
+
+        // payload — optional, unchanged if absent
+        let payload = existing.payload;
+        if (body.payload !== undefined) {
+          if (typeof body.payload !== 'string' || body.payload.length === 0) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'payload must be a non-empty string' }));
+            return;
+          }
+          if (Buffer.byteLength(body.payload, 'utf8') > 4096) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'payload exceeds 4096 bytes' }));
+            return;
+          }
+          payload = body.payload;
+        }
+
+        // tz — optional. Present key resolves it (string→validate, null→clear to UTC); absent→unchanged.
+        let tz = existing.tz;
+        let tzChanged = false;
+        if (Object.prototype.hasOwnProperty.call(body, 'tz')) {
+          const tzRaw = body.tz;
+          if (tzRaw === null) {
+            tz = null;
+            tzChanged = true;
+          } else if (typeof tzRaw === 'string' && tzValidate(tzRaw)) {
+            tz = tzRaw;
+            tzChanged = true;
+          } else {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid IANA timezone' }));
+            return;
+          }
+        }
+
+        // when-field — at most one of schedule | due_at | duration
+        const hasSchedule = body.schedule !== undefined;
+        const hasDueAt = body.due_at !== undefined;
+        const hasDuration = body.duration !== undefined;
+        const timingCount = (hasSchedule ? 1 : 0) + (hasDueAt ? 1 : 0) + (hasDuration ? 1 : 0);
+        if (timingCount > 1) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'at most one of schedule, due_at, or duration may be provided' }));
+          return;
+        }
+
+        let schedule = existing.schedule;
+        let due_at = existing.due_at;
+
+        if (hasSchedule) {
+          const sched = body.schedule;
+          if (typeof sched !== 'string' || !cronValidate(sched)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'schedule must be a valid cron expression (to make a one-shot, set due_at or duration)' }));
+            return;
+          }
+          const next = tz !== null ? cronNextTz(sched, Date.now(), tz) : cronNext(sched, Date.now());
+          if (next === null) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'cron has no future occurrence within 366 days' }));
+            return;
+          }
+          schedule = sched;
+          due_at = next;
+        } else if (hasDueAt) {
+          const dueAtVal = body.due_at;
+          if (tz !== null && typeof dueAtVal === 'string' && isBareIso(dueAtVal)) {
+            due_at = bareIsoToUtc(dueAtVal, tz);
+            schedule = null;
+          } else if (typeof dueAtVal === 'number' && Number.isFinite(dueAtVal) && dueAtVal > Date.now()) {
+            due_at = dueAtVal;
+            schedule = null;
+          } else {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'due_at must be a future unix ms timestamp' }));
+            return;
+          }
+        } else if (hasDuration) {
+          const durVal = body.duration;
+          const parsed = typeof durVal === 'string' ? parseDuration(durVal) : null;
+          if (parsed === null) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'duration is unparseable or zero' }));
+            return;
+          }
+          due_at = Date.now() + parsed;
+          schedule = null;
+        } else if (tzChanged && existing.schedule !== null) {
+          // No when-field, but tz changed on a recurring reminder → recompute next due in the new tz.
+          const next = tz !== null ? cronNextTz(existing.schedule, Date.now(), tz) : cronNext(existing.schedule, Date.now());
+          if (next === null) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'cron has no future occurrence within 366 days' }));
+            return;
+          }
+          due_at = next;
+        }
+
+        const updated = updateReminder(db, id, { payload, schedule, due_at, tz });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(updated));
         return;
       }
 
