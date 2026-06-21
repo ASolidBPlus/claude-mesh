@@ -20,6 +20,7 @@ import {
   FileRecord,
 } from './db.ts';
 import { incMsgStatus, incSent, incReceived, incAclDenied, incError, incBytes, incFile, observePayloadBytes } from './metrics.ts';
+import { emitTap } from './tap.ts';
 
 export interface SendFrame {
   type: 'send';
@@ -85,7 +86,8 @@ export function routeDirect(
   db: Database,
   agentIndex: Map<string, WebSocket>,
   from_agent: string,
-  frame: SendFrame
+  frame: SendFrame,
+  observerIndex: Map<string, WebSocket> = new Map()
 ): RouterResult {
   // 1. Payload size check
   const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
@@ -168,6 +170,12 @@ export function routeDirect(
     incMsgStatus('direct', 'queued');
   }
 
+  emitTap(observerIndex, {
+    type: 'tap', msg_id: frame.msg_id, kind: 'direct',
+    from: from_agent, to: frame.to, topic: null, correlation_id: null,
+    sent_at, size: payloadBytes, payload: frame.payload,
+  });
+
   return { ok: true, msg_id: frame.msg_id };
 }
 
@@ -191,7 +199,8 @@ export function routePublish(
   db: Database,
   agentIndex: Map<string, WebSocket>,
   from_agent: string,
-  frame: PublishFrame
+  frame: PublishFrame,
+  observerIndex: Map<string, WebSocket> = new Map()
 ): RouterResult {
   // 1. Payload size check
   const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
@@ -284,6 +293,12 @@ export function routePublish(
     }
   }
 
+  emitTap(observerIndex, {
+    type: 'tap', msg_id: frame.msg_id, kind: 'topic',
+    from: from_agent, to: null, topic: frame.topic, correlation_id: null,
+    sent_at, size: payloadBytes, payload: frame.payload,
+  });
+
   return { ok: true, msg_id: frame.msg_id };
 }
 
@@ -348,7 +363,8 @@ export function routeRequest(
   db: Database,
   agentIndex: Map<string, WebSocket>,
   from_agent: string,
-  frame: RequestFrame
+  frame: RequestFrame,
+  observerIndex: Map<string, WebSocket> = new Map()
 ): RouterResult {
   // 1. Payload size check
   const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
@@ -432,6 +448,12 @@ export function routeRequest(
     incMsgStatus('request', 'queued');
   }
 
+  emitTap(observerIndex, {
+    type: 'tap', msg_id: frame.msg_id, kind: 'request',
+    from: from_agent, to: frame.to, topic: null, correlation_id: frame.correlation_id,
+    sent_at, size: payloadBytes, payload: frame.payload,
+  });
+
   return { ok: true, msg_id: frame.msg_id };
 }
 
@@ -457,7 +479,8 @@ export function routeFile(
   from_agent: string,
   frame: FileSendFrame,
   maxFileBytes: number,
-  filesDir: string
+  filesDir: string,
+  observerIndex: Map<string, WebSocket> = new Map()
 ): RouterResult {
   // 1. Validate base64 — attempt decode and check round-trip
   let decoded: Buffer;
@@ -561,6 +584,13 @@ export function routeFile(
     incMsgStatus('file', 'queued');
   }
 
+  emitTap(observerIndex, {
+    type: 'tap', msg_id: frame.msg_id, kind: 'file',
+    from: from_agent, to: frame.to, topic: null, correlation_id: null,
+    sent_at, size: size_bytes, payload: null,
+    file_id, filename: frame.filename, content_type,
+  });
+
   return { ok: true, msg_id: frame.msg_id };
 }
 
@@ -604,7 +634,8 @@ export function routeResponse(
   agentIndex: Map<string, WebSocket>,
   from_agent: string,
   frame: ResponseFrame,
-  pendingRequests: Map<string, PendingRequest>
+  pendingRequests: Map<string, PendingRequest>,
+  observerIndex: Map<string, WebSocket> = new Map()
 ): RouterResult & { deliverFrame?: string } {
   // 1. Look up pending request
   const pending = pendingRequests.get(frame.correlation_id);
@@ -664,6 +695,12 @@ export function routeResponse(
   incSent(from_agent);
   incBytes('in', payloadBytes);
   observePayloadBytes(payloadBytes);
+
+  emitTap(observerIndex, {
+    type: 'tap', msg_id: frame.msg_id, kind: 'response',
+    from: from_agent, to: pending.fromAgent, topic: null, correlation_id: frame.correlation_id,
+    sent_at, size: payloadBytes, payload: frame.payload,
+  });
 
   return { ok: true, deliverFrame };
 }

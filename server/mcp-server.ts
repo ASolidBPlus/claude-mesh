@@ -146,7 +146,8 @@ const NOT_IMPLEMENTED_RESPONSE = {
 export async function startMcpServer(
   db: Database,
   agentIndex: Map<string, WebSocket> = new Map(),
-  pendingRequests: Map<string, PendingRequest> = new Map()
+  pendingRequests: Map<string, PendingRequest> = new Map(),
+  observerIndex: Map<string, WebSocket> = new Map()
 ): Promise<McpServerHandle> {
   const server = new Server(
     { name: 'mesh', version: '0.1.0' },
@@ -209,7 +210,7 @@ export async function startMcpServer(
       const result = routeDirect(db, agentIndex, as_agent, {
         type: 'send', msg_id: msgId, to, payload: message,
         content_type: 'text/plain', ttl_ms,
-      });
+      }, observerIndex);
       if (result.ok) {
         return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, msg_id: result.msg_id }) }], isError: false };
       }
@@ -231,7 +232,7 @@ export async function startMcpServer(
       const result = routePublish(db, agentIndex, as_agent, {
         type: 'publish', msg_id: msgId, topic, payload: message,
         content_type: 'text/plain', ttl_ms,
-      });
+      }, observerIndex);
       if (result.ok) {
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, msg_id: msgId }) }],
@@ -339,7 +340,7 @@ export async function startMcpServer(
         content_type: 'text/plain',
         ttl_ms,
         correlation_id: correlationId,
-      });
+      }, observerIndex);
       if (!result.ok) {
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],

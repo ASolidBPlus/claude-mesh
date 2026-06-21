@@ -26,6 +26,10 @@ import {
   updateReminder,
   cancelReminder as dbCancelReminder,
   Reminder,
+  grantObserver,
+  revokeObserver,
+  isObserver,
+  listObservers,
 } from './db.ts';
 import { generateToken, hashToken } from './auth.ts';
 import { parseDuration } from './duration.ts';
@@ -80,6 +84,7 @@ export function startHttpAdmin(
   filesDir: string = '/data/files',
   agentIndex: Map<string, WebSocket> = new Map(),
   pendingRequests: Map<string, PendingRequest> = new Map(),
+  observerIndex: Map<string, WebSocket> = new Map(),   // NEW — defaulted
 ): Promise<HttpAdminHandle> {
   return new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
@@ -201,6 +206,41 @@ export function startHttpAdmin(
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ inbound, outbound }));
         return;
+      }
+
+      if (pathname === '/observers' && method === 'POST') {
+        const raw = await readBody(req);
+        let body: Record<string, unknown>;
+        try { body = JSON.parse(raw); }
+        catch { res.writeHead(400, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:'invalid JSON'})); return; }
+
+        const agent_id = body.agent_id;
+        if (typeof agent_id !== 'string' || !agent_id) {
+          res.writeHead(400, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:'agent_id is required'})); return;
+        }
+        if (getAgentById(db, agent_id) === null) {
+          res.writeHead(404, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:'agent not found'})); return;
+        }
+        const granted_by = typeof body.granted_by === 'string' ? body.granted_by : 'system';
+        const row = grantObserver(db, agent_id, granted_by);
+        // Live-activate for a currently-connected socket (no reconnect needed).
+        try { const ws = agentIndex.get(agent_id); if (ws !== undefined) observerIndex.set(agent_id, ws); } catch (_) { /* never 500 on live-index update */ }
+        res.writeHead(201, {'Content-Type':'application/json'}); res.end(JSON.stringify(row)); return;
+      }
+
+      const observerDeleteMatch = pathname.match(/^\/observers\/([^/]+)$/);
+      if (observerDeleteMatch && method === 'DELETE') {
+        const id = observerDeleteMatch[1];
+        const removed = revokeObserver(db, id);
+        if (!removed) {
+          res.writeHead(404, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:'not an observer'})); return;
+        }
+        try { observerIndex.delete(id); } catch (_) { /* never 500 on live-index update */ }
+        res.writeHead(200, {'Content-Type':'application/json'}); res.end(JSON.stringify({ok:true})); return;
+      }
+
+      if (pathname === '/observers' && method === 'GET') {
+        res.writeHead(200, {'Content-Type':'application/json'}); res.end(JSON.stringify(listObservers(db))); return;
       }
 
       if (pathname === '/topics' && method === 'POST') {

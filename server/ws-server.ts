@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as net from 'net';
-import { getAgentById, setOnline, touchAgent, getPendingMessages, markAcked, aclRelated, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents } from './db.ts';
+import { getAgentById, setOnline, touchAgent, getPendingMessages, markAcked, aclRelated, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
 import { validateToken } from './auth.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
@@ -20,6 +20,7 @@ export interface WsServerHandle {
   wss: WebSocketServer;
   agentIndex: Map<string, WebSocket>;
   pendingRequests: Map<string, PendingRequest>;
+  observerIndex: Map<string, WebSocket>;
   shutdown(): Promise<void>;
 }
 
@@ -40,6 +41,7 @@ export function startWsServer(
   maxFileBytes: number = 10_485_760,
   filesDir: string = '/data/files',
   presenceDebounceMs: number = 0,   // 0 = immediate (legacy). Production passes config value.
+  observerIndex: Map<string, WebSocket> = new Map(),   // NEW — defaulted
 ): Promise<WsServerHandle> {
   return new Promise((resolve, reject) => {
     // Create an HTTP server explicitly so we can track and destroy its sockets
@@ -204,6 +206,17 @@ export function startWsServer(
               presenceState.set(agentId, { pendingOfflineTimer: null, onlineBroadcast: true });
             }
 
+            // SAFETY INVARIANT: observerIndex is the SOLE set the tap fan-out writes
+            // to. Membership is added here exactly once, ONLY iff isObserver(agentId)
+            // (admin-granted), and removed on disconnect/revoke. There is no other
+            // writer, so a non-observer connection can never receive a tap frame.
+            // Wrapped so an observer-lookup failure can never break auth or delivery.
+            try {
+              if (isObserver(db, agentId)) {
+                observerIndex.set(agentId, ws);
+              }
+            } catch (_) { /* tap must never affect auth or delivery */ }
+
             return;
           }
 
@@ -224,7 +237,7 @@ export function startWsServer(
 
           if (frameType === 'send') {
             const f = parsed as SendFrame;
-            const result = routeDirect(db, agentIndex, state.agentId!, f);
+            const result = routeDirect(db, agentIndex, state.agentId!, f, observerIndex);
             if (result.ok) {
               try {
                 ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
@@ -252,7 +265,7 @@ export function startWsServer(
 
           if (frameType === 'publish') {
             const f = parsed as PublishFrame;
-            const result = routePublish(db, agentIndex, state.agentId!, f);
+            const result = routePublish(db, agentIndex, state.agentId!, f, observerIndex);
             if (result.ok) {
               try {
                 ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
@@ -334,7 +347,7 @@ export function startWsServer(
               } catch (_) { /* ignore */ }
               return;
             }
-            const result = routeRequest(db, agentIndex, state.agentId!, { ...f, ttl_ms });
+            const result = routeRequest(db, agentIndex, state.agentId!, { ...f, ttl_ms }, observerIndex);
             if (!result.ok) {
               try {
                 ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: result.error_code, message: result.error_message }));
@@ -378,7 +391,7 @@ export function startWsServer(
               } catch (_) { /* ignore */ }
               return;
             }
-            const result = routeResponse(db, agentIndex, state.agentId!, f, pendingRequests);
+            const result = routeResponse(db, agentIndex, state.agentId!, f, pendingRequests, observerIndex);
             if (!result.ok) {
               try {
                 ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: result.error_code, message: result.error_message }));
@@ -417,7 +430,7 @@ export function startWsServer(
               }));
               return;
             }
-            const result = routeFile(db, agentIndex, state.agentId!, f, maxFileBytes, filesDir);
+            const result = routeFile(db, agentIndex, state.agentId!, f, maxFileBytes, filesDir, observerIndex);
             if (result.ok) {
               ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
             } else {
@@ -619,6 +632,7 @@ export function startWsServer(
             const agentId = connState.agentId;
             setOnline(db, agentId, false);
             agentIndex.delete(agentId);
+            try { observerIndex.delete(agentId); } catch (_) { /* never throw on close */ }
 
             const disconnectTime = Date.now();
             const ps = presenceState.get(agentId);
@@ -651,6 +665,7 @@ export function startWsServer(
         wss,
         agentIndex,
         pendingRequests,
+        observerIndex,
         shutdown(): Promise<void> {
           if (shutdownStarted) {
             return Promise.resolve();

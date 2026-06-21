@@ -78,6 +78,12 @@ export interface Reminder {
   tz: string | null;   // IANA tz; null = UTC
 }
 
+export interface Observer {
+  agent_id: string;
+  granted_at: number;   // unix ms
+  granted_by: string;   // admin-supplied label or "system"
+}
+
 // ──────────────────────────────────────────────
 // 5.1 Database initialization
 // ──────────────────────────────────────────────
@@ -179,6 +185,12 @@ export function openDb(path: string): Database {
       ON reminders(status, due_at) WHERE status = 'pending';
     CREATE INDEX IF NOT EXISTS idx_reminders_agent
       ON reminders(agent_id, status);
+
+    CREATE TABLE IF NOT EXISTS observers (
+      agent_id   TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+      granted_at INTEGER NOT NULL,
+      granted_by TEXT NOT NULL
+    );
   `);
 
   // Migration for existing databases: add new columns if they don't exist yet
@@ -684,6 +696,34 @@ export function deleteDeliveredOneShots(db: Database, olderThanMs: number): numb
     DELETE FROM reminders WHERE status = 'delivered' AND schedule IS NULL AND last_fired_at < ?
   `).run(olderThanMs);
   return result.changes;
+}
+
+// ──────────────────────────────────────────────
+// 5.9 Observers
+// ──────────────────────────────────────────────
+
+export function grantObserver(db: Database, agent_id: string, granted_by: string): Observer {
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO observers (agent_id, granted_at, granted_by)
+    VALUES (?, ?, ?)
+    ON CONFLICT(agent_id) DO UPDATE SET granted_at = excluded.granted_at, granted_by = excluded.granted_by
+  `).run(agent_id, now, granted_by);
+  return db.prepare('SELECT * FROM observers WHERE agent_id = ?').get(agent_id) as Observer;
+}
+
+export function revokeObserver(db: Database, agent_id: string): boolean {
+  const result = db.prepare('DELETE FROM observers WHERE agent_id = ?').run(agent_id);
+  return result.changes > 0;
+}
+
+export function isObserver(db: Database, agent_id: string): boolean {
+  const row = db.prepare('SELECT 1 FROM observers WHERE agent_id = ?').get(agent_id);
+  return row !== null;
+}
+
+export function listObservers(db: Database): Observer[] {
+  return db.prepare('SELECT * FROM observers ORDER BY granted_at ASC').all() as Observer[];
 }
 
 // ──────────────────────────────────────────────

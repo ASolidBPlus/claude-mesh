@@ -6,6 +6,7 @@ import { startCleanup, CleanupHandle } from './cleanup.ts';
 import { startReminderScheduler, ReminderSchedulerHandle } from './reminder-scheduler.ts';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Database } from 'bun:sqlite';
+import { WebSocket } from 'ws';
 import { mkdirSync } from 'fs';
 
 export interface Config {
@@ -113,9 +114,16 @@ async function main() {
     process.exit(1);
   }
 
+  // Single shared observerIndex: created ONCE here and passed to startWsServer
+  // (populate/cleanup/fan-out), startHttpAdmin (live grant/revoke), AND
+  // startMcpServer (so MCP-originated traffic is tapped too). The SAME Map
+  // instance must reach all three so admin grant/revoke mutate exactly the map
+  // the WS and MCP fan-out read.
+  const observerIndex = new Map<string, WebSocket>();
+
   let wsHandle: WsServerHandle;
   try {
-    wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes, config.filesDir, config.presenceDebounceMs);
+    wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes, config.filesDir, config.presenceDebounceMs, observerIndex);
   } catch (err) {
     process.stderr.write(`Failed to start WebSocket server: ${err}\n`);
     process.exit(1);
@@ -123,7 +131,7 @@ async function main() {
 
   const { agentIndex, pendingRequests } = wsHandle;
 
-  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, wsHandle.pendingRequests);
+  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, wsHandle.pendingRequests, observerIndex);
 
   let cleanupHandle: CleanupHandle | null = null;
   let reminderHandle: ReminderSchedulerHandle | null = null;
@@ -152,7 +160,7 @@ async function main() {
     process.exit(0);
   }
 
-  const mcpHandle = await startMcpServer(db, agentIndex, pendingRequests);
+  const mcpHandle = await startMcpServer(db, agentIndex, pendingRequests, observerIndex);
   const transport = new StdioServerTransport();
   await mcpHandle.server.connect(transport);
 
