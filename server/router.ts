@@ -19,6 +19,7 @@ import {
   markFileDelivered,
   FileRecord,
 } from './db.ts';
+import { incMsgStatus, incSent, incReceived, incAclDenied, incError, incBytes, incFile, observePayloadBytes } from './metrics.ts';
 
 export interface SendFrame {
   type: 'send';
@@ -89,18 +90,27 @@ export function routeDirect(
   // 1. Payload size check
   const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
   if (payloadBytes > 1_048_576) {
+    incError('MESSAGE_TOO_LARGE');
     return { ok: false, error_code: 'MESSAGE_TOO_LARGE', error_message: 'payload exceeds 1 MB limit' };
   }
 
   // 2. Recipient exists check
   if (getAgentById(db, frame.to) === null) {
+    incError('AGENT_NOT_FOUND');
     return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
   }
 
   // 3. ACL check
   if (!aclCheck(db, from_agent, frame.to)) {
+    incError('ACL_DENIED');
+    incAclDenied(from_agent);
     return { ok: false, error_code: 'ACL_DENIED', error_message: `${from_agent} is not permitted to send to ${frame.to}` };
   }
+
+  // accepted+routed
+  incSent(from_agent);
+  incBytes('in', payloadBytes);
+  observePayloadBytes(payloadBytes);
 
   // 4. Compute expires_at
   const ttl = frame.ttl_ms === undefined ? 300_000 : frame.ttl_ms;
@@ -135,10 +145,14 @@ export function routeDirect(
     });
     recipientWs.send(deliverFrame);
     markDelivered(db, frame.msg_id);
+    incMsgStatus('direct', 'delivered');
+    incReceived(frame.to);
+    incBytes('out', payloadBytes);
   } else {
     // 6. Recipient offline
     if (ttl === 0) {
       // ttl_ms=0 and offline: discard
+      incMsgStatus('direct', 'dropped');
       return { ok: true, msg_id: frame.msg_id };
     }
     insertMessage(db, {
@@ -151,6 +165,7 @@ export function routeDirect(
       sent_at,
       expires_at,
     });
+    incMsgStatus('direct', 'queued');
   }
 
   return { ok: true, msg_id: frame.msg_id };
@@ -165,6 +180,9 @@ export function drainQueue(
   for (const msg of pending) {
     ws.send(buildDeliverFrame(msg));
     markDelivered(db, msg.id);
+    incMsgStatus(msg.kind, 'delivered');
+    incReceived(agentId);
+    incBytes('out', Buffer.byteLength(msg.payload, 'utf8'));
   }
   return pending.length;
 }
@@ -178,8 +196,13 @@ export function routePublish(
   // 1. Payload size check
   const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
   if (payloadBytes > 1_048_576) {
+    incError('MESSAGE_TOO_LARGE');
     return { ok: false, error_code: 'MESSAGE_TOO_LARGE', error_message: 'payload exceeds 1 MB limit' };
   }
+
+  incSent(from_agent);
+  incBytes('in', payloadBytes);
+  observePayloadBytes(payloadBytes);
 
   // 2. Ensure topic exists
   getOrCreateTopic(db, frame.topic, from_agent);
@@ -203,6 +226,8 @@ export function routePublish(
   for (const subscriber_id of subscribers) {
     // 5a. ACL check
     if (!aclCheck(db, from_agent, subscriber_id)) {
+      incError('ACL_DENIED');
+      incAclDenied(from_agent);
       continue;
     }
 
@@ -235,9 +260,13 @@ export function routePublish(
         sent_at,
       }));
       markDelivered(db, msgId);
+      incMsgStatus('topic', 'delivered');
+      incReceived(subscriber_id);
+      incBytes('out', payloadBytes);
     } else {
       // 5d. Offline
       if (ttl === 0) {
+        incMsgStatus('topic', 'dropped');
         continue;
       }
       insertMessage(db, {
@@ -251,6 +280,7 @@ export function routePublish(
         sent_at,
         expires_at,
       });
+      incMsgStatus('topic', 'queued');
     }
   }
 
@@ -308,6 +338,7 @@ export interface PendingRequest {
   expiresAt: number;
   msgId: string;
   timer: ReturnType<typeof setTimeout>;
+  startTime?: number;          // NEW — set when the request is registered
   ws?: WebSocket;
   resolve?: (payload: string) => void;
   reject?: (err: Error) => void;
@@ -322,18 +353,27 @@ export function routeRequest(
   // 1. Payload size check
   const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
   if (payloadBytes > 1_048_576) {
+    incError('MESSAGE_TOO_LARGE');
     return { ok: false, error_code: 'MESSAGE_TOO_LARGE', error_message: 'payload exceeds 1 MB limit' };
   }
 
   // 2. Recipient exists check
   if (getAgentById(db, frame.to) === null) {
+    incError('AGENT_NOT_FOUND');
     return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
   }
 
   // 3. ACL check
   if (!aclCheck(db, from_agent, frame.to)) {
+    incError('ACL_DENIED');
+    incAclDenied(from_agent);
     return { ok: false, error_code: 'ACL_DENIED', error_message: `${from_agent} is not permitted to send to ${frame.to}` };
   }
+
+  // accepted+routed
+  incSent(from_agent);
+  incBytes('in', payloadBytes);
+  observePayloadBytes(payloadBytes);
 
   // 4. Compute expires_at
   const ttl = frame.ttl_ms === undefined ? 300_000 : frame.ttl_ms;
@@ -369,9 +409,13 @@ export function routeRequest(
     });
     recipientWs.send(deliverFrame);
     markDelivered(db, frame.msg_id);
+    incMsgStatus('request', 'delivered');
+    incReceived(frame.to);
+    incBytes('out', payloadBytes);
   } else {
     // 6. Recipient offline
     if (ttl === 0) {
+      incMsgStatus('request', 'dropped');
       return { ok: true, msg_id: frame.msg_id };
     }
     insertMessage(db, {
@@ -385,6 +429,7 @@ export function routeRequest(
       sent_at,
       expires_at,
     });
+    incMsgStatus('request', 'queued');
   }
 
   return { ok: true, msg_id: frame.msg_id };
@@ -420,29 +465,36 @@ export function routeFile(
     decoded = Buffer.from(frame.data, 'base64');
     // Round-trip check: re-encoding must match original (no garbage accepted)
     if (decoded.toString('base64') !== frame.data) {
+      incError('INVALID_BASE64');
       return { ok: false, error_code: 'INVALID_BASE64', error_message: 'data is not valid base64' };
     }
   } catch {
+    incError('INVALID_BASE64');
     return { ok: false, error_code: 'INVALID_BASE64', error_message: 'data is not valid base64' };
   }
 
   // 2. Check decoded byte count
   if (decoded.byteLength > maxFileBytes) {
+    incError('FILE_TOO_LARGE');
     return { ok: false, error_code: 'FILE_TOO_LARGE', error_message: `file exceeds ${maxFileBytes} byte limit` };
   }
 
   // 3. Recipient exists check
   if (getAgentById(db, frame.to) === null) {
+    incError('AGENT_NOT_FOUND');
     return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
   }
 
   // 4. ACL check
   if (!aclCheck(db, from_agent, frame.to)) {
+    incError('ACL_DENIED');
+    incAclDenied(from_agent);
     return { ok: false, error_code: 'ACL_DENIED', error_message: `${from_agent} is not permitted to send to ${frame.to}` };
   }
 
   // 4b. Caption size validation
   if (frame.caption !== undefined && Buffer.byteLength(frame.caption, 'utf8') > 4096) {
+    incError('CAPTION_TOO_LARGE');
     return { ok: false, error_code: 'CAPTION_TOO_LARGE', error_message: 'caption exceeds 4096 byte limit' };
   }
 
@@ -460,6 +512,7 @@ export function routeFile(
   // 7. If recipient offline and ttl_ms === 0: discard entirely
   const recipientWs = agentIndex.get(frame.to);
   if (recipientWs === undefined && ttl === 0) {
+    incMsgStatus('file', 'dropped');
     return { ok: true, msg_id: frame.msg_id };
   }
 
@@ -481,6 +534,8 @@ export function routeFile(
     caption: frame.caption ?? null,
     reply_to_msg_id: frame.reply_to_msg_id ?? null,
   });
+  incFile();
+  incSent(from_agent);
 
   // 9. Deliver if recipient online
   if (recipientWs !== undefined) {
@@ -499,6 +554,11 @@ export function routeFile(
     });
     recipientWs.send(deliverFrame);
     markFileDelivered(db, file_id);
+    incMsgStatus('file', 'delivered');
+    incReceived(frame.to);
+  }
+  if (recipientWs === undefined) {
+    incMsgStatus('file', 'queued');
   }
 
   return { ok: true, msg_id: frame.msg_id };
@@ -549,18 +609,22 @@ export function routeResponse(
   // 1. Look up pending request
   const pending = pendingRequests.get(frame.correlation_id);
   if (pending === undefined) {
+    incError('CORRELATION_NOT_FOUND');
     return { ok: false, error_code: 'CORRELATION_NOT_FOUND', error_message: `no pending request for correlation_id: ${frame.correlation_id}` };
   }
 
   // 2. Validate responder identity
   const originalMsg = getMessageByCorrelationId(db, frame.correlation_id);
   if (originalMsg === null || originalMsg.to_agent !== from_agent) {
+    incError('ACL_DENIED');
+    incAclDenied(from_agent);
     return { ok: false, error_code: 'ACL_DENIED', error_message: 'only the original recipient may respond' };
   }
 
   // 3. Payload size check
   const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
   if (payloadBytes > 1_048_576) {
+    incError('MESSAGE_TOO_LARGE');
     return { ok: false, error_code: 'MESSAGE_TOO_LARGE', error_message: 'payload exceeds 1 MB limit' };
   }
 
@@ -594,6 +658,12 @@ export function routeResponse(
     content_type,
     sent_at,
   });
+
+  // Emit ONLY sent / in-bytes / payload-histogram here. delivered / received /
+  // out-bytes / duration are emitted exactly once in ws-server's response handler.
+  incSent(from_agent);
+  incBytes('in', payloadBytes);
+  observePayloadBytes(payloadBytes);
 
   return { ok: true, deliverFrame };
 }

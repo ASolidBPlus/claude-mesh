@@ -459,11 +459,33 @@ export function queryMessages(
   return db.prepare(sql).all(...params) as Message[];
 }
 
-export function expireMessages(db: Database): number {
+export function expireMessages(db: Database): Record<string, number> {
   const now = Date.now();
-  const result = db.prepare('DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < ?')
-    .run(now);
-  return result.changes;
+  const rows = db.prepare(
+    `SELECT kind, COUNT(*) AS c FROM messages
+     WHERE expires_at IS NOT NULL AND expires_at < ? GROUP BY kind`
+  ).all(now) as { kind: string; c: number }[];
+  const counts: Record<string, number> = {};
+  for (const r of rows) counts[r.kind] = r.c;
+  db.prepare('DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < ?').run(now);
+  return counts;
+}
+
+export function countTopics(db: Database): number {
+  return (db.prepare('SELECT COUNT(*) AS c FROM topics').get() as { c: number }).c;
+}
+export function countSubscriptions(db: Database): number {
+  return (db.prepare('SELECT COUNT(*) AS c FROM subscriptions').get() as { c: number }).c;
+}
+export function countAgentsOnline(db: Database): number {
+  return (db.prepare('SELECT COUNT(*) AS c FROM agents WHERE online = 1').get() as { c: number }).c;
+}
+export function countPendingMessages(db: Database): number {
+  const now = Date.now();
+  return (db.prepare(
+    `SELECT COUNT(*) AS c FROM messages
+     WHERE delivered_at IS NULL AND (expires_at IS NULL OR expires_at >= ?)`
+  ).get(now) as { c: number }).c;
 }
 
 // ──────────────────────────────────────────────

@@ -358,6 +358,7 @@ export async function startMcpServer(
           expiresAt: Date.now() + ttl_ms,
           msgId,
           timer,
+          startTime: Date.now(),
           resolve,
           reject,
         });

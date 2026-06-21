@@ -30,6 +30,8 @@ import {
 import { generateToken, hashToken } from './auth.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
+import { PendingRequest } from './router.ts';
+import { renderMetrics } from './metrics.ts';
 
 export interface HttpAdminHandle {
   server: http.Server;
@@ -76,10 +78,23 @@ export function startHttpAdmin(
   adminToken: string,
   maxFileBytes: number = 10_485_760,
   filesDir: string = '/data/files',
-  agentIndex: Map<string, WebSocket> = new Map()
+  agentIndex: Map<string, WebSocket> = new Map(),
+  pendingRequests: Map<string, PendingRequest> = new Map(),
 ): Promise<HttpAdminHandle> {
   return new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
+      // /metrics is unauthenticated by design — this listener binds to the admin port
+      // which is internal-only (not exposed publicly). Read-only Prometheus exposition.
+      if (req.method === 'GET' && new URL(req.url!, 'http://localhost').pathname === '/metrics') {
+        try {
+          const body = renderMetrics(db, pendingRequests);
+          res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+          res.end(body);
+        } catch (_) {
+          res.writeHead(500); res.end();
+        }
+        return;
+      }
       if (!requireAdmin(req, res, adminToken)) return;
 
       const url = new URL(req.url!, 'http://localhost');

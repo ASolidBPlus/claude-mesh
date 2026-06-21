@@ -9,6 +9,7 @@ import {
 } from './db.ts';
 import { buildDeliverFrame } from './router.ts';
 import { cronNext, cronNextTz } from './cron.ts';
+import { incReminderFired, incMsgStatus, incSent, incReceived, incBytes, observePayloadBytes } from './metrics.ts';
 
 export interface ReminderSchedulerHandle {
   stop(): void;
@@ -43,6 +44,12 @@ export function startReminderScheduler(
         expires_at: null, // reminders never expire from the message queue
       });
 
+      const rbytes = Buffer.byteLength(reminder.payload, 'utf8');
+      incReminderFired();
+      incSent('mesh');
+      incBytes('in', rbytes);
+      observePayloadBytes(rbytes);
+
       // Deliver immediately if the agent is online; otherwise leave the message
       // queued (delivered_at=NULL) for drainQueue to pick up on reconnect.
       const ws = agentIndex.get(reminder.agent_id);
@@ -51,6 +58,11 @@ export function startReminderScheduler(
           ws.send(buildDeliverFrame(m));
         } catch (_) { /* ignore */ }
         markDelivered(db, m.id);
+        incMsgStatus('reminder', 'delivered');
+        incReceived(reminder.agent_id);
+        incBytes('out', rbytes);
+      } else {
+        incMsgStatus('reminder', 'queued');
       }
 
       if (reminder.schedule === null) {

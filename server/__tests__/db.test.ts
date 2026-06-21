@@ -655,7 +655,7 @@ describe('expireMessages', () => {
     const pastTime = Date.now() - 10000;
     insertMessage(db, { id: 'old1', kind: 'direct', from_agent: 'x', payload: 'p', sent_at: 1, expires_at: pastTime });
     insertMessage(db, { id: 'old2', kind: 'direct', from_agent: 'x', payload: 'p', sent_at: 2, expires_at: pastTime });
-    const count = expireMessages(db);
+    const count = Object.values(expireMessages(db)).reduce((a, b) => a + b, 0);
     expect(count).toBe(2);
     expect(getMessage(db, 'old1')).toBeNull();
     expect(getMessage(db, 'old2')).toBeNull();
@@ -678,7 +678,7 @@ describe('expireMessages', () => {
 
   it('returns 0 when no rows qualify for deletion', () => {
     const db = freshDb();
-    expect(expireMessages(db)).toBe(0);
+    expect(Object.values(expireMessages(db)).reduce((a, b) => a + b, 0)).toBe(0);
   });
 });
 

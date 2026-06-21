@@ -14,6 +14,7 @@ import {
   PublishFrame, SubscribeFrame, UnsubscribeFrame,
   RequestFrame, ResponseFrame, PendingRequest,
 } from './router.ts';
+import { incMsgStatus, incReceived, incBytes, observeRequestDuration } from './metrics.ts';
 
 export interface WsServerHandle {
   wss: WebSocketServer;
@@ -359,6 +360,7 @@ export function startWsServer(
               expiresAt: Date.now() + ttl_ms,
               msgId: f.msg_id,
               timer,
+              startTime: Date.now(),
               ws,
             });
             try {
@@ -389,6 +391,10 @@ export function startWsServer(
             pendingRequests.delete(f.correlation_id);
             if (pending.ws) {
               try { pending.ws.send(result.deliverFrame!); } catch (_) { /* ignore */ }
+              incMsgStatus('response', 'delivered');
+              incReceived(pending.fromAgent);
+              incBytes('out', Buffer.byteLength(f.payload, 'utf8'));
+              if (typeof pending.startTime === 'number') observeRequestDuration((Date.now() - pending.startTime) / 1000);
             }
             if (pending.resolve) {
               pending.resolve(JSON.parse(result.deliverFrame!).payload);

@@ -3,6 +3,7 @@ import { WebSocket } from 'ws';
 import { unlinkSync } from 'fs';
 import { expireMessages, deleteExpiredFiles, deleteDeliveredOneShots } from './db.ts';
 import { PendingRequest } from './router.ts';
+import { incExpiredByKind } from './metrics.ts';
 
 export interface CleanupHandle {
   stop(): void;
@@ -23,8 +24,13 @@ export function startCleanup(
 
   const timer = setInterval(() => {
     try {
-      const expired = expireMessages(db);
-      process.stdout.write(`[cleanup] expired ${expired} message(s)\n`);
+      const expiredByKind = expireMessages(db);
+      let expiredTotal = 0;
+      for (const [kind, n] of Object.entries(expiredByKind)) {
+        incExpiredByKind(kind, n);
+        expiredTotal += n;
+      }
+      process.stdout.write(`[cleanup] expired ${expiredTotal} message(s)\n`);
 
       const expiredPaths = deleteExpiredFiles(db);
       for (const p of expiredPaths) {
