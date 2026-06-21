@@ -412,7 +412,7 @@ describe('reminder WS frame handlers', () => {
     ws.close();
   });
 
-  it('remind with recurring "0 9 * * 1" (agent weekly): ack with schedule and next-Monday due_at', async () => {
+  it('remind with recurring "0 9 * * 1" (weekly): ack with schedule and next-Monday due_at', async () => {
     const { ws, col } = await authConnect(port, db, 'a1');
     const before = Date.now();
     ws.send(JSON.stringify({ type: 'remind', text: 'weekly', when: '0 9 * * 1', recurring: true }));

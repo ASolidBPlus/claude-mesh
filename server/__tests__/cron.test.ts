@@ -9,7 +9,7 @@ describe('cronValidate', () => {
   it('rejects "invalid"', () => { expect(cronValidate('invalid')).toBe(false); });
   it('rejects out-of-range minute 60', () => { expect(cronValidate('60 * * * *')).toBe(false); });
   it('rejects 6-field expression', () => { expect(cronValidate('* * * * * *')).toBe(false); });
-  it('accepts agent weekly 0 9 * * 1', () => { expect(cronValidate('0 9 * * 1')).toBe(true); });
+  it('accepts weekly 0 9 * * 1', () => { expect(cronValidate('0 9 * * 1')).toBe(true); });
   it('rejects dow=7 (not a Sunday alias)', () => { expect(cronValidate('0 9 * * 7')).toBe(false); });
 
   // Extra defensive cases (DIRECTIVE 4b)
@@ -57,7 +57,7 @@ describe('cronNext', () => {
     expect(next).toBe(Date.UTC(2026, 5, 17, 14, 35, 0));
   });
 
-  it('agent weekly next-due: first Monday 09:00 UTC strictly after REF', () => {
+  it('weekly next-due: first Monday 09:00 UTC strictly after REF', () => {
     const REF = Date.UTC(2026, 5, 17, 14, 30, 0); // Wed 2026-06-17 14:30 UTC
     const next = cronNext('0 9 * * 1', REF)!;
     expect(next).toBe(Date.UTC(2026, 5, 22, 9, 0, 0)); // Mon 2026-06-22 09:00 UTC

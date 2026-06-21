@@ -3,3 +3,12 @@ node_modules/
 *.db-wal
 *.db-shm
 .env
+
+# Internal dev/sprint + local-env artifacts (kept locally, not in the public repo)
+CLAUDE.md
+HANDOFF.md
+orchestrator-defaults.md
+PLAN.md
+PLAN_EVAL.md
+EVAL.md
+sprints/

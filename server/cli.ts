@@ -36,7 +36,7 @@ process.stdout.write(
   `token: ${rawToken}\n` +
   `\n` +
   `Store this token securely — it will not be shown again.\n` +
-  `Add to ~/.claude/channels/mesh/.env:\n` +
+  `Set these in your client environment:\n` +
   `  MESH_AGENT_ID=${agentId}\n` +
   `  MESH_AGENT_TOKEN=${rawToken}\n` +
   `  MESH_SERVER_URL=ws://localhost:7384\n`
