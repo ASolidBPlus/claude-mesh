@@ -1,0 +1,33 @@
+{
+  "name": "@claude-mesh/client",
+  "version": "0.1.0",
+  "description": "MeshClient — the reusable WebSocket client SDK for the claude-mesh fabric (shared protocol types + MeshClient).",
+  "license": "MIT",
+  "type": "module",
+  "main": "./client/src/index.ts",
+  "module": "./client/src/index.ts",
+  "types": "./client/src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./client/src/index.ts",
+      "import": "./client/src/index.ts"
+    },
+    "./protocol": {
+      "types": "./client/src/protocol.ts",
+      "import": "./client/src/protocol.ts"
+    }
+  },
+  "files": ["client/src"],
+  "scripts": {
+    "test:client": "cd client && bun test",
+    "test:server": "cd server && bun test"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.5.0"
+  }
+}

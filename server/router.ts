@@ -22,33 +22,17 @@ import {
 import { incMsgStatus, incSent, incReceived, incAclDenied, incError, incBytes, incFile, observePayloadBytes } from './metrics.ts';
 import { emitTap } from './tap.ts';
 
-export interface SendFrame {
-  type: 'send';
-  msg_id: string;
-  to: string;
-  payload: string;
-  content_type?: string;
-  ttl_ms?: number;
-}
-
-export interface PublishFrame {
-  type: 'publish';
-  msg_id: string;
-  topic: string;
-  payload: string;
-  content_type?: string;
-  ttl_ms?: number;
-}
-
-export interface SubscribeFrame {
-  type: 'subscribe';
-  topic: string;
-}
-
-export interface UnsubscribeFrame {
-  type: 'unsubscribe';
-  topic: string;
-}
+// Wire-frame types live in the shared client package (single source of truth).
+// Import them for local type annotations AND re-export so existing importers of
+// these names from './router.ts' (e.g. ws-server.ts) keep resolving unchanged.
+import type {
+  SendFrame, PublishFrame, SubscribeFrame, UnsubscribeFrame,
+  RequestFrame, ResponseFrame, FileSendFrame,
+} from '../client/src/protocol.ts';
+export type {
+  SendFrame, PublishFrame, SubscribeFrame, UnsubscribeFrame,
+  RequestFrame, ResponseFrame, FileSendFrame,
+};
 
 export interface RouterResult {
   ok: boolean;
@@ -326,26 +310,10 @@ export function routeUnsubscribe(
 }
 
 // ──────────────────────────────────────────────
-// Sprint 7: Request/Response types and routing
+// Sprint 7: Request/Response routing
+// (RequestFrame / ResponseFrame wire types are imported from the shared
+// client protocol module above.)
 // ──────────────────────────────────────────────
-
-export interface RequestFrame {
-  type: 'request';
-  msg_id: string;
-  to: string;
-  payload: string;
-  content_type?: string;
-  ttl_ms?: number;
-  correlation_id: string;
-}
-
-export interface ResponseFrame {
-  type: 'response';
-  msg_id: string;
-  correlation_id: string;
-  payload: string;
-  content_type?: string;
-}
 
 export interface PendingRequest {
   correlationId: string;
@@ -459,19 +427,8 @@ export function routeRequest(
 
 // ──────────────────────────────────────────────
 // Sprint 9: File Transfer
+// (FileSendFrame wire type is imported from the shared client protocol module above.)
 // ──────────────────────────────────────────────
-
-export interface FileSendFrame {
-  type: 'file_send';
-  msg_id: string;
-  to: string;
-  filename: string;
-  content_type?: string;
-  data: string;       // base64
-  ttl_ms?: number;
-  caption?: string;
-  reply_to_msg_id?: string;
-}
 
 export function routeFile(
   db: Database,
