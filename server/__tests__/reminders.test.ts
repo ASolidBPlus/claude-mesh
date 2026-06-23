@@ -25,6 +25,13 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { randomBytes } from 'crypto';
 
+// A future date for the tz one-shot tests, so they never rot as the clock
+// advances (the server rejects one-shots whose due time is already past).
+// June is Australia/Adelaide standard time (ACST, UTC+9:30) every year, so the
+// wall-clock→UTC conversion (09:00 → 23:30 the prior day) is stable for any year.
+const TZ_YEAR = new Date().getUTCFullYear() + 2;
+const TZ_ISO = `${TZ_YEAR}-06-22T09:00:00`;
+
 // ──────────────────────────────────────────────
 // DB helper tests (no server)
 // ──────────────────────────────────────────────
@@ -544,20 +551,20 @@ describe('reminder WS frame handlers', () => {
 
   it('test 24: WS remind one-shot BARE-ISO + tz → wall-clock in tz', async () => {
     const { ws, col } = await authConnect(port, db, 'a1');
-    ws.send(JSON.stringify({ type: 'remind', text: 'x', when: '2026-06-22T09:00:00', tz: 'Australia/Adelaide' }));
+    ws.send(JSON.stringify({ type: 'remind', text: 'x', when: TZ_ISO, tz: 'Australia/Adelaide' }));
     const ack = await col.wait(m => m.type === 'ack');
-    expect(ack.due_at).toBe(wallTimeToUtc(2026, 5, 22, 9, 0, 'Australia/Adelaide'));
-    expect(ack.due_at).toBe(Date.UTC(2026, 5, 21, 23, 30, 0));
-    expect(ack.due_at).not.toBe(Date.parse('2026-06-22T09:00:00'));
+    expect(ack.due_at).toBe(wallTimeToUtc(TZ_YEAR, 5, 22, 9, 0, 'Australia/Adelaide'));
+    expect(ack.due_at).toBe(Date.UTC(TZ_YEAR, 5, 21, 23, 30, 0));
+    expect(ack.due_at).not.toBe(Date.parse(TZ_ISO));
     expect(getReminder(db, ack.reminder_id)!.tz).toBe('Australia/Adelaide');
     ws.close();
   });
 
   it('test 25: WS remind one-shot ZONED-ISO + tz → absolute (no-op)', async () => {
     const { ws, col } = await authConnect(port, db, 'a1');
-    ws.send(JSON.stringify({ type: 'remind', text: 'x', when: '2026-06-22T09:00:00Z', tz: 'Australia/Adelaide' }));
+    ws.send(JSON.stringify({ type: 'remind', text: 'x', when: `${TZ_ISO}Z`, tz: 'Australia/Adelaide' }));
     const ack = await col.wait(m => m.type === 'ack');
-    expect(ack.due_at).toBe(Date.parse('2026-06-22T09:00:00Z'));
+    expect(ack.due_at).toBe(Date.parse(`${TZ_ISO}Z`));
     expect(getReminder(db, ack.reminder_id)!.tz).toBe('Australia/Adelaide');
     ws.close();
   });
@@ -904,12 +911,12 @@ describe('reminder HTTP admin endpoints', () => {
   });
 
   it('test 29: POST one-shot BARE-ISO due_at + tz → wall-clock in tz', async () => {
-    const res = await post({ agent_id: 'agentA', payload: 'x', due_at: '2026-06-22T09:00:00', tz: 'Australia/Adelaide' });
+    const res = await post({ agent_id: 'agentA', payload: 'x', due_at: TZ_ISO, tz: 'Australia/Adelaide' });
     expect(res.status).toBe(201);
     const r = await res.json() as any;
     expect(r.tz).toBe('Australia/Adelaide');
-    expect(r.due_at).toBe(Date.UTC(2026, 5, 21, 23, 30, 0));
-    expect(r.due_at).not.toBe(Date.parse('2026-06-22T09:00:00'));
+    expect(r.due_at).toBe(Date.UTC(TZ_YEAR, 5, 21, 23, 30, 0));
+    expect(r.due_at).not.toBe(Date.parse(TZ_ISO));
   });
 });
 
