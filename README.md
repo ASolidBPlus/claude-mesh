@@ -162,7 +162,50 @@ If your request frame carries a `msg_id`, the matching server reply echoes it ba
 
 ## 4. How to write a client
 
-A mesh client is a thin WebSocket loop: **connect → auth → receive `deliver` frames → reply**. The "brain" (what you say in reply) is the only part that's yours. Here's a complete, minimal client in JavaScript (works under Node or Bun with the `ws` package; the pattern is identical in any language with a WebSocket library).
+A mesh client is a thin WebSocket loop: **connect → auth → receive `deliver` frames → reply**. The "brain" (what you say in reply) is the only part that's yours. Two ways to build one:
+
+- **Use the official SDK — [`@claude-mesh/client`](#41-the-quickest-path-claude-meshclient).** On JavaScript/TypeScript (Node or Bun), this is the recommended path: it implements the whole protocol — auth, the deliver loop, request/response correlation, and reconnect-with-backoff — so you only write your brain.
+- **Implement the protocol directly — [from scratch](#42-from-scratch-any-language),** in any language with a WebSocket library. The full wire protocol is in [§3](#3-frame-protocol-reference); the worked example below shows the pattern.
+
+### 4.1 The quickest path: `@claude-mesh/client`
+
+Install straight from the repo — Bun imports the TypeScript source, no build step:
+```bash
+bun add github:ASolidBPlus/claude-mesh        # pin for reproducibility: …claude-mesh#<commit-or-tag>
+```
+```ts
+import { MeshClient, type Inbound } from '@claude-mesh/client';
+
+const client = new MeshClient({
+  serverUrl:  process.env.MESH_SERVER_URL,   // or omit all three to read env directly:
+  agentId:    process.env.MESH_AGENT_ID,     //   MESH_SERVER_URL / MESH_AGENT_ID / MESH_AGENT_TOKEN
+  agentToken: process.env.MESH_AGENT_TOKEN,  // the RAW token from POST /agents (the SDK never hashes)
+});
+
+client.on('connect', () => console.log('mesh connected'));
+client.on('disconnect', () => {});            // reconnect (backoff + re-auth + re-subscribe) is automatic
+
+client.onMessage(async (m: Inbound) => {       // fires for direct / topic / request / response / file
+  const reply = await decide(m);               // ← your brain (LLM, script, human, service)
+  if (m.kind === 'request' && m.correlationId) // answer a correlated request…
+    await client.send(m.from, reply, { kind: 'response', correlationId: m.correlationId });
+  else if (reply != null)                      // …or a plain direct reply
+    await client.send(m.from, reply);
+});
+
+await client.connect();                        // resolves once authenticated
+await client.subscribe('alerts');              // topic pub/sub
+await client.publish('alerts', 'disk full');
+const answer = await client.request('bob', 'are you there?', { timeoutMs: 60_000 }); // awaits the response
+client.close();
+```
+`Inbound` is the normalized, camelCase delivery: `{ msgId, kind, from, to?, topic?, correlationId?, text?, payload?, sentAt }` (plus `fileId` / `filename` / `contentType` and `payload: null` when `kind === 'file'`). `text` equals `payload` for text messages. The default `request` timeout is 30 s — pass a larger `timeoutMs` when the responder is an LLM persona (model + tool latency can exceed 30 s). File **content** is out of scope for the SDK (`GET /files/:id` is admin-gated); `Inbound` carries only the file metadata. Full surface + limits: [`client/README.md`](client/README.md).
+
+> The SDK is the **single shared implementation** — the channel plugin, this server's CLI, and downstream runtimes all converge on it (its wire types are the same ones the server uses), so the protocol can't drift. Prefer it over re-rolling the loop.
+
+### 4.2 From scratch (any language)
+
+If you're not on JS/Bun, or you want to see exactly what the SDK does for you, here's the whole loop by hand — the same **connect → auth → receive → reply** pattern, in JavaScript with the `ws` package (identical in any language with a WebSocket library):
 
 ```js
 import { WebSocket } from 'ws';
@@ -394,5 +437,9 @@ The image (`oven/bun:1-alpine`, entrypoint `bun server.ts`) sets `MESH_WS_PORT=7
 | `server/metrics.ts` | Prometheus metric registry + exposition |
 | `server/reminder-scheduler.ts` | Durable reminder scheduling |
 | `server/cleanup.ts` | TTL expiry sweeps |
+| `client/src/protocol.ts` | **Shared** wire-frame types — the single protocol definition, imported by both the client and `server/router.ts` (so they can't drift) |
+| `client/src/client.ts` | `MeshClient` — the official protocol-client SDK ([`@claude-mesh/client`](#41-the-quickest-path-claude-meshclient)) |
+
+(The repo is a small monorepo: `server/` is the bus, `client/` is the SDK, and the root `package.json` publishes the SDK as `@claude-mesh/client`.)
 
 Remember the one rule when you extend this: **the bus moves messages and emits raw observability — everything analytic is a consumer.**
