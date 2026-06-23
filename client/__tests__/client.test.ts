@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { openDb, registerAgent, aclGrant } from '../../server/db.ts';
 import { generateToken, hashToken } from '../../server/auth.ts';
 import { startWsServer, WsServerHandle } from '../../server/ws-server.ts';
+import { startReminderScheduler } from '../../server/reminder-scheduler.ts';
+import { insertReminder } from '../../server/db.ts';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import { mkdtempSync } from 'fs';
@@ -281,5 +283,116 @@ describe('MeshClient', () => {
     expect(caught).not.toBeNull();
     expect(caught.code).toBe('ACL_DENIED');
     expect(elapsed).toBeLessThan(2000);
+  });
+
+  // ── reminders ────────────────────────────────────────────────
+
+  // 12
+  it('remind() with a duration resolves { reminderId, dueAt }', async () => {
+    const a = newClient('A', tokenA);
+    await a.connect();
+    const before = Date.now();
+    const res = await a.remind({ text: 'wake', when: '60s' });
+    expect(typeof res.reminderId).toBe('string');
+    expect(res.reminderId.length).toBeGreaterThan(0);
+    expect(res.dueAt).toBeGreaterThanOrEqual(before + 59_000);
+    expect(res.dueAt).toBeLessThanOrEqual(Date.now() + 61_000);
+  });
+
+  // 13
+  it('remind() with recurring cron + tz resolves with schedule stored', async () => {
+    const a = newClient('A', tokenA);
+    await a.connect();
+    const res = await a.remind({
+      text: 'standup',
+      when: '0 9 * * 1',
+      recurring: true,
+      tz: 'Australia/Adelaide',
+    });
+    expect(typeof res.reminderId).toBe('string');
+    const list = await a.listReminders();
+    const rem = list.find((r) => r.id === res.reminderId);
+    expect(rem).toBeDefined();
+    expect(rem!.schedule).toBe('0 9 * * 1');
+  });
+
+  // 14
+  it('remind() with a bad when rejects with INVALID_WHEN', async () => {
+    const a = newClient('A', tokenA);
+    await a.connect();
+    let caught: any = null;
+    try {
+      await a.remind({ text: 'x', when: 'not-a-time' });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).not.toBeNull();
+    expect(caught.code).toBe('INVALID_WHEN');
+  });
+
+  // 15
+  it('listReminders() returns a camelCase array; schedule null for one-shot', async () => {
+    const a = newClient('A', tokenA);
+    await a.connect();
+    await a.remind({ text: 'one', when: '1h' });
+    await a.remind({ text: 'weekly', when: '0 9 * * 1', recurring: true });
+
+    const list = await a.listReminders();
+    expect(list.length).toBe(2);
+    const oneShot = list.find((r) => r.payload === 'one')!;
+    const recurring = list.find((r) => r.payload === 'weekly')!;
+    expect(oneShot.schedule).toBeNull();
+    expect(typeof oneShot.dueAt).toBe('number');
+    expect(typeof oneShot.id).toBe('string');
+    expect(typeof oneShot.createdAt).toBe('number');
+    expect(oneShot.lastFiredAt).toBeNull();
+    expect(recurring.schedule).toBe('0 9 * * 1');
+  });
+
+  // 16
+  it('cancelReminder() resolves and removes it; nonexistent rejects REMINDER_NOT_FOUND', async () => {
+    const a = newClient('A', tokenA);
+    await a.connect();
+    const r1 = await a.remind({ text: 'one', when: '1h' });
+    await a.remind({ text: 'two', when: '2h' });
+
+    await expect(a.cancelReminder(r1.reminderId)).resolves.toBeUndefined();
+    const list = await a.listReminders();
+    expect(list.find((r) => r.id === r1.reminderId)).toBeUndefined();
+    expect(list.length).toBe(1);
+
+    let caught: any = null;
+    try {
+      await a.cancelReminder('nope');
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).not.toBeNull();
+    expect(caught.code).toBe('REMINDER_NOT_FOUND');
+  });
+
+  // 17
+  it('a fired reminder is received as Inbound{kind:"reminder", from:"mesh"}', async () => {
+    const a = newClient('A', tokenA);
+    const got = new Promise<Inbound>((resolve) => { a.onMessage(resolve); });
+    await a.connect();
+
+    // create a reminder due in the past directly, then tick the scheduler
+    insertReminder(db, {
+      id: 'fired-1',
+      agent_id: 'A',
+      due_at: Date.now() - 1000,
+      schedule: null,
+      payload: 'time to ship',
+      created_at: Date.now(),
+    });
+    const sched = startReminderScheduler(db, handle.agentIndex, 999999);
+    sched.tick();
+    sched.stop();
+
+    const msg = await got;
+    expect(msg.kind).toBe('reminder');
+    expect(msg.from).toBe('mesh');
+    expect(msg.text).toBe('time to ship');
   });
 });

@@ -68,6 +68,26 @@ export interface FileSendFrame {
   reply_to_msg_id?: string;
 }
 
+export interface RemindFrame {
+  type: 'remind';
+  msg_id?: string;
+  text: string;
+  when: string; // duration | ISO | cron (when recurring)
+  recurring?: boolean;
+  tz?: string; // IANA timezone
+}
+
+export interface ListRemindersFrame {
+  type: 'list_reminders';
+  msg_id?: string;
+}
+
+export interface CancelReminderFrame {
+  type: 'cancel_reminder';
+  id: string;
+  msg_id?: string;
+}
+
 export interface AuthFrame {
   type: 'auth';
   agent_id: string;
@@ -90,7 +110,7 @@ export interface AuthOkFrame {
 export interface DeliverFrame {
   type: 'deliver';
   msg_id: string;
-  kind: 'direct' | 'topic' | 'request' | 'response';
+  kind: 'direct' | 'topic' | 'request' | 'response' | 'reminder';
   from: string;
   to: string | null;
   topic: string | null;
@@ -167,6 +187,9 @@ export type OutboundFrame =
   | RequestFrame
   | ResponseFrame
   | FileSendFrame
+  | RemindFrame
+  | ListRemindersFrame
+  | CancelReminderFrame
   | AuthFrame;
 
 export type InboundFrame =

@@ -7,12 +7,28 @@ import type {
   SubscribeFrame,
   UnsubscribeFrame,
   RequestFrame,
+  RemindFrame,
+  ListRemindersFrame,
+  CancelReminderFrame,
   DeliverFrame,
   FileDeliverFrame,
   AckFrame,
   ErrorFrame,
+  RemindersListFrame,
   InboundFrame,
 } from './protocol.ts';
+
+/**
+ * A pending reminder as returned by `listReminders()` — camelCase.
+ */
+export interface Reminder {
+  id: string;
+  dueAt: number;
+  schedule: string | null;
+  payload: string;
+  createdAt: number;
+  lastFiredAt: number | null;
+}
 
 export interface MeshClientConfig {
   serverUrl?: string; // default process.env.MESH_SERVER_URL
@@ -38,7 +54,7 @@ export interface RequestOpts {
  */
 export interface Inbound {
   msgId: string;
-  kind: 'direct' | 'topic' | 'request' | 'response' | 'file';
+  kind: 'direct' | 'topic' | 'request' | 'response' | 'file' | 'reminder';
   from: string;
   to?: string | null;
   topic?: string | null;
@@ -80,6 +96,13 @@ export class MeshClient {
 
   // ack waiters keyed by ref (= msg_id for send/publish, = topic for sub/unsub)
   private pendingAcks = new Map<string, Settler<void>>();
+  // remind() ack waiters keyed by ref (= msg_id); ack carries reminder_id + due_at
+  private pendingReminds = new Map<
+    string,
+    Settler<{ reminderId: string; dueAt: number }>
+  >();
+  // listReminders() waiters keyed by ref (= msg_id); resolved by reminders_list frame
+  private pendingReminderLists = new Map<string, Settler<Reminder[]>>();
   // request waiters keyed by correlation_id; also indexed by msg_id for fast-fail
   private pendingRequests = new Map<
     string,
@@ -205,6 +228,62 @@ export class MeshClient {
     });
   }
 
+  remind(opts: {
+    text: string;
+    when: string;
+    recurring?: boolean;
+    tz?: string;
+  }): Promise<{ reminderId: string; dueAt: number }> {
+    if (!this.isOpen()) {
+      return Promise.reject(new Error('not connected'));
+    }
+    const msgId = this.id();
+    const frame: RemindFrame = {
+      type: 'remind',
+      msg_id: msgId,
+      text: opts.text,
+      when: opts.when,
+    };
+    if (opts.recurring !== undefined) frame.recurring = opts.recurring;
+    if (opts.tz !== undefined) frame.tz = opts.tz;
+    return new Promise<{ reminderId: string; dueAt: number }>((resolve, reject) => {
+      this.pendingReminds.set(msgId, { resolve, reject });
+      try {
+        this.ws!.send(JSON.stringify(frame));
+      } catch (err) {
+        this.pendingReminds.delete(msgId);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+
+  listReminders(): Promise<Reminder[]> {
+    if (!this.isOpen()) {
+      return Promise.reject(new Error('not connected'));
+    }
+    const msgId = this.id();
+    const frame: ListRemindersFrame = { type: 'list_reminders', msg_id: msgId };
+    return new Promise<Reminder[]>((resolve, reject) => {
+      this.pendingReminderLists.set(msgId, { resolve, reject });
+      try {
+        this.ws!.send(JSON.stringify(frame));
+      } catch (err) {
+        this.pendingReminderLists.delete(msgId);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+
+  cancelReminder(id: string): Promise<void> {
+    const msgId = this.id();
+    const frame: CancelReminderFrame = {
+      type: 'cancel_reminder',
+      id,
+      msg_id: msgId,
+    };
+    return this.sendWithAck(msgId, frame);
+  }
+
   close(): void {
     this.shouldReconnect = false;
     if (this.reconnectTimer !== null) {
@@ -223,6 +302,14 @@ export class MeshClient {
       a.reject(closedErr);
     }
     this.pendingAcks.clear();
+    for (const [, r] of this.pendingReminds) {
+      r.reject(closedErr);
+    }
+    this.pendingReminds.clear();
+    for (const [, l] of this.pendingReminderLists) {
+      l.reject(closedErr);
+    }
+    this.pendingReminderLists.clear();
 
     if (this.ws !== null) {
       try {
@@ -402,10 +489,12 @@ export class MeshClient {
       case 'error':
         this.onError(frame);
         return;
+      case 'reminders_list':
+        this.onRemindersList(frame);
+        return;
       case 'pong':
       case 'agent_status':
       case 'presence_list':
-      case 'reminders_list':
         return; // ignored (out of scope for SDK v0.1)
       default:
         return;
@@ -455,11 +544,37 @@ export class MeshClient {
   private onAck(frame: AckFrame): void {
     const ref = frame.ref;
     if (ref === undefined) return;
+    const remindWaiter = this.pendingReminds.get(ref);
+    if (remindWaiter !== undefined) {
+      this.pendingReminds.delete(ref);
+      remindWaiter.resolve({
+        reminderId: frame.reminder_id ?? '',
+        dueAt: frame.due_at ?? 0,
+      });
+      return;
+    }
     const waiter = this.pendingAcks.get(ref);
     if (waiter !== undefined) {
       this.pendingAcks.delete(ref);
       waiter.resolve();
     }
+  }
+
+  private onRemindersList(frame: RemindersListFrame): void {
+    const ref = frame.ref;
+    if (ref === undefined) return;
+    const waiter = this.pendingReminderLists.get(ref);
+    if (waiter === undefined) return;
+    this.pendingReminderLists.delete(ref);
+    const reminders: Reminder[] = frame.reminders.map((r) => ({
+      id: r.id as string,
+      dueAt: r.due_at as number,
+      schedule: (r.schedule ?? null) as string | null,
+      payload: r.payload as string,
+      createdAt: r.created_at as number,
+      lastFiredAt: (r.last_fired_at ?? null) as number | null,
+    }));
+    waiter.resolve(reminders);
   }
 
   private onError(frame: ErrorFrame): void {
@@ -501,6 +616,20 @@ export class MeshClient {
         p.reject(this.makeError(frame));
         return;
       }
+    }
+
+    const remindWaiter = this.pendingReminds.get(ref);
+    if (remindWaiter !== undefined) {
+      this.pendingReminds.delete(ref);
+      remindWaiter.reject(this.makeError(frame));
+      return;
+    }
+
+    const listWaiter = this.pendingReminderLists.get(ref);
+    if (listWaiter !== undefined) {
+      this.pendingReminderLists.delete(ref);
+      listWaiter.reject(this.makeError(frame));
+      return;
     }
 
     const ackWaiter = this.pendingAcks.get(ref);

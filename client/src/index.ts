@@ -5,5 +5,6 @@ export type {
   SendOpts,
   RequestOpts,
   Inbound,
+  Reminder,
 } from './client.ts';
 export * from './protocol.ts'; // all wire types + MeshKind for external consumers
