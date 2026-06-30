@@ -402,6 +402,7 @@ MESH_ADMIN_TOKEN=dev-secret bun server.ts      # WS :7384, admin :7385
 | `MESH_CLEANUP_INTERVAL_MS` | `60000` | Expiry sweep interval |
 | `MESH_REMINDER_INTERVAL_MS` | `10000` | Reminder scheduler tick |
 | `MESH_PRESENCE_DEBOUNCE_MS` | `12000` | Suppress presence flap on reconnect within this window (`0` = immediate) |
+| `MESH_MCP_MODE` | `0` | `1` = run as an MCP stdio server (stdin EOF shuts the server down). Default `0` runs as a standalone daemon that survives stdin being closed (e.g. `docker run -d`). |
 
 **Docker:**
 ```bash
