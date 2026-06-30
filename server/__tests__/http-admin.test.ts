@@ -743,3 +743,83 @@ describe('GET /messages', () => {
     expect(res.status).toBe(401);
   });
 });
+
+// ── Route-dispatch characterization ───────────────────────────────────────
+// Pins the edges a route-table extraction is most likely to drift: the
+// top-level 404 fall-through, the absence of any 405 (wrong method on a known
+// path falls through to 404), and exact-vs-:id precedence. These assert the
+// CURRENT behaviour and must stay green across the extraction (delta 0).
+describe('http-admin route dispatch (characterization)', () => {
+  let db: Database;
+  let handle: HttpAdminHandle;
+  let base: string;
+  const token = 'test-admin-token';
+  let filesDir: string;
+  const auth = () => ({ 'Authorization': `Bearer ${token}` });
+
+  beforeEach(async () => {
+    db = openDb(':memory:');
+    filesDir = mkdtempSync(join(tmpdir(), 'mesh-test-'));
+    handle = await startHttpAdmin(0, db, token, 10_485_760, filesDir, new Map());
+    const port = (handle.server.address() as net.AddressInfo).port;
+    base = `http://localhost:${port}`;
+  });
+
+  afterEach(async () => {
+    await handle.shutdown().catch(() => {});
+    db.close();
+  });
+
+  it('unknown path → 404 {error:"not found"}', async () => {
+    const res = await fetch(`${base}/nope`, { headers: auth() });
+    expect(res.status).toBe(404);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.error).toBe('not found');
+  });
+
+  it('unknown nested path → 404 {error:"not found"}', async () => {
+    const res = await fetch(`${base}/acl/extra/segments`, { headers: auth() });
+    expect(res.status).toBe(404);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.error).toBe('not found');
+  });
+
+  it('wrong method on a known path falls through to 404, NOT 405 (PUT /acl)', async () => {
+    const res = await fetch(`${base}/acl`, { method: 'PUT', headers: auth(), body: '{}' });
+    expect(res.status).toBe(404);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.error).toBe('not found');
+  });
+
+  it('wrong method on a known path falls through to 404, NOT 405 (POST /messages)', async () => {
+    const res = await fetch(`${base}/messages`, { method: 'POST', headers: auth(), body: '{}' });
+    expect(res.status).toBe(404);
+  });
+
+  it('wrong method on a known path falls through to 404, NOT 405 (PUT /agents)', async () => {
+    const res = await fetch(`${base}/agents`, { method: 'PUT', headers: auth(), body: '{}' });
+    expect(res.status).toBe(404);
+  });
+
+  it('precedence: GET /agents (list, array) vs GET /agents/:id (single object) are distinct handlers', async () => {
+    registerAgent(db, { id: 'prec-agent', token_hash: hashToken('t'), hostname: 'h1' });
+
+    const listRes = await fetch(`${base}/agents`, { headers: auth() });
+    expect(listRes.status).toBe(200);
+    const list = await listRes.json();
+    expect(Array.isArray(list)).toBe(true);
+    expect((list as Record<string, unknown>[]).some((a) => a.id === 'prec-agent')).toBe(true);
+
+    const oneRes = await fetch(`${base}/agents/prec-agent`, { headers: auth() });
+    expect(oneRes.status).toBe(200);
+    const one = await oneRes.json();
+    expect(Array.isArray(one)).toBe(false);
+    expect((one as Record<string, unknown>).id).toBe('prec-agent');
+    expect((one as Record<string, unknown>).hostname).toBe('h1');
+  });
+
+  it('precedence: GET /agents/:id for unknown id → 404 (not the list handler)', async () => {
+    const res = await fetch(`${base}/agents/ghost-xyz`, { headers: auth() });
+    expect(res.status).toBe(404);
+  });
+});
