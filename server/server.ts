@@ -19,6 +19,7 @@ export interface Config {
   filesDir: string;
   reminderIntervalMs: number;
   presenceDebounceMs: number;
+  mcpMode: boolean;
 }
 
 export function loadConfig(): Config {
@@ -98,7 +99,14 @@ export function loadConfig(): Config {
     presenceDebounceMs = parsed;
   }
 
-  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs };
+  // MCP stdio mode: when running as an MCP server driven over the process's
+  // stdin/stdout (set MESH_MCP_MODE=1), stdin EOF means the parent disconnected
+  // and the server should shut down. As a standalone WS+HTTP daemon (the default,
+  // e.g. `docker run -d`), stdin EOF is environmental noise and must NOT trigger
+  // shutdown — otherwise the daemon exits immediately on startup.
+  const mcpMode = process.env.MESH_MCP_MODE === '1';
+
+  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode };
 }
 
 async function main() {
@@ -167,8 +175,12 @@ async function main() {
   cleanupHandle = startCleanup(db, pendingRequests, agentIndex, config.cleanupIntervalMs);
   reminderHandle = startReminderScheduler(db, wsHandle.agentIndex, config.reminderIntervalMs);
 
-  process.stdin.on('end', shutdown);
-  process.stdin.on('close', shutdown);
+  // Only treat stdin EOF as a shutdown signal in MCP stdio mode. A standalone
+  // daemon (the default) must survive stdin being closed (e.g. `docker run -d`).
+  if (config.mcpMode) {
+    process.stdin.on('end', shutdown);
+    process.stdin.on('close', shutdown);
+  }
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 
