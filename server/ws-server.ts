@@ -35,6 +35,449 @@ interface PresenceState {
   onlineBroadcast: boolean; // true while peers currently believe this agent is online
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Post-auth frame dispatch
+//
+// Each post-auth frame type is a named handler taking a single FrameCtx; the
+// POST_AUTH_HANDLERS map (frame type -> handler) replaces what was a 13-arm
+// inline `if (frameType === 'x') {...}` chain, so static analysis sees the
+// handlers as symbols and the dispatch as explicit map edges. Frame types are
+// mutually-exclusive exact strings (no precedence/overlap), so an O(1) map is
+// the natural structure. A non-string / unknown `type` falls through to the
+// NOT_IMPLEMENTED error at the dispatch site, exactly as the if-chain did.
+//
+// Handlers run only post-auth, so `state.agentId` is non-null (the `!`
+// assertions are preserved from the original inline blocks). All handlers are
+// synchronous — there is no `await` in the dispatch path.
+// ──────────────────────────────────────────────────────────────────────────
+
+interface FrameCtx {
+  ws: WebSocket;
+  state: ConnState;
+  db: Database;
+  frame: Record<string, unknown>;
+  parsed: unknown;
+  agentIndex: Map<string, WebSocket>;
+  pendingRequests: Map<string, PendingRequest>;
+  observerIndex: Map<string, WebSocket>;
+  maxFileBytes: number;
+  filesDir: string;
+}
+
+type FrameHandler = (ctx: FrameCtx) => void;
+
+function handlePing(ctx: FrameCtx): void {
+  const { ws, state, db, frame } = ctx;
+  const ts = frame.ts;
+  const serverTs = Date.now();
+  try {
+    ws.send(JSON.stringify({ type: 'pong', ts, server_ts: serverTs }));
+  } catch (_) { /* ignore */ }
+  if (state.agentId !== null) {
+    touchAgent(db, state.agentId);
+  }
+}
+
+function handleSend(ctx: FrameCtx): void {
+  const { ws, state, db, parsed, agentIndex, observerIndex } = ctx;
+  const f = parsed as SendFrame;
+  const result = routeDirect(db, agentIndex, state.agentId!, f, observerIndex);
+  if (result.ok) {
+    try {
+      ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
+    } catch (_) { /* ignore */ }
+  } else {
+    try {
+      ws.send(JSON.stringify({
+        type: 'error',
+        ref: f.msg_id,
+        code: result.error_code,
+        message: result.error_message,
+      }));
+    } catch (_) { /* ignore */ }
+  }
+}
+
+function handleAck(ctx: FrameCtx): void {
+  const { db, parsed } = ctx;
+  const msgId = (parsed as Record<string, unknown>).msg_id;
+  if (typeof msgId === 'string') {
+    markAcked(db, msgId);
+  }
+}
+
+function handlePublish(ctx: FrameCtx): void {
+  const { ws, state, db, parsed, agentIndex, observerIndex } = ctx;
+  const f = parsed as PublishFrame;
+  const result = routePublish(db, agentIndex, state.agentId!, f, observerIndex);
+  if (result.ok) {
+    try {
+      ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
+    } catch (_) { /* ignore */ }
+  } else {
+    try {
+      ws.send(JSON.stringify({
+        type: 'error',
+        ref: f.msg_id,
+        code: result.error_code,
+        message: result.error_message,
+      }));
+    } catch (_) { /* ignore */ }
+  }
+}
+
+function handleSubscribe(ctx: FrameCtx): void {
+  const { ws, state, db, parsed } = ctx;
+  const f = parsed as SubscribeFrame;
+  const result = routeSubscribe(db, state.agentId!, f);
+  if (result.ok) {
+    try {
+      ws.send(JSON.stringify({ type: 'ack', ref: f.topic, ok: true }));
+    } catch (_) { /* ignore */ }
+  } else {
+    try {
+      ws.send(JSON.stringify({
+        type: 'error',
+        ref: f.topic,
+        code: result.error_code,
+        message: result.error_message,
+      }));
+    } catch (_) { /* ignore */ }
+  }
+}
+
+function handleUnsubscribe(ctx: FrameCtx): void {
+  const { ws, state, db, parsed } = ctx;
+  const f = parsed as UnsubscribeFrame;
+  const result = routeUnsubscribe(db, state.agentId!, f);
+  if (result.ok) {
+    try {
+      ws.send(JSON.stringify({ type: 'ack', ref: f.topic, ok: true }));
+    } catch (_) { /* ignore */ }
+  } else {
+    try {
+      ws.send(JSON.stringify({
+        type: 'error',
+        ref: f.topic,
+        code: result.error_code,
+        message: result.error_message,
+      }));
+    } catch (_) { /* ignore */ }
+  }
+}
+
+function handleRequest(ctx: FrameCtx): void {
+  const { ws, state, db, parsed, agentIndex, pendingRequests, observerIndex } = ctx;
+  const f = parsed as RequestFrame;
+  // Validate required fields
+  if (typeof f.msg_id !== 'string' || typeof f.to !== 'string' || typeof f.payload !== 'string' || typeof f.correlation_id !== 'string') {
+    try {
+      ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: 'INVALID_REQUEST', message: 'msg_id, to, payload, and correlation_id are required strings' }));
+    } catch (_) { /* ignore */ }
+    return;
+  }
+  // Validate ttl_ms
+  const ttl_ms = f.ttl_ms === undefined ? 30_000 : f.ttl_ms;
+  if (ttl_ms === 0 || ttl_ms > 300_000) {
+    try {
+      ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: 'INVALID_REQUEST', message: 'ttl_ms must be between 1 and 300000' }));
+    } catch (_) { /* ignore */ }
+    return;
+  }
+  // Check for duplicate correlation_id
+  if (pendingRequests.has(f.correlation_id)) {
+    try {
+      ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: 'INVALID_REQUEST', message: `duplicate correlation_id: ${f.correlation_id}` }));
+    } catch (_) { /* ignore */ }
+    return;
+  }
+  const result = routeRequest(db, agentIndex, state.agentId!, { ...f, ttl_ms }, observerIndex);
+  if (!result.ok) {
+    try {
+      ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: result.error_code, message: result.error_message }));
+    } catch (_) { /* ignore */ }
+    return;
+  }
+  // Register pending request
+  const correlationId = f.correlation_id;
+  const timer = setTimeout(() => {
+    pendingRequests.delete(correlationId);
+    try {
+      ws.send(JSON.stringify({
+        type: 'error',
+        ref: correlationId,
+        code: 'REQUEST_TIMEOUT',
+        message: `no response received within ${ttl_ms}ms`,
+      }));
+    } catch (_) { /* ignore: socket may be closed */ }
+  }, ttl_ms);
+  pendingRequests.set(correlationId, {
+    correlationId,
+    fromAgent: state.agentId!,
+    expiresAt: Date.now() + ttl_ms,
+    msgId: f.msg_id,
+    timer,
+    startTime: Date.now(),
+    ws,
+  });
+  try {
+    ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
+  } catch (_) { /* ignore */ }
+}
+
+function handleResponse(ctx: FrameCtx): void {
+  const { ws, state, db, parsed, agentIndex, pendingRequests, observerIndex } = ctx;
+  const f = parsed as ResponseFrame;
+  // Validate required fields
+  if (typeof f.msg_id !== 'string' || typeof f.correlation_id !== 'string' || typeof f.payload !== 'string') {
+    try {
+      ws.send(JSON.stringify({ type: 'error', ref: (f as Record<string, unknown>).msg_id, code: 'INVALID_REQUEST', message: 'msg_id, correlation_id, and payload are required strings' }));
+    } catch (_) { /* ignore */ }
+    return;
+  }
+  const result = routeResponse(db, agentIndex, state.agentId!, f, pendingRequests, observerIndex);
+  if (!result.ok) {
+    try {
+      ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: result.error_code, message: result.error_message }));
+    } catch (_) { /* ignore */ }
+    return;
+  }
+  // Retrieve pending entry
+  const pending = pendingRequests.get(f.correlation_id)!;
+  clearTimeout(pending.timer);
+  pendingRequests.delete(f.correlation_id);
+  if (pending.ws) {
+    try { pending.ws.send(result.deliverFrame!); } catch (_) { /* ignore */ }
+    incMsgStatus('response', 'delivered');
+    incReceived(pending.fromAgent);
+    incBytes('out', Buffer.byteLength(f.payload, 'utf8'));
+    if (typeof pending.startTime === 'number') observeRequestDuration((Date.now() - pending.startTime) / 1000);
+  }
+  if (pending.resolve) {
+    pending.resolve(JSON.parse(result.deliverFrame!).payload);
+  }
+  try {
+    ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
+  } catch (_) { /* ignore */ }
+}
+
+function handleFileSend(ctx: FrameCtx): void {
+  const { ws, state, db, parsed, agentIndex, maxFileBytes, filesDir, observerIndex } = ctx;
+  const f = parsed as FileSendFrame;
+  // Validate required string fields: msg_id, to, filename, data
+  if (typeof f.msg_id !== 'string' || typeof f.to !== 'string' ||
+      typeof f.filename !== 'string' || typeof f.data !== 'string') {
+    ws.send(JSON.stringify({
+      type: 'error', ref: f.msg_id,
+      code: 'INVALID_REQUEST',
+      message: 'msg_id, to, filename, and data are required strings',
+    }));
+    return;
+  }
+  const result = routeFile(db, agentIndex, state.agentId!, f, maxFileBytes, filesDir, observerIndex);
+  if (result.ok) {
+    ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
+  } else {
+    ws.send(JSON.stringify({
+      type: 'error', ref: f.msg_id,
+      code: result.error_code,
+      message: result.error_message,
+    }));
+  }
+}
+
+function handleRemind(ctx: FrameCtx): void {
+  const { ws, state, db, frame } = ctx;
+  const text = frame.text;
+  const when = frame.when;
+  const recurring = frame.recurring === true;
+  // ref-correlation: echo the REQUEST's msg_id on every reply when present.
+  const reqMsgId = (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) ? frame.msg_id : undefined;
+  const refPart = reqMsgId ? { ref: reqMsgId } : {};
+
+  if (typeof text !== 'string' || text.length === 0) {
+    try {
+      ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_WHEN', message: 'text is required' }));
+    } catch (_) { /* ignore */ }
+    return;
+  }
+  if (Buffer.byteLength(text, 'utf8') > 4096) {
+    try {
+      ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'PAYLOAD_TOO_LARGE', message: 'text exceeds 4096 bytes' }));
+    } catch (_) { /* ignore */ }
+    return;
+  }
+  if (typeof when !== 'string' || when.length === 0) {
+    try {
+      ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_WHEN', message: 'when is required' }));
+    } catch (_) { /* ignore */ }
+    return;
+  }
+
+  // Optional per-reminder IANA timezone. When present, cron fields and
+  // bare offset-less ISO one-shots are interpreted as wall-clock in tz.
+  const tzRaw = frame.tz;
+  if (tzRaw !== undefined) {
+    if (typeof tzRaw !== 'string' || !tzValidate(tzRaw)) {
+      try {
+        ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_TZ', message: 'invalid IANA timezone' }));
+      } catch (_) { /* ignore */ }
+      return;
+    }
+  }
+  const tz = (typeof tzRaw === 'string') ? tzRaw : null;
+
+  let due_at: number;
+  let schedule: string | null;
+
+  if (recurring) {
+    if (!cronValidate(when)) {
+      try {
+        ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_CRON', message: 'invalid cron expression' }));
+      } catch (_) { /* ignore */ }
+      return;
+    }
+    const next = tz !== null ? cronNextTz(when, Date.now(), tz) : cronNext(when, Date.now());
+    if (next === null) {
+      try {
+        ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_CRON', message: 'no future occurrence found' }));
+      } catch (_) { /* ignore */ }
+      return;
+    }
+    due_at = next;
+    schedule = when;
+  } else {
+    const dur = parseDuration(when);
+    if (dur !== null) {
+      // Duration → absolute (tz is a no-op, still recorded).
+      due_at = Date.now() + dur;
+      schedule = null;
+    } else if (tz !== null && isBareIso(when)) {
+      // Bare offset-less ISO + tz → interpret as wall-clock in tz.
+      due_at = bareIsoToUtc(when, tz);
+      schedule = null;
+    } else {
+      const parsedTime = new Date(when).getTime();
+      if (Number.isFinite(parsedTime)) {
+        if (parsedTime <= Date.now()) {
+          try {
+            ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_WHEN', message: 'due time is in the past' }));
+          } catch (_) { /* ignore */ }
+          return;
+        }
+        due_at = parsedTime;
+        schedule = null;
+      } else {
+        try {
+          ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_WHEN', message: 'when must be a duration (e.g. "90s"), ISO datetime, or cron expression with recurring=true' }));
+        } catch (_) { /* ignore */ }
+        return;
+      }
+    }
+  }
+
+  const rem = insertReminder(db, {
+    id: crypto.randomUUID(),
+    agent_id: state.agentId!,
+    due_at,
+    schedule,
+    payload: text,
+    created_at: Date.now(),
+    tz,
+  });
+  try {
+    ws.send(JSON.stringify({ type: 'ack', ...refPart, ok: true, reminder_id: rem.id, due_at: rem.due_at }));
+  } catch (_) { /* ignore */ }
+}
+
+function handleListReminders(ctx: FrameCtx): void {
+  const { ws, state, db, frame } = ctx;
+  const reminders = listAgentReminders(db, state.agentId!);
+  const resp: { type: string; ref?: string; reminders: unknown[] } = {
+    type: 'reminders_list',
+    reminders: reminders.map(r => ({
+      id: r.id,
+      due_at: r.due_at,
+      schedule: r.schedule,
+      payload: r.payload,
+      created_at: r.created_at,
+      last_fired_at: r.last_fired_at,
+    })),
+  };
+  if (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) resp.ref = frame.msg_id;
+  try {
+    ws.send(JSON.stringify(resp));
+  } catch (_) { /* ignore */ }
+}
+
+function handleCancelReminder(ctx: FrameCtx): void {
+  const { ws, state, db, frame } = ctx;
+  const id = frame.id;
+  // ref-correlation: echo the REQUEST's msg_id when present.
+  const reqMsgId = (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) ? frame.msg_id : undefined;
+  const refPart = reqMsgId ? { ref: reqMsgId } : {};
+  if (typeof id !== 'string' || id.length === 0) {
+    try {
+      ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'REMINDER_NOT_FOUND', message: 'reminder not found' }));
+    } catch (_) { /* ignore */ }
+    return;
+  }
+  const rem = getReminder(db, id);
+  if (rem === null || rem.agent_id !== state.agentId!) {
+    try {
+      ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'REMINDER_NOT_FOUND', message: 'reminder not found' }));
+    } catch (_) { /* ignore */ }
+    return;
+  }
+  const cancelled = dbCancelReminder(db, id);
+  if (!cancelled) {
+    try {
+      ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'REMINDER_NOT_FOUND', message: 'reminder not found or already cancelled' }));
+    } catch (_) { /* ignore */ }
+    return;
+  }
+  try {
+    ws.send(JSON.stringify({ type: 'ack', ...refPart, ok: true }));
+  } catch (_) { /* ignore */ }
+}
+
+function handleListPresence(ctx: FrameCtx): void {
+  const { ws, state, db, frame } = ctx;
+  // Self-authed: post-auth dispatch only runs after authed===true, so
+  // state.agentId is non-null here (the first-frame gate rejects an
+  // unauthed list_presence with AUTH_REQUIRED + close 1008).
+  const caller = state.agentId!;
+  const all = listAgents(db);
+  // ACL-filtered roster: agents the caller is ACL-related to, plus self.
+  const result = all
+    .filter(a => a.id === caller || aclRelated(db, caller, a.id))
+    .map(a => ({ id: a.id, online: a.online === 1, last_seen: a.last_seen }));
+  const resp: { type: string; ref?: string; agents: typeof result } = { type: 'presence_list', agents: result };
+  if (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) resp.ref = frame.msg_id;
+  try {
+    ws.send(JSON.stringify(resp));
+  } catch (_) { /* ignore */ }
+}
+
+// Frame type -> handler. Exact-string keys, mutually exclusive (no precedence),
+// so map order is behavior-irrelevant. A type absent from this map (or a
+// non-string type) falls through to NOT_IMPLEMENTED at the dispatch site.
+const POST_AUTH_HANDLERS: Record<string, FrameHandler> = {
+  ping: handlePing,
+  send: handleSend,
+  ack: handleAck,
+  publish: handlePublish,
+  subscribe: handleSubscribe,
+  unsubscribe: handleUnsubscribe,
+  request: handleRequest,
+  response: handleResponse,
+  file_send: handleFileSend,
+  remind: handleRemind,
+  list_reminders: handleListReminders,
+  cancel_reminder: handleCancelReminder,
+  list_presence: handleListPresence,
+};
+
 export function startWsServer(
   port: number,
   db: Database,
@@ -220,399 +663,13 @@ export function startWsServer(
             return;
           }
 
-          // Post-auth frame dispatch
+          // Post-auth frame dispatch — handlers are named module-level functions
+          // keyed by frame type in POST_AUTH_HANDLERS. A non-string or unknown
+          // type falls through to NOT_IMPLEMENTED, exactly as the prior if-chain.
           const frameType = frame.type;
-
-          if (frameType === 'ping') {
-            const ts = frame.ts;
-            const serverTs = Date.now();
-            try {
-              ws.send(JSON.stringify({ type: 'pong', ts, server_ts: serverTs }));
-            } catch (_) { /* ignore */ }
-            if (state.agentId !== null) {
-              touchAgent(db, state.agentId);
-            }
-            return;
-          }
-
-          if (frameType === 'send') {
-            const f = parsed as SendFrame;
-            const result = routeDirect(db, agentIndex, state.agentId!, f, observerIndex);
-            if (result.ok) {
-              try {
-                ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
-              } catch (_) { /* ignore */ }
-            } else {
-              try {
-                ws.send(JSON.stringify({
-                  type: 'error',
-                  ref: f.msg_id,
-                  code: result.error_code,
-                  message: result.error_message,
-                }));
-              } catch (_) { /* ignore */ }
-            }
-            return;
-          }
-
-          if (frameType === 'ack') {
-            const msgId = (parsed as Record<string, unknown>).msg_id;
-            if (typeof msgId === 'string') {
-              markAcked(db, msgId);
-            }
-            return;
-          }
-
-          if (frameType === 'publish') {
-            const f = parsed as PublishFrame;
-            const result = routePublish(db, agentIndex, state.agentId!, f, observerIndex);
-            if (result.ok) {
-              try {
-                ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
-              } catch (_) { /* ignore */ }
-            } else {
-              try {
-                ws.send(JSON.stringify({
-                  type: 'error',
-                  ref: f.msg_id,
-                  code: result.error_code,
-                  message: result.error_message,
-                }));
-              } catch (_) { /* ignore */ }
-            }
-            return;
-          }
-
-          if (frameType === 'subscribe') {
-            const f = parsed as SubscribeFrame;
-            const result = routeSubscribe(db, state.agentId!, f);
-            if (result.ok) {
-              try {
-                ws.send(JSON.stringify({ type: 'ack', ref: f.topic, ok: true }));
-              } catch (_) { /* ignore */ }
-            } else {
-              try {
-                ws.send(JSON.stringify({
-                  type: 'error',
-                  ref: f.topic,
-                  code: result.error_code,
-                  message: result.error_message,
-                }));
-              } catch (_) { /* ignore */ }
-            }
-            return;
-          }
-
-          if (frameType === 'unsubscribe') {
-            const f = parsed as UnsubscribeFrame;
-            const result = routeUnsubscribe(db, state.agentId!, f);
-            if (result.ok) {
-              try {
-                ws.send(JSON.stringify({ type: 'ack', ref: f.topic, ok: true }));
-              } catch (_) { /* ignore */ }
-            } else {
-              try {
-                ws.send(JSON.stringify({
-                  type: 'error',
-                  ref: f.topic,
-                  code: result.error_code,
-                  message: result.error_message,
-                }));
-              } catch (_) { /* ignore */ }
-            }
-            return;
-          }
-
-          if (frameType === 'request') {
-            const f = parsed as RequestFrame;
-            // Validate required fields
-            if (typeof f.msg_id !== 'string' || typeof f.to !== 'string' || typeof f.payload !== 'string' || typeof f.correlation_id !== 'string') {
-              try {
-                ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: 'INVALID_REQUEST', message: 'msg_id, to, payload, and correlation_id are required strings' }));
-              } catch (_) { /* ignore */ }
-              return;
-            }
-            // Validate ttl_ms
-            const ttl_ms = f.ttl_ms === undefined ? 30_000 : f.ttl_ms;
-            if (ttl_ms === 0 || ttl_ms > 300_000) {
-              try {
-                ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: 'INVALID_REQUEST', message: 'ttl_ms must be between 1 and 300000' }));
-              } catch (_) { /* ignore */ }
-              return;
-            }
-            // Check for duplicate correlation_id
-            if (pendingRequests.has(f.correlation_id)) {
-              try {
-                ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: 'INVALID_REQUEST', message: `duplicate correlation_id: ${f.correlation_id}` }));
-              } catch (_) { /* ignore */ }
-              return;
-            }
-            const result = routeRequest(db, agentIndex, state.agentId!, { ...f, ttl_ms }, observerIndex);
-            if (!result.ok) {
-              try {
-                ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: result.error_code, message: result.error_message }));
-              } catch (_) { /* ignore */ }
-              return;
-            }
-            // Register pending request
-            const correlationId = f.correlation_id;
-            const timer = setTimeout(() => {
-              pendingRequests.delete(correlationId);
-              try {
-                ws.send(JSON.stringify({
-                  type: 'error',
-                  ref: correlationId,
-                  code: 'REQUEST_TIMEOUT',
-                  message: `no response received within ${ttl_ms}ms`,
-                }));
-              } catch (_) { /* ignore: socket may be closed */ }
-            }, ttl_ms);
-            pendingRequests.set(correlationId, {
-              correlationId,
-              fromAgent: state.agentId!,
-              expiresAt: Date.now() + ttl_ms,
-              msgId: f.msg_id,
-              timer,
-              startTime: Date.now(),
-              ws,
-            });
-            try {
-              ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
-            } catch (_) { /* ignore */ }
-            return;
-          }
-
-          if (frameType === 'response') {
-            const f = parsed as ResponseFrame;
-            // Validate required fields
-            if (typeof f.msg_id !== 'string' || typeof f.correlation_id !== 'string' || typeof f.payload !== 'string') {
-              try {
-                ws.send(JSON.stringify({ type: 'error', ref: (f as Record<string, unknown>).msg_id, code: 'INVALID_REQUEST', message: 'msg_id, correlation_id, and payload are required strings' }));
-              } catch (_) { /* ignore */ }
-              return;
-            }
-            const result = routeResponse(db, agentIndex, state.agentId!, f, pendingRequests, observerIndex);
-            if (!result.ok) {
-              try {
-                ws.send(JSON.stringify({ type: 'error', ref: f.msg_id, code: result.error_code, message: result.error_message }));
-              } catch (_) { /* ignore */ }
-              return;
-            }
-            // Retrieve pending entry
-            const pending = pendingRequests.get(f.correlation_id)!;
-            clearTimeout(pending.timer);
-            pendingRequests.delete(f.correlation_id);
-            if (pending.ws) {
-              try { pending.ws.send(result.deliverFrame!); } catch (_) { /* ignore */ }
-              incMsgStatus('response', 'delivered');
-              incReceived(pending.fromAgent);
-              incBytes('out', Buffer.byteLength(f.payload, 'utf8'));
-              if (typeof pending.startTime === 'number') observeRequestDuration((Date.now() - pending.startTime) / 1000);
-            }
-            if (pending.resolve) {
-              pending.resolve(JSON.parse(result.deliverFrame!).payload);
-            }
-            try {
-              ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
-            } catch (_) { /* ignore */ }
-            return;
-          }
-
-          if (frameType === 'file_send') {
-            const f = parsed as FileSendFrame;
-            // Validate required string fields: msg_id, to, filename, data
-            if (typeof f.msg_id !== 'string' || typeof f.to !== 'string' ||
-                typeof f.filename !== 'string' || typeof f.data !== 'string') {
-              ws.send(JSON.stringify({
-                type: 'error', ref: f.msg_id,
-                code: 'INVALID_REQUEST',
-                message: 'msg_id, to, filename, and data are required strings',
-              }));
-              return;
-            }
-            const result = routeFile(db, agentIndex, state.agentId!, f, maxFileBytes, filesDir, observerIndex);
-            if (result.ok) {
-              ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
-            } else {
-              ws.send(JSON.stringify({
-                type: 'error', ref: f.msg_id,
-                code: result.error_code,
-                message: result.error_message,
-              }));
-            }
-            return;
-          }
-
-          if (frameType === 'remind') {
-            const text = frame.text;
-            const when = frame.when;
-            const recurring = frame.recurring === true;
-            // ref-correlation: echo the REQUEST's msg_id on every reply when present.
-            const reqMsgId = (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) ? frame.msg_id : undefined;
-            const refPart = reqMsgId ? { ref: reqMsgId } : {};
-
-            if (typeof text !== 'string' || text.length === 0) {
-              try {
-                ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_WHEN', message: 'text is required' }));
-              } catch (_) { /* ignore */ }
-              return;
-            }
-            if (Buffer.byteLength(text, 'utf8') > 4096) {
-              try {
-                ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'PAYLOAD_TOO_LARGE', message: 'text exceeds 4096 bytes' }));
-              } catch (_) { /* ignore */ }
-              return;
-            }
-            if (typeof when !== 'string' || when.length === 0) {
-              try {
-                ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_WHEN', message: 'when is required' }));
-              } catch (_) { /* ignore */ }
-              return;
-            }
-
-            // Optional per-reminder IANA timezone. When present, cron fields and
-            // bare offset-less ISO one-shots are interpreted as wall-clock in tz.
-            const tzRaw = frame.tz;
-            if (tzRaw !== undefined) {
-              if (typeof tzRaw !== 'string' || !tzValidate(tzRaw)) {
-                try {
-                  ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_TZ', message: 'invalid IANA timezone' }));
-                } catch (_) { /* ignore */ }
-                return;
-              }
-            }
-            const tz = (typeof tzRaw === 'string') ? tzRaw : null;
-
-            let due_at: number;
-            let schedule: string | null;
-
-            if (recurring) {
-              if (!cronValidate(when)) {
-                try {
-                  ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_CRON', message: 'invalid cron expression' }));
-                } catch (_) { /* ignore */ }
-                return;
-              }
-              const next = tz !== null ? cronNextTz(when, Date.now(), tz) : cronNext(when, Date.now());
-              if (next === null) {
-                try {
-                  ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_CRON', message: 'no future occurrence found' }));
-                } catch (_) { /* ignore */ }
-                return;
-              }
-              due_at = next;
-              schedule = when;
-            } else {
-              const dur = parseDuration(when);
-              if (dur !== null) {
-                // Duration → absolute (tz is a no-op, still recorded).
-                due_at = Date.now() + dur;
-                schedule = null;
-              } else if (tz !== null && isBareIso(when)) {
-                // Bare offset-less ISO + tz → interpret as wall-clock in tz.
-                due_at = bareIsoToUtc(when, tz);
-                schedule = null;
-              } else {
-                const parsedTime = new Date(when).getTime();
-                if (Number.isFinite(parsedTime)) {
-                  if (parsedTime <= Date.now()) {
-                    try {
-                      ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_WHEN', message: 'due time is in the past' }));
-                    } catch (_) { /* ignore */ }
-                    return;
-                  }
-                  due_at = parsedTime;
-                  schedule = null;
-                } else {
-                  try {
-                    ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'INVALID_WHEN', message: 'when must be a duration (e.g. "90s"), ISO datetime, or cron expression with recurring=true' }));
-                  } catch (_) { /* ignore */ }
-                  return;
-                }
-              }
-            }
-
-            const rem = insertReminder(db, {
-              id: crypto.randomUUID(),
-              agent_id: state.agentId!,
-              due_at,
-              schedule,
-              payload: text,
-              created_at: Date.now(),
-              tz,
-            });
-            try {
-              ws.send(JSON.stringify({ type: 'ack', ...refPart, ok: true, reminder_id: rem.id, due_at: rem.due_at }));
-            } catch (_) { /* ignore */ }
-            return;
-          }
-
-          if (frameType === 'list_reminders') {
-            const reminders = listAgentReminders(db, state.agentId!);
-            const resp: { type: string; ref?: string; reminders: unknown[] } = {
-              type: 'reminders_list',
-              reminders: reminders.map(r => ({
-                id: r.id,
-                due_at: r.due_at,
-                schedule: r.schedule,
-                payload: r.payload,
-                created_at: r.created_at,
-                last_fired_at: r.last_fired_at,
-              })),
-            };
-            if (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) resp.ref = frame.msg_id;
-            try {
-              ws.send(JSON.stringify(resp));
-            } catch (_) { /* ignore */ }
-            return;
-          }
-
-          if (frameType === 'cancel_reminder') {
-            const id = frame.id;
-            // ref-correlation: echo the REQUEST's msg_id when present.
-            const reqMsgId = (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) ? frame.msg_id : undefined;
-            const refPart = reqMsgId ? { ref: reqMsgId } : {};
-            if (typeof id !== 'string' || id.length === 0) {
-              try {
-                ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'REMINDER_NOT_FOUND', message: 'reminder not found' }));
-              } catch (_) { /* ignore */ }
-              return;
-            }
-            const rem = getReminder(db, id);
-            if (rem === null || rem.agent_id !== state.agentId!) {
-              try {
-                ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'REMINDER_NOT_FOUND', message: 'reminder not found' }));
-              } catch (_) { /* ignore */ }
-              return;
-            }
-            const cancelled = dbCancelReminder(db, id);
-            if (!cancelled) {
-              try {
-                ws.send(JSON.stringify({ type: 'error', ...refPart, code: 'REMINDER_NOT_FOUND', message: 'reminder not found or already cancelled' }));
-              } catch (_) { /* ignore */ }
-              return;
-            }
-            try {
-              ws.send(JSON.stringify({ type: 'ack', ...refPart, ok: true }));
-            } catch (_) { /* ignore */ }
-            return;
-          }
-
-          if (frameType === 'list_presence') {
-            // Self-authed: post-auth dispatch only runs after authed===true, so
-            // state.agentId is non-null here (the first-frame gate rejects an
-            // unauthed list_presence with AUTH_REQUIRED + close 1008).
-            const caller = state.agentId!;
-            const all = listAgents(db);
-            // ACL-filtered roster: agents the caller is ACL-related to, plus self.
-            const result = all
-              .filter(a => a.id === caller || aclRelated(db, caller, a.id))
-              .map(a => ({ id: a.id, online: a.online === 1, last_seen: a.last_seen }));
-            const resp: { type: string; ref?: string; agents: typeof result } = { type: 'presence_list', agents: result };
-            if (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) resp.ref = frame.msg_id;
-            try {
-              ws.send(JSON.stringify(resp));
-            } catch (_) { /* ignore */ }
+          const handler = typeof frameType === 'string' ? POST_AUTH_HANDLERS[frameType] : undefined;
+          if (handler !== undefined) {
+            handler({ ws, state, db, frame, parsed, agentIndex, pendingRequests, observerIndex, maxFileBytes, filesDir });
             return;
           }
 

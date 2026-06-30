@@ -462,6 +462,48 @@ describe('startWsServer', () => {
     ws.close();
   }, 10000);
 
+  // Characterization for #17: a post-auth frame whose `type` is non-string or
+  // absent must fall through to NOT_IMPLEMENTED (connection stays open) — the
+  // same path as an unknown string type. Pins the dispatch-map `typeof
+  // frameType === 'string'` guard before the if-chain → table extraction.
+  it('authenticated client sending a non-string frame type receives NOT_IMPLEMENTED and stays open', async () => {
+    const rawToken = generateToken();
+    registerAgent(db, { id: 'agent-ni-num', token_hash: hashToken(rawToken), hostname: 'host1' });
+
+    const ws = await connectWs(port);
+    const authMsgPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'agent-ni-num', token: rawToken }));
+    await authMsgPromise;
+
+    const replyPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 123 }));
+
+    const reply = JSON.parse(await replyPromise);
+    expect(reply.type).toBe('error');
+    expect(reply.code).toBe('NOT_IMPLEMENTED');
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  }, 10000);
+
+  it('authenticated client sending a frame with no type receives NOT_IMPLEMENTED and stays open', async () => {
+    const rawToken = generateToken();
+    registerAgent(db, { id: 'agent-ni-none', token_hash: hashToken(rawToken), hostname: 'host1' });
+
+    const ws = await connectWs(port);
+    const authMsgPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'agent-ni-none', token: rawToken }));
+    await authMsgPromise;
+
+    const replyPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ foo: 'bar' }));
+
+    const reply = JSON.parse(await replyPromise);
+    expect(reply.type).toBe('error');
+    expect(reply.code).toBe('NOT_IMPLEMENTED');
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  }, 10000);
+
   it('authenticated client sending send frame with unknown recipient receives error', async () => {
     const rawToken = generateToken();
     registerAgent(db, { id: 'agent-send-err', token_hash: hashToken(rawToken), hostname: 'host1' });
