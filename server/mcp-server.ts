@@ -143,6 +143,267 @@ const NOT_IMPLEMENTED_RESPONSE = {
   isError: true,
 };
 
+// ──────────────────────────────────────────────────────────────────────────
+// MCP tool dispatch
+//
+// Each tool is a named module-level handler taking a single ToolCtx; the
+// TOOL_HANDLERS map (tool name -> handler) replaces what was a 9-arm inline
+// `if (toolName === 'mesh_x') {...}` chain inside one anonymous CallTool
+// callback, so static analysis sees the per-tool handlers as symbols and the
+// dispatch as explicit map edges. Tool names are mutually-exclusive exact
+// strings (no precedence), so an O(1) map is the natural structure. `mesh_request`
+// is async (it awaits a response); the others are synchronous — the ToolHandler
+// return type covers both. The CallTool guard (KNOWN_TOOL_NAMES) and the
+// NOT_IMPLEMENTED_RESPONSE fall-through are preserved at the dispatch site.
+// ──────────────────────────────────────────────────────────────────────────
+
+type ToolResult = { content: { type: 'text'; text: string }[]; isError: boolean };
+
+interface ToolCtx {
+  args: Record<string, unknown>;
+  db: Database;
+  agentIndex: Map<string, WebSocket>;
+  observerIndex: Map<string, WebSocket>;
+  pendingRequests: Map<string, PendingRequest>;
+}
+
+type ToolHandler = (ctx: ToolCtx) => Promise<ToolResult> | ToolResult;
+
+function handleMeshDiscover(ctx: ToolCtx): ToolResult {
+  const { args, db } = ctx;
+  const onlineOnly = args.filter_online === true;
+  let agents = listAgents(db, onlineOnly);
+
+  if (typeof args.capability === 'string' && args.capability.length > 0) {
+    const cap = args.capability;
+    agents = agents.filter(agent => {
+      const caps: unknown = JSON.parse(agent.capabilities);
+      return Array.isArray(caps) && caps.includes(cap);
+    });
+  }
+
+  const result = agents.map(agent => ({
+    id: agent.id,
+    hostname: agent.hostname,
+    online: agent.online === 1,
+    capabilities: JSON.parse(agent.capabilities) as string[],
+    metadata: JSON.parse(agent.metadata) as Record<string, unknown>,
+    last_seen: agent.last_seen,
+    registered_at: agent.registered_at,
+  }));
+
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+    isError: false,
+  };
+}
+
+function handleMeshSend(ctx: ToolCtx): ToolResult {
+  const { args, db, agentIndex, observerIndex } = ctx;
+  const { to, message, ttl_seconds, as_agent } = args as {
+    to: string; message: string; ttl_seconds?: number; as_agent: string;
+  };
+  const msgId = crypto.randomUUID();
+  const ttl_ms = ttl_seconds !== undefined ? ttl_seconds * 1000 : 300_000;
+  const result = routeDirect(db, agentIndex, as_agent, {
+    type: 'send', msg_id: msgId, to, payload: message,
+    content_type: 'text/plain', ttl_ms,
+  }, observerIndex);
+  if (result.ok) {
+    return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, msg_id: result.msg_id }) }], isError: false };
+  }
+  return { content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }], isError: true };
+}
+
+function handleMeshAclAllow(ctx: ToolCtx): ToolResult {
+  const { args, db } = ctx;
+  const { agent_id, as_agent } = args as { agent_id: string; as_agent: string };
+  const row = aclGrant(db, agent_id, as_agent, as_agent);
+  return { content: [{ type: 'text' as const, text: JSON.stringify(row) }], isError: false };
+}
+
+function handleMeshBroadcast(ctx: ToolCtx): ToolResult {
+  const { args, db, agentIndex, observerIndex } = ctx;
+  const { topic, message, ttl_seconds, as_agent } = args as {
+    topic: string; message: string; ttl_seconds?: number; as_agent: string;
+  };
+  const msgId = crypto.randomUUID();
+  const ttl_ms = ttl_seconds !== undefined ? ttl_seconds * 1000 : 300_000;
+  const result = routePublish(db, agentIndex, as_agent, {
+    type: 'publish', msg_id: msgId, topic, payload: message,
+    content_type: 'text/plain', ttl_ms,
+  }, observerIndex);
+  if (result.ok) {
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, msg_id: msgId }) }],
+      isError: false,
+    };
+  }
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],
+    isError: true,
+  };
+}
+
+function handleMeshSubscribe(ctx: ToolCtx): ToolResult {
+  const { args, db } = ctx;
+  const { topic, as_agent } = args as { topic: string; as_agent: string };
+  const result = routeSubscribe(db, as_agent, { type: 'subscribe', topic });
+  if (result.ok) {
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, topic }) }],
+      isError: false,
+    };
+  }
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],
+    isError: true,
+  };
+}
+
+function handleMeshUnsubscribe(ctx: ToolCtx): ToolResult {
+  const { args, db } = ctx;
+  const { topic, as_agent } = args as { topic: string; as_agent: string };
+  const result = routeUnsubscribe(db, as_agent, { type: 'unsubscribe', topic });
+  if (result.ok) {
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, topic }) }],
+      isError: false,
+    };
+  }
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],
+    isError: true,
+  };
+}
+
+function handleMeshAclDeny(ctx: ToolCtx): ToolResult {
+  const { args, db } = ctx;
+  const { agent_id, as_agent } = args as { agent_id: string; as_agent: string };
+  aclRevoke(db, agent_id, as_agent);
+  return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true }) }], isError: false };
+}
+
+function handleMeshStatus(ctx: ToolCtx): ToolResult {
+  const { args, db } = ctx;
+  const { as_agent } = args as { as_agent?: string };
+  if (typeof as_agent !== 'string' || as_agent.length === 0) {
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ error: 'INVALID_REQUEST', message: 'as_agent is required' }) }],
+      isError: true,
+    };
+  }
+  const agent = getAgentById(db, as_agent);
+  if (agent === null) {
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ error: 'AGENT_NOT_FOUND', message: 'agent not found' }) }],
+      isError: true,
+    };
+  }
+  const subscriptions = getAgentSubscriptions(db, as_agent);
+  const queued_messages = getPendingMessages(db, as_agent).length;
+  const server_uptime_ms = Date.now() - SERVER_START_MS;
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify({
+      agent_id: as_agent,
+      online: agent.online === 1,
+      subscriptions,
+      queued_messages,
+      server_uptime_ms,
+    }) }],
+    isError: false,
+  };
+}
+
+async function handleMeshRequest(ctx: ToolCtx): Promise<ToolResult> {
+  const { args, db, agentIndex, observerIndex, pendingRequests } = ctx;
+  const { to, message, as_agent, timeout_seconds } = args as {
+    to?: string; message?: string; as_agent?: string; timeout_seconds?: number;
+  };
+  // Validate required fields
+  if (typeof to !== 'string' || typeof message !== 'string' || typeof as_agent !== 'string') {
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ error: 'INVALID_REQUEST', message: 'to, message, and as_agent are required' }) }],
+      isError: true,
+    };
+  }
+  const timeoutSecs = timeout_seconds === undefined ? 30 : timeout_seconds;
+  if (timeoutSecs <= 0 || timeoutSecs > 300) {
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ error: 'INVALID_REQUEST', message: 'timeout_seconds must be between 1 and 300' }) }],
+      isError: true,
+    };
+  }
+  const ttl_ms = timeoutSecs * 1000;
+  const msgId = crypto.randomUUID();
+  const correlationId = crypto.randomUUID();
+  const result = routeRequest(db, agentIndex, as_agent, {
+    type: 'request',
+    msg_id: msgId,
+    to,
+    payload: message,
+    content_type: 'text/plain',
+    ttl_ms,
+    correlation_id: correlationId,
+  }, observerIndex);
+  if (!result.ok) {
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],
+      isError: true,
+    };
+  }
+  // Create a promise that resolves when the response arrives
+  const responsePayload = await new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingRequests.delete(correlationId);
+      reject(new Error('REQUEST_TIMEOUT'));
+    }, ttl_ms);
+    pendingRequests.set(correlationId, {
+      correlationId,
+      fromAgent: as_agent,
+      expiresAt: Date.now() + ttl_ms,
+      msgId,
+      timer,
+      startTime: Date.now(),
+      resolve,
+      reject,
+    });
+  }).catch((err: Error) => {
+    if (err.message === 'REQUEST_TIMEOUT') {
+      return null;
+    }
+    throw err;
+  });
+
+  if (responsePayload === null) {
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ error: 'REQUEST_TIMEOUT' }) }],
+      isError: true,
+    };
+  }
+
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, response: responsePayload }) }],
+    isError: false,
+  };
+}
+
+// Tool name -> handler. Exact-string keys, mutually exclusive (no precedence),
+// so map order is behavior-irrelevant. A name in KNOWN_TOOL_NAMES but absent
+// here falls through to NOT_IMPLEMENTED_RESPONSE at the dispatch site (defensive;
+// unreachable while this map covers every entry in TOOLS).
+const TOOL_HANDLERS: Record<string, ToolHandler> = {
+  mesh_send: handleMeshSend,
+  mesh_broadcast: handleMeshBroadcast,
+  mesh_subscribe: handleMeshSubscribe,
+  mesh_unsubscribe: handleMeshUnsubscribe,
+  mesh_discover: handleMeshDiscover,
+  mesh_status: handleMeshStatus,
+  mesh_acl_allow: handleMeshAclAllow,
+  mesh_acl_deny: handleMeshAclDeny,
+  mesh_request: handleMeshRequest,
+};
+
 export async function startMcpServer(
   db: Database,
   agentIndex: Map<string, WebSocket> = new Map(),
@@ -173,214 +434,12 @@ export async function startMcpServer(
 
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
 
-    if (toolName === 'mesh_discover') {
-      const onlineOnly = args.filter_online === true;
-      let agents = listAgents(db, onlineOnly);
-
-      if (typeof args.capability === 'string' && args.capability.length > 0) {
-        const cap = args.capability;
-        agents = agents.filter(agent => {
-          const caps: unknown = JSON.parse(agent.capabilities);
-          return Array.isArray(caps) && caps.includes(cap);
-        });
-      }
-
-      const result = agents.map(agent => ({
-        id: agent.id,
-        hostname: agent.hostname,
-        online: agent.online === 1,
-        capabilities: JSON.parse(agent.capabilities) as string[],
-        metadata: JSON.parse(agent.metadata) as Record<string, unknown>,
-        last_seen: agent.last_seen,
-        registered_at: agent.registered_at,
-      }));
-
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify(result) }],
-        isError: false,
-      };
-    }
-
-    if (toolName === 'mesh_send') {
-      const { to, message, ttl_seconds, as_agent } = args as {
-        to: string; message: string; ttl_seconds?: number; as_agent: string;
-      };
-      const msgId = crypto.randomUUID();
-      const ttl_ms = ttl_seconds !== undefined ? ttl_seconds * 1000 : 300_000;
-      const result = routeDirect(db, agentIndex, as_agent, {
-        type: 'send', msg_id: msgId, to, payload: message,
-        content_type: 'text/plain', ttl_ms,
-      }, observerIndex);
-      if (result.ok) {
-        return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, msg_id: result.msg_id }) }], isError: false };
-      }
-      return { content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }], isError: true };
-    }
-
-    if (toolName === 'mesh_acl_allow') {
-      const { agent_id, as_agent } = args as { agent_id: string; as_agent: string };
-      const row = aclGrant(db, agent_id, as_agent, as_agent);
-      return { content: [{ type: 'text' as const, text: JSON.stringify(row) }], isError: false };
-    }
-
-    if (toolName === 'mesh_broadcast') {
-      const { topic, message, ttl_seconds, as_agent } = args as {
-        topic: string; message: string; ttl_seconds?: number; as_agent: string;
-      };
-      const msgId = crypto.randomUUID();
-      const ttl_ms = ttl_seconds !== undefined ? ttl_seconds * 1000 : 300_000;
-      const result = routePublish(db, agentIndex, as_agent, {
-        type: 'publish', msg_id: msgId, topic, payload: message,
-        content_type: 'text/plain', ttl_ms,
-      }, observerIndex);
-      if (result.ok) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, msg_id: msgId }) }],
-          isError: false,
-        };
-      }
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],
-        isError: true,
-      };
-    }
-
-    if (toolName === 'mesh_subscribe') {
-      const { topic, as_agent } = args as { topic: string; as_agent: string };
-      const result = routeSubscribe(db, as_agent, { type: 'subscribe', topic });
-      if (result.ok) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, topic }) }],
-          isError: false,
-        };
-      }
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],
-        isError: true,
-      };
-    }
-
-    if (toolName === 'mesh_unsubscribe') {
-      const { topic, as_agent } = args as { topic: string; as_agent: string };
-      const result = routeUnsubscribe(db, as_agent, { type: 'unsubscribe', topic });
-      if (result.ok) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, topic }) }],
-          isError: false,
-        };
-      }
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],
-        isError: true,
-      };
-    }
-
-    if (toolName === 'mesh_acl_deny') {
-      const { agent_id, as_agent } = args as { agent_id: string; as_agent: string };
-      aclRevoke(db, agent_id, as_agent);
-      return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true }) }], isError: false };
-    }
-
-    if (toolName === 'mesh_status') {
-      const { as_agent } = args as { as_agent?: string };
-      if (typeof as_agent !== 'string' || as_agent.length === 0) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ error: 'INVALID_REQUEST', message: 'as_agent is required' }) }],
-          isError: true,
-        };
-      }
-      const agent = getAgentById(db, as_agent);
-      if (agent === null) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ error: 'AGENT_NOT_FOUND', message: 'agent not found' }) }],
-          isError: true,
-        };
-      }
-      const subscriptions = getAgentSubscriptions(db, as_agent);
-      const queued_messages = getPendingMessages(db, as_agent).length;
-      const server_uptime_ms = Date.now() - SERVER_START_MS;
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify({
-          agent_id: as_agent,
-          online: agent.online === 1,
-          subscriptions,
-          queued_messages,
-          server_uptime_ms,
-        }) }],
-        isError: false,
-      };
-    }
-
-    if (toolName === 'mesh_request') {
-      const { to, message, as_agent, timeout_seconds } = args as {
-        to?: string; message?: string; as_agent?: string; timeout_seconds?: number;
-      };
-      // Validate required fields
-      if (typeof to !== 'string' || typeof message !== 'string' || typeof as_agent !== 'string') {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ error: 'INVALID_REQUEST', message: 'to, message, and as_agent are required' }) }],
-          isError: true,
-        };
-      }
-      const timeoutSecs = timeout_seconds === undefined ? 30 : timeout_seconds;
-      if (timeoutSecs <= 0 || timeoutSecs > 300) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ error: 'INVALID_REQUEST', message: 'timeout_seconds must be between 1 and 300' }) }],
-          isError: true,
-        };
-      }
-      const ttl_ms = timeoutSecs * 1000;
-      const msgId = crypto.randomUUID();
-      const correlationId = crypto.randomUUID();
-      const result = routeRequest(db, agentIndex, as_agent, {
-        type: 'request',
-        msg_id: msgId,
-        to,
-        payload: message,
-        content_type: 'text/plain',
-        ttl_ms,
-        correlation_id: correlationId,
-      }, observerIndex);
-      if (!result.ok) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],
-          isError: true,
-        };
-      }
-      // Create a promise that resolves when the response arrives
-      const responsePayload = await new Promise<string>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          pendingRequests.delete(correlationId);
-          reject(new Error('REQUEST_TIMEOUT'));
-        }, ttl_ms);
-        pendingRequests.set(correlationId, {
-          correlationId,
-          fromAgent: as_agent,
-          expiresAt: Date.now() + ttl_ms,
-          msgId,
-          timer,
-          startTime: Date.now(),
-          resolve,
-          reject,
-        });
-      }).catch((err: Error) => {
-        if (err.message === 'REQUEST_TIMEOUT') {
-          return null;
-        }
-        throw err;
-      });
-
-      if (responsePayload === null) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ error: 'REQUEST_TIMEOUT' }) }],
-          isError: true,
-        };
-      }
-
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, response: responsePayload }) }],
-        isError: false,
-      };
+    // Named handler per tool; see TOOL_HANDLERS (module scope). A KNOWN tool
+    // with no handler entry falls through to NOT_IMPLEMENTED_RESPONSE, exactly
+    // as the prior if-chain did.
+    const handler = TOOL_HANDLERS[toolName];
+    if (handler !== undefined) {
+      return handler({ args, db, agentIndex, observerIndex, pendingRequests });
     }
 
     return NOT_IMPLEMENTED_RESPONSE;
