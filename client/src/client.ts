@@ -185,6 +185,14 @@ export class MeshClient {
     return this.sendWithAck(msgId, frame);
   }
 
+  /**
+   * Subscribe to a topic. The topic is tracked and auto-replayed on every
+   * reconnect, so a subscription survives connection drops. If the connection
+   * drops while this call's ack is in flight, the promise rejects with
+   * `code: 'CONNECTION_RESET'` — but the subscription is still replayed on the
+   * next reconnect, so it takes effect regardless; treat such a reject as
+   * transient (re-subscribing is safe).
+   */
   subscribe(topic: string): Promise<void> {
     this.subscribedTopics.add(topic);
     const frame: SubscribeFrame = { type: 'subscribe', topic };
@@ -197,6 +205,16 @@ export class MeshClient {
     return this.sendWithAck(topic, frame);
   }
 
+  /**
+   * Send a request and await the peer's response.
+   *
+   * If the connection drops while the request is in flight, the returned
+   * promise rejects promptly with an Error whose `code` is `CONNECTION_RESET`
+   * (rather than waiting out `timeoutMs`). Note the request may already have
+   * reached the peer before the drop, so a retry has at-least-once semantics —
+   * the peer can process the logical request twice. Make retried requests
+   * idempotent, or branch on `err.code === 'CONNECTION_RESET'` to decide.
+   */
   request(to: string, text: string, opts: RequestOpts = {}): Promise<Inbound> {
     if (!this.isOpen()) {
       return Promise.reject(new Error('not connected'));
@@ -292,24 +310,7 @@ export class MeshClient {
     }
     this.clearConnectTimeout();
 
-    const closedErr = new Error('client closed');
-    for (const [, p] of this.pendingRequests) {
-      clearTimeout(p.timer);
-      p.reject(closedErr);
-    }
-    this.pendingRequests.clear();
-    for (const [, a] of this.pendingAcks) {
-      a.reject(closedErr);
-    }
-    this.pendingAcks.clear();
-    for (const [, r] of this.pendingReminds) {
-      r.reject(closedErr);
-    }
-    this.pendingReminds.clear();
-    for (const [, l] of this.pendingReminderLists) {
-      l.reject(closedErr);
-    }
-    this.pendingReminderLists.clear();
+    this.failAllPending(new Error('client closed'));
 
     if (this.ws !== null) {
       try {
@@ -369,6 +370,40 @@ export class MeshClient {
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
+  }
+
+  /**
+   * Reject and clear EVERY in-flight waiter — requests, acks, reminds, and
+   * reminder-lists — with `err`, clearing request timeout timers first so a
+   * cleared timer can never later double-settle.
+   *
+   * Called from two places:
+   *  - close(): err = `client closed`.
+   *  - the socket 'close' handler on an unexpected drop: err = `connection
+   *    reset` (code CONNECTION_RESET). A drop orphans every in-flight waiter —
+   *    the server routes any response to the now-dead socket, so a reconnect
+   *    can't recover it. Failing fast lets callers retry instead of request()
+   *    waiting out its full timeoutMs and the ack/remind/list waiters (which
+   *    have NO timeout) hanging until close().
+   */
+  private failAllPending(err: Error): void {
+    for (const [, p] of this.pendingRequests) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+    this.pendingRequests.clear();
+    for (const [, a] of this.pendingAcks) {
+      a.reject(err);
+    }
+    this.pendingAcks.clear();
+    for (const [, r] of this.pendingReminds) {
+      r.reject(err);
+    }
+    this.pendingReminds.clear();
+    for (const [, l] of this.pendingReminderLists) {
+      l.reject(err);
+    }
+    this.pendingReminderLists.clear();
   }
 
   private emit(event: MeshClientEvent, ...args: any[]): void {
@@ -447,6 +482,20 @@ export class MeshClient {
       if (this.ws === ws) {
         this.ws = null;
       }
+      // Fail every in-flight waiter fast on the drop. The server has already
+      // (or will) route any response to this now-dead socket, so a reconnect
+      // cannot recover them — without this, request() would wait out its full
+      // timeoutMs and the ack/remind/list waiters (no timeout) would hang
+      // until close(). After an explicit close() the maps are already cleared,
+      // so this is a no-op.
+      //
+      // NOTE: a subscribe() in flight at the drop also rejects here with
+      // CONNECTION_RESET, but onAuthOk auto-replays subscribedTopics on
+      // reconnect — the subscription still takes effect, so treat the reject
+      // as transient (re-subscribing is safe / it is already live).
+      this.failAllPending(
+        Object.assign(new Error('connection reset'), { code: 'CONNECTION_RESET' })
+      );
       this.emit('disconnect');
       if (this.shouldReconnect) {
         this.scheduleReconnect(config);

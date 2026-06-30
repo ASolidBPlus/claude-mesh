@@ -127,17 +127,17 @@ describe('MeshClient reconnect robustness', () => {
   }, 15000);
 
   // ── Test 2 ───────────────────────────────────────────────────────────
-  // An in-flight request that spans a forced reconnect must settle
-  // DETERMINISTICALLY (no hang), exactly once, and must not leave a stale timer
-  // that double-settles or disrupts later requests. We also assert that the
-  // request still works normally once the client has reconnected.
+  // An in-flight request that spans a forced reconnect must FAIL FAST on the
+  // drop — rejecting promptly with `code: 'CONNECTION_RESET'` rather than
+  // waiting out its full timeoutMs — settle exactly once, leave no stale timer
+  // that double-settles, and not disrupt later requests.
   //
-  // NOTE on actual behaviour: dropping the socket does NOT itself reject a
-  // pending request (the client only clears pendingRequests on explicit
-  // `close()`); the request's own timeout timer survives the reconnect and is
-  // what settles it. With a small timeoutMs this is fast and deterministic —
-  // it rejects with `request timeout`, never hangs, and never double-settles.
-  it('in-flight request across a forced reconnect settles once and never hangs', async () => {
+  // We give the request a LARGE timeoutMs (10s) and a target that never answers
+  // (C is offline), so the ONLY thing that can settle it quickly is the
+  // drop-driven CONNECTION_RESET reject. If the old wait-out-the-timeout
+  // behaviour regressed, this request would hang ~10s and the elapsed-time
+  // assertion (and ultimately the test timeout) would catch it.
+  it('in-flight request fails fast with CONNECTION_RESET on a forced reconnect', async () => {
     aclGrant(db, 'A', 'B', 'system');
     aclGrant(db, 'B', 'A', 'system');
     aclGrant(db, 'A', 'C', 'system'); // allowed-but-offline target for the in-flight request
@@ -155,30 +155,41 @@ describe('MeshClient reconnect robustness', () => {
     await a.connect();
 
     // Start a request to C (registered+allowed but OFFLINE, so it is queued and
-    // never answered), then immediately drop A's socket so the request is
-    // in-flight across the reconnect.
+    // never answered) with a deliberately large timeout, then immediately drop
+    // A's socket so the request is in-flight across the reconnect.
     let settleCount = 0;
     let outcome: string = 'pending';
+    let outcomeCode: string | undefined;
+    const startedAt = Date.now();
+    let settledAt = 0;
     const inflight = a
-      .request('C', 'q?', { timeoutMs: 500 })
+      .request('C', 'q?', { timeoutMs: 10_000 })
       .then(
-        () => { settleCount++; outcome = 'resolved'; },
-        (e) => { settleCount++; outcome = 'rejected:' + (e as Error).message; },
+        () => { settleCount++; outcome = 'resolved'; settledAt = Date.now(); },
+        (e) => {
+          settleCount++;
+          outcome = 'rejected:' + (e as Error).message;
+          outcomeCode = (e as { code?: string }).code;
+          settledAt = Date.now();
+        },
       );
 
     // Force-close the underlying socket → drives the real reconnect path.
     (a as unknown as { ws: { close: () => void } }).ws.close();
 
-    // It must settle (not hang). With the small timeout it rejects deterministically.
+    // It must settle fast — via the drop, NOT the 10s timeout.
     await inflight;
     expect(settleCount).toBe(1);
-    expect(outcome).toBe('rejected:request timeout');
+    expect(outcome).toBe('rejected:connection reset');
+    expect(outcomeCode).toBe('CONNECTION_RESET');
+    // Fail-fast: settled far sooner than the 10s timeoutMs.
+    expect(settledAt - startedAt).toBeLessThan(3000);
 
-    // Give the old timer's window time to (not) fire a second time and let A reconnect.
+    // Give any stale timer its window to (not) fire a second time and let A reconnect.
     await aConnect.next();
     await delay(800);
 
-    // The promise did not double-settle from any stale timer.
+    // The promise did not double-settle from a leftover timer.
     expect(settleCount).toBe(1);
 
     // A subsequent normal request works after reconnect — no leaked correlation
@@ -186,6 +197,77 @@ describe('MeshClient reconnect robustness', () => {
     const res = await a.request('B', 'q2?', { timeoutMs: 3000 });
     expect(res.kind).toBe('response');
     expect(res.text).toBe('ans');
+  }, 15000);
+
+  // ── Test 2a ──────────────────────────────────────────────────────────
+  // A forced drop rejects and clears ALL FOUR pending maps (requests, acks,
+  // reminds, reminderLists) with `code: 'CONNECTION_RESET'`, leaving no leaks.
+  // The ack/remind/list waiters have NO timeout of their own, so before this
+  // fix they would hang until close(); here they must fail fast on the drop.
+  it('forced drop rejects all four pending maps with CONNECTION_RESET (no leaks)', async () => {
+    aclGrant(db, 'A', 'C', 'system'); // C offline → request queues, never answers
+    const a = newClient('A', tokenA);
+    await a.connect();
+
+    const results: { label: string; outcome: string; code?: string }[] = [];
+    const collect = (label: string, p: Promise<unknown>) =>
+      p.then(
+        () => results.push({ label, outcome: 'resolved' }),
+        (e) => results.push({ label, outcome: (e as Error).message, code: (e as { code?: string }).code }),
+      );
+
+    // (a) A genuine in-flight request (large timeout so only the drop can settle it).
+    const reqP = collect('req', a.request('C', 'q?', { timeoutMs: 30_000 }));
+
+    // (b) Seed the ack/remind/list maps directly — these waiters are normally
+    // cleared same-tick by the server's ack, so they can't be observed pending
+    // deterministically. Seeding proves the drop teardown covers every map.
+    const internals = a as unknown as {
+      pendingRequests: Map<string, unknown>;
+      pendingAcks: Map<string, { resolve: () => void; reject: (e: Error) => void }>;
+      pendingReminds: Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>;
+      pendingReminderLists: Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>;
+    };
+    const ackP = new Promise<void>((resolve, reject) => {
+      internals.pendingAcks.set('seed-ack', { resolve, reject });
+    });
+    const remindP = new Promise<unknown>((resolve, reject) => {
+      internals.pendingReminds.set('seed-remind', { resolve, reject });
+    });
+    const listP = new Promise<unknown>((resolve, reject) => {
+      internals.pendingReminderLists.set('seed-list', { resolve, reject });
+    });
+    const all = Promise.all([
+      reqP,
+      collect('ack', ackP),
+      collect('remind', remindP),
+      collect('list', listP),
+    ]);
+
+    // All four maps non-empty before the drop.
+    expect(internals.pendingRequests.size).toBe(1);
+    expect(internals.pendingAcks.size).toBe(1);
+    expect(internals.pendingReminds.size).toBe(1);
+    expect(internals.pendingReminderLists.size).toBe(1);
+
+    // Force-close to drive the real drop path (NOT close()), then stop reconnect
+    // so the test ends cleanly.
+    (a as unknown as { ws: { close: () => void } }).ws.close();
+    await all;
+    a.close();
+
+    // Every waiter rejected with `connection reset` / CONNECTION_RESET.
+    for (const r of results) {
+      expect(r.outcome).toBe('connection reset');
+      expect(r.code).toBe('CONNECTION_RESET');
+    }
+    expect(results.map((r) => r.label).sort()).toEqual(['ack', 'list', 'remind', 'req']);
+
+    // All maps cleared — no leaks.
+    expect(internals.pendingRequests.size).toBe(0);
+    expect(internals.pendingAcks.size).toBe(0);
+    expect(internals.pendingReminds.size).toBe(0);
+    expect(internals.pendingReminderLists.size).toBe(0);
   }, 15000);
 
   // ── Test 2b ──────────────────────────────────────────────────────────
