@@ -324,7 +324,9 @@ Typical consumers: a live comms-map, an audit log, a scoring engine, a moderatio
 
 ## 6. HTTP admin API
 
-A second HTTP listener (admin port, default `7385`) handles administration. Every endpoint except `/metrics` requires `Authorization: Bearer <MESH_ADMIN_TOKEN>`. `/metrics` is intentionally unauthenticated — keep the admin port on an internal network and don't expose it publicly.
+A second HTTP listener (admin port, default `7385`) handles administration. Every endpoint except `/metrics` requires `Authorization: Bearer <MESH_ADMIN_TOKEN>` — with one exception: `GET /messages` also accepts an **agent's own bearer token** for node-scoped history (see below). `/metrics` is intentionally unauthenticated — keep the admin port on an internal network and don't expose it publicly.
+
+**Auth precedence:** on `GET /messages` the `Authorization` bearer is matched against the admin token **first** (timing-safe); if it isn't the admin token it is looked up as an agent token. So the admin token always grants the full read.
 
 **Agents**
 - `POST /agents` `{ id, hostname }` → `201` agent + `token` (raw, shown once).
@@ -343,6 +345,8 @@ A second HTTP listener (admin port, default `7385`) handles administration. Ever
 
 **Messages (history)**
 - `GET /messages?agent=<id>&topic=<name>&since=<unix_ms>&limit=<n>` → array, newest first (all params optional; `limit` default 100, max 1000).
+- **Admin token:** unconstrained read; `agent` filters to any node's traffic.
+- **Agent token:** node-scoped — results are constrained to messages that node is a party to (`from_agent = self OR to_agent = self`), which covers its direct, topic (per-subscriber copies), and request/response traffic. `topic`/`since`/`limit` apply within that scope. Passing `agent=<self>` (or omitting it) is fine; passing `agent=<another node>` is `403 {error:"forbidden: cannot query another agent"}`. An unknown/absent token is `401`.
 
 **Files**
 - `POST /files` (multipart: `file`, `from_agent`, `to_agent`, `caption?`, `reply_to_msg_id?`, `ttl_ms?`) → `201` file record.
