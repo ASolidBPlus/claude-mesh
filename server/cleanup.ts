@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import { unlinkSync } from 'fs';
-import { expireMessages, deleteExpiredFiles, deleteDeliveredOneShots } from './db.ts';
+import { countExpiredUndeliveredSince, sweepRetention, deleteExpiredFiles, deleteDeliveredOneShots } from './db.ts';
 import { PendingRequest } from './router.ts';
 import { incExpiredByKind } from './metrics.ts';
 
@@ -13,7 +13,8 @@ export function startCleanup(
   db: Database,
   pendingRequests: Map<string, PendingRequest>,
   agentIndex: Map<string, WebSocket>,
-  intervalMs?: number
+  intervalMs?: number,
+  retentionMs?: number | null
 ): CleanupHandle {
   const resolvedIntervalMs = intervalMs ?? parseInt(process.env.MESH_CLEANUP_INTERVAL_MS ?? '60000', 10);
 
@@ -22,15 +23,30 @@ export function startCleanup(
     process.exit(1);
   }
 
+  const resolvedRetentionMs = retentionMs ?? null;
+
+  // High-water mark for the windowed expired-undelivered counter: each tick
+  // counts rows whose TTL fell in [lastExpireSweepAt, now) exactly once.
+  let lastExpireSweepAt = Date.now();
+
   const timer = setInterval(() => {
     try {
-      const expiredByKind = expireMessages(db);
+      const now = Date.now();
+      const expiredByKind = countExpiredUndeliveredSince(db, lastExpireSweepAt, now);
+      lastExpireSweepAt = now;
       let expiredTotal = 0;
       for (const [kind, n] of Object.entries(expiredByKind)) {
         incExpiredByKind(kind, n);
         expiredTotal += n;
       }
-      process.stdout.write(`[cleanup] expired ${expiredTotal} message(s)\n`);
+      process.stdout.write(`[cleanup] expired ${expiredTotal} undelivered message(s)\n`);
+
+      // Retention sweep: only when configured. Deletes rows older than the
+      // window EXCEPT still-deliverable pending mail (see sweepRetention).
+      if (resolvedRetentionMs !== null) {
+        const removed = sweepRetention(db, resolvedRetentionMs);
+        process.stdout.write(`[cleanup] retention swept ${removed} message(s)\n`);
+      }
 
       const expiredPaths = deleteExpiredFiles(db);
       for (const p of expiredPaths) {

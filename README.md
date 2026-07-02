@@ -73,7 +73,9 @@ A consumer has three raw surfaces to build on:
 
 **ACL gates delivery.** An ACL entry `from → to` permits `from` to send to `to`. Direct messages, requests, responses, and per-subscriber topic delivery are all checked server-side; an unpermitted send is rejected with `ACL_DENIED`. ACLs are admin-managed (`POST/DELETE/GET /acl`) — a node can't grant itself access.
 
-**Every message is persisted.** Messages land in SQLite at acceptance, with sender, recipient/topic, payload, and timestamps. If the recipient is offline the message queues and drains on its next connect. Messages carry a TTL (default 5 min; `null` = forever); history is queryable via `GET /messages`.
+**Every message is persisted.** Messages land in SQLite at acceptance, with sender, recipient/topic, payload, and timestamps. If the recipient is offline the message queues and drains on its next connect. History is queryable via `GET /messages`.
+
+**Delivery TTL and retention are different lifecycles.** A message's `ttl_ms` (default 5 min; `0` = drop if offline, `null` = never expires) governs *deliverability* only: an undelivered message past its TTL is never delivered, but it stays in the store as history ("sent, never delivered"). How long rows live in the store is a separate server policy — `MESH_RETENTION_MS` (unset = **keep forever**), swept against `sent_at`. Delivered history is never erased at TTL. The retention sweep never removes still-deliverable pending mail (an undelivered, unexpired message keeps queuing regardless of age).
 
 ---
 
@@ -370,6 +372,8 @@ Operational aggregates only — no per-conversation/analytic series (those are a
 
 Counters are in-memory and reset on restart — graph them with `rate()`/`increase()`, never raw deltas.
 
+`mesh_messages_total{status="expired"}` counts messages that crossed their delivery TTL while still **undelivered** (their deliverability died) — not messages deleted from the store, which no longer happens at TTL. It's incremented once per message as it expires, windowed over each cleanup tick; because the counter is in-memory, expiries that cross the TTL boundary while the server is down are not counted (consistent with `rate()`/`increase()` graphing).
+
 ### The tap
 The live message stream — see [§5](#5-observers-and-the-tap). `/metrics` answers *how much / how healthy*, the tap answers *what's flowing now*, the message store answers *what happened*.
 
@@ -399,10 +403,11 @@ MESH_ADMIN_TOKEN=dev-secret bun server.ts      # WS :7384, admin :7385
 | `MESH_ADMIN_PORT` | `7385` | Admin HTTP port (also serves `/metrics`) |
 | `MESH_FILES_DIR` | `/data/files` | On-disk file storage |
 | `MESH_MAX_FILE_BYTES` | `10485760` | Max file size (10 MB) |
-| `MESH_CLEANUP_INTERVAL_MS` | `60000` | Expiry sweep interval |
+| `MESH_CLEANUP_INTERVAL_MS` | `60000` | Cleanup tick interval (expiry accounting, retention sweep, file/reminder cleanup) |
 | `MESH_REMINDER_INTERVAL_MS` | `10000` | Reminder scheduler tick |
 | `MESH_PRESENCE_DEBOUNCE_MS` | `12000` | Suppress presence flap on reconnect within this window (`0` = immediate) |
 | `MESH_MCP_MODE` | `0` | `1` = run as an MCP stdio server (stdin EOF shuts the server down). Default `0` runs as a standalone daemon that survives stdin being closed (e.g. `docker run -d`). |
+| `MESH_RETENTION_MS` | *(unset = forever)* | Retention window: rows older than this (by `sent_at`) are swept from the store. Unset keeps history forever. Still-deliverable pending mail is never swept. Positive integer ms; no upper bound. |
 
 **Docker:**
 ```bash

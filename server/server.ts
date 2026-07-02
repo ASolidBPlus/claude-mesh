@@ -20,6 +20,7 @@ export interface Config {
   reminderIntervalMs: number;
   presenceDebounceMs: number;
   mcpMode: boolean;
+  retentionMs: number | null;
 }
 
 export function loadConfig(): Config {
@@ -106,7 +107,21 @@ export function loadConfig(): Config {
   // shutdown — otherwise the daemon exits immediately on startup.
   const mcpMode = process.env.MESH_MCP_MODE === '1';
 
-  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode };
+  // Message retention (#34): how long delivered/expired rows stay in the store,
+  // swept by the cleanup tick against sent_at. Unset ⇒ null ⇒ keep forever.
+  // No upper cap — retention windows are legitimately large (days/weeks).
+  let retentionMs: number | null = null;
+  const retentionStr = process.env.MESH_RETENTION_MS;
+  if (retentionStr !== undefined) {
+    const parsed = parseInt(retentionStr, 10);
+    if (isNaN(parsed) || parsed <= 0 || String(parsed) !== retentionStr.trim()) {
+      process.stderr.write(`MESH_RETENTION_MS must be a positive integer (ms), got: ${retentionStr}\n`);
+      process.exit(1);
+    }
+    retentionMs = parsed;
+  }
+
+  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs };
 }
 
 async function main() {
@@ -172,7 +187,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await mcpHandle.server.connect(transport);
 
-  cleanupHandle = startCleanup(db, pendingRequests, agentIndex, config.cleanupIntervalMs);
+  cleanupHandle = startCleanup(db, pendingRequests, agentIndex, config.cleanupIntervalMs, config.retentionMs);
   reminderHandle = startReminderScheduler(db, wsHandle.agentIndex, config.reminderIntervalMs);
 
   // Only treat stdin EOF as a shutdown signal in MCP stdio mode. A standalone

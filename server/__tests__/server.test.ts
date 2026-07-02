@@ -5,7 +5,7 @@ import type { Config } from '../server.ts';
 async function callLoadConfig(env: Record<string, string | undefined>): Promise<{ config?: Config; exitCode?: number }> {
   // Save original env
   const saved: Record<string, string | undefined> = {};
-  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE'];
+  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS'];
   for (const key of keys) {
     saved[key] = process.env[key];
     if (env[key] !== undefined) {
@@ -65,7 +65,7 @@ describe('loadConfig', () => {
   it('returns defaults when only MESH_ADMIN_TOKEN is set', async () => {
     const { config, exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok' });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, adminToken: 'tok', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false });
+    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, adminToken: 'tok', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null });
   });
 
   it('returns correct values when all valid env vars are set', async () => {
@@ -75,7 +75,7 @@ describe('loadConfig', () => {
       MESH_WS_PORT: '8080',
     });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, adminToken: 'secret', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false });
+    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, adminToken: 'secret', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null });
   });
 
   it('MESH_MAX_FILE_BYTES: defaults to 10 MB when not set', async () => {
@@ -149,6 +149,28 @@ describe('loadConfig', () => {
     const { config, exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_MCP_MODE: 'true' });
     expect(exitCode).toBeUndefined();
     expect(config?.mcpMode).toBe(false);
+  });
+
+  it('MESH_RETENTION_MS: defaults to null (keep forever)', async () => {
+    const { config, exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok' });
+    expect(exitCode).toBeUndefined();
+    expect(config?.retentionMs).toBeNull();
+  });
+
+  it('MESH_RETENTION_MS: reads a positive integer', async () => {
+    const { config, exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_RETENTION_MS: '604800000' });
+    expect(exitCode).toBeUndefined();
+    expect(config?.retentionMs).toBe(604800000);
+  });
+
+  it('MESH_RETENTION_MS: exits with 1 when set to 0', async () => {
+    const { exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_RETENTION_MS: '0' });
+    expect(exitCode).toBe(1);
+  });
+
+  it('MESH_RETENTION_MS: exits with 1 when non-integer', async () => {
+    const { exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_RETENTION_MS: 'abc' });
+    expect(exitCode).toBe(1);
   });
 
   it('exits with code 1 when MESH_WS_PORT is not a number', async () => {
