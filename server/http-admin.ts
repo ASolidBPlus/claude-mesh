@@ -4,6 +4,7 @@ import * as net from 'net';
 import { WebSocket } from 'ws';
 import {
   getAgentById,
+  getAgentByToken,
   aclGrant,
   aclRevoke,
   aclCheck,
@@ -31,7 +32,7 @@ import {
   isObserver,
   listObservers,
 } from './db.ts';
-import { generateToken, hashToken } from './auth.ts';
+import { generateToken, hashToken, timingSafeEqual } from './auth.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
 import { PendingRequest } from './router.ts';
@@ -62,6 +63,37 @@ function requireAdmin(
   res.writeHead(401, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'unauthorized' }));
   return false;
+}
+
+// Result of authenticating a request on an agent-or-admin route.
+type AuthResult = { mode: 'admin' } | { mode: 'agent'; agentId: string };
+
+// Resolve auth for a route that accepts EITHER the admin token OR an agent's
+// own bearer token. Admin is checked FIRST (exact, timing-safe) — if the token
+// is the configured admin token the caller is admin; otherwise it is looked up
+// as an agent token (SHA-256 hashed, then matched against agents.token_hash —
+// the raw token is never byte-compared against a stored secret). Returns null
+// and writes 401 when neither matches.
+function resolveAuth(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  db: Database,
+  adminToken: string
+): AuthResult | null {
+  const header = req.headers['authorization'];
+  if (typeof header === 'string' && header.startsWith('Bearer ')) {
+    const token = header.slice('Bearer '.length);
+    if (timingSafeEqual(token, adminToken)) {
+      return { mode: 'admin' };
+    }
+    const agent = getAgentByToken(db, token);
+    if (agent !== null) {
+      return { mode: 'agent', agentId: agent.id };
+    }
+  }
+  res.writeHead(401, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'unauthorized' }));
+  return null;
 }
 
 function formatAgent(agent: Agent): Record<string, unknown> {
@@ -97,6 +129,10 @@ interface AdminCtx {
   observerIndex: Map<string, WebSocket>;
   maxFileBytes: number;
   filesDir: string;
+  // Authenticated caller. 'admin' for admin-token routes; for 'agentOrAdmin'
+  // routes it is 'admin' or the specific agent. Handlers that don't scope by
+  // caller ignore it.
+  auth: AuthResult;
 }
 
 type AdminHandler = (ctx: AdminCtx) => Promise<void> | void;
@@ -105,6 +141,9 @@ interface Route {
   method: string;
   match: (pathname: string) => Record<string, string> | null;
   handler: AdminHandler;
+  // 'admin' (default) requires the admin token; 'agentOrAdmin' also accepts an
+  // agent's own bearer token (self-scoped in the handler).
+  auth?: 'admin' | 'agentOrAdmin';
 }
 
 // Path matchers: `exact` for a literal path, `idMatch` to capture a single
@@ -387,7 +426,7 @@ function handleAgentDelete(ctx: AdminCtx): void {
 }
 
 function handleMessagesGet(ctx: AdminCtx): void {
-  const { res, db, url } = ctx;
+  const { res, db, url, auth } = ctx;
   const agentParam = url.searchParams.get('agent') || undefined;
   const topicParam = url.searchParams.get('topic') || undefined;
   const sinceRaw = url.searchParams.get('since');
@@ -396,8 +435,23 @@ function handleMessagesGet(ctx: AdminCtx): void {
   const since = sinceRaw !== null ? parseInt(sinceRaw, 10) : undefined;
   const limit = limitRaw !== null ? parseInt(limitRaw, 10) : undefined;
 
+  // Node-scoped read (#35): a non-admin agent only ever sees traffic it is a
+  // party to. The (from_agent = X OR to_agent = X) scope covers direct, topic
+  // (persisted as per-subscriber copies with to_agent = subscriber), and
+  // request/response rows. Requesting another agent's scope is a hard 403;
+  // admin is unconstrained (behaves exactly as before).
+  let effectiveAgent = agentParam;
+  if (auth.mode === 'agent') {
+    if (agentParam !== undefined && agentParam !== auth.agentId) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'forbidden: cannot query another agent' }));
+      return;
+    }
+    effectiveAgent = auth.agentId;
+  }
+
   const messages = queryMessages(db, {
-    agent: agentParam,
+    agent: effectiveAgent,
     topic: topicParam,
     since: Number.isNaN(since) ? undefined : since,
     limit: Number.isNaN(limit) ? undefined : limit,
@@ -865,7 +919,7 @@ const ROUTES: Route[] = [
   { method: 'GET',    match: exact('/agents'),                       handler: handleAgentGet },
   { method: 'GET',    match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentById },
   { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentDelete },
-  { method: 'GET',    match: exact('/messages'),                     handler: handleMessagesGet },
+  { method: 'GET',    match: exact('/messages'),                     handler: handleMessagesGet, auth: 'agentOrAdmin' },
   { method: 'GET',    match: idMatch(/^\/files\/([^/]+)$/),          handler: handleFileById },
   { method: 'POST',   match: exact('/files'),                        handler: handleFilePost },
   { method: 'POST',   match: exact('/reminders'),                    handler: handleReminderPost },
@@ -898,17 +952,37 @@ export function startHttpAdmin(
         }
         return;
       }
-      if (!requireAdmin(req, res, adminToken)) return;
-
       const url = new URL(req.url!, 'http://localhost');
       const pathname = url.pathname;
       const method = req.method;
 
+      // Find the matched route first, then apply its auth. This preserves the
+      // original ordering: unmatched paths (and admin routes) go through
+      // requireAdmin, so an unauthenticated request to an unknown path still
+      // gets 401 (not 404). Only 'agentOrAdmin' routes accept an agent token.
+      let matched: Route | undefined;
+      let params: Record<string, string> = {};
       for (const route of ROUTES) {
         if (route.method !== method) continue;
-        const params = route.match(pathname);
-        if (params === null) continue;
-        await route.handler({ req, res, db, url, params, agentIndex, observerIndex, maxFileBytes, filesDir });
+        const p = route.match(pathname);
+        if (p === null) continue;
+        matched = route;
+        params = p;
+        break;
+      }
+
+      let auth: AuthResult;
+      if (matched && matched.auth === 'agentOrAdmin') {
+        const resolved = resolveAuth(req, res, db, adminToken);
+        if (resolved === null) return; // 401 already written
+        auth = resolved;
+      } else {
+        if (!requireAdmin(req, res, adminToken)) return;
+        auth = { mode: 'admin' };
+      }
+
+      if (matched) {
+        await matched.handler({ req, res, db, url, params, agentIndex, observerIndex, maxFileBytes, filesDir, auth });
         return;
       }
 
