@@ -66,6 +66,7 @@ export interface FileSendFrame {
   ttl_ms?: number;
   caption?: string;
   reply_to_msg_id?: string;
+  group_id?: string; // #60: optional grouping tag for a multi-file send (passthrough)
 }
 
 export interface RemindFrame {
@@ -132,6 +133,7 @@ export interface AckFrame {
   msg_id?: string;
   reminder_id?: string;
   due_at?: number;
+  file_id?: string; // #60: on a file_send ack, the stored file's id (so the sender learns it)
 }
 
 export interface ErrorFrame {
@@ -178,6 +180,7 @@ export interface FileDeliverFrame {
   fetch_url: string;
   caption: string | null;
   reply_to_msg_id: string | null;
+  group_id: string | null; // #60: grouping tag echoed from the send (null = ungrouped)
 }
 
 // ──────────────────────────────────────────────

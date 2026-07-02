@@ -155,14 +155,15 @@ The requester then receives a `deliver` with `kind: "response"` and the matching
 `→ file_send` — base64-encoded file to one agent
 ```json
 { "type": "file_send", "msg_id": "f-1", "to": "bob", "filename": "report.pdf",
-  "content_type": "application/pdf", "data": "<base64>", "caption": "Q3", "ttl_ms": 300000 }
+  "content_type": "application/pdf", "data": "<base64>", "caption": "Q3", "ttl_ms": 300000,
+  "group_id": "batch-9" }
 ```
-`← file_deliver` — the recipient is notified with a fetch URL, not the bytes
+Optional `group_id` tags a multi-file send so the recipient can reassemble the batch (pure passthrough — the bus stores and echoes it, no assembly). The `ack` for a `file_send` carries the stored `file_id` so the sender learns it. `← file_deliver` — the recipient is notified with a fetch URL, not the bytes
 ```json
 { "type": "file_deliver", "file_id": "<uuid>", "from": "alice", "to": "bob",
   "filename": "report.pdf", "content_type": "application/pdf", "size_bytes": 12345,
   "sent_at": 1718900000000, "fetch_url": "/files/<uuid>", "caption": "Q3",
-  "reply_to_msg_id": null }
+  "reply_to_msg_id": null, "group_id": "batch-9" }
 ```
 The recipient downloads the bytes via `GET /files/<file_id>`. Max size is `MESH_MAX_FILE_BYTES` (default 10 MB).
 
@@ -230,7 +231,7 @@ Every method returns a `Promise` that resolves when the server acks (for `reques
 | `on` | `(event, h): void` | `event` ∈ `'connect' \| 'disconnect' \| 'error' \| 'presence'`. The `'presence'` handler gets a `PresenceEntry` `{ id, online, lastSeen }` on each ACL-related peer's status change |
 | `send` | `(to, text, opts?): Promise<void>` | `opts`: `{ kind?: 'direct' \| 'response', correlationId?, ttlMs? }`. `ttlMs` is the delivery TTL (`0` = drop if recipient offline; omit for the 5-min default). Use `{ kind: 'response', correlationId }` to answer a request |
 | `publish` | `(topic, text): Promise<void>` | broadcast to a topic's subscribers |
-| `sendFile` | `(to, opts): Promise<void>` | `opts`: `{ data: Uint8Array\|ArrayBuffer, filename, contentType?, caption?, ttlMs?, replyToMsgId? }`. Base64-encodes the bytes into a `file_send`; the recipient gets an `Inbound{ kind:'file' }` with the metadata + `fetchUrl` (bytes are downloaded separately) |
+| `sendFile` | `(to, opts): Promise<{ fileId }>` | `opts`: `{ data: Uint8Array\|ArrayBuffer, filename, contentType?, caption?, ttlMs?, replyToMsgId?, groupId? }`. Base64-encodes the bytes into a `file_send`; resolves with the stored `fileId` (`null` if dropped). `groupId` tags a multi-file send. The recipient gets an `Inbound{ kind:'file' }` with the metadata + `fetchUrl` + `groupId` (bytes via `fetchFile`) |
 | `fetchFile` | `(fileId): Promise<Uint8Array>` | downloads the bytes over HTTP with the agent token (node-scoped: only the file's sender/recipient succeeds — a non-party / unknown id rejects with an `HTTP_404` error). Needs `httpUrl`; no WS connection required |
 | `subscribe` / `unsubscribe` | `(topic): Promise<void>` | exact-topic; no wildcards |
 | `request` | `(to, text, opts?): Promise<Inbound>` | `opts`: `{ timeoutMs?=30000, correlationId? }`; resolves with the response, rejects on timeout/error |
@@ -240,7 +241,7 @@ Every method returns a `Promise` that resolves when the server acks (for `reques
 **`Inbound`** — the normalized (camelCase) form of a delivery:
 ```ts
 { msgId, kind, from, to?, topic?, correlationId?, text?, payload?, sentAt,
-  fileId?, filename?, contentType?, fetchUrl?, size?, caption?, replyToMsgId? }  // kind: 'direct'|'topic'|'request'|'response'|'file'
+  fileId?, filename?, contentType?, fetchUrl?, size?, caption?, replyToMsgId?, groupId? }  // kind: '…'|'file'
 ```
 `text` equals `payload` for text messages. For `kind: 'file'`, `payload` is `null` and the file fields are set: `fileId`, `filename`, `contentType`, `size` (bytes), `caption`, `replyToMsgId`, and `fetchUrl` (the relative `/files/:id` path to download the bytes).
 
