@@ -11,6 +11,7 @@ import type {
   ListRemindersFrame,
   CancelReminderFrame,
   ListPresenceFrame,
+  FileSendFrame,
   DeliverFrame,
   FileDeliverFrame,
   AckFrame,
@@ -81,6 +82,19 @@ export interface Inbound {
   fileId?: string;
   filename?: string;
   contentType?: string; // = content_type
+  fetchUrl?: string;    // = fetch_url (relative path; join against httpUrl to download — see fetchFile)
+  size?: number;        // = size_bytes
+  caption?: string | null;      // = caption
+  replyToMsgId?: string | null; // = reply_to_msg_id
+}
+
+export interface SendFileOpts {
+  data: Uint8Array | ArrayBuffer; // raw bytes; base64-encoded internally
+  filename: string;
+  contentType?: string; // default 'application/octet-stream' (server-side)
+  caption?: string;
+  ttlMs?: number;       // delivery TTL; omit for the 5-min server default
+  replyToMsgId?: string;
 }
 
 interface ResolvedConfig {
@@ -201,6 +215,31 @@ export class MeshClient {
       topic,
       payload: text,
     };
+    return this.sendWithAck(msgId, frame);
+  }
+
+  /**
+   * Send a file to an agent. `opts.data` is raw bytes (Uint8Array/Buffer or
+   * ArrayBuffer); it's base64-encoded internally into the `file_send` frame.
+   * Resolves on the server ack. The recipient receives an `Inbound` with
+   * `kind:'file'` carrying `fileId`/`filename`/`contentType`/`size`/`caption`/
+   * `fetchUrl` — the bytes are fetched separately via `fetchFile(fileId)`.
+   */
+  sendFile(to: string, opts: SendFileOpts): Promise<void> {
+    const bytes = opts.data instanceof Uint8Array ? opts.data : new Uint8Array(opts.data);
+    const data = Buffer.from(bytes).toString('base64');
+    const msgId = this.id();
+    const frame: FileSendFrame = {
+      type: 'file_send',
+      msg_id: msgId,
+      to,
+      filename: opts.filename,
+      data,
+    };
+    if (opts.contentType !== undefined) frame.content_type = opts.contentType;
+    if (opts.ttlMs !== undefined) frame.ttl_ms = opts.ttlMs;
+    if (opts.caption !== undefined) frame.caption = opts.caption;
+    if (opts.replyToMsgId !== undefined) frame.reply_to_msg_id = opts.replyToMsgId;
     return this.sendWithAck(msgId, frame);
   }
 
@@ -797,6 +836,10 @@ export class MeshClient {
       fileId: f.file_id,
       filename: f.filename,
       contentType: f.content_type,
+      fetchUrl: f.fetch_url,
+      size: f.size_bytes,
+      caption: f.caption,
+      replyToMsgId: f.reply_to_msg_id,
     };
   }
 }
