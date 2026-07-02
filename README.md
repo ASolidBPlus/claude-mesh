@@ -329,8 +329,9 @@ A second HTTP listener (admin port, default `7385`) handles administration. Ever
 **Auth precedence:** on `GET /messages` the `Authorization` bearer is matched against the admin token **first** (timing-safe); if it isn't the admin token it is looked up as an agent token. So the admin token always grants the full read.
 
 **Agents**
-- `POST /agents` `{ id, hostname }` → `201` agent + `token` (raw, shown once).
-- `GET /agents[?online=true]` → list. `GET /agents/:id` → one. `DELETE /agents/:id` → `{ ok: true }`.
+- `POST /agents` `{ id, hostname, namespace? }` → `201` agent + `token` (raw, shown once). `namespace` is an optional string (identity label; null if omitted).
+- `GET /agents[?online=true]` → list. `GET /agents/:id` → one. `DELETE /agents/:id` → `{ ok: true }`. Agent objects include parsed `metadata` (object) and `namespace` (string or null).
+- `PATCH /agents/:id` `{ metadata?, namespace? }` → updated agent. **Partial update**: only the keys you send change; an omitted key is left untouched. `metadata` is **replace** (not merge — do read-modify-write) and must be a JSON object ≤ 4096 bytes serialized (oversized/non-object → `400`, never truncated). `namespace` is a string (set) or `null` (clear). The bus attaches no semantics to either — `namespace` is an inert identity label (no routing/ACL/enforcement).
 
 **ACL**
 - `POST /acl` `{ from_agent, to_agent, granted_by? }` → `201`. `DELETE /acl` `{ from_agent, to_agent }`.

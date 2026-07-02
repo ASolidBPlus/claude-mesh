@@ -19,6 +19,7 @@ import {
   markFileDelivered,
   deleteAgent,
   registerAgent,
+  updateAgent,
   queryMessages,
   insertReminder,
   listAgentReminders,
@@ -103,6 +104,7 @@ function formatAgent(agent: Agent): Record<string, unknown> {
     online: agent.online === 1,
     capabilities: JSON.parse(agent.capabilities) as unknown[],
     metadata: JSON.parse(agent.metadata) as Record<string, unknown>,
+    namespace: agent.namespace ?? null,
     registered_at: agent.registered_at,
     last_seen: agent.last_seen,
   };
@@ -375,9 +377,21 @@ async function handleAgentPost(ctx: AdminCtx): Promise<void> {
     return;
   }
 
+  // Optional namespace (#41): a string sets it, absent leaves it null. The bus
+  // attaches no semantics to the value.
+  let namespace: string | null = null;
+  if (Object.prototype.hasOwnProperty.call(body, 'namespace')) {
+    if (body.namespace !== null && typeof body.namespace !== 'string') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'namespace must be a string or null' }));
+      return;
+    }
+    namespace = body.namespace as string | null;
+  }
+
   const rawToken = generateToken();
   const token_hash = hashToken(rawToken);
-  const agent = registerAgent(db, { id, token_hash, hostname });
+  const agent = registerAgent(db, { id, token_hash, hostname, namespace });
 
   res.writeHead(201, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ...formatAgent(agent), token: rawToken }));
@@ -423,6 +437,60 @@ function handleAgentDelete(ctx: AdminCtx): void {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ok: true }));
+}
+
+async function handleAgentPatch(ctx: AdminCtx): Promise<void> {
+  const { req, res, db, params } = ctx;
+  const id = params.id as string; // idMatch always populates :id
+  if (getAgentById(db, id) === null) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'agent not found' }));
+    return;
+  }
+
+  const raw = await readBody(req);
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid JSON' }));
+    return;
+  }
+
+  // Genuine PARTIAL update: only fields PRESENT in the body are touched. An
+  // omitted field is left exactly as-is (never nulled). metadata is REPLACE
+  // (not merge) — consumers do read-modify-write.
+  const fields: { metadata?: string; namespace?: string | null } = {};
+
+  if (Object.prototype.hasOwnProperty.call(body, 'metadata')) {
+    const metadata = body.metadata;
+    if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'metadata must be a JSON object' }));
+      return;
+    }
+    const serialized = JSON.stringify(metadata);
+    if (Buffer.byteLength(serialized, 'utf8') > 4096) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'metadata exceeds 4096 bytes' }));
+      return;
+    }
+    fields.metadata = serialized;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, 'namespace')) {
+    if (body.namespace !== null && typeof body.namespace !== 'string') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'namespace must be a string or null' }));
+      return;
+    }
+    fields.namespace = body.namespace as string | null;
+  }
+
+  const updated = updateAgent(db, id, fields);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(formatAgent(updated as Agent)));
 }
 
 function handleMessagesGet(ctx: AdminCtx): void {
@@ -937,6 +1005,7 @@ const ROUTES: Route[] = [
   { method: 'POST',   match: exact('/agents'),                       handler: handleAgentPost },
   { method: 'GET',    match: exact('/agents'),                       handler: handleAgentGet },
   { method: 'GET',    match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentById },
+  { method: 'PATCH',  match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentPatch },
   { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentDelete },
   { method: 'GET',    match: exact('/messages'),                     handler: handleMessagesGet, auth: 'agentOrAdmin' },
   { method: 'GET',    match: idMatch(/^\/files\/([^/]+)$/),          handler: handleFileById },
