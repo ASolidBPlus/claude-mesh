@@ -10,6 +10,8 @@ import {
   aclCheck,
   listInboundAcl,
   listOutboundAcl,
+  listAclByGrantedBy,
+  listAclByGrantedByPrefix,
   getOrCreateTopic,
   listTopics,
   listAgents,
@@ -239,24 +241,52 @@ async function handleAclDelete(ctx: AdminCtx): Promise<void> {
 function handleAclGet(ctx: AdminCtx): void {
   const { res, db, url } = ctx;
   const agent = url.searchParams.get('agent');
+  const grantedBy = url.searchParams.get('granted_by');            // exact
+  const grantedByPrefix = url.searchParams.get('granted_by_prefix'); // prefix
 
-  if (!agent) {
+  // At most one granted_by mode (exact vs prefix are mutually exclusive).
+  if (grantedBy !== null && grantedByPrefix !== null) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'agent query param required' }));
+    res.end(JSON.stringify({ error: 'provide at most one of granted_by, granted_by_prefix' }));
     return;
   }
 
-  if (getAgentById(db, agent) === null) {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'agent not found' }));
+  // At least one selector is required (matches the original agent-required rule).
+  if (!agent && grantedBy === null && grantedByPrefix === null) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'one of agent, granted_by, or granted_by_prefix is required' }));
     return;
   }
 
-  const inbound = listInboundAcl(db, agent);
-  const outbound = listOutboundAcl(db, agent);
+  // Agent-scoped (back-compat): {inbound, outbound}, optionally narrowed by
+  // granted_by/prefix (JS filter — an agent's ACL set is small).
+  if (agent) {
+    if (getAgentById(db, agent) === null) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'agent not found' }));
+      return;
+    }
+    let inbound = listInboundAcl(db, agent);
+    let outbound = listOutboundAcl(db, agent);
+    if (grantedBy !== null) {
+      inbound = inbound.filter((r) => r.granted_by === grantedBy);
+      outbound = outbound.filter((r) => r.granted_by === grantedBy);
+    } else if (grantedByPrefix !== null) {
+      inbound = inbound.filter((r) => r.granted_by.startsWith(grantedByPrefix));
+      outbound = outbound.filter((r) => r.granted_by.startsWith(grantedByPrefix));
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ inbound, outbound }));
+    return;
+  }
 
+  // Global provenance query (no agent): flat {matches} list — the reconciler
+  // path ("every edge I stamped under <namespace>").
+  const matches = grantedBy !== null
+    ? listAclByGrantedBy(db, grantedBy)
+    : listAclByGrantedByPrefix(db, grantedByPrefix as string);
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ inbound, outbound }));
+  res.end(JSON.stringify({ matches }));
 }
 
 async function handleObserverPost(ctx: AdminCtx): Promise<void> {

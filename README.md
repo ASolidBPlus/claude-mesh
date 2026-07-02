@@ -335,7 +335,8 @@ A second HTTP listener (admin port, default `7385`) handles administration. Ever
 
 **ACL**
 - `POST /acl` `{ from_agent, to_agent, granted_by? }` → `201`. `DELETE /acl` `{ from_agent, to_agent }`.
-- `GET /acl?agent=<id>` → `{ inbound: [...], outbound: [...] }`.
+- `GET /acl?agent=<id>` → `{ inbound: [...], outbound: [...] }` (rows carry `from_agent`, `to_agent`, `granted_by`, `granted_at`).
+- **Provenance filter (`granted_by`).** Add `granted_by=<exact>` or `granted_by_prefix=<prefix>` (prefix uses SQL `LIKE`, with `%`/`_`/`\` in the value matched literally). With `agent=` it narrows that agent's inbound/outbound. **Without `agent=`** it's a global query → `{ matches: [...] }` — every ACL edge stamped by that writer / writer-namespace across the table (the reconciler path: "list every edge I granted under `mesh-chat:group:*`"). At least one of `agent` / `granted_by` / `granted_by_prefix` is required (else `400`); `granted_by` + `granted_by_prefix` together is `400`. The bus stores `granted_by` as opaque provenance — no namespace enforcement.
 
 **Observers**
 - `POST /observers` `{ agent_id, granted_by? }` → `201` (live-activates a connected socket).

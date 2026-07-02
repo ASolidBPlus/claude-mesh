@@ -379,6 +379,22 @@ export function listOutboundAcl(db: Database, id: string): AclRow[] {
   return db.prepare('SELECT * FROM acl WHERE from_agent = ?').all(id) as AclRow[];
 }
 
+// #38: global ACL provenance queries — every edge stamped by a given writer
+// (exact) or writer-namespace (prefix), across the whole table, for reconcilers
+// diffing desired-vs-actual. Rows carry from_agent/to_agent/granted_by/granted_at.
+export function listAclByGrantedBy(db: Database, grantedBy: string): AclRow[] {
+  return db.prepare('SELECT * FROM acl WHERE granted_by = ? ORDER BY granted_at ASC').all(grantedBy) as AclRow[];
+}
+
+export function listAclByGrantedByPrefix(db: Database, prefix: string): AclRow[] {
+  // Escape LIKE metacharacters in the prefix so %/_/\ in a granted_by namespace
+  // are matched literally; only the trailing % is a wildcard.
+  const escaped = prefix.replace(/[\\%_]/g, (c) => '\\' + c);
+  return db.prepare(
+    "SELECT * FROM acl WHERE granted_by LIKE ? ESCAPE '\\' ORDER BY granted_at ASC"
+  ).all(escaped + '%') as AclRow[];
+}
+
 // ──────────────────────────────────────────────
 // 5.4 Messages
 // ──────────────────────────────────────────────

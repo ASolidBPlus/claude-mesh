@@ -157,14 +157,15 @@ describe('http-admin', () => {
     expect(body.ok).toBe(true);
   });
 
-  // GET /acl
-  it('GET /acl — 400 if agent param missing', async () => {
+  // GET /acl — with no selector at all it's still a 400 (message widened in #38
+  // now that granted_by / granted_by_prefix are also valid selectors).
+  it('GET /acl — 400 if no selector (agent / granted_by / granted_by_prefix) given', async () => {
     const res = await fetch(`${base}/acl`, {
       headers: { 'Authorization': `Bearer ${token}` },
     });
     expect(res.status).toBe(400);
     const body = await res.json() as Record<string, unknown>;
-    expect(body.error).toBe('agent query param required');
+    expect(body.error).toBe('one of agent, granted_by, or granted_by_prefix is required');
   });
 
   it('GET /acl — 404 if agent not in registry', async () => {
