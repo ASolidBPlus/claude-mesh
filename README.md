@@ -344,7 +344,8 @@ A second HTTP listener (admin port, default `7385`) handles administration. Ever
 - `POST /topics` `{ name, created_by, description?, metadata? }` → `201`. `GET /topics` → list. (Publishing auto-creates a topic; this is only for pre-registering one.)
 
 **Messages (history)**
-- `GET /messages?agent=<id>&topic=<name>&since=<unix_ms>&limit=<n>` → array, newest first (all params optional; `limit` default 100, max 1000).
+- `GET /messages?agent=<id>&topic=<name>&since=<unix_ms>&limit=<n>&before=<cursor>` → array, newest first (all params optional; `limit` default 100, max 1000).
+- **Backward pagination:** ordering is `sent_at DESC, id DESC`. To load older messages, pass `before=<sent_at>:<id>` built from the **oldest row of the previous page** (`` `${last.sent_at}:${last.id}` ``); the response is the bare array, so the cursor is derived client-side (no wrapper). Rows strictly older than the cursor are returned, stable across rows sharing a `sent_at`. `since` + `before` together bound a window. A malformed cursor is `400`.
 - **Admin token:** unconstrained read; `agent` filters to any node's traffic.
 - **Agent token:** node-scoped — results are constrained to messages that node is a party to (`from_agent = self OR to_agent = self`), which covers its direct, topic (per-subscriber copies), and request/response traffic. `topic`/`since`/`limit` apply within that scope. Passing `agent=<self>` (or omitting it) is fine; passing `agent=<another node>` is `403 {error:"forbidden: cannot query another agent"}`. An unknown/absent token is `401`.
 
