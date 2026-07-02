@@ -3,6 +3,7 @@ export type {
   MeshClientConfig,
   MeshClientEvent,
   SendOpts,
+  SendFileOpts,
   RequestOpts,
   Inbound,
   Reminder,

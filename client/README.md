@@ -93,6 +93,7 @@ undefined at `connect()` time, `connect()` rejects with a clear error.
 | `on(event, fn)` | `void` | `'connect' \| 'disconnect' \| 'error' \| 'presence'`. `'presence'` fires with a `PresenceEntry` `{ id, online, lastSeen }` on each ACL-related peer's status change |
 | `send(to, text, opts?)` | `Promise<void>` | resolves on the server ack; `opts.kind:'response'` requires `opts.correlationId`; `opts.ttlMs` sets the delivery TTL (`0` = drop if recipient offline, omit for the 5-min default) |
 | `publish(topic, text)` | `Promise<void>` | resolves on ack |
+| `sendFile(to, opts)` | `Promise<void>` | `opts: { data: Uint8Array\|ArrayBuffer, filename, contentType?, caption?, ttlMs?, replyToMsgId? }`; base64-encodes bytes into a `file_send`, resolves on ack. Recipient gets an `Inbound{ kind:'file', fileId, filename, contentType, size, caption, replyToMsgId, fetchUrl }` — download bytes from `fetchUrl` |
 | `subscribe(topic)` / `unsubscribe(topic)` | `Promise<void>` | resolve on ack; subscriptions are replayed on every reconnect |
 | `request(to, text, opts?)` | `Promise<Inbound>` | resolves with the `response`; rejects on timeout or server error (e.g. `ACL_DENIED`) |
 | `listPresence()` | `Promise<PresenceEntry[]>` | roster of self + peers you share a **direct** ACL edge with (either direction), from the registry — each `{ id, online, lastSeen }`. Includes registered peers that have never connected (`online:false`); does **not** include peers reachable only via a shared topic/group (derive those from `GET /acl` + your group model) |

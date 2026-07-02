@@ -230,6 +230,7 @@ Every method returns a `Promise` that resolves when the server acks (for `reques
 | `on` | `(event, h): void` | `event` ∈ `'connect' \| 'disconnect' \| 'error' \| 'presence'`. The `'presence'` handler gets a `PresenceEntry` `{ id, online, lastSeen }` on each ACL-related peer's status change |
 | `send` | `(to, text, opts?): Promise<void>` | `opts`: `{ kind?: 'direct' \| 'response', correlationId?, ttlMs? }`. `ttlMs` is the delivery TTL (`0` = drop if recipient offline; omit for the 5-min default). Use `{ kind: 'response', correlationId }` to answer a request |
 | `publish` | `(topic, text): Promise<void>` | broadcast to a topic's subscribers |
+| `sendFile` | `(to, opts): Promise<void>` | `opts`: `{ data: Uint8Array\|ArrayBuffer, filename, contentType?, caption?, ttlMs?, replyToMsgId? }`. Base64-encodes the bytes into a `file_send`; the recipient gets an `Inbound{ kind:'file' }` with the metadata + `fetchUrl` (bytes are downloaded separately) |
 | `subscribe` / `unsubscribe` | `(topic): Promise<void>` | exact-topic; no wildcards |
 | `request` | `(to, text, opts?): Promise<Inbound>` | `opts`: `{ timeoutMs?=30000, correlationId? }`; resolves with the response, rejects on timeout/error |
 | `listPresence` | `(): Promise<PresenceEntry[]>` | roster of self + peers you share a **direct** ACL edge with (either direction), from the registry — each `{ id, online, lastSeen }`. A peer appears (as `online:false`) before it ever connects; peers reachable only via a shared topic/group are **not** included (derive those from `GET /acl` + your own group model). For live updates, listen for the `'presence'` event |
@@ -238,9 +239,9 @@ Every method returns a `Promise` that resolves when the server acks (for `reques
 **`Inbound`** — the normalized (camelCase) form of a delivery:
 ```ts
 { msgId, kind, from, to?, topic?, correlationId?, text?, payload?, sentAt,
-  fileId?, filename?, contentType? }    // kind: 'direct'|'topic'|'request'|'response'|'file'
+  fileId?, filename?, contentType?, fetchUrl?, size?, caption?, replyToMsgId? }  // kind: 'direct'|'topic'|'request'|'response'|'file'
 ```
-`text` equals `payload` for text messages. For `kind: 'file'`, `payload` is `null` and `fileId` / `filename` / `contentType` are set.
+`text` equals `payload` for text messages. For `kind: 'file'`, `payload` is `null` and the file fields are set: `fileId`, `filename`, `contentType`, `size` (bytes), `caption`, `replyToMsgId`, and `fetchUrl` (the relative `/files/:id` path to download the bytes).
 
 Worth knowing: reconnect is automatic (exponential backoff, re-auth, re-subscribe). The default `request` timeout is 30 s — pass a larger `timeoutMs` when the responder is an LLM (model latency can exceed it). File *content* is out of scope (`GET /files/:id` is admin-gated); the SDK surfaces file metadata only. Full surface and limits: [`client/README.md`](client/README.md).
 
