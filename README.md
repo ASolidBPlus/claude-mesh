@@ -227,11 +227,12 @@ Every method returns a `Promise` that resolves when the server acks (for `reques
 | constructor | `new MeshClient(config?)` | `{ serverUrl?, agentId?, agentToken? }`; any omitted field falls back to `MESH_SERVER_URL` / `MESH_AGENT_ID` / `MESH_AGENT_TOKEN` |
 | `connect` | `(): Promise<void>` | opens the socket + authenticates; resolves on `auth_ok` |
 | `onMessage` | `(h: (m: Inbound) => void): void` | fires for every inbound delivery (direct/topic/request/response/file) |
-| `on` | `(event, h): void` | `event` ∈ `'connect' \| 'disconnect' \| 'error'` |
-| `send` | `(to, text, opts?): Promise<void>` | `opts`: `{ kind?: 'direct' \| 'response', correlationId? }`. Use `{ kind: 'response', correlationId }` to answer a request |
+| `on` | `(event, h): void` | `event` ∈ `'connect' \| 'disconnect' \| 'error' \| 'presence'`. The `'presence'` handler gets a `PresenceEntry` `{ id, online, lastSeen }` on each ACL-related peer's status change |
+| `send` | `(to, text, opts?): Promise<void>` | `opts`: `{ kind?: 'direct' \| 'response', correlationId?, ttlMs? }`. `ttlMs` is the delivery TTL (`0` = drop if recipient offline; omit for the 5-min default). Use `{ kind: 'response', correlationId }` to answer a request |
 | `publish` | `(topic, text): Promise<void>` | broadcast to a topic's subscribers |
 | `subscribe` / `unsubscribe` | `(topic): Promise<void>` | exact-topic; no wildcards |
 | `request` | `(to, text, opts?): Promise<Inbound>` | `opts`: `{ timeoutMs?=30000, correlationId? }`; resolves with the response, rejects on timeout/error |
+| `listPresence` | `(): Promise<PresenceEntry[]>` | current roster — self + ACL-related peers — each `{ id, online, lastSeen }`. For live updates, listen for the `'presence'` event |
 | `close` | `(): void` | graceful shutdown; stops reconnecting |
 
 **`Inbound`** — the normalized (camelCase) form of a delivery:

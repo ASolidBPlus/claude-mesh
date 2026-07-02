@@ -10,11 +10,14 @@ import type {
   RemindFrame,
   ListRemindersFrame,
   CancelReminderFrame,
+  ListPresenceFrame,
   DeliverFrame,
   FileDeliverFrame,
   AckFrame,
   ErrorFrame,
   RemindersListFrame,
+  AgentStatusFrame,
+  PresenceListFrame,
   InboundFrame,
 } from './protocol.ts';
 
@@ -36,11 +39,23 @@ export interface MeshClientConfig {
   agentToken?: string; // default process.env.MESH_AGENT_TOKEN
 }
 
-export type MeshClientEvent = 'connect' | 'disconnect' | 'error';
+export type MeshClientEvent = 'connect' | 'disconnect' | 'error' | 'presence';
 
 export interface SendOpts {
   correlationId?: string;
   kind?: 'direct' | 'response';
+  /** Delivery TTL in ms for a direct send. Omit for the server default (5 min);
+   *  `0` = drop if the recipient is offline. Governs deliverability of the
+   *  queued copy, not how long history is retained (see MESH_RETENTION_MS). */
+  ttlMs?: number;
+}
+
+/** A presence snapshot entry (from `listPresence()`), or the payload of a
+ *  `'presence'` event (emitted on each `agent_status` change). camelCase. */
+export interface PresenceEntry {
+  id: string;
+  online: boolean;
+  lastSeen: number;
 }
 
 export interface RequestOpts {
@@ -90,7 +105,8 @@ export class MeshClient {
     connect: ((...args: any[]) => void)[];
     disconnect: ((...args: any[]) => void)[];
     error: ((...args: any[]) => void)[];
-  } = { connect: [], disconnect: [], error: [] };
+    presence: ((...args: any[]) => void)[];
+  } = { connect: [], disconnect: [], error: [], presence: [] };
 
   private subscribedTopics = new Set<string>();
 
@@ -103,6 +119,8 @@ export class MeshClient {
   >();
   // listReminders() waiters keyed by ref (= msg_id); resolved by reminders_list frame
   private pendingReminderLists = new Map<string, Settler<Reminder[]>>();
+  // listPresence() waiters keyed by ref (= msg_id); resolved by presence_list frame
+  private pendingPresenceLists = new Map<string, Settler<PresenceEntry[]>>();
   // request waiters keyed by correlation_id; also indexed by msg_id for fast-fail
   private pendingRequests = new Map<
     string,
@@ -171,6 +189,7 @@ export class MeshClient {
     }
     const msgId = this.id();
     const frame: SendFrame = { type: 'send', msg_id: msgId, to, payload: text };
+    if (opts.ttlMs !== undefined) frame.ttl_ms = opts.ttlMs;
     return this.sendWithAck(msgId, frame);
   }
 
@@ -302,6 +321,28 @@ export class MeshClient {
     return this.sendWithAck(msgId, frame);
   }
 
+  /**
+   * Fetch the current presence roster — the agents this node is ACL-related to,
+   * plus itself — each with `online` and `lastSeen`. For live updates, listen
+   * for the `'presence'` event (emitted on every `agent_status` change).
+   */
+  listPresence(): Promise<PresenceEntry[]> {
+    if (!this.isOpen()) {
+      return Promise.reject(new Error('not connected'));
+    }
+    const msgId = this.id();
+    const frame: ListPresenceFrame = { type: 'list_presence', msg_id: msgId };
+    return new Promise<PresenceEntry[]>((resolve, reject) => {
+      this.pendingPresenceLists.set(msgId, { resolve, reject });
+      try {
+        this.ws!.send(JSON.stringify(frame));
+      } catch (err) {
+        this.pendingPresenceLists.delete(msgId);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+
   close(): void {
     this.shouldReconnect = false;
     if (this.reconnectTimer !== null) {
@@ -373,9 +414,9 @@ export class MeshClient {
   }
 
   /**
-   * Reject and clear EVERY in-flight waiter — requests, acks, reminds, and
-   * reminder-lists — with `err`, clearing request timeout timers first so a
-   * cleared timer can never later double-settle.
+   * Reject and clear EVERY in-flight waiter — requests, acks, reminds,
+   * reminder-lists, and presence-lists — with `err`, clearing request timeout
+   * timers first so a cleared timer can never later double-settle.
    *
    * Called from two places:
    *  - close(): err = `client closed`.
@@ -404,6 +445,10 @@ export class MeshClient {
       l.reject(err);
     }
     this.pendingReminderLists.clear();
+    for (const [, p] of this.pendingPresenceLists) {
+      p.reject(err);
+    }
+    this.pendingPresenceLists.clear();
   }
 
   private emit(event: MeshClientEvent, ...args: any[]): void {
@@ -541,10 +586,14 @@ export class MeshClient {
       case 'reminders_list':
         this.onRemindersList(frame);
         return;
-      case 'pong':
       case 'agent_status':
+        this.onAgentStatus(frame);
+        return;
       case 'presence_list':
-        return; // ignored (out of scope for SDK v0.1)
+        this.onPresenceList(frame);
+        return;
+      case 'pong':
+        return; // ignored
       default:
         return;
     }
@@ -624,6 +673,25 @@ export class MeshClient {
       lastFiredAt: (r.last_fired_at ?? null) as number | null,
     }));
     waiter.resolve(reminders);
+  }
+
+  private onAgentStatus(frame: AgentStatusFrame): void {
+    this.emit('presence', {
+      id: frame.agent_id,
+      online: frame.online,
+      lastSeen: frame.last_seen,
+    } as PresenceEntry);
+  }
+
+  private onPresenceList(frame: PresenceListFrame): void {
+    const ref = frame.ref;
+    if (ref === undefined) return;
+    const waiter = this.pendingPresenceLists.get(ref);
+    if (waiter === undefined) return;
+    this.pendingPresenceLists.delete(ref);
+    waiter.resolve(
+      frame.agents.map((a) => ({ id: a.id, online: a.online, lastSeen: a.last_seen }))
+    );
   }
 
   private onError(frame: ErrorFrame): void {

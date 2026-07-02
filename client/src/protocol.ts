@@ -88,6 +88,11 @@ export interface CancelReminderFrame {
   msg_id?: string;
 }
 
+export interface ListPresenceFrame {
+  type: 'list_presence';
+  msg_id?: string;
+}
+
 export interface AuthFrame {
   type: 'auth';
   agent_id: string;
@@ -190,6 +195,7 @@ export type OutboundFrame =
   | RemindFrame
   | ListRemindersFrame
   | CancelReminderFrame
+  | ListPresenceFrame
   | AuthFrame;
 
 export type InboundFrame =

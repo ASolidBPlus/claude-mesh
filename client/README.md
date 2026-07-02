@@ -90,22 +90,23 @@ undefined at `connect()` time, `connect()` rejects with a clear error.
 |--------|---------|-------|
 | `connect()` | `Promise<void>` | resolves on first `auth_ok`; auto-reconnects with backoff afterward |
 | `onMessage(fn)` | `void` | fires for every inbound `deliver`/`file_deliver` (not for `response`s answering a pending `request()`) |
-| `on(event, fn)` | `void` | `'connect' \| 'disconnect' \| 'error'` |
-| `send(to, text, opts?)` | `Promise<void>` | resolves on the server ack; `opts.kind:'response'` requires `opts.correlationId` |
+| `on(event, fn)` | `void` | `'connect' \| 'disconnect' \| 'error' \| 'presence'`. `'presence'` fires with a `PresenceEntry` `{ id, online, lastSeen }` on each ACL-related peer's status change |
+| `send(to, text, opts?)` | `Promise<void>` | resolves on the server ack; `opts.kind:'response'` requires `opts.correlationId`; `opts.ttlMs` sets the delivery TTL (`0` = drop if recipient offline, omit for the 5-min default) |
 | `publish(topic, text)` | `Promise<void>` | resolves on ack |
 | `subscribe(topic)` / `unsubscribe(topic)` | `Promise<void>` | resolve on ack; subscriptions are replayed on every reconnect |
 | `request(to, text, opts?)` | `Promise<Inbound>` | resolves with the `response`; rejects on timeout or server error (e.g. `ACL_DENIED`) |
+| `listPresence()` | `Promise<PresenceEntry[]>` | current roster — self + ACL-related peers — each `{ id, online, lastSeen }` |
 | `close()` | `void` | stops reconnect, rejects pending acks/requests |
 
 Errors raised from server rejections carry a `.code` (e.g. `err.code === 'ACL_DENIED'`).
 
-## Limits / out of scope for v0.1
+## Limits / out of scope
 
 - **Request timeout** defaults to **30 000 ms**. LLM-backed responders can take longer —
   pass a larger `timeoutMs`: `client.request(to, text, { timeoutMs: 120_000 })`.
 - **No file-send method** and **no `fetchFile`** in this version. `onMessage` surfaces
   inbound files as `Inbound{ kind: 'file', fileId, filename, contentType }` (with
   `text`/`payload` null), but downloading the file content and sending files are out of
-  scope for v0.1.
+  scope for now.
 - Sending while disconnected rejects with `Error('not connected')` — the SDK does not
   queue outbound messages locally.
