@@ -38,6 +38,13 @@ export interface MeshClientConfig {
   serverUrl?: string; // default process.env.MESH_SERVER_URL
   agentId?: string; // default process.env.MESH_AGENT_ID
   agentToken?: string; // default process.env.MESH_AGENT_TOKEN
+  // Admin HTTP base URL for fetchFile() (e.g. 'http://host:7385'). The admin
+  // API is usually a DIFFERENT port than the WS serverUrl, so this can't be
+  // derived reliably — set it (or MESH_HTTP_URL) to use fetchFile when the
+  // admin port ≠ ws port (the default). If unset, fetchFile falls back to
+  // serverUrl with ws→http (same host+port), which only works when they share
+  // a port.
+  httpUrl?: string; // default process.env.MESH_HTTP_URL
 }
 
 export type MeshClientEvent = 'connect' | 'disconnect' | 'error' | 'presence';
@@ -389,6 +396,32 @@ export class MeshClient {
     });
   }
 
+  /**
+   * Download a file's bytes over HTTP using this node's agent token. Node-scoped
+   * server-side (#57): resolves only if this node is the file's sender or
+   * recipient (or admin), else rejects — a non-party / unknown id both surface
+   * as an HTTP 404 (no existence oracle).
+   *
+   * Uses the admin HTTP base from `httpUrl` / `MESH_HTTP_URL` (see MeshClientConfig);
+   * the admin port usually differs from the ws port, so set it. Does NOT require
+   * an open WS connection.
+   */
+  async fetchFile(fileId: string): Promise<Uint8Array> {
+    const cfg = this.resolveConfig();
+    const httpBase = this.resolveHttpUrl(cfg.serverUrl);
+    const url = new URL(`/files/${encodeURIComponent(fileId)}`, httpBase);
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${cfg.agentToken}` },
+    });
+    if (!res.ok) {
+      throw Object.assign(new Error(`fetchFile ${fileId} failed: HTTP ${res.status}`), {
+        code: `HTTP_${res.status}`,
+        status: res.status,
+      });
+    }
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
   close(): void {
     this.shouldReconnect = false;
     if (this.reconnectTimer !== null) {
@@ -427,6 +460,15 @@ export class MeshClient {
       throw new Error('MeshClient: agentToken is required (config or MESH_AGENT_TOKEN)');
     }
     return { serverUrl, agentId, agentToken };
+  }
+
+  // Resolve the admin HTTP base for fetchFile(): explicit httpUrl / MESH_HTTP_URL,
+  // else derive from serverUrl by swapping ws→http / wss→https (same host+port —
+  // only correct when the admin API shares the ws port, which is NOT the default).
+  private resolveHttpUrl(serverUrl: string): string {
+    const explicit = this.config.httpUrl ?? process.env.MESH_HTTP_URL;
+    if (explicit !== undefined && explicit !== '') return explicit;
+    return serverUrl.replace(/^ws(s?):\/\//i, 'http$1://');
   }
 
   private id(): string {

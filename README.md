@@ -224,13 +224,14 @@ Every method returns a `Promise` that resolves when the server acks (for `reques
 
 | Method | Signature | Notes |
 |---|---|---|
-| constructor | `new MeshClient(config?)` | `{ serverUrl?, agentId?, agentToken? }`; any omitted field falls back to `MESH_SERVER_URL` / `MESH_AGENT_ID` / `MESH_AGENT_TOKEN` |
+| constructor | `new MeshClient(config?)` | `{ serverUrl?, agentId?, agentToken?, httpUrl? }`; any omitted field falls back to `MESH_SERVER_URL` / `MESH_AGENT_ID` / `MESH_AGENT_TOKEN` / `MESH_HTTP_URL`. `httpUrl` is the admin HTTP base for `fetchFile` (usually a different port than the WS `serverUrl` — set it) |
 | `connect` | `(): Promise<void>` | opens the socket + authenticates; resolves on `auth_ok` |
 | `onMessage` | `(h: (m: Inbound) => void): void` | fires for every inbound delivery (direct/topic/request/response/file) |
 | `on` | `(event, h): void` | `event` ∈ `'connect' \| 'disconnect' \| 'error' \| 'presence'`. The `'presence'` handler gets a `PresenceEntry` `{ id, online, lastSeen }` on each ACL-related peer's status change |
 | `send` | `(to, text, opts?): Promise<void>` | `opts`: `{ kind?: 'direct' \| 'response', correlationId?, ttlMs? }`. `ttlMs` is the delivery TTL (`0` = drop if recipient offline; omit for the 5-min default). Use `{ kind: 'response', correlationId }` to answer a request |
 | `publish` | `(topic, text): Promise<void>` | broadcast to a topic's subscribers |
 | `sendFile` | `(to, opts): Promise<void>` | `opts`: `{ data: Uint8Array\|ArrayBuffer, filename, contentType?, caption?, ttlMs?, replyToMsgId? }`. Base64-encodes the bytes into a `file_send`; the recipient gets an `Inbound{ kind:'file' }` with the metadata + `fetchUrl` (bytes are downloaded separately) |
+| `fetchFile` | `(fileId): Promise<Uint8Array>` | downloads the bytes over HTTP with the agent token (node-scoped: only the file's sender/recipient succeeds — a non-party / unknown id rejects with an `HTTP_404` error). Needs `httpUrl`; no WS connection required |
 | `subscribe` / `unsubscribe` | `(topic): Promise<void>` | exact-topic; no wildcards |
 | `request` | `(to, text, opts?): Promise<Inbound>` | `opts`: `{ timeoutMs?=30000, correlationId? }`; resolves with the response, rejects on timeout/error |
 | `listPresence` | `(): Promise<PresenceEntry[]>` | roster of self + peers you share a **direct** ACL edge with (either direction), from the registry — each `{ id, online, lastSeen }`. A peer appears (as `online:false`) before it ever connects; peers reachable only via a shared topic/group are **not** included (derive those from `GET /acl` + your own group model). For live updates, listen for the `'presence'` event |
