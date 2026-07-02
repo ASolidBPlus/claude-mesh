@@ -10,6 +10,7 @@ export interface Agent {
   hostname: string;
   capabilities: string;    // raw JSON string, e.g. '["file-transfer","broadcast"]'
   metadata: string;        // raw JSON string, e.g. '{"region":"eu-west"}'
+  namespace: string | null; // #41: first-class identity label; null = unnamespaced. No routing/ACL semantics.
   registered_at: number;   // unix ms
   last_seen: number;       // unix ms
   online: number;          // 0 | 1
@@ -101,6 +102,7 @@ export function openDb(path: string): Database {
       hostname     TEXT NOT NULL,
       capabilities TEXT NOT NULL DEFAULT '[]',
       metadata     TEXT NOT NULL DEFAULT '{}',
+      namespace    TEXT,
       registered_at INTEGER NOT NULL,
       last_seen    INTEGER NOT NULL,
       online       INTEGER NOT NULL DEFAULT 0
@@ -203,6 +205,10 @@ export function openDb(path: string): Database {
   // get tz=NULL and keep behaving exactly as before (UTC cron).
   try { db.exec('ALTER TABLE reminders ADD COLUMN tz TEXT'); } catch {}
 
+  // #41 migration: first-class nullable `namespace` on agents (identity label;
+  // no routing/ACL/enforcement — inert data). Existing rows get namespace=NULL.
+  try { db.exec('ALTER TABLE agents ADD COLUMN namespace TEXT'); } catch {}
+
   // Sprint 12 migration: drop the deprecated `data` column (base64 blob in
   // SQLite) if it still exists from pre-Sprint-12 databases. It was declared
   // NOT NULL, so insertFile would otherwise fail with a NOT NULL constraint
@@ -229,16 +235,18 @@ export function registerAgent(
     hostname: string;
     capabilities?: string;
     metadata?: string;
+    namespace?: string | null;
   }
 ): Agent {
   const now = Date.now();
   const capabilities = agent.capabilities ?? '[]';
   const metadata = agent.metadata ?? '{}';
+  const namespace = agent.namespace ?? null;
 
   db.prepare(`
-    INSERT INTO agents (id, token_hash, hostname, capabilities, metadata, registered_at, last_seen, online)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-  `).run(agent.id, agent.token_hash, agent.hostname, capabilities, metadata, now, now);
+    INSERT INTO agents (id, token_hash, hostname, capabilities, metadata, namespace, registered_at, last_seen, online)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+  `).run(agent.id, agent.token_hash, agent.hostname, capabilities, metadata, namespace, now, now);
 
   return getAgentById(db, agent.id) as Agent;
 }
@@ -285,6 +293,7 @@ export function updateAgent(
     capabilities?: string;
     metadata?: string;
     hostname?: string;
+    namespace?: string | null;
   }
 ): Agent | null {
   const setClauses: string[] = [];
@@ -301,6 +310,12 @@ export function updateAgent(
   if (fields.hostname !== undefined) {
     setClauses.push('hostname = ?');
     values.push(fields.hostname);
+  }
+  // namespace: explicit null clears it, so distinguish "provided" (incl. null)
+  // from "omitted" — an omitted namespace leaves the column untouched.
+  if (fields.namespace !== undefined) {
+    setClauses.push('namespace = ?');
+    values.push(fields.namespace);
   }
 
   if (setClauses.length === 0) {
