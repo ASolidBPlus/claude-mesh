@@ -435,6 +435,24 @@ function handleMessagesGet(ctx: AdminCtx): void {
   const since = sinceRaw !== null ? parseInt(sinceRaw, 10) : undefined;
   const limit = limitRaw !== null ? parseInt(limitRaw, 10) : undefined;
 
+  // Backward pagination (#36): opaque `before` cursor = "<sent_at>:<id>",
+  // derived by the client from the oldest row of the previous page. Rows
+  // strictly older than the cursor are returned (stable sent_at,id tie-break),
+  // so "load older" tiles without duplicates or gaps even across equal sent_at.
+  let before: { sentAt: number; id: string } | undefined;
+  const beforeRaw = url.searchParams.get('before');
+  if (beforeRaw !== null) {
+    const sep = beforeRaw.indexOf(':');
+    const sentAt = sep > 0 ? parseInt(beforeRaw.slice(0, sep), 10) : NaN;
+    const id = sep > 0 ? beforeRaw.slice(sep + 1) : '';
+    if (Number.isNaN(sentAt) || id === '') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid before cursor (expected "<sent_at>:<id>")' }));
+      return;
+    }
+    before = { sentAt, id };
+  }
+
   // Node-scoped read (#35): a non-admin agent only ever sees traffic it is a
   // party to. The (from_agent = X OR to_agent = X) scope covers direct, topic
   // (persisted as per-subscriber copies with to_agent = subscriber), and
@@ -455,6 +473,7 @@ function handleMessagesGet(ctx: AdminCtx): void {
     topic: topicParam,
     since: Number.isNaN(since) ? undefined : since,
     limit: Number.isNaN(limit) ? undefined : limit,
+    before,
   });
 
   res.writeHead(200, { 'Content-Type': 'application/json' });

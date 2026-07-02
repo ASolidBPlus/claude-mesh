@@ -444,6 +444,10 @@ export function queryMessages(
     topic?: string;
     since?: number;
     limit?: number;
+    // Backward-pagination cursor (#36): return only rows strictly OLDER than
+    // (sentAt, id) under the `sent_at DESC, id DESC` order. The (sent_at, id)
+    // composite gives a stable tie-break across rows sharing one sent_at.
+    before?: { sentAt: number; id: string };
   }
 ): Message[] {
   const clauses: string[] = [];
@@ -461,12 +465,16 @@ export function queryMessages(
     clauses.push('sent_at >= ?');
     params.push(opts.since);
   }
+  if (opts.before !== undefined) {
+    clauses.push('(sent_at < ? OR (sent_at = ? AND id < ?))');
+    params.push(opts.before.sentAt, opts.before.sentAt, opts.before.id);
+  }
 
   let limit = opts.limit ?? 100;
   if (limit > 1000) limit = 1000;
 
   const where = clauses.length > 0 ? 'WHERE ' + clauses.join(' AND ') : '';
-  const sql = `SELECT * FROM messages ${where} ORDER BY sent_at DESC LIMIT ?`;
+  const sql = `SELECT * FROM messages ${where} ORDER BY sent_at DESC, id DESC LIMIT ?`;
   params.push(limit);
 
   return db.prepare(sql).all(...params) as Message[];
