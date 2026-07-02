@@ -76,7 +76,9 @@ describe('GET /files/:id — node-scoped (#57)', () => {
     const missing = await get('/files/does-not-exist', TOK_C);
     expect(unrelated.status).toBe(404);
     expect(missing.status).toBe(404);
-    // identical bodies → C cannot tell "not yours" from "no such file"
+    // identical status, headers AND body → C cannot tell "not yours" from
+    // "no such file" on any axis.
+    expect(unrelated.headers.get('content-type')).toBe(missing.headers.get('content-type'));
     expect(await unrelated.json()).toEqual(await missing.json());
   });
 
@@ -97,5 +99,11 @@ describe('GET /files/:id — node-scoped (#57)', () => {
     expect((await get('/observers', TOK_C)).status).toBe(401);
     expect((await get('/topics', TOK_C)).status).toBe(401);
     expect((await get('/reminders', TOK_C)).status).toBe(401);
+    // POST /files stays admin-only too — agent token must NOT be able to ingest.
+    const postFiles = await fetch(`${base}/files`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOK_C}` },
+    });
+    expect(postFiles.status).toBe(401);
   });
 });
