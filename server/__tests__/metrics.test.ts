@@ -7,7 +7,7 @@ import { tmpdir } from 'os';
 import * as net from 'net';
 import {
   openDb, registerAgent, aclGrant, setOnline, subscribe, getOrCreateTopic,
-  insertMessage, insertReminder, expireMessages,
+  insertMessage, insertReminder, countExpiredUndeliveredSince,
 } from '../db.ts';
 import { generateToken, hashToken } from '../auth.ts';
 import {
@@ -322,7 +322,8 @@ describe('metrics E2E routing', () => {
     const past = Date.now() - 10_000;
     insertMessage(db, { id: 'd1', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'p', sent_at: 1, expires_at: past });
     insertMessage(db, { id: 't1', kind: 'topic', from_agent: 'a', to_agent: 'b', payload: 'p', sent_at: 2, expires_at: past });
-    const c = expireMessages(db);
+    // #34: expiry no longer deletes; the counter is windowed over expires_at.
+    const c = countExpiredUndeliveredSince(db, 0, Date.now());
     for (const [k, n] of Object.entries(c)) incExpiredByKind(k, n);
     const out = renderMetrics(db);
     expect(lineValue(out, 'mesh_messages_total{kind="direct",status="expired"}')).toBe(1);

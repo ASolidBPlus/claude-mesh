@@ -148,6 +148,7 @@ export function openDb(path: string): Database {
     CREATE INDEX IF NOT EXISTS idx_messages_topic ON messages(topic, sent_at);
     CREATE INDEX IF NOT EXISTS idx_messages_correlation ON messages(correlation_id);
     CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at) WHERE expires_at IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_messages_sent_at ON messages(sent_at);
     CREATE INDEX IF NOT EXISTS idx_agents_last_seen ON agents(last_seen);
 
     CREATE TABLE IF NOT EXISTS files (
@@ -471,16 +472,50 @@ export function queryMessages(
   return db.prepare(sql).all(...params) as Message[];
 }
 
-export function expireMessages(db: Database): Record<string, number> {
-  const now = Date.now();
+// Delivery TTL and retention are DIFFERENT lifecycles (#34):
+//   - expires_at governs DELIVERABILITY only (the drain gate in
+//     getPendingMessages/getPendingTopicMessages/countPendingMessages already
+//     enforces it — an undelivered message past its TTL is never delivered).
+//   - retention governs how long rows stay in the store; see sweepRetention.
+// Neither deletes delivered history at TTL anymore.
+
+// Count, by kind, the undelivered messages that crossed their TTL in the
+// window [since, now) — i.e. newly "expired undelivered" since the last sweep.
+// Deletes nothing. Windowed so each row is counted exactly once as it expires
+// (undelivered-past-TTL rows are stable — the drain gate means they never
+// become delivered). Backs the process-lived expired-undelivered counter.
+export function countExpiredUndeliveredSince(
+  db: Database,
+  since: number,
+  now: number
+): Record<string, number> {
   const rows = db.prepare(
     `SELECT kind, COUNT(*) AS c FROM messages
-     WHERE expires_at IS NOT NULL AND expires_at < ? GROUP BY kind`
-  ).all(now) as { kind: string; c: number }[];
+     WHERE delivered_at IS NULL
+       AND expires_at IS NOT NULL
+       AND expires_at >= ? AND expires_at < ?
+     GROUP BY kind`
+  ).all(since, now) as { kind: string; c: number }[];
   const counts: Record<string, number> = {};
   for (const r of rows) counts[r.kind] = r.c;
-  db.prepare('DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < ?').run(now);
   return counts;
+}
+
+// Retention sweep: delete rows older than the retention window, EXCEPT those
+// still deliverable (undelivered AND not-yet-expired) — retention must never
+// destroy durable pending mail (e.g. a ttl:null message to a long-offline
+// agent). Only ever called when a retention window is configured
+// (MESH_RETENTION_MS); unset ⇒ never called ⇒ keep everything forever.
+// Returns the number of rows removed. Reusable shape for the files table (#39).
+export function sweepRetention(db: Database, retentionMs: number): number {
+  const now = Date.now();
+  const cutoff = now - retentionMs;
+  const result = db.prepare(
+    `DELETE FROM messages
+     WHERE sent_at < ?
+       AND NOT (delivered_at IS NULL AND (expires_at IS NULL OR expires_at >= ?))`
+  ).run(cutoff, now);
+  return result.changes;
 }
 
 export function countTopics(db: Database): number {

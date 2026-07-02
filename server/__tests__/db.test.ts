@@ -22,7 +22,8 @@ import {
   getPendingTopicMessages,
   getMessage,
   getMessageByCorrelationId,
-  expireMessages,
+  countExpiredUndeliveredSince,
+  sweepRetention,
   getOrCreateTopic,
   listTopics,
   deleteTopic,
@@ -649,36 +650,78 @@ describe('getMessageByCorrelationId', () => {
 // expireMessages
 // ──────────────────────────────────────────────
 
-describe('expireMessages', () => {
-  it('deletes rows where expires_at < Date.now() and returns the deleted count', () => {
+describe('countExpiredUndeliveredSince', () => {
+  it('counts undelivered rows whose expires_at is in [since, now), by kind — and deletes nothing', () => {
     const db = freshDb();
-    const pastTime = Date.now() - 10000;
-    insertMessage(db, { id: 'old1', kind: 'direct', from_agent: 'x', payload: 'p', sent_at: 1, expires_at: pastTime });
-    insertMessage(db, { id: 'old2', kind: 'direct', from_agent: 'x', payload: 'p', sent_at: 2, expires_at: pastTime });
-    const count = Object.values(expireMessages(db)).reduce((a, b) => a + b, 0);
-    expect(count).toBe(2);
-    expect(getMessage(db, 'old1')).toBeNull();
-    expect(getMessage(db, 'old2')).toBeNull();
+    const now = Date.now();
+    insertMessage(db, { id: 'e-d', kind: 'direct', from_agent: 'x', payload: 'p', sent_at: 1, expires_at: now - 5000 });
+    insertMessage(db, { id: 'e-t', kind: 'topic', from_agent: 'x', payload: 'p', sent_at: 2, expires_at: now - 5000 });
+    const c = countExpiredUndeliveredSince(db, 0, now);
+    expect(c.direct).toBe(1);
+    expect(c.topic).toBe(1);
+    // nothing deleted — expiry is not a delete anymore
+    expect(getMessage(db, 'e-d')).not.toBeNull();
+    expect(getMessage(db, 'e-t')).not.toBeNull();
   });
 
-  it('does not delete rows where expires_at IS NULL', () => {
+  it('excludes rows that expired BEFORE the window (since), so each expiry counts once', () => {
     const db = freshDb();
-    insertMessage(db, { id: 'keep1', kind: 'direct', from_agent: 'x', payload: 'p', sent_at: 1, expires_at: null });
-    expireMessages(db);
-    expect(getMessage(db, 'keep1')).not.toBeNull();
+    const now = Date.now();
+    insertMessage(db, { id: 'old', kind: 'direct', from_agent: 'x', payload: 'p', sent_at: 1, expires_at: now - 10_000 });
+    // window starts after the row already expired → not counted this tick
+    expect(countExpiredUndeliveredSince(db, now - 5_000, now).direct).toBeUndefined();
+    // a window that contains the expiry counts it
+    expect(countExpiredUndeliveredSince(db, now - 20_000, now).direct).toBe(1);
   });
 
-  it('does not delete rows where expires_at >= Date.now()', () => {
+  it('excludes DELIVERED rows (only undelivered messages "expire")', () => {
     const db = freshDb();
-    const futureTime = Date.now() + 60000;
-    insertMessage(db, { id: 'keep2', kind: 'direct', from_agent: 'x', payload: 'p', sent_at: 1, expires_at: futureTime });
-    expireMessages(db);
-    expect(getMessage(db, 'keep2')).not.toBeNull();
+    const now = Date.now();
+    const m = insertMessage(db, { id: 'del', kind: 'direct', from_agent: 'x', payload: 'p', sent_at: 1, expires_at: now - 5000 });
+    markDelivered(db, m.id);
+    expect(countExpiredUndeliveredSince(db, 0, now).direct).toBeUndefined();
   });
 
-  it('returns 0 when no rows qualify for deletion', () => {
+  it('excludes rows with expires_at IS NULL (never expire)', () => {
     const db = freshDb();
-    expect(Object.values(expireMessages(db)).reduce((a, b) => a + b, 0)).toBe(0);
+    insertMessage(db, { id: 'forever', kind: 'direct', from_agent: 'x', payload: 'p', sent_at: 1, expires_at: null });
+    expect(Object.keys(countExpiredUndeliveredSince(db, 0, Date.now())).length).toBe(0);
+  });
+});
+
+describe('sweepRetention', () => {
+  it('deletes rows older than the window, returns the count', () => {
+    const db = freshDb();
+    const old = Date.now() - 100_000;
+    const d = insertMessage(db, { id: 'ret-del', kind: 'direct', from_agent: 'x', to_agent: 'b', payload: 'p', sent_at: old, expires_at: null });
+    markDelivered(db, d.id);
+    const removed = sweepRetention(db, 1);
+    expect(removed).toBe(1);
+    expect(getMessage(db, 'ret-del')).toBeNull();
+  });
+
+  it('never deletes still-deliverable pending mail (undelivered + unexpired), regardless of age', () => {
+    const db = freshDb();
+    const old = Date.now() - 100_000;
+    // undelivered, ttl:null (never expires) → still deliverable → must survive
+    insertMessage(db, { id: 'pending-forever', kind: 'direct', from_agent: 'x', to_agent: 'b', payload: 'p', sent_at: old, expires_at: null });
+    // undelivered, not-yet-expired → still deliverable → must survive
+    insertMessage(db, { id: 'pending-live', kind: 'direct', from_agent: 'x', to_agent: 'b', payload: 'p', sent_at: old, expires_at: Date.now() + 60_000 });
+    // undelivered but expired → no longer deliverable → swept
+    insertMessage(db, { id: 'pending-expired', kind: 'direct', from_agent: 'x', to_agent: 'b', payload: 'p', sent_at: old, expires_at: Date.now() - 5000 });
+    const removed = sweepRetention(db, 1);
+    expect(removed).toBe(1);
+    expect(getMessage(db, 'pending-forever')).not.toBeNull();
+    expect(getMessage(db, 'pending-live')).not.toBeNull();
+    expect(getMessage(db, 'pending-expired')).toBeNull();
+  });
+
+  it('does not delete rows newer than the window', () => {
+    const db = freshDb();
+    const m = insertMessage(db, { id: 'recent', kind: 'direct', from_agent: 'x', to_agent: 'b', payload: 'p', sent_at: Date.now(), expires_at: null });
+    markDelivered(db, m.id);
+    expect(sweepRetention(db, 3_600_000)).toBe(0);
+    expect(getMessage(db, 'recent')).not.toBeNull();
   });
 });
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { openDb, registerAgent, aclGrant, insertMessage, getMessage, insertFile, getFile } from '../db.ts';
+import { openDb, registerAgent, aclGrant, insertMessage, markDelivered, getMessage, insertFile, getFile } from '../db.ts';
 import { startCleanup } from '../cleanup.ts';
 import { WebSocket } from 'ws';
 import { PendingRequest } from '../router.ts';
@@ -12,55 +12,52 @@ function wait(ms: number): Promise<void> {
 }
 
 describe('cleanup', () => {
-  it('expires messages and logs count', async () => {
+  it('#34: does NOT delete on expiry when retention is unset (expiry only gates deliverability)', async () => {
     const db = openDb(':memory:');
     registerAgent(db, { id: 'agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
     registerAgent(db, { id: 'agent-b', token_hash: 'b'.repeat(64), hostname: 'host2' });
     aclGrant(db, 'agent-a', 'agent-b', 'system');
 
     const pastExpiry = Date.now() - 5000;
-    const noExpiry = null;
 
-    const msg1 = insertMessage(db, {
-      id: 'msg-expired-1',
-      kind: 'direct',
-      from_agent: 'agent-a',
-      to_agent: 'agent-b',
-      payload: 'hello',
-      sent_at: Date.now() - 10000,
-      expires_at: pastExpiry,
-    });
+    // delivered + expired (the data-loss case that used to be erased)
+    const msg1 = insertMessage(db, { id: 'msg-delivered-exp', kind: 'direct', from_agent: 'agent-a', to_agent: 'agent-b', payload: 'hello', sent_at: Date.now() - 10000, expires_at: pastExpiry });
+    markDelivered(db, msg1.id);
+    // undelivered + expired
+    const msg2 = insertMessage(db, { id: 'msg-undelivered-exp', kind: 'direct', from_agent: 'agent-a', to_agent: 'agent-b', payload: 'hello2', sent_at: Date.now() - 10000, expires_at: pastExpiry });
+    // no expiry
+    const msg3 = insertMessage(db, { id: 'msg-no-expiry', kind: 'direct', from_agent: 'agent-a', to_agent: 'agent-b', payload: 'hello3', sent_at: Date.now(), expires_at: null });
 
-    const msg2 = insertMessage(db, {
-      id: 'msg-expired-2',
-      kind: 'direct',
-      from_agent: 'agent-a',
-      to_agent: 'agent-b',
-      payload: 'hello2',
-      sent_at: Date.now() - 10000,
-      expires_at: pastExpiry,
-    });
-
-    const msg3 = insertMessage(db, {
-      id: 'msg-no-expiry',
-      kind: 'direct',
-      from_agent: 'agent-a',
-      to_agent: 'agent-b',
-      payload: 'hello3',
-      sent_at: Date.now(),
-      expires_at: noExpiry,
-    });
-
-    const pendingRequests = new Map<string, PendingRequest>();
-    const agentIndex = new Map<string, WebSocket>();
-
-    const handle = startCleanup(db, pendingRequests, agentIndex, 50);
+    const handle = startCleanup(db, new Map<string, PendingRequest>(), new Map<string, WebSocket>(), 50);
     await wait(100);
     handle.stop();
 
-    expect(getMessage(db, msg1.id)).toBeNull();
-    expect(getMessage(db, msg2.id)).toBeNull();
+    // #34: retention unset → cleanup deletes nothing; all rows survive as history.
+    expect(getMessage(db, msg1.id)).not.toBeNull();
+    expect(getMessage(db, msg2.id)).not.toBeNull();
     expect(getMessage(db, msg3.id)).not.toBeNull();
+
+    db.close();
+  });
+
+  it('#34: retention sweep removes old delivered/expired rows but keeps still-deliverable pending mail', async () => {
+    const db = openDb(':memory:');
+    const old = Date.now() - 100_000;
+
+    const delivered = insertMessage(db, { id: 'ret-delivered', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'x', sent_at: old, expires_at: null });
+    markDelivered(db, delivered.id);
+    const expired = insertMessage(db, { id: 'ret-expired', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'y', sent_at: old, expires_at: Date.now() - 5000 });
+    // undelivered ttl:null older than retention → still deliverable → must survive
+    const pending = insertMessage(db, { id: 'ret-pending', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'z', sent_at: old, expires_at: null });
+
+    // retentionMs=1 → everything older than ~now is eligible (except deliverable)
+    const handle = startCleanup(db, new Map<string, PendingRequest>(), new Map<string, WebSocket>(), 50, 1);
+    await wait(100);
+    handle.stop();
+
+    expect(getMessage(db, delivered.id)).toBeNull();
+    expect(getMessage(db, expired.id)).toBeNull();
+    expect(getMessage(db, pending.id)).not.toBeNull();
 
     db.close();
   });
