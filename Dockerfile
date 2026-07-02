@@ -11,7 +11,7 @@ COPY server/*.ts ./
 # Runtime
 ENV MESH_DB_PATH=/data/mesh.db \
     MESH_WS_PORT=7432 \
-    MESH_HTTP_PORT=7433 \
+    MESH_ADMIN_PORT=7433 \
     MESH_CLEANUP_INTERVAL_MS=60000 \
     MESH_MAX_FILE_BYTES=10485760 \
     MESH_FILES_DIR=/data/files
