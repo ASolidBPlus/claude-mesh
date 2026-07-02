@@ -232,7 +232,7 @@ Every method returns a `Promise` that resolves when the server acks (for `reques
 | `publish` | `(topic, text): Promise<void>` | broadcast to a topic's subscribers |
 | `subscribe` / `unsubscribe` | `(topic): Promise<void>` | exact-topic; no wildcards |
 | `request` | `(to, text, opts?): Promise<Inbound>` | `opts`: `{ timeoutMs?=30000, correlationId? }`; resolves with the response, rejects on timeout/error |
-| `listPresence` | `(): Promise<PresenceEntry[]>` | current roster — self + ACL-related peers — each `{ id, online, lastSeen }`. For live updates, listen for the `'presence'` event |
+| `listPresence` | `(): Promise<PresenceEntry[]>` | roster of self + peers you share a **direct** ACL edge with (either direction), from the registry — each `{ id, online, lastSeen }`. A peer appears (as `online:false`) before it ever connects; peers reachable only via a shared topic/group are **not** included (derive those from `GET /acl` + your own group model). For live updates, listen for the `'presence'` event |
 | `close` | `(): void` | graceful shutdown; stops reconnecting |
 
 **`Inbound`** — the normalized (camelCase) form of a delivery:
