@@ -276,7 +276,8 @@ function handleFileSend(ctx: FrameCtx): void {
   }
   const result = routeFile(db, agentIndex, state.agentId!, f, maxFileBytes, filesDir, observerIndex);
   if (result.ok) {
-    ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
+    // #60: echo the stored file's id so the sender learns it (absent if dropped).
+    ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true, file_id: result.fileId }));
   } else {
     ws.send(JSON.stringify({
       type: 'error', ref: f.msg_id,

@@ -93,6 +93,7 @@ export interface Inbound {
   size?: number;        // = size_bytes
   caption?: string | null;      // = caption
   replyToMsgId?: string | null; // = reply_to_msg_id
+  groupId?: string | null;      // = group_id (multi-file grouping tag; null = ungrouped)
 }
 
 export interface SendFileOpts {
@@ -102,6 +103,7 @@ export interface SendFileOpts {
   caption?: string;
   ttlMs?: number;       // delivery TTL; omit for the 5-min server default
   replyToMsgId?: string;
+  groupId?: string;     // group N files from one send under a shared tag (passthrough)
 }
 
 interface ResolvedConfig {
@@ -142,6 +144,8 @@ export class MeshClient {
   private pendingReminderLists = new Map<string, Settler<Reminder[]>>();
   // listPresence() waiters keyed by ref (= msg_id); resolved by presence_list frame
   private pendingPresenceLists = new Map<string, Settler<PresenceEntry[]>>();
+  // sendFile() waiters keyed by ref (= msg_id); ack carries the stored file_id
+  private pendingFileSends = new Map<string, Settler<{ fileId: string | null }>>();
   // request waiters keyed by correlation_id; also indexed by msg_id for fast-fail
   private pendingRequests = new Map<
     string,
@@ -228,11 +232,17 @@ export class MeshClient {
   /**
    * Send a file to an agent. `opts.data` is raw bytes (Uint8Array/Buffer or
    * ArrayBuffer); it's base64-encoded internally into the `file_send` frame.
-   * Resolves on the server ack. The recipient receives an `Inbound` with
-   * `kind:'file'` carrying `fileId`/`filename`/`contentType`/`size`/`caption`/
-   * `fetchUrl` — the bytes are fetched separately via `fetchFile(fileId)`.
+   * Resolves on the server ack with `{ fileId }` — the stored file's id (which
+   * the sender can index / later fetch via `fetchFile`). `fileId` is `null` if
+   * the file was dropped (ttlMs:0 to an offline recipient — nothing stored).
+   * `opts.groupId` tags a multi-file send so the recipient can reassemble it.
+   * The recipient receives an `Inbound{ kind:'file' }` with the metadata +
+   * `fetchUrl`/`groupId`.
    */
-  sendFile(to: string, opts: SendFileOpts): Promise<void> {
+  sendFile(to: string, opts: SendFileOpts): Promise<{ fileId: string | null }> {
+    if (!this.isOpen()) {
+      return Promise.reject(new Error('not connected'));
+    }
     const bytes = opts.data instanceof Uint8Array ? opts.data : new Uint8Array(opts.data);
     const data = Buffer.from(bytes).toString('base64');
     const msgId = this.id();
@@ -247,7 +257,16 @@ export class MeshClient {
     if (opts.ttlMs !== undefined) frame.ttl_ms = opts.ttlMs;
     if (opts.caption !== undefined) frame.caption = opts.caption;
     if (opts.replyToMsgId !== undefined) frame.reply_to_msg_id = opts.replyToMsgId;
-    return this.sendWithAck(msgId, frame);
+    if (opts.groupId !== undefined) frame.group_id = opts.groupId;
+    return new Promise<{ fileId: string | null }>((resolve, reject) => {
+      this.pendingFileSends.set(msgId, { resolve, reject });
+      try {
+        this.ws!.send(JSON.stringify(frame));
+      } catch (err) {
+        this.pendingFileSends.delete(msgId);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
   }
 
   /**
@@ -503,8 +522,8 @@ export class MeshClient {
 
   /**
    * Reject and clear EVERY in-flight waiter — requests, acks, reminds,
-   * reminder-lists, and presence-lists — with `err`, clearing request timeout
-   * timers first so a cleared timer can never later double-settle.
+   * reminder-lists, presence-lists, and file-sends — with `err`, clearing
+   * request timeout timers first so a cleared timer can never later double-settle.
    *
    * Called from two places:
    *  - close(): err = `client closed`.
@@ -537,6 +556,10 @@ export class MeshClient {
       p.reject(err);
     }
     this.pendingPresenceLists.clear();
+    for (const [, f] of this.pendingFileSends) {
+      f.reject(err);
+    }
+    this.pendingFileSends.clear();
   }
 
   private emit(event: MeshClientEvent, ...args: any[]): void {
@@ -739,6 +762,12 @@ export class MeshClient {
       });
       return;
     }
+    const fileSendWaiter = this.pendingFileSends.get(ref);
+    if (fileSendWaiter !== undefined) {
+      this.pendingFileSends.delete(ref);
+      fileSendWaiter.resolve({ fileId: frame.file_id ?? null });
+      return;
+    }
     const waiter = this.pendingAcks.get(ref);
     if (waiter !== undefined) {
       this.pendingAcks.delete(ref);
@@ -837,6 +866,13 @@ export class MeshClient {
       return;
     }
 
+    const fileSendWaiter = this.pendingFileSends.get(ref);
+    if (fileSendWaiter !== undefined) {
+      this.pendingFileSends.delete(ref);
+      fileSendWaiter.reject(this.makeError(frame));
+      return;
+    }
+
     const ackWaiter = this.pendingAcks.get(ref);
     if (ackWaiter !== undefined) {
       this.pendingAcks.delete(ref);
@@ -882,6 +918,7 @@ export class MeshClient {
       size: f.size_bytes,
       caption: f.caption,
       replyToMsgId: f.reply_to_msg_id,
+      groupId: f.group_id,
     };
   }
 }

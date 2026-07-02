@@ -65,6 +65,7 @@ export interface FileRecord {
   delivered_at: number | null;
   caption: string | null;
   reply_to_msg_id: string | null;
+  group_id: string | null; // #60: multi-file grouping tag (null = ungrouped)
 }
 
 export interface Reminder {
@@ -165,7 +166,8 @@ export function openDb(path: string): Database {
       expires_at      INTEGER,
       delivered_at    INTEGER,
       caption         TEXT,
-      reply_to_msg_id TEXT
+      reply_to_msg_id TEXT,
+      group_id        TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_files_to_agent   ON files(to_agent, delivered_at);
@@ -208,6 +210,10 @@ export function openDb(path: string): Database {
   // #41 migration: first-class nullable `namespace` on agents (identity label;
   // no routing/ACL/enforcement — inert data). Existing rows get namespace=NULL.
   try { db.exec('ALTER TABLE agents ADD COLUMN namespace TEXT'); } catch {}
+
+  // #60 migration: optional `group_id` on files — a passthrough grouping tag for
+  // multi-file sends (Telegram media-group model). Existing rows get NULL.
+  try { db.exec('ALTER TABLE files ADD COLUMN group_id TEXT'); } catch {}
 
   // Sprint 12 migration: drop the deprecated `data` column (base64 blob in
   // SQLite) if it still exists from pre-Sprint-12 databases. It was declared
@@ -657,21 +663,23 @@ export function insertFile(
     expires_at: number | null;
     caption?: string | null;
     reply_to_msg_id?: string | null;
+    group_id?: string | null;
   }
 ): FileRecord {
   const caption = file.caption ?? null;
   const reply_to_msg_id = file.reply_to_msg_id ?? null;
+  const group_id = file.group_id ?? null;
 
   db.prepare(`
-    INSERT INTO files (id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at, caption, reply_to_msg_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-  `).run(file.id, file.from_agent, file.to_agent, file.filename, file.content_type, file.size_bytes, file.file_path, file.sent_at, file.expires_at, caption, reply_to_msg_id);
+    INSERT INTO files (id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at, caption, reply_to_msg_id, group_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+  `).run(file.id, file.from_agent, file.to_agent, file.filename, file.content_type, file.size_bytes, file.file_path, file.sent_at, file.expires_at, caption, reply_to_msg_id, group_id);
 
   return getFile(db, file.id) as FileRecord;
 }
 
 export function getFile(db: Database, id: string): FileRecord | null {
-  return db.prepare('SELECT id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at, caption, reply_to_msg_id FROM files WHERE id = ?').get(id) as FileRecord | null;
+  return db.prepare('SELECT id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at, caption, reply_to_msg_id, group_id FROM files WHERE id = ?').get(id) as FileRecord | null;
 }
 
 export function markFileDelivered(db: Database, id: string): void {

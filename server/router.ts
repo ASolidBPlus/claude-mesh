@@ -39,6 +39,7 @@ export interface RouterResult {
   msg_id?: string;
   error_code?: string;
   error_message?: string;
+  fileId?: string; // #60: routeFile returns the stored file's id (absent if dropped)
 }
 
 export function buildDeliverFrame(msg: {
@@ -513,6 +514,7 @@ export function routeFile(
     expires_at,
     caption: frame.caption ?? null,
     reply_to_msg_id: frame.reply_to_msg_id ?? null,
+    group_id: frame.group_id ?? null,
   });
   incFile();
   incSent(from_agent);
@@ -531,6 +533,7 @@ export function routeFile(
       fetch_url: `/files/${file_id}`,
       caption: frame.caption ?? null,
       reply_to_msg_id: frame.reply_to_msg_id ?? null,
+      group_id: frame.group_id ?? null,
     });
     recipientWs.send(deliverFrame);
     markFileDelivered(db, file_id);
@@ -548,7 +551,7 @@ export function routeFile(
     file_id, filename: frame.filename, content_type,
   });
 
-  return { ok: true, msg_id: frame.msg_id };
+  return { ok: true, msg_id: frame.msg_id, fileId: file_id };
 }
 
 export function drainFileQueue(
@@ -558,7 +561,7 @@ export function drainFileQueue(
 ): number {
   const now = Date.now();
   const pendingFiles = db.prepare(`
-    SELECT id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at, caption, reply_to_msg_id FROM files
+    SELECT id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at, caption, reply_to_msg_id, group_id FROM files
     WHERE to_agent = ?
       AND delivered_at IS NULL
       AND (expires_at IS NULL OR expires_at >= ?)
@@ -578,6 +581,7 @@ export function drainFileQueue(
       fetch_url: `/files/${file.id}`,
       caption: file.caption,
       reply_to_msg_id: file.reply_to_msg_id,
+      group_id: file.group_id,
     });
     ws.send(deliverFrame);
     markFileDelivered(db, file.id);
