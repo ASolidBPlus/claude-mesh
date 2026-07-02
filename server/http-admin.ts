@@ -579,10 +579,19 @@ function handleMessagesGet(ctx: AdminCtx): void {
 }
 
 async function handleFileById(ctx: AdminCtx): Promise<void> {
-  const { res, db, params } = ctx;
+  const { res, db, params, auth } = ctx;
   const id = params.id;
   const file = getFile(db, id);
-  if (file === null) {
+
+  // Node-scoped read (#57): an AGENT may fetch a file only if it is that file's
+  // sender or recipient; admin has full access. Deny-by-default returns the
+  // SAME 404 as a missing file — an agent cannot distinguish "no such file"
+  // from "exists but not yours", so it can't enumerate/probe file_ids across
+  // nodes (no existence oracle). from_agent/to_agent are already stored.
+  const authorized =
+    file !== null &&
+    (auth.mode === 'admin' || file.from_agent === auth.agentId || file.to_agent === auth.agentId);
+  if (!authorized) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'file not found' }));
     return;
@@ -1038,7 +1047,7 @@ const ROUTES: Route[] = [
   { method: 'PATCH',  match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentPatch },
   { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentDelete },
   { method: 'GET',    match: exact('/messages'),                     handler: handleMessagesGet, auth: 'agentOrAdmin' },
-  { method: 'GET',    match: idMatch(/^\/files\/([^/]+)$/),          handler: handleFileById },
+  { method: 'GET',    match: idMatch(/^\/files\/([^/]+)$/),          handler: handleFileById, auth: 'agentOrAdmin' },
   { method: 'POST',   match: exact('/files'),                        handler: handleFilePost },
   { method: 'POST',   match: exact('/reminders'),                    handler: handleReminderPost },
   { method: 'GET',    match: exact('/reminders'),                    handler: handleReminderGet },

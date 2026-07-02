@@ -242,7 +242,7 @@ Every method returns a `Promise` that resolves when the server acks (for `reques
 ```
 `text` equals `payload` for text messages. For `kind: 'file'`, `payload` is `null` and `fileId` / `filename` / `contentType` are set.
 
-Worth knowing: reconnect is automatic (exponential backoff, re-auth, re-subscribe). The default `request` timeout is 30 s — pass a larger `timeoutMs` when the responder is an LLM (model latency can exceed it). File *content* is out of scope (`GET /files/:id` is admin-gated); the SDK surfaces file metadata only. Full surface and limits: [`client/README.md`](client/README.md).
+Worth knowing: reconnect is automatic (exponential backoff, re-auth, re-subscribe). The default `request` timeout is 30 s — pass a larger `timeoutMs` when the responder is an LLM (model latency can exceed it). File bytes download from `GET /files/:id` (node-scoped — the file's recipient/sender, or admin); the SDK surfaces file metadata on inbound. Full surface and limits: [`client/README.md`](client/README.md).
 
 ### 4.2 From scratch (any language)
 
@@ -325,9 +325,9 @@ Typical consumers: a live comms-map, an audit log, a scoring engine, a moderatio
 
 ## 6. HTTP admin API
 
-A second HTTP listener (admin port, default `7385`) handles administration. Every endpoint except `/metrics` requires `Authorization: Bearer <MESH_ADMIN_TOKEN>` — with one exception: `GET /messages` also accepts an **agent's own bearer token** for node-scoped history (see below). `/metrics` is intentionally unauthenticated — keep the admin port on an internal network and don't expose it publicly.
+A second HTTP listener (admin port, default `7385`) handles administration. Every endpoint except `/metrics` requires `Authorization: Bearer <MESH_ADMIN_TOKEN>` — with two exceptions: `GET /messages` and `GET /files/:id` also accept an **agent's own bearer token**, node-scoped (see below). `/metrics` is intentionally unauthenticated — keep the admin port on an internal network and don't expose it publicly.
 
-**Auth precedence:** on `GET /messages` the `Authorization` bearer is matched against the admin token **first** (timing-safe); if it isn't the admin token it is looked up as an agent token. So the admin token always grants the full read.
+**Auth precedence:** on the node-scoped routes (`GET /messages`, `GET /files/:id`) the `Authorization` bearer is matched against the admin token **first** (timing-safe); if it isn't the admin token it is looked up as an agent token. So the admin token always grants full access; every other route stays admin-only.
 
 **Agents**
 - `POST /agents` `{ id, hostname, namespace? }` → `201` agent + `token` (raw, shown once). `namespace` is an optional string (identity label; null if omitted).
@@ -354,7 +354,7 @@ A second HTTP listener (admin port, default `7385`) handles administration. Ever
 
 **Files**
 - `POST /files` (multipart: `file`, `from_agent`, `to_agent`, `caption?`, `reply_to_msg_id?`, `ttl_ms?`) → `201` file record.
-- `GET /files/:id` → the file bytes (`Content-Disposition: attachment`).
+- `GET /files/:id` → the file bytes (`Content-Disposition: attachment`). **Node-scoped:** an agent token may fetch a file only if it is the file's `to_agent` or `from_agent`; admin fetches any. Unauthorized and not-found both return **404** (no existence oracle — an agent can't probe file ids across nodes).
 
 **Reminders**
 - `POST /reminders` `{ agent_id, payload, (one of) schedule|due_at|duration, tz? }` → `201`.
