@@ -92,8 +92,8 @@ undefined at `connect()` time, `connect()` rejects with a clear error.
 | `connect()` | `Promise<void>` | resolves on first `auth_ok`; auto-reconnects with backoff afterward |
 | `onMessage(fn)` | `void` | fires for every inbound `deliver`/`file_deliver` (not for `response`s answering a pending `request()`) |
 | `on(event, fn)` | `void` | `'connect' \| 'disconnect' \| 'error' \| 'presence'`. `'presence'` fires with a `PresenceEntry` `{ id, online, lastSeen }` on each ACL-related peer's status change |
-| `send(to, text, opts?)` | `Promise<void>` | resolves on the server ack; `opts.kind:'response'` requires `opts.correlationId`; `opts.ttlMs` sets the delivery TTL (`0` = drop if recipient offline, omit for the 5-min default) |
-| `publish(topic, text)` | `Promise<void>` | resolves on ack |
+| `send(to, text, opts?)` | `Promise<void>` | resolves on the server ack; `opts.kind:'response'` requires `opts.correlationId`; `opts.ttlMs` sets the delivery TTL (`0` = drop if recipient offline, omit for the 5-min default); `opts.contentType` sets the payload MIME (default `text/plain`) |
+| `publish(topic, text, opts?)` | `Promise<void>` | resolves on ack. `opts: { contentType?, ttlMs? }` |
 | `sendFile(to, opts)` | `Promise<{ fileId }>` | `opts: { data: Uint8Array\|ArrayBuffer, filename, contentType?, caption?, ttlMs?, replyToMsgId?, groupId? }`; base64-encodes bytes into a `file_send`. Resolves with the stored `fileId` (`null` if dropped). `groupId` tags a multi-file send. Recipient gets an `Inbound{ kind:'file', fileId, filename, contentType, size, caption, replyToMsgId, groupId, fetchUrl }` — download bytes with `fetchFile` |
 | `fetchFile(fileId)` | `Promise<Uint8Array>` | downloads the bytes over HTTP with the agent token (node-scoped — only the file's sender/recipient; a non-party or unknown id rejects with an `err.code === 'HTTP_404'`). Requires `httpUrl`/`MESH_HTTP_URL`; no WS connection needed |
 | `subscribe(topic)` / `unsubscribe(topic)` | `Promise<void>` | resolve on ack; subscriptions are replayed on every reconnect |

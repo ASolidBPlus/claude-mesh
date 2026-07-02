@@ -56,6 +56,16 @@ export interface SendOpts {
    *  `0` = drop if the recipient is offline. Governs deliverability of the
    *  queued copy, not how long history is retained (see MESH_RETENTION_MS). */
   ttlMs?: number;
+  /** MIME type for the payload (default `text/plain`). Surfaced to the
+   *  recipient as `Inbound.contentType`. */
+  contentType?: string;
+}
+
+export interface PublishOpts {
+  /** MIME type for the payload (default `text/plain`). */
+  contentType?: string;
+  /** Delivery TTL in ms (default 5 min; `0` = drop for offline subscribers). */
+  ttlMs?: number;
 }
 
 /** A presence snapshot entry (from `listPresence()`), or the payload of a
@@ -210,15 +220,17 @@ export class MeshClient {
         correlation_id: opts.correlationId,
         payload: text,
       };
+      if (opts.contentType !== undefined) frame.content_type = opts.contentType;
       return this.sendWithAck(msgId, frame);
     }
     const msgId = this.id();
     const frame: SendFrame = { type: 'send', msg_id: msgId, to, payload: text };
     if (opts.ttlMs !== undefined) frame.ttl_ms = opts.ttlMs;
+    if (opts.contentType !== undefined) frame.content_type = opts.contentType;
     return this.sendWithAck(msgId, frame);
   }
 
-  publish(topic: string, text: string): Promise<void> {
+  publish(topic: string, text: string, opts: PublishOpts = {}): Promise<void> {
     const msgId = this.id();
     const frame: PublishFrame = {
       type: 'publish',
@@ -226,6 +238,8 @@ export class MeshClient {
       topic,
       payload: text,
     };
+    if (opts.contentType !== undefined) frame.content_type = opts.contentType;
+    if (opts.ttlMs !== undefined) frame.ttl_ms = opts.ttlMs;
     return this.sendWithAck(msgId, frame);
   }
 
