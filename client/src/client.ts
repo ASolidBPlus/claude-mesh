@@ -322,9 +322,16 @@ export class MeshClient {
   }
 
   /**
-   * Fetch the current presence roster — the agents this node is ACL-related to,
-   * plus itself — each with `online` and `lastSeen`. For live updates, listen
-   * for the `'presence'` event (emitted on every `agent_status` change).
+   * Fetch the current presence roster: this node plus every registered peer it
+   * shares a DIRECT ACL edge with (either direction), each with `online` and
+   * `lastSeen`. Scope notes:
+   *  - It's registry-based, not session-based — a peer appears (as
+   *    `online:false`) before it has ever connected.
+   *  - Only DIRECT ACL peers are included; a peer reachable only via a shared
+   *    topic/group is NOT here — build that roster from `GET /acl` + your own
+   *    group model and overlay presence.
+   * For live updates, listen for the `'presence'` event (emitted on every
+   * `agent_status` change).
    */
   listPresence(): Promise<PresenceEntry[]> {
     if (!this.isOpen()) {

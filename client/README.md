@@ -95,7 +95,7 @@ undefined at `connect()` time, `connect()` rejects with a clear error.
 | `publish(topic, text)` | `Promise<void>` | resolves on ack |
 | `subscribe(topic)` / `unsubscribe(topic)` | `Promise<void>` | resolve on ack; subscriptions are replayed on every reconnect |
 | `request(to, text, opts?)` | `Promise<Inbound>` | resolves with the `response`; rejects on timeout or server error (e.g. `ACL_DENIED`) |
-| `listPresence()` | `Promise<PresenceEntry[]>` | current roster — self + ACL-related peers — each `{ id, online, lastSeen }` |
+| `listPresence()` | `Promise<PresenceEntry[]>` | roster of self + peers you share a **direct** ACL edge with (either direction), from the registry — each `{ id, online, lastSeen }`. Includes registered peers that have never connected (`online:false`); does **not** include peers reachable only via a shared topic/group (derive those from `GET /acl` + your group model) |
 | `close()` | `void` | stops reconnect, rejects pending acks/requests |
 
 Errors raised from server rejections carry a `.code` (e.g. `err.code === 'ACL_DENIED'`).
