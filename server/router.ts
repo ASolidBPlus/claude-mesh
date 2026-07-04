@@ -109,16 +109,24 @@ export function routeDirect(
   // 5. Recipient online
   const recipientWs = agentIndex.get(frame.to);
   if (recipientWs !== undefined) {
-    insertMessage(db, {
-      id: frame.msg_id,
-      kind: 'direct',
-      from_agent,
-      to_agent: frame.to,
-      payload: frame.payload,
-      content_type,
-      sent_at,
-      expires_at,
-    });
+    // ttl_ms=0 = EPHEMERAL: deliver live but do NOT persist a row (and hence
+    // nothing to markDelivered). Beat/heartbeat-class streams use this so they
+    // never accumulate as scrollback history. (Offline ttl-0 is already dropped
+    // below.) A stored row's only purpose is offline-queue + scrollback; an
+    // online ephemeral delivery needs neither.
+    const ephemeral = ttl === 0;
+    if (!ephemeral) {
+      insertMessage(db, {
+        id: frame.msg_id,
+        kind: 'direct',
+        from_agent,
+        to_agent: frame.to,
+        payload: frame.payload,
+        content_type,
+        sent_at,
+        expires_at,
+      });
+    }
     const deliverFrame = buildDeliverFrame({
       id: frame.msg_id,
       kind: 'direct',
@@ -131,7 +139,7 @@ export function routeDirect(
       sent_at,
     });
     recipientWs.send(deliverFrame);
-    markDelivered(db, frame.msg_id);
+    if (!ephemeral) markDelivered(db, frame.msg_id);
     incMsgStatus('direct', 'delivered');
     incReceived(frame.to);
     incBytes('out', payloadBytes);
@@ -231,17 +239,23 @@ export function routePublish(
     // 5c. Online
     const recipientWs = agentIndex.get(subscriber_id);
     if (recipientWs !== undefined) {
-      insertMessage(db, {
-        id: msgId,
-        kind: 'topic',
-        from_agent,
-        to_agent: subscriber_id,
-        topic: frame.topic,
-        payload: frame.payload,
-        content_type,
-        sent_at,
-        expires_at,
-      });
+      // ttl_ms=0 = EPHEMERAL: deliver live, persist nothing (see routeDirect).
+      // Beat/heartbeat topics (e.g. turn-status) use this so they never
+      // accumulate as scrollback history and starve real-message reads.
+      const ephemeral = ttl === 0;
+      if (!ephemeral) {
+        insertMessage(db, {
+          id: msgId,
+          kind: 'topic',
+          from_agent,
+          to_agent: subscriber_id,
+          topic: frame.topic,
+          payload: frame.payload,
+          content_type,
+          sent_at,
+          expires_at,
+        });
+      }
       recipientWs.send(buildDeliverFrame({
         id: msgId,
         kind: 'topic',
@@ -253,7 +267,7 @@ export function routePublish(
         content_type,
         sent_at,
       }));
-      markDelivered(db, msgId);
+      if (!ephemeral) markDelivered(db, msgId);
       incMsgStatus('topic', 'delivered');
       incReceived(subscriber_id);
       incBytes('out', payloadBytes);

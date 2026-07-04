@@ -529,6 +529,14 @@ function handleMessagesGet(ctx: AdminCtx): void {
   const topicParam = url.searchParams.get('topic') || undefined;
   const sinceRaw = url.searchParams.get('since');
   const limitRaw = url.searchParams.get('limit');
+  // Optional kind filter (#38-family): `kinds=direct,request,response,file` lets
+  // a DM/scrollback scan skip high-volume 'topic' beat rows. Whitelisted so an
+  // arbitrary value can't reach the SQL; empty after filtering = no constraint.
+  const KNOWN_KINDS = ['direct', 'topic', 'request', 'response', 'file', 'reminder'];
+  const kindsRaw = url.searchParams.get('kinds');
+  const kinds = kindsRaw
+    ? kindsRaw.split(',').map(k => k.trim()).filter(k => KNOWN_KINDS.includes(k))
+    : undefined;
 
   const since = sinceRaw !== null ? parseInt(sinceRaw, 10) : undefined;
   const limit = limitRaw !== null ? parseInt(limitRaw, 10) : undefined;
@@ -572,6 +580,7 @@ function handleMessagesGet(ctx: AdminCtx): void {
     since: Number.isNaN(since) ? undefined : since,
     limit: Number.isNaN(limit) ? undefined : limit,
     before,
+    kinds,
   });
 
   res.writeHead(200, { 'Content-Type': 'application/json' });

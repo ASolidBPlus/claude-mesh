@@ -485,6 +485,10 @@ export function queryMessages(
     // (sentAt, id) under the `sent_at DESC, id DESC` order. The (sent_at, id)
     // composite gives a stable tie-break across rows sharing one sent_at.
     before?: { sentAt: number; id: string };
+    // Restrict to these message kinds (e.g. ['direct','request','response',
+    // 'file']) so a DM/scrollback scan can skip high-volume 'topic' beat rows
+    // and not exhaust its row budget on them. Empty/undefined = all kinds.
+    kinds?: string[];
   }
 ): Message[] {
   const clauses: string[] = [];
@@ -497,6 +501,10 @@ export function queryMessages(
   if (opts.topic) {
     clauses.push('topic = ?');
     params.push(opts.topic);
+  }
+  if (opts.kinds && opts.kinds.length > 0) {
+    clauses.push(`kind IN (${opts.kinds.map(() => '?').join(',')})`);
+    params.push(...opts.kinds);
   }
   if (opts.since !== undefined) {
     clauses.push('sent_at >= ?');

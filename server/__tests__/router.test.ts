@@ -121,7 +121,7 @@ describe('routeDirect', () => {
     expect(getMessage(db, msgId)).toBeNull();
   });
 
-  it('ttl_ms=0 and online recipient delivers immediately', () => {
+  it('ttl_ms=0 and online recipient delivers live but does NOT persist (ephemeral)', () => {
     registerAgent(db, { id: 'agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
     registerAgent(db, { id: 'agent-b', token_hash: 'b'.repeat(64), hostname: 'host2' });
     aclGrant(db, 'agent-a', 'agent-b', 'system');
@@ -136,13 +136,11 @@ describe('routeDirect', () => {
     });
 
     expect(result.ok).toBe(true);
+    // Delivered live over the wire…
     expect(calls).toHaveLength(1);
-    const frame = JSON.parse(calls[0]);
-    expect(frame.type).toBe('deliver');
-
-    const msg = getMessage(db, msgId);
-    expect(msg).not.toBeNull();
-    expect(msg!.delivered_at).not.toBeNull();
+    expect(JSON.parse(calls[0]).type).toBe('deliver');
+    // …but NO row persisted — ttl_ms=0 is fire-and-forget, never scrollback.
+    expect(getMessage(db, msgId)).toBeNull();
   });
 
   it('respects ttl_ms for expires_at', () => {
