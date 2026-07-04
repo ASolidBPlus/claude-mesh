@@ -7,7 +7,7 @@ import { hashToken } from '../auth.ts';
 import { startWsServer, WsServerHandle } from '../ws-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
 import { emitTap, TapFrame, TAP_BUFFER_LIMIT_BYTES } from '../tap.ts';
-import { routeDirect, routePublish, routeRequest } from '../router.ts';
+import { routeDirect, routePublish } from '../router.ts';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import * as net from 'net';
@@ -129,7 +129,7 @@ describe('tap — admin /observers endpoints', () => {
 
   beforeEach(async () => {
     db = openDb(':memory:');
-    httpHandle = await startHttpAdmin(0, db, ADMIN_TOKEN, 10_485_760, '/tmp', new Map(), new Map(), new Map());
+    httpHandle = await startHttpAdmin(0, db, ADMIN_TOKEN, 10_485_760, '/tmp', new Map(), new Map());
     const port = (httpHandle.server.address() as net.AddressInfo).port;
     base = `http://localhost:${port}`;
   });
@@ -225,7 +225,7 @@ describe('tap — live gating end-to-end', () => {
     // ONE shared observerIndex passed to BOTH subsystems (mirrors server.ts).
     observerIndex = new Map<string, WebSocket>();
     wsHandle = await startWsServer(wsPort, db, 10_485_760, filesDir, 0, observerIndex);
-    httpHandle = await startHttpAdmin(0, db, ADMIN_TOKEN, 10_485_760, filesDir, wsHandle.agentIndex, wsHandle.pendingRequests, observerIndex);
+    httpHandle = await startHttpAdmin(0, db, ADMIN_TOKEN, 10_485_760, filesDir, wsHandle.agentIndex, observerIndex);
     base = `http://localhost:${(httpHandle.server.address() as net.AddressInfo).port}`;
     // confirm the same instance is shared
     expect(wsHandle.observerIndex).toBe(observerIndex);
@@ -357,20 +357,8 @@ describe('tap — live gating end-to-end', () => {
     await flushBarrier(OBS);
     expect(OBS.frames.filter((f) => f.type === 'tap' && f.msg_id === 'pub1').length).toBe(1);
 
-    // request
-    A.ws.send(JSON.stringify({ type: 'request', msg_id: 'req1', to: 'B', payload: 'req-p', correlation_id: 'corr-1' }));
-    const rtap = await waitForFrame(OBS, (f) => f.type === 'tap' && f.msg_id === 'req1');
-    expect(rtap.kind).toBe('request');
-    expect(rtap.correlation_id).toBe('corr-1');
-
-    // response (B responds to the request)
-    await waitForFrame(B, (f) => f.type === 'deliver' && f.kind === 'request' && f.correlation_id === 'corr-1');
-    B.ws.send(JSON.stringify({ type: 'response', msg_id: 'resp1', correlation_id: 'corr-1', payload: 'resp-p' }));
-    const restap = await waitForFrame(OBS, (f) => f.type === 'tap' && f.msg_id === 'resp1');
-    expect(restap.kind).toBe('response');
-    expect(restap.from).toBe('B');
-    expect(restap.to).toBe('A');
-    expect(restap.correlation_id).toBe('corr-1');
+    // (removed) request + response tap assertions — the native request/response
+    // primitive was stripped per Joel's strip.
 
     // file
     const data = Buffer.from('file-bytes-here').toString('base64');
@@ -443,7 +431,7 @@ describe('tap — live gating end-to-end', () => {
 
 describe('tap — MCP-path ingress is tapped via the shared observerIndex', () => {
   // These tests exercise the SECOND ingress path: the stdio MCP interface
-  // (mcp-server.ts) calls routeDirect/routePublish/routeRequest directly with the
+  // (mcp-server.ts) calls routeDirect/routePublish directly with the
   // SAME shared observerIndex that startMcpServer is now threaded. We connect a
   // granted observer over WS (which populates the shared observerIndex through the
   // real grant path), then invoke the route fns exactly the way mcp-server does and
@@ -464,7 +452,7 @@ describe('tap — MCP-path ingress is tapped via the shared observerIndex', () =
     filesDir = mkdtempSync(join(tmpdir(), 'mesh-mcptap-'));
     observerIndex = new Map<string, WebSocket>();
     wsHandle = await startWsServer(wsPort, db, 10_485_760, filesDir, 0, observerIndex);
-    httpHandle = await startHttpAdmin(0, db, ADMIN_TOKEN, 10_485_760, filesDir, wsHandle.agentIndex, wsHandle.pendingRequests, observerIndex);
+    httpHandle = await startHttpAdmin(0, db, ADMIN_TOKEN, 10_485_760, filesDir, wsHandle.agentIndex, observerIndex);
     base = `http://localhost:${(httpHandle.server.address() as net.AddressInfo).port}`;
     agentIndex = wsHandle.agentIndex;
     // confirm the SAME instance is shared — same invariant the MCP path relies on.
@@ -527,25 +515,8 @@ describe('tap — MCP-path ingress is tapped via the shared observerIndex', () =
     expect(tap.payload).toBe('mcp-topic');
   });
 
-  it('23. MCP-originated request is tapped (shared observerIndex)', async () => {
-    makeAgent(db, 'A'); makeAgent(db, 'B'); makeAgent(db, 'OBS');
-    aclGrant(db, 'A', 'B', 'sys');
-    await grantObs('OBS');
-    const OBS = await authClient(wsPort, db, 'OBS');
-
-    const result = routeRequest(db, agentIndex, 'A', {
-      type: 'request', msg_id: 'mcp-req1', to: 'B', payload: 'mcp-req',
-      content_type: 'text/plain', ttl_ms: 30_000, correlation_id: 'mcp-corr-1',
-    }, observerIndex);
-    expect(result.ok).toBe(true);
-
-    const tap = await waitForFrame(OBS, (f) => f.type === 'tap' && f.msg_id === 'mcp-req1');
-    expect(tap.kind).toBe('request');
-    expect(tap.from).toBe('A');
-    expect(tap.to).toBe('B');
-    expect(tap.correlation_id).toBe('mcp-corr-1');
-    expect(tap.payload).toBe('mcp-req');
-  });
+  // (removed) '23. MCP-originated request is tapped' — the mesh_request MCP tool
+  // and native request routing were stripped per Joel's strip.
 
   it('24. CRITICAL non-observer gets ZERO taps via the MCP path', async () => {
     makeAgent(db, 'A'); makeAgent(db, 'B'); makeAgent(db, 'NON'); makeAgent(db, 'OBS');

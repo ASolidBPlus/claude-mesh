@@ -2,7 +2,6 @@ import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import { unlinkSync } from 'fs';
 import { countExpiredUndeliveredSince, sweepRetention, deleteExpiredFiles, deleteDeliveredOneShots } from './db.ts';
-import { PendingRequest } from './router.ts';
 import { incExpiredByKind } from './metrics.ts';
 
 export interface CleanupHandle {
@@ -11,7 +10,6 @@ export interface CleanupHandle {
 
 export function startCleanup(
   db: Database,
-  pendingRequests: Map<string, PendingRequest>,
   agentIndex: Map<string, WebSocket>,
   intervalMs?: number,
   retentionMs?: number | null
@@ -53,31 +51,6 @@ export function startCleanup(
         try { unlinkSync(p); } catch {}
       }
       process.stdout.write(`[cleanup] expired ${expiredPaths.length} file(s)\n`);
-
-      let expiredRequests = 0;
-      for (const [correlationId, entry] of pendingRequests) {
-        if (entry.expiresAt <= Date.now()) {
-          clearTimeout(entry.timer);
-
-          if (entry.ws && entry.ws.readyState === WebSocket.OPEN) {
-            entry.ws.send(JSON.stringify({
-              type: 'error',
-              ref: correlationId,
-              code: 'REQUEST_TIMEOUT',
-              message: 'request expired during server cleanup',
-            }));
-          }
-
-          if (entry.reject) {
-            entry.reject(new Error('REQUEST_TIMEOUT'));
-          }
-
-          pendingRequests.delete(correlationId);
-          expiredRequests++;
-        }
-      }
-
-      process.stdout.write(`[cleanup] expired ${expiredRequests} pending request(s)\n`);
 
       const deletedReminders = deleteDeliveredOneShots(db, Date.now() - 86_400_000);
       process.stdout.write(`[cleanup] cleaned ${deletedReminders} old delivered reminder(s)\n`);

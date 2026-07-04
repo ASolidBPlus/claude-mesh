@@ -152,9 +152,9 @@ async function main() {
     process.exit(1);
   }
 
-  const { agentIndex, pendingRequests } = wsHandle;
+  const { agentIndex } = wsHandle;
 
-  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, wsHandle.pendingRequests, observerIndex);
+  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, observerIndex);
 
   let cleanupHandle: CleanupHandle | null = null;
   let reminderHandle: ReminderSchedulerHandle | null = null;
@@ -183,11 +183,11 @@ async function main() {
     process.exit(0);
   }
 
-  const mcpHandle = await startMcpServer(db, agentIndex, pendingRequests, observerIndex);
+  const mcpHandle = await startMcpServer(db, agentIndex, observerIndex);
   const transport = new StdioServerTransport();
   await mcpHandle.server.connect(transport);
 
-  cleanupHandle = startCleanup(db, pendingRequests, agentIndex, config.cleanupIntervalMs, config.retentionMs);
+  cleanupHandle = startCleanup(db, agentIndex, config.cleanupIntervalMs, config.retentionMs);
   reminderHandle = startReminderScheduler(db, wsHandle.agentIndex, config.reminderIntervalMs);
 
   // Only treat stdin EOF as a shutdown signal in MCP stdio mode. A standalone

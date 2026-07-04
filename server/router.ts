@@ -12,7 +12,6 @@ import {
   getTopicSubscribers,
   subscribe as dbSubscribe,
   unsubscribe as dbUnsubscribe,
-  getMessageByCorrelationId,
   Message,
   insertFile,
   getFile,
@@ -27,11 +26,11 @@ import { emitTap } from './tap.ts';
 // these names from './router.ts' (e.g. ws-server.ts) keep resolving unchanged.
 import type {
   SendFrame, PublishFrame, SubscribeFrame, UnsubscribeFrame,
-  RequestFrame, ResponseFrame, FileSendFrame,
+  FileSendFrame,
 } from '../client/src/protocol.ts';
 export type {
   SendFrame, PublishFrame, SubscribeFrame, UnsubscribeFrame,
-  RequestFrame, ResponseFrame, FileSendFrame,
+  FileSendFrame,
 };
 
 export interface RouterResult {
@@ -325,122 +324,6 @@ export function routeUnsubscribe(
 }
 
 // ──────────────────────────────────────────────
-// Sprint 7: Request/Response routing
-// (RequestFrame / ResponseFrame wire types are imported from the shared
-// client protocol module above.)
-// ──────────────────────────────────────────────
-
-export interface PendingRequest {
-  correlationId: string;
-  fromAgent: string;
-  expiresAt: number;
-  msgId: string;
-  timer: ReturnType<typeof setTimeout>;
-  startTime?: number;          // NEW — set when the request is registered
-  ws?: WebSocket;
-  resolve?: (payload: string) => void;
-  reject?: (err: Error) => void;
-}
-
-export function routeRequest(
-  db: Database,
-  agentIndex: Map<string, WebSocket>,
-  from_agent: string,
-  frame: RequestFrame,
-  observerIndex: Map<string, WebSocket> = new Map()
-): RouterResult {
-  // 1. Payload size check
-  const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
-  if (payloadBytes > 1_048_576) {
-    incError('MESSAGE_TOO_LARGE');
-    return { ok: false, error_code: 'MESSAGE_TOO_LARGE', error_message: 'payload exceeds 1 MB limit' };
-  }
-
-  // 2. Recipient exists check
-  if (getAgentById(db, frame.to) === null) {
-    incError('AGENT_NOT_FOUND');
-    return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
-  }
-
-  // 3. ACL check
-  if (!aclCheck(db, from_agent, frame.to)) {
-    incError('ACL_DENIED');
-    incAclDenied(from_agent);
-    return { ok: false, error_code: 'ACL_DENIED', error_message: `${from_agent} is not permitted to send to ${frame.to}` };
-  }
-
-  // accepted+routed
-  incSent(from_agent);
-  incBytes('in', payloadBytes);
-  observePayloadBytes(payloadBytes);
-
-  // 4. Compute expires_at
-  const ttl = frame.ttl_ms === undefined ? 300_000 : frame.ttl_ms;
-  const expires_at = ttl === 0 ? null : Date.now() + ttl;
-
-  const content_type = frame.content_type ?? 'text/plain';
-  const sent_at = Date.now();
-
-  // 5. Recipient online
-  const recipientWs = agentIndex.get(frame.to);
-  if (recipientWs !== undefined) {
-    insertMessage(db, {
-      id: frame.msg_id,
-      kind: 'request',
-      from_agent,
-      to_agent: frame.to,
-      correlation_id: frame.correlation_id,
-      payload: frame.payload,
-      content_type,
-      sent_at,
-      expires_at,
-    });
-    const deliverFrame = buildDeliverFrame({
-      id: frame.msg_id,
-      kind: 'request',
-      from_agent,
-      to_agent: frame.to,
-      topic: null,
-      correlation_id: frame.correlation_id,
-      payload: frame.payload,
-      content_type,
-      sent_at,
-    });
-    recipientWs.send(deliverFrame);
-    markDelivered(db, frame.msg_id);
-    incMsgStatus('request', 'delivered');
-    incReceived(frame.to);
-    incBytes('out', payloadBytes);
-  } else {
-    // 6. Recipient offline
-    if (ttl === 0) {
-      incMsgStatus('request', 'dropped');
-      return { ok: true, msg_id: frame.msg_id };
-    }
-    insertMessage(db, {
-      id: frame.msg_id,
-      kind: 'request',
-      from_agent,
-      to_agent: frame.to,
-      correlation_id: frame.correlation_id,
-      payload: frame.payload,
-      content_type,
-      sent_at,
-      expires_at,
-    });
-    incMsgStatus('request', 'queued');
-  }
-
-  emitTap(observerIndex, {
-    type: 'tap', msg_id: frame.msg_id, kind: 'request',
-    from: from_agent, to: frame.to, topic: null, correlation_id: frame.correlation_id,
-    sent_at, size: payloadBytes, payload: frame.payload,
-  });
-
-  return { ok: true, msg_id: frame.msg_id };
-}
-
-// ──────────────────────────────────────────────
 // Sprint 9: File Transfer
 // (FileSendFrame wire type is imported from the shared client protocol module above.)
 // ──────────────────────────────────────────────
@@ -602,80 +485,4 @@ export function drainFileQueue(
   }
 
   return pendingFiles.length;
-}
-
-export function routeResponse(
-  db: Database,
-  agentIndex: Map<string, WebSocket>,
-  from_agent: string,
-  frame: ResponseFrame,
-  pendingRequests: Map<string, PendingRequest>,
-  observerIndex: Map<string, WebSocket> = new Map()
-): RouterResult & { deliverFrame?: string } {
-  // 1. Look up pending request
-  const pending = pendingRequests.get(frame.correlation_id);
-  if (pending === undefined) {
-    incError('CORRELATION_NOT_FOUND');
-    return { ok: false, error_code: 'CORRELATION_NOT_FOUND', error_message: `no pending request for correlation_id: ${frame.correlation_id}` };
-  }
-
-  // 2. Validate responder identity
-  const originalMsg = getMessageByCorrelationId(db, frame.correlation_id);
-  if (originalMsg === null || originalMsg.to_agent !== from_agent) {
-    incError('ACL_DENIED');
-    incAclDenied(from_agent);
-    return { ok: false, error_code: 'ACL_DENIED', error_message: 'only the original recipient may respond' };
-  }
-
-  // 3. Payload size check
-  const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
-  if (payloadBytes > 1_048_576) {
-    incError('MESSAGE_TOO_LARGE');
-    return { ok: false, error_code: 'MESSAGE_TOO_LARGE', error_message: 'payload exceeds 1 MB limit' };
-  }
-
-  const content_type = frame.content_type ?? 'text/plain';
-  const sent_at = Date.now();
-
-  // 4. Store the response
-  const responseMsg = insertMessage(db, {
-    id: frame.msg_id,
-    kind: 'response',
-    from_agent,
-    to_agent: pending.fromAgent,
-    correlation_id: frame.correlation_id,
-    payload: frame.payload,
-    content_type,
-    sent_at,
-  });
-
-  // 5. Mark response delivered immediately
-  markDelivered(db, frame.msg_id);
-
-  // 6. Build the deliver frame for the requester
-  const deliverFrame = buildDeliverFrame({
-    id: frame.msg_id,
-    kind: 'response',
-    from_agent,
-    to_agent: pending.fromAgent,
-    topic: null,
-    correlation_id: frame.correlation_id,
-    payload: frame.payload,
-    content_type,
-    sent_at,
-  });
-
-  // Emit ONLY sent / in-bytes / payload-histogram here. delivered / received /
-  // out-bytes / duration are emitted exactly once in ws-server's response handler.
-  incSent(from_agent);
-  incBytes('in', payloadBytes);
-  observePayloadBytes(payloadBytes);
-
-  emitTap(observerIndex, {
-    type: 'tap', msg_id: frame.msg_id, kind: 'response',
-    from: from_agent, to: pending.fromAgent, topic: null, correlation_id: frame.correlation_id,
-    sent_at, size: payloadBytes, payload: frame.payload,
-  });
-
-  return { ok: true, deliverFrame };
 }
