@@ -1095,6 +1095,18 @@ describe('queryMessages', () => {
     expect(msgs[0].id).toBe('qs2');
   });
 
+  it('with kinds filter returns only the listed kinds (skip topic beats)', () => {
+    const db = freshDb();
+    insertMessage(db, { id: 'qk1', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'dm', sent_at: 1000 });
+    insertMessage(db, { id: 'qk2', kind: 'topic', from_agent: 'a', to_agent: 'b', topic: 'sys.presence.turn', payload: 'beat', sent_at: 2000 });
+    insertMessage(db, { id: 'qk3', kind: 'request', from_agent: 'a', to_agent: 'b', payload: 'q', sent_at: 3000 });
+    const msgs = queryMessages(db, { kinds: ['direct', 'request', 'response', 'file'] });
+    expect(msgs.map(m => m.id).sort()).toEqual(['qk1', 'qk3']); // topic beat excluded
+    // Empty/absent kinds = no constraint (back-compat).
+    expect(queryMessages(db, { kinds: [] })).toHaveLength(3);
+    expect(queryMessages(db, {})).toHaveLength(3);
+  });
+
   it('with limit clamped to 1000', () => {
     const db = freshDb();
     for (let i = 0; i < 5; i++) {

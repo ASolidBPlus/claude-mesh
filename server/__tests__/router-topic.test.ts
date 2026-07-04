@@ -179,6 +179,28 @@ describe('routePublish', () => {
     expect(pending).toHaveLength(0);
   });
 
+  it('ONLINE subscriber with ttl_ms=0 delivers live but persists NOTHING (ephemeral beat)', () => {
+    // The scrollback-bloat fix: turn-status/heartbeat beats publish at ttl 0 so
+    // an online subscriber gets the live copy without a stored row accumulating.
+    setup(db);
+    getOrCreateTopic(db, 'sys.presence.turn', 'agent-pub');
+    subscribe(db, 'agent-sub', 'sys.presence.turn');
+
+    const { ws: mockWs, calls } = mockWsTracked();
+    const agentIndex = new Map<string, WebSocket>([['agent-sub', mockWs]]);
+
+    const result = routePublish(db, agentIndex, 'agent-pub', {
+      type: 'publish', msg_id: crypto.randomUUID(), topic: 'sys.presence.turn',
+      payload: '{"state":"busy"}', ttl_ms: 0,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(1);               // delivered live
+    expect(JSON.parse(calls[0]).type).toBe('deliver');
+    const rows = db.prepare('SELECT * FROM messages WHERE topic = ?').all('sys.presence.turn');
+    expect(rows).toHaveLength(0);                 // …but zero rows persisted
+  });
+
   it('publish with zero subscribers returns ok', () => {
     registerAgent(db, { id: 'agent-pub', token_hash: 'p'.repeat(64), hostname: 'h1' });
     const result = routePublish(db, new Map(), 'agent-pub', {
