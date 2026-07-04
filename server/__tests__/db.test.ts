@@ -21,7 +21,6 @@ import {
   getPendingMessages,
   getPendingTopicMessages,
   getMessage,
-  getMessageByCorrelationId,
   countExpiredUndeliveredSince,
   sweepRetention,
   getOrCreateTopic,
@@ -627,24 +626,8 @@ describe('getPendingTopicMessages', () => {
   });
 });
 
-// ──────────────────────────────────────────────
-// getMessageByCorrelationId
-// ──────────────────────────────────────────────
-
-describe('getMessageByCorrelationId', () => {
-  it('returns the message whose correlation_id matches', () => {
-    const db = freshDb();
-    insertMessage(db, { id: 'req-1', kind: 'request', from_agent: 'x', payload: 'request', sent_at: 100, correlation_id: 'corr-abc' });
-    const msg = getMessageByCorrelationId(db, 'corr-abc');
-    expect(msg).not.toBeNull();
-    expect(msg!.id).toBe('req-1');
-  });
-
-  it('returns null when no message matches', () => {
-    const db = freshDb();
-    expect(getMessageByCorrelationId(db, 'no-such-corr')).toBeNull();
-  });
-});
+// (removed) getMessageByCorrelationId describe — the function backed only the
+// native request/response routing, removed per Joel's strip.
 
 // ──────────────────────────────────────────────
 // expireMessages
@@ -1099,8 +1082,8 @@ describe('queryMessages', () => {
     const db = freshDb();
     insertMessage(db, { id: 'qk1', kind: 'direct', from_agent: 'a', to_agent: 'b', payload: 'dm', sent_at: 1000 });
     insertMessage(db, { id: 'qk2', kind: 'topic', from_agent: 'a', to_agent: 'b', topic: 'sys.presence.turn', payload: 'beat', sent_at: 2000 });
-    insertMessage(db, { id: 'qk3', kind: 'request', from_agent: 'a', to_agent: 'b', payload: 'q', sent_at: 3000 });
-    const msgs = queryMessages(db, { kinds: ['direct', 'request', 'response', 'file'] });
+    insertMessage(db, { id: 'qk3', kind: 'file', from_agent: 'a', to_agent: 'b', payload: 'f', sent_at: 3000 });
+    const msgs = queryMessages(db, { kinds: ['direct', 'file'] });
     expect(msgs.map(m => m.id).sort()).toEqual(['qk1', 'qk3']); // topic beat excluded
     // Empty/absent kinds = no constraint (back-compat).
     expect(queryMessages(db, { kinds: [] })).toHaveLength(3);

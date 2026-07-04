@@ -133,35 +133,8 @@ describe('MeshClient', () => {
   });
 
   // 5
-  it('request/response round-trip resolves with the response', async () => {
-    aclGrant(db, 'A', 'B', 'system');
-    aclGrant(db, 'B', 'A', 'system');
-    const a = newClient('A', tokenA);
-    const b = newClient('B', tokenB);
-
-    b.onMessage((m) => {
-      if (m.kind === 'request' && m.correlationId) {
-        b.send('A', 'ans', { kind: 'response', correlationId: m.correlationId });
-      }
-    });
-    await b.connect();
-    await a.connect();
-
-    const res = await a.request('B', 'q?');
-    expect(res.kind).toBe('response');
-    expect(res.text).toBe('ans');
-  });
-
-  // 6
-  it('request timeout rejects when no response comes', async () => {
-    aclGrant(db, 'A', 'B', 'system');
-    const a = newClient('A', tokenA);
-    const b = newClient('B', tokenB);
-    await b.connect(); // B online but never answers
-    await a.connect();
-
-    await expect(a.request('B', 'q?', { timeoutMs: 300 })).rejects.toThrow('request timeout');
-  });
+  // (removed) 'request/response round-trip' + 'request timeout' — tested the
+  // removed native request/response primitive; deleted per Joel's strip.
 
   // 7
   it('reconnect re-auths, re-subscribes, and resumes delivery', async () => {
@@ -265,25 +238,9 @@ describe('MeshClient', () => {
     await expect(a.send('B', 'x')).rejects.toThrow('not connected');
   });
 
-  // 11 (amendment 4): request to an agent with NO ACL fast-fails on ACL_DENIED,
-  // NOT via the 30s timeout.
-  it('request to a no-ACL agent rejects quickly with ACL_DENIED', async () => {
-    // A → C has no ACL grant
-    const a = newClient('A', tokenA);
-    await a.connect();
-
-    let caught: any = null;
-    const start = Date.now();
-    try {
-      await a.request('C', 'q?'); // default 30s timeout — must NOT wait that long
-    } catch (err) {
-      caught = err;
-    }
-    const elapsed = Date.now() - start;
-    expect(caught).not.toBeNull();
-    expect(caught.code).toBe('ACL_DENIED');
-    expect(elapsed).toBeLessThan(2000);
-  });
+  // (removed) 'request to a no-ACL agent rejects quickly with ACL_DENIED' —
+  // tested the removed native request primitive; deleted per Joel's strip.
+  // (ACL fast-fail is still covered for directs by 'ACL-denied send rejects…'.)
 
   // ── reminders ────────────────────────────────────────────────
 

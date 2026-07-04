@@ -13,7 +13,7 @@ import { generateToken, hashToken } from '../auth.ts';
 import {
   incMsgStatus, incSent, incReceived, incAclDenied, incError, incBytes,
   incFile, incReminderFired, incExpiredByKind,
-  observePayloadBytes, observeRequestDuration,
+  observePayloadBytes,
   renderMetrics, __resetMetricsForTest,
 } from '../metrics.ts';
 import { routeDirect, routePublish, routeFile } from '../router.ts';
@@ -143,16 +143,8 @@ describe('metrics counters', () => {
     expect(lineValue(out, 'mesh_message_payload_bytes_sum')).toBe(5100);
   });
 
-  it('T11 observeRequestDuration histogram', () => {
-    observeRequestDuration(0.02);
-    observeRequestDuration(0.3);
-    const out = renderMetrics(db);
-    expect(lineValue(out, 'mesh_request_duration_seconds_bucket{le="0.025"}')).toBe(1);
-    expect(lineValue(out, 'mesh_request_duration_seconds_bucket{le="0.5"}')).toBe(2);
-    expect(lineValue(out, 'mesh_request_duration_seconds_bucket{le="+Inf"}')).toBe(2);
-    expect(lineValue(out, 'mesh_request_duration_seconds_count')).toBe(2);
-    expect(lineValue(out, 'mesh_request_duration_seconds_sum')).toBeCloseTo(0.32, 6);
-  });
+  // (removed) T11 observeRequestDuration histogram — the request_duration metric
+  // measured the removed request/response round-trip; deleted per Joel's strip.
 
   it('T12 histogram cumulative beyond top bucket', () => {
     observePayloadBytes(2_000_000);
@@ -193,12 +185,8 @@ describe('metrics gauges', () => {
     expect(lineValue(out, 'mesh_pending_messages')).toBe(1);
   });
 
-  it('T16 pending_requests via 2nd arg', () => {
-    const out1 = renderMetrics(db, new Map([['c1', {}]]));
-    expect(lineValue(out1, 'mesh_pending_requests')).toBe(1);
-    const out2 = renderMetrics(db);
-    expect(lineValue(out2, 'mesh_pending_requests')).toBe(0);
-  });
+  // (removed) T16 pending_requests — the mesh_pending_requests gauge counted
+  // the removed request/response correlations; deleted per Joel's strip.
 
   it('T17 reminders_pending', () => {
     registerAgent(db, { id: 'alice', token_hash: 'a'.repeat(64), hostname: 'h1' });
@@ -373,9 +361,8 @@ describe('metrics safety & exposition', () => {
   it('T29 malformed input never throws', () => {
     expect(() => incMsgStatus(undefined as any, null as any)).not.toThrow();
     expect(() => incBytes('x', NaN)).not.toThrow();
-    expect(() => observeRequestDuration(NaN)).not.toThrow();
     expect(() => incExpiredByKind('k', -5)).not.toThrow();
-    expect(() => renderMetrics(db, undefined)).not.toThrow();
+    expect(() => renderMetrics(db)).not.toThrow();
   });
 
   it('T30 exposition validity (full)', () => {
@@ -385,7 +372,6 @@ describe('metrics safety & exposition', () => {
     const agentIndex = new Map<string, WebSocket>();
     agentIndex.set('b', mockWsOpen());
     routeDirect(db, agentIndex, 'a', { type: 'send', msg_id: crypto.randomUUID(), to: 'b', payload: 'mixed-traffic' });
-    observeRequestDuration(0.05);
     observePayloadBytes(2048);
     const out = renderMetrics(db);
     expect(out.endsWith('\n')).toBe(true);
@@ -395,9 +381,6 @@ describe('metrics safety & exposition', () => {
       if (line.startsWith('#')) continue;
       expect(sampleRe.test(line)).toBe(true);
     }
-    expect(out).toContain('mesh_request_duration_seconds_bucket{le="+Inf"}');
-    expect(out).toContain('mesh_request_duration_seconds_sum');
-    expect(out).toContain('mesh_request_duration_seconds_count');
     expect(out).toContain('mesh_message_payload_bytes_bucket{le="+Inf"}');
     expect(out).toContain('mesh_message_payload_bytes_sum');
     expect(out).toContain('mesh_message_payload_bytes_count');
@@ -447,34 +430,8 @@ describe('metrics request/response E2E (real ws-server)', () => {
     __resetMetricsForTest();
   });
 
-  it('T24 request+response round trip', async () => {
-    const wsA = await connectWs(port);
-    const wsB = await connectWs(port);
-    wsA.send(JSON.stringify({ type: 'auth', agent_id: 'agent-a', token: tokenA }));
-    await waitFor(wsA, (m) => m.type === 'auth_ok');
-    wsB.send(JSON.stringify({ type: 'auth', agent_id: 'agent-b', token: tokenB }));
-    await waitFor(wsB, (m) => m.type === 'auth_ok');
-
-    const corrId = crypto.randomUUID();
-    const reqMsgId = crypto.randomUUID();
-    wsA.send(JSON.stringify({ type: 'request', msg_id: reqMsgId, to: 'agent-b', payload: '{"q":1}', ttl_ms: 5000, correlation_id: corrId }));
-    await waitFor(wsB, (m) => m.type === 'deliver' && m.kind === 'request');
-
-    const respMsgId = crypto.randomUUID();
-    wsB.send(JSON.stringify({ type: 'response', msg_id: respMsgId, correlation_id: corrId, payload: '{"a":1}' }));
-    await waitFor(wsA, (m) => m.type === 'deliver' && m.kind === 'response');
-    await waitFor(wsB, (m) => m.type === 'ack' && m.ref === respMsgId);
-
-    const out = renderMetrics(edb, handle.pendingRequests);
-    expect(lineValue(out, 'mesh_messages_total{kind="request",status="delivered"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_total{kind="response",status="delivered"}')).toBe(1);
-    expect(lineValue(out, 'mesh_request_duration_seconds_count')).toBe(1);
-    expect(lineValue(out, 'mesh_request_duration_seconds_sum')!).toBeGreaterThanOrEqual(0);
-    expect(lineValue(out, 'mesh_pending_requests')).toBe(0);
-
-    wsA.close();
-    wsB.close();
-  });
+  // (removed) T24 request+response round trip — exercised the removed native
+  // request/response primitive + its metrics; deleted per Joel's strip.
 });
 
 describe('metrics HTTP endpoint', () => {
@@ -493,7 +450,7 @@ describe('metrics HTTP endpoint', () => {
     const agentIndex = new Map<string, WebSocket>();
     agentIndex.set('b', mockWsOpen());
     routeDirect(hdb, agentIndex, 'a', { type: 'send', msg_id: crypto.randomUUID(), to: 'b', payload: 'http-metrics' });
-    observeRequestDuration(0.03);
+    observePayloadBytes(1024);
     const filesDir = mkdtempSync(join(tmpdir(), 'mesh-metrics-http-'));
     handle = await startHttpAdmin(0, hdb, token, 10_485_760, filesDir, agentIndex);
     const port = (handle.server.address() as net.AddressInfo).port;
@@ -514,7 +471,7 @@ describe('metrics HTTP endpoint', () => {
     expect(body).toContain('mesh_messages_total');
     expect(body).toContain('mesh_messages_sent_total');
     expect(body).toContain('mesh_bytes_total');
-    expect(body).toContain('mesh_request_duration_seconds_bucket');
+    expect(body).toContain('mesh_message_payload_bytes_bucket');
 
     const res2 = await fetch(`${base}/agents`);
     expect(res2.status).toBe(401);

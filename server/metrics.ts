@@ -34,7 +34,6 @@ function histObserve(h: Histogram, v: number): void {
   }
   h.inf += 1;
 }
-const requestDuration = newHistogram([0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]);
 const payloadBytes    = newHistogram([64, 256, 1024, 4096, 16384, 65536, 262144, 1048576]);
 
 function bump(m: LabeledCounter, key: string, by = 1): void { m.set(key, (m.get(key) ?? 0) + by); }
@@ -80,11 +79,6 @@ export function incExpiredByKind(kind: string, n: number): void {
     if (Number.isFinite(n) && n > 0) bump(msgStatus, `${s(kind)}\0expired`, n);
   } catch (_) { /* metrics must never affect delivery */ }
 }
-export function observeRequestDuration(seconds: number): void {
-  try {
-    if (Number.isFinite(seconds)) histObserve(requestDuration, seconds);
-  } catch (_) { /* metrics must never affect delivery */ }
-}
 export function observePayloadBytes(n: number): void {
   try {
     if (Number.isFinite(n)) histObserve(payloadBytes, n);
@@ -109,7 +103,7 @@ function renderHistogram(name: string, help: string, h: Histogram, lines: string
   lines.push(`${name}_count ${h.count}`);
 }
 
-export function renderMetrics(db: Database, pendingRequests?: Map<string, unknown>): string {
+export function renderMetrics(db: Database): string {
   const lines: string[] = [];
 
   // mesh_messages_total {kind,status}
@@ -195,11 +189,6 @@ export function renderMetrics(db: Database, pendingRequests?: Map<string, unknow
   lines.push('# TYPE mesh_pending_messages gauge');
   lines.push(`mesh_pending_messages ${countPendingMessages(db)}`);
 
-  // mesh_pending_requests
-  lines.push('# HELP mesh_pending_requests In-flight request/response correlations.');
-  lines.push('# TYPE mesh_pending_requests gauge');
-  lines.push(`mesh_pending_requests ${pendingRequests ? pendingRequests.size : 0}`);
-
   // mesh_reminders_pending
   lines.push('# HELP mesh_reminders_pending Reminders currently in pending status.');
   lines.push('# TYPE mesh_reminders_pending gauge');
@@ -207,7 +196,6 @@ export function renderMetrics(db: Database, pendingRequests?: Map<string, unknow
   lines.push(`mesh_reminders_pending ${pendingReminders}`);
 
   // Histograms
-  renderHistogram('mesh_request_duration_seconds', 'Request to response round-trip seconds.', requestDuration, lines);
   renderHistogram('mesh_message_payload_bytes', 'Accepted message payload sizes in bytes.', payloadBytes, lines);
 
   return lines.join('\n') + '\n';
@@ -226,7 +214,7 @@ export function __resetMetricsForTest(): void {
   bytes.clear();
   filesTotal = 0;
   remindersFired = 0;
-  for (const h of [requestDuration, payloadBytes]) {
+  for (const h of [payloadBytes]) {
     h.counts.fill(0);
     h.inf = 0;
     h.sum = 0;

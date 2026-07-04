@@ -11,7 +11,7 @@ import { WebSocket } from 'ws';
 import { listAgents, aclGrant, aclRevoke, getAgentSubscriptions, getAgentById, getPendingMessages } from './db.ts';
 
 const SERVER_START_MS = Date.now();
-import { routeDirect, routePublish, routeSubscribe, routeUnsubscribe, routeRequest, PendingRequest } from './router.ts';
+import { routeDirect, routePublish, routeSubscribe, routeUnsubscribe } from './router.ts';
 
 export interface McpServerHandle {
   server: Server;
@@ -121,19 +121,6 @@ const TOOLS = [
       required: ['agent_id', 'as_agent'],
     },
   },
-  {
-    name: 'mesh_request',
-    description: 'Send a request and wait for a response',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        to: { type: 'string' },
-        message: { type: 'string' },
-        timeout_seconds: { type: 'number' },
-      },
-      required: ['to', 'message'],
-    },
-  },
 ];
 
 const KNOWN_TOOL_NAMES = new Set(TOOLS.map(t => t.name));
@@ -151,9 +138,9 @@ const NOT_IMPLEMENTED_RESPONSE = {
 // `if (toolName === 'mesh_x') {...}` chain inside one anonymous CallTool
 // callback, so static analysis sees the per-tool handlers as symbols and the
 // dispatch as explicit map edges. Tool names are mutually-exclusive exact
-// strings (no precedence), so an O(1) map is the natural structure. `mesh_request`
-// is async (it awaits a response); the others are synchronous — the ToolHandler
-// return type covers both. The CallTool guard (KNOWN_TOOL_NAMES) and the
+// strings (no precedence), so an O(1) map is the natural structure. The
+// ToolHandler return type covers both sync and async handlers. The CallTool
+// guard (KNOWN_TOOL_NAMES) and the
 // NOT_IMPLEMENTED_RESPONSE fall-through are preserved at the dispatch site.
 // ──────────────────────────────────────────────────────────────────────────
 
@@ -164,7 +151,6 @@ interface ToolCtx {
   db: Database;
   agentIndex: Map<string, WebSocket>;
   observerIndex: Map<string, WebSocket>;
-  pendingRequests: Map<string, PendingRequest>;
 }
 
 type ToolHandler = (ctx: ToolCtx) => Promise<ToolResult> | ToolResult;
@@ -315,79 +301,6 @@ function handleMeshStatus(ctx: ToolCtx): ToolResult {
   };
 }
 
-async function handleMeshRequest(ctx: ToolCtx): Promise<ToolResult> {
-  const { args, db, agentIndex, observerIndex, pendingRequests } = ctx;
-  const { to, message, as_agent, timeout_seconds } = args as {
-    to?: string; message?: string; as_agent?: string; timeout_seconds?: number;
-  };
-  // Validate required fields
-  if (typeof to !== 'string' || typeof message !== 'string' || typeof as_agent !== 'string') {
-    return {
-      content: [{ type: 'text' as const, text: JSON.stringify({ error: 'INVALID_REQUEST', message: 'to, message, and as_agent are required' }) }],
-      isError: true,
-    };
-  }
-  const timeoutSecs = timeout_seconds === undefined ? 30 : timeout_seconds;
-  if (timeoutSecs <= 0 || timeoutSecs > 300) {
-    return {
-      content: [{ type: 'text' as const, text: JSON.stringify({ error: 'INVALID_REQUEST', message: 'timeout_seconds must be between 1 and 300' }) }],
-      isError: true,
-    };
-  }
-  const ttl_ms = timeoutSecs * 1000;
-  const msgId = crypto.randomUUID();
-  const correlationId = crypto.randomUUID();
-  const result = routeRequest(db, agentIndex, as_agent, {
-    type: 'request',
-    msg_id: msgId,
-    to,
-    payload: message,
-    content_type: 'text/plain',
-    ttl_ms,
-    correlation_id: correlationId,
-  }, observerIndex);
-  if (!result.ok) {
-    return {
-      content: [{ type: 'text' as const, text: JSON.stringify({ error: result.error_code, message: result.error_message }) }],
-      isError: true,
-    };
-  }
-  // Create a promise that resolves when the response arrives
-  const responsePayload = await new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      pendingRequests.delete(correlationId);
-      reject(new Error('REQUEST_TIMEOUT'));
-    }, ttl_ms);
-    pendingRequests.set(correlationId, {
-      correlationId,
-      fromAgent: as_agent,
-      expiresAt: Date.now() + ttl_ms,
-      msgId,
-      timer,
-      startTime: Date.now(),
-      resolve,
-      reject,
-    });
-  }).catch((err: Error) => {
-    if (err.message === 'REQUEST_TIMEOUT') {
-      return null;
-    }
-    throw err;
-  });
-
-  if (responsePayload === null) {
-    return {
-      content: [{ type: 'text' as const, text: JSON.stringify({ error: 'REQUEST_TIMEOUT' }) }],
-      isError: true,
-    };
-  }
-
-  return {
-    content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, response: responsePayload }) }],
-    isError: false,
-  };
-}
-
 // Tool name -> handler. Exact-string keys, mutually exclusive (no precedence),
 // so map order is behavior-irrelevant. A name in KNOWN_TOOL_NAMES but absent
 // here falls through to NOT_IMPLEMENTED_RESPONSE at the dispatch site (defensive;
@@ -401,13 +314,11 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
   mesh_status: handleMeshStatus,
   mesh_acl_allow: handleMeshAclAllow,
   mesh_acl_deny: handleMeshAclDeny,
-  mesh_request: handleMeshRequest,
 };
 
 export async function startMcpServer(
   db: Database,
   agentIndex: Map<string, WebSocket> = new Map(),
-  pendingRequests: Map<string, PendingRequest> = new Map(),
   observerIndex: Map<string, WebSocket> = new Map()
 ): Promise<McpServerHandle> {
   const server = new Server(
@@ -439,7 +350,7 @@ export async function startMcpServer(
     // as the prior if-chain did.
     const handler = TOOL_HANDLERS[toolName];
     if (handler !== undefined) {
-      return handler({ args, db, agentIndex, observerIndex, pendingRequests });
+      return handler({ args, db, agentIndex, observerIndex });
     }
 
     return NOT_IMPLEMENTED_RESPONSE;

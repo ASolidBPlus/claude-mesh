@@ -468,11 +468,6 @@ export function getMessage(db: Database, id: string): Message | null {
   return db.prepare('SELECT * FROM messages WHERE id = ?').get(id) as Message | null;
 }
 
-export function getMessageByCorrelationId(db: Database, correlationId: string): Message | null {
-  return db.prepare(`
-    SELECT * FROM messages WHERE correlation_id = ? ORDER BY sent_at ASC LIMIT 1
-  `).get(correlationId) as Message | null;
-}
 
 export function queryMessages(
   db: Database,

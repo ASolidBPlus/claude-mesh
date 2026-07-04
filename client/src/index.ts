@@ -5,7 +5,6 @@ export type {
   SendOpts,
   PublishOpts,
   SendFileOpts,
-  RequestOpts,
   Inbound,
   Reminder,
   PresenceEntry,

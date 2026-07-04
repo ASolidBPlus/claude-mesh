@@ -38,7 +38,6 @@ import {
 import { generateToken, hashToken, timingSafeEqual } from './auth.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
-import { PendingRequest } from './router.ts';
 import { renderMetrics } from './metrics.ts';
 
 export interface HttpAdminHandle {
@@ -1071,7 +1070,6 @@ export function startHttpAdmin(
   maxFileBytes: number = 10_485_760,
   filesDir: string = '/data/files',
   agentIndex: Map<string, WebSocket> = new Map(),
-  pendingRequests: Map<string, PendingRequest> = new Map(),
   observerIndex: Map<string, WebSocket> = new Map(),   // NEW — defaulted
 ): Promise<HttpAdminHandle> {
   return new Promise((resolve, reject) => {
@@ -1080,7 +1078,7 @@ export function startHttpAdmin(
       // which is internal-only (not exposed publicly). Read-only Prometheus exposition.
       if (req.method === 'GET' && new URL(req.url!, 'http://localhost').pathname === '/metrics') {
         try {
-          const body = renderMetrics(db, pendingRequests);
+          const body = renderMetrics(db);
           res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
           res.end(body);
         } catch (_) {

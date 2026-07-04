@@ -38,24 +38,6 @@ export interface UnsubscribeFrame {
   topic: string;
 }
 
-export interface RequestFrame {
-  type: 'request';
-  msg_id: string;
-  to: string;
-  payload: string;
-  content_type?: string;
-  ttl_ms?: number;
-  correlation_id: string;
-}
-
-export interface ResponseFrame {
-  type: 'response';
-  msg_id: string;
-  correlation_id: string;
-  payload: string;
-  content_type?: string;
-}
-
 export interface FileSendFrame {
   type: 'file_send';
   msg_id: string;
@@ -104,7 +86,7 @@ export interface AuthFrame {
 // Server → client frames (the client parses these)
 // ──────────────────────────────────────────────
 
-export type MeshKind = 'direct' | 'topic' | 'request' | 'response' | 'file';
+export type MeshKind = 'direct' | 'topic' | 'file';
 
 export interface AuthOkFrame {
   type: 'auth_ok';
@@ -116,10 +98,13 @@ export interface AuthOkFrame {
 export interface DeliverFrame {
   type: 'deliver';
   msg_id: string;
-  kind: 'direct' | 'topic' | 'request' | 'response' | 'reminder';
+  kind: 'direct' | 'topic' | 'reminder';
   from: string;
   to: string | null;
   topic: string | null;
+  // Inert since the request/response strip: only req/resp frames ever set this;
+  // always null for surviving kinds. Kept as a nullable wire field to avoid a
+  // deliver-frame contract change across parsers (backend mesh-ws, mesh-chat).
   correlation_id: string | null;
   payload: string;
   content_type: string;
@@ -192,8 +177,6 @@ export type OutboundFrame =
   | PublishFrame
   | SubscribeFrame
   | UnsubscribeFrame
-  | RequestFrame
-  | ResponseFrame
   | FileSendFrame
   | RemindFrame
   | ListRemindersFrame

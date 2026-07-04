@@ -15,7 +15,6 @@ const EXPECTED_TOOLS = [
   'mesh_status',
   'mesh_acl_allow',
   'mesh_acl_deny',
-  'mesh_request',
 ];
 
 const REQUIRED_FIELDS: Record<string, string[]> = {
@@ -27,7 +26,6 @@ const REQUIRED_FIELDS: Record<string, string[]> = {
   mesh_status: ['as_agent'],
   mesh_acl_allow: ['agent_id', 'as_agent'],
   mesh_acl_deny: ['agent_id', 'as_agent'],
-  mesh_request: ['to', 'message'],
 };
 
 describe('startMcpServer', () => {
@@ -57,9 +55,9 @@ describe('startMcpServer', () => {
     expect(handle.server).toBeDefined();
   });
 
-  it('ListTools returns exactly 9 tools', async () => {
+  it('ListTools returns exactly 8 tools', async () => {
     const result = await client.listTools();
-    expect(result.tools).toHaveLength(9);
+    expect(result.tools).toHaveLength(8);
   });
 
   it('ListTools includes all nine tool names', async () => {
@@ -101,12 +99,8 @@ describe('startMcpServer', () => {
     expect(typeof parsed.msg_id).toBe('string');
   });
 
-  it('CallTool mesh_request without as_agent returns isError true with INVALID_REQUEST', async () => {
-    const result = await client.callTool({ name: 'mesh_request', arguments: { to: 'a', message: 'b' } });
-    expect(result.isError).toBe(true);
-    const parsed = JSON.parse((result.content as Array<{ type: string; text: string }>)[0].text);
-    expect(parsed.error).toBe('INVALID_REQUEST');
-  });
+  // (removed) 'CallTool mesh_request …' — the mesh_request tool tested the
+  // removed native request/response primitive; deleted per Joel's strip.
 
   it('CallTool mesh_status with empty input returns isError true with INVALID_REQUEST', async () => {
     const result = await client.callTool({ name: 'mesh_status', arguments: {} });
@@ -120,8 +114,8 @@ describe('startMcpServer', () => {
     setOnline(db, 'status-agent', true);
     // Subscribe to a topic
     const agentIndex = new Map();
-    const pendingRequests = new Map();
-    const localHandle = await startMcpServer(db, agentIndex, pendingRequests);
+    const observerIndex = new Map();
+    const localHandle = await startMcpServer(db, agentIndex, observerIndex);
     const [clientTransport2, serverTransport2] = InMemoryTransport.createLinkedPair();
     await localHandle.server.connect(serverTransport2);
     const client2 = new Client({ name: 'test2', version: '0.0.0' }, { capabilities: {} });

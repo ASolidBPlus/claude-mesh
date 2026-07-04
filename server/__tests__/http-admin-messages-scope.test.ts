@@ -34,14 +34,14 @@ describe('GET /messages — node-scoped auth (#35)', () => {
     // A-party traffic
     insertMessage(db, { id: 'd-ab', kind: 'direct', from_agent: 'A', to_agent: 'B', payload: 'a→b', sent_at: 10 });
     insertMessage(db, { id: 'topic-a', kind: 'topic', from_agent: 'pub', to_agent: 'A', topic: 'news', payload: 'to-A', sent_at: 20 });
-    insertMessage(db, { id: 'req-ab', kind: 'request', from_agent: 'A', to_agent: 'B', correlation_id: 'c1', payload: 'q', sent_at: 30 });
-    insertMessage(db, { id: 'resp-ba', kind: 'response', from_agent: 'B', to_agent: 'A', correlation_id: 'c1', payload: 'r', sent_at: 40 });
+    insertMessage(db, { id: 'req-ab', kind: 'direct', from_agent: 'A', to_agent: 'B', payload: 'q', sent_at: 30 });
+    insertMessage(db, { id: 'resp-ba', kind: 'direct', from_agent: 'B', to_agent: 'A', payload: 'r', sent_at: 40 });
 
     // B↔C traffic — A is party to NONE of it
     insertMessage(db, { id: 'd-bc', kind: 'direct', from_agent: 'B', to_agent: 'C', payload: 'b→c', sent_at: 50 });
     insertMessage(db, { id: 'topic-b', kind: 'topic', from_agent: 'pub', to_agent: 'B', topic: 'news', payload: 'to-B', sent_at: 60 }); // SAME topic as A
-    insertMessage(db, { id: 'req-bc', kind: 'request', from_agent: 'B', to_agent: 'C', correlation_id: 'c2', payload: 'q', sent_at: 70 });
-    insertMessage(db, { id: 'resp-cb', kind: 'response', from_agent: 'C', to_agent: 'B', correlation_id: 'c2', payload: 'r', sent_at: 80 });
+    insertMessage(db, { id: 'req-bc', kind: 'direct', from_agent: 'B', to_agent: 'C', payload: 'q', sent_at: 70 });
+    insertMessage(db, { id: 'resp-cb', kind: 'direct', from_agent: 'C', to_agent: 'B', payload: 'r', sent_at: 80 });
   });
 
   afterEach(async () => {

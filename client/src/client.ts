@@ -2,11 +2,9 @@ import { WebSocket } from 'ws';
 import type {
   AuthFrame,
   SendFrame,
-  ResponseFrame,
   PublishFrame,
   SubscribeFrame,
   UnsubscribeFrame,
-  RequestFrame,
   RemindFrame,
   ListRemindersFrame,
   CancelReminderFrame,
@@ -50,8 +48,6 @@ export interface MeshClientConfig {
 export type MeshClientEvent = 'connect' | 'disconnect' | 'error' | 'presence';
 
 export interface SendOpts {
-  correlationId?: string;
-  kind?: 'direct' | 'response';
   /** Delivery TTL in ms for a direct send. Omit for the server default (5 min);
    *  `0` = drop if the recipient is offline. Governs deliverability of the
    *  queued copy, not how long history is retained (see MESH_RETENTION_MS). */
@@ -76,22 +72,16 @@ export interface PresenceEntry {
   lastSeen: number;
 }
 
-export interface RequestOpts {
-  timeoutMs?: number;
-  correlationId?: string;
-}
-
 /**
- * Normalized inbound message — the single shape `onMessage`/`request` hand back.
+ * Normalized inbound message — the single shape `onMessage` hands back.
  * Wire snake_case is normalized to camelCase here.
  */
 export interface Inbound {
   msgId: string;
-  kind: 'direct' | 'topic' | 'request' | 'response' | 'file' | 'reminder';
+  kind: 'direct' | 'topic' | 'file' | 'reminder';
   from: string;
   to?: string | null;
   topic?: string | null;
-  correlationId?: string | null;
   text?: string | null; // = payload for non-file; null for file
   payload?: string | null; // raw payload (alias of text for non-file); null for file
   sentAt: number;
@@ -127,7 +117,6 @@ type Settler<T> = { resolve: (v: T) => void; reject: (e: Error) => void };
 const CONNECT_TIMEOUT_MS = 10_000;
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_MAX_MS = 30_000;
-const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 export class MeshClient {
   private config: MeshClientConfig;
@@ -156,16 +145,6 @@ export class MeshClient {
   private pendingPresenceLists = new Map<string, Settler<PresenceEntry[]>>();
   // sendFile() waiters keyed by ref (= msg_id); ack carries the stored file_id
   private pendingFileSends = new Map<string, Settler<{ fileId: string | null }>>();
-  // request waiters keyed by correlation_id; also indexed by msg_id for fast-fail
-  private pendingRequests = new Map<
-    string,
-    {
-      resolve: (m: Inbound) => void;
-      reject: (e: Error) => void;
-      timer: ReturnType<typeof setTimeout>;
-      msgId: string;
-    }
-  >();
 
   // reconnect / connect-handshake state
   private shouldReconnect = false;
@@ -206,23 +185,6 @@ export class MeshClient {
   }
 
   send(to: string, text: string, opts: SendOpts = {}): Promise<void> {
-    const kind = opts.kind ?? 'direct';
-    if (kind === 'response') {
-      if (opts.correlationId === undefined) {
-        return Promise.reject(
-          new Error('send(kind:"response") requires opts.correlationId')
-        );
-      }
-      const msgId = this.id();
-      const frame: ResponseFrame = {
-        type: 'response',
-        msg_id: msgId,
-        correlation_id: opts.correlationId,
-        payload: text,
-      };
-      if (opts.contentType !== undefined) frame.content_type = opts.contentType;
-      return this.sendWithAck(msgId, frame);
-    }
     const msgId = this.id();
     const frame: SendFrame = { type: 'send', msg_id: msgId, to, payload: text };
     if (opts.ttlMs !== undefined) frame.ttl_ms = opts.ttlMs;
@@ -301,47 +263,6 @@ export class MeshClient {
     this.subscribedTopics.delete(topic);
     const frame: UnsubscribeFrame = { type: 'unsubscribe', topic };
     return this.sendWithAck(topic, frame);
-  }
-
-  /**
-   * Send a request and await the peer's response.
-   *
-   * If the connection drops while the request is in flight, the returned
-   * promise rejects promptly with an Error whose `code` is `CONNECTION_RESET`
-   * (rather than waiting out `timeoutMs`). Note the request may already have
-   * reached the peer before the drop, so a retry has at-least-once semantics —
-   * the peer can process the logical request twice. Make retried requests
-   * idempotent, or branch on `err.code === 'CONNECTION_RESET'` to decide.
-   */
-  request(to: string, text: string, opts: RequestOpts = {}): Promise<Inbound> {
-    if (!this.isOpen()) {
-      return Promise.reject(new Error('not connected'));
-    }
-    const correlationId = opts.correlationId ?? this.id();
-    const timeoutMs = opts.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-    const msgId = this.id();
-
-    return new Promise<Inbound>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingRequests.delete(correlationId);
-        reject(new Error('request timeout'));
-      }, timeoutMs);
-      this.pendingRequests.set(correlationId, {
-        resolve,
-        reject,
-        timer,
-        msgId,
-      });
-      const frame: RequestFrame = {
-        type: 'request',
-        msg_id: msgId,
-        to,
-        payload: text,
-        correlation_id: correlationId,
-        ttl_ms: timeoutMs,
-      };
-      this.rawSend(frame);
-    });
   }
 
   remind(opts: {
@@ -535,25 +456,17 @@ export class MeshClient {
   }
 
   /**
-   * Reject and clear EVERY in-flight waiter — requests, acks, reminds,
-   * reminder-lists, presence-lists, and file-sends — with `err`, clearing
-   * request timeout timers first so a cleared timer can never later double-settle.
+   * Reject and clear EVERY in-flight waiter — acks, reminds, reminder-lists,
+   * presence-lists, and file-sends — with `err`.
    *
    * Called from two places:
    *  - close(): err = `client closed`.
    *  - the socket 'close' handler on an unexpected drop: err = `connection
    *    reset` (code CONNECTION_RESET). A drop orphans every in-flight waiter —
-   *    the server routes any response to the now-dead socket, so a reconnect
-   *    can't recover it. Failing fast lets callers retry instead of request()
-   *    waiting out its full timeoutMs and the ack/remind/list waiters (which
-   *    have NO timeout) hanging until close().
+   *    a reconnect can't recover it. Failing fast lets callers retry instead of
+   *    the ack/remind/list waiters (which have NO timeout) hanging until close().
    */
   private failAllPending(err: Error): void {
-    for (const [, p] of this.pendingRequests) {
-      clearTimeout(p.timer);
-      p.reject(err);
-    }
-    this.pendingRequests.clear();
     for (const [, a] of this.pendingAcks) {
       a.reject(err);
     }
@@ -747,16 +660,6 @@ export class MeshClient {
   }
 
   private onDeliver(frame: DeliverFrame): void {
-    if (frame.kind === 'response') {
-      const pending = this.pendingRequests.get(frame.correlation_id ?? '');
-      if (pending !== undefined) {
-        clearTimeout(pending.timer);
-        this.pendingRequests.delete(frame.correlation_id ?? '');
-        pending.resolve(this.normalizeDeliver(frame));
-        return;
-      }
-      // no matching request → fall through to onMessage
-    }
     this.messageHandler?.(this.normalizeDeliver(frame));
   }
 
@@ -848,24 +751,6 @@ export class MeshClient {
       return;
     }
 
-    // A request error may carry ref === correlation_id (REQUEST_TIMEOUT) OR
-    // ref === request msg_id (validation / ACL_DENIED on the request frame).
-    const byCorrelation = this.pendingRequests.get(ref);
-    if (byCorrelation !== undefined) {
-      clearTimeout(byCorrelation.timer);
-      this.pendingRequests.delete(ref);
-      byCorrelation.reject(this.makeError(frame));
-      return;
-    }
-    for (const [cid, p] of this.pendingRequests) {
-      if (p.msgId === ref) {
-        clearTimeout(p.timer);
-        this.pendingRequests.delete(cid);
-        p.reject(this.makeError(frame));
-        return;
-      }
-    }
-
     const remindWaiter = this.pendingReminds.get(ref);
     if (remindWaiter !== undefined) {
       this.pendingReminds.delete(ref);
@@ -908,7 +793,6 @@ export class MeshClient {
       from: f.from,
       to: f.to,
       topic: f.topic,
-      correlationId: f.correlation_id,
       text: f.payload,
       payload: f.payload,
       contentType: f.content_type,
