@@ -43,6 +43,19 @@ export interface MeshClientConfig {
   // serverUrl with ws→http (same host+port), which only works when they share
   // a port.
   httpUrl?: string; // default process.env.MESH_HTTP_URL
+
+  // ── Keepalive tuning (optional) ──
+  // Defaults are the production values and are what you want in almost every
+  // case; they exist mainly so tests can drive the liveness path in
+  // milliseconds instead of minutes.
+  /** Keepalive ping period (default 25 000 ms). */
+  pingIntervalMs?: number;
+  /** How long without a pong before the socket is declared dead and terminated,
+   *  forcing a reconnect (default 60 000 ms). */
+  pongDeadlineMs?: number;
+  /** How long an in-flight send/remind/list may wait for its server ack before
+   *  rejecting with `code: 'ACK_TIMEOUT'` (default 10 000 ms). */
+  ackTimeoutMs?: number;
 }
 
 export type MeshClientEvent = 'connect' | 'disconnect' | 'error' | 'presence';
@@ -69,7 +82,12 @@ export interface PublishOpts {
 export interface PresenceEntry {
   id: string;
   online: boolean;
+  /** Last TRAFFIC (unix ms) — when this node last actually sent/received. */
   lastSeen: number;
+  /** Last proof-of-life (unix ms): stamped when the node answers the keepalive
+      ping, so it advances for an idle-but-healthy node too. `null` = never seen
+      alive. Use this, not lastSeen, to tell "quiet" from "channel is dead". */
+  lastAlive: number | null;
 }
 
 /**
@@ -112,11 +130,44 @@ interface ResolvedConfig {
   agentToken: string;
 }
 
-type Settler<T> = { resolve: (v: T) => void; reject: (e: Error) => void };
+type Settler<T> = {
+  resolve: (v: T) => void;
+  reject: (e: Error) => void;
+  /** Ack-timeout timer (see armWaiter) — cleared whenever the waiter settles. */
+  timer?: ReturnType<typeof setTimeout>;
+};
 
 const CONNECT_TIMEOUT_MS = 10_000;
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_MAX_MS = 30_000;
+
+// ── Liveness (channel-drop class) ────────────────────────────────────────────
+// A severed TCP path (e.g. a container's network namespace churning on
+// recreate) delivers no FIN/RST, so `ws.readyState` stays OPEN forever and the
+// 'close' event — the ONLY trigger for scheduleReconnect() — never fires. The
+// client would sit wedged indefinitely: sends buffer into a dead socket without
+// throwing, and inbound never arrives.
+//
+// So we prove liveness ourselves: ping on an interval, require a pong inside a
+// deadline, and on a miss TERMINATE the socket (never close(): a closing
+// handshake waits for a peer frame that a severed path will never send). The
+// terminate synthesises 'close', which re-arms the existing, already-correct
+// failAllPending → 'disconnect' → scheduleReconnect path.
+//
+// App-level {type:'ping'} rather than a protocol-level ws.ping() on purpose: a
+// protocol pong is answered by the peer's *library*, so it can succeed while the
+// server's event loop is wedged. An app-level pong is produced by the server's
+// frame handler, so it proves end-to-end application liveness.
+//
+// Constants match claude-spawner's backend MeshWs, which has run these guards in
+// production against this same server.
+const PING_INTERVAL_MS = 25_000;
+const PONG_DEADLINE_MS = 60_000;
+const LIVENESS_CHECK_MS = 5_000;
+
+/** How long a waiter may sit unanswered before it rejects with ACK_TIMEOUT.
+    Bounds every in-flight promise so a send can never silently vanish. */
+const ACK_TIMEOUT_MS = 10_000;
 
 export class MeshClient {
   private config: MeshClientConfig;
@@ -153,6 +204,11 @@ export class MeshClient {
   private connectTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   private connectSettler: Settler<void> | null = null;
   private firstAuthDone = false;
+
+  // liveness state (see the PING_INTERVAL_MS block above)
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private livenessTimer: ReturnType<typeof setInterval> | null = null;
+  private lastPongAt = 0;
 
   constructor(config: MeshClientConfig = {}) {
     this.config = config;
@@ -235,11 +291,11 @@ export class MeshClient {
     if (opts.replyToMsgId !== undefined) frame.reply_to_msg_id = opts.replyToMsgId;
     if (opts.groupId !== undefined) frame.group_id = opts.groupId;
     return new Promise<{ fileId: string | null }>((resolve, reject) => {
-      this.pendingFileSends.set(msgId, { resolve, reject });
+      this.armWaiter(this.pendingFileSends, msgId, { resolve, reject });
       try {
         this.ws!.send(JSON.stringify(frame));
       } catch (err) {
-        this.pendingFileSends.delete(msgId);
+        this.takeWaiter(this.pendingFileSends, msgId);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
@@ -284,11 +340,11 @@ export class MeshClient {
     if (opts.recurring !== undefined) frame.recurring = opts.recurring;
     if (opts.tz !== undefined) frame.tz = opts.tz;
     return new Promise<{ reminderId: string; dueAt: number }>((resolve, reject) => {
-      this.pendingReminds.set(msgId, { resolve, reject });
+      this.armWaiter(this.pendingReminds, msgId, { resolve, reject });
       try {
         this.ws!.send(JSON.stringify(frame));
       } catch (err) {
-        this.pendingReminds.delete(msgId);
+        this.takeWaiter(this.pendingReminds, msgId);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
@@ -301,11 +357,11 @@ export class MeshClient {
     const msgId = this.id();
     const frame: ListRemindersFrame = { type: 'list_reminders', msg_id: msgId };
     return new Promise<Reminder[]>((resolve, reject) => {
-      this.pendingReminderLists.set(msgId, { resolve, reject });
+      this.armWaiter(this.pendingReminderLists, msgId, { resolve, reject });
       try {
         this.ws!.send(JSON.stringify(frame));
       } catch (err) {
-        this.pendingReminderLists.delete(msgId);
+        this.takeWaiter(this.pendingReminderLists, msgId);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
@@ -340,11 +396,11 @@ export class MeshClient {
     const msgId = this.id();
     const frame: ListPresenceFrame = { type: 'list_presence', msg_id: msgId };
     return new Promise<PresenceEntry[]>((resolve, reject) => {
-      this.pendingPresenceLists.set(msgId, { resolve, reject });
+      this.armWaiter(this.pendingPresenceLists, msgId, { resolve, reject });
       try {
         this.ws!.send(JSON.stringify(frame));
       } catch (err) {
-        this.pendingPresenceLists.delete(msgId);
+        this.takeWaiter(this.pendingPresenceLists, msgId);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
@@ -383,6 +439,7 @@ export class MeshClient {
       this.reconnectTimer = null;
     }
     this.clearConnectTimeout();
+    this.stopHeartbeat();
 
     this.failAllPending(new Error('client closed'));
 
@@ -440,19 +497,110 @@ export class MeshClient {
     this.ws!.send(JSON.stringify(frame));
   }
 
+  /**
+   * Register a waiter WITH a bounded timeout. Without this, a waiter parked on a
+   * socket that stopped transmitting never settles — the caller hangs forever and
+   * the send is reported to nobody. On expiry the waiter rejects with
+   * `code: 'ACK_TIMEOUT'`, symmetrical with the 'CONNECTION_RESET' rejection a
+   * detected drop produces.
+   */
+  private armWaiter<T>(map: Map<string, Settler<T>>, ref: string, settler: Settler<T>): void {
+    const ackTimeoutMs = this.config.ackTimeoutMs ?? ACK_TIMEOUT_MS;
+    const timer = setTimeout(() => {
+      // only settle if THIS waiter is still the registered one
+      if (map.get(ref) !== settler) return;
+      map.delete(ref);
+      settler.reject(
+        Object.assign(new Error(`timed out after ${ackTimeoutMs}ms waiting for server ack`), {
+          code: 'ACK_TIMEOUT',
+        })
+      );
+    }, ackTimeoutMs);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    settler.timer = timer;
+    map.set(ref, settler);
+  }
+
+  /** Remove a waiter and clear its ack-timeout timer. Returns it, if present. */
+  private takeWaiter<T>(map: Map<string, Settler<T>>, ref: string): Settler<T> | undefined {
+    const settler = map.get(ref);
+    if (settler === undefined) return undefined;
+    if (settler.timer !== undefined) clearTimeout(settler.timer);
+    map.delete(ref);
+    return settler;
+  }
+
   private sendWithAck(ref: string, frame: object): Promise<void> {
     if (!this.isOpen()) {
       return Promise.reject(new Error('not connected'));
     }
     return new Promise<void>((resolve, reject) => {
-      this.pendingAcks.set(ref, { resolve, reject });
+      this.armWaiter(this.pendingAcks, ref, { resolve, reject });
       try {
         this.ws!.send(JSON.stringify(frame));
       } catch (err) {
-        this.pendingAcks.delete(ref);
+        this.takeWaiter(this.pendingAcks, ref);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
+  }
+
+  // ── liveness: heartbeat + dead-man switch ──────────────────────────────────
+
+  /**
+   * Start pinging on `ws` and force a reconnect if pongs stop.
+   *
+   * The socket is captured and identity-checked on every tick: a timer left over
+   * from a previous socket must NEVER terminate the current one — that would be
+   * a self-inflicted version of the very bug this fixes. (Same guard shape as
+   * the `this.ws === ws` check in the 'close' handler.)
+   */
+  private startHeartbeat(ws: WebSocket): void {
+    this.stopHeartbeat();
+    this.lastPongAt = Date.now(); // seed: no pong is "overdue" the instant we auth
+
+    const pingIntervalMs = this.config.pingIntervalMs ?? PING_INTERVAL_MS;
+    const pongDeadlineMs = this.config.pongDeadlineMs ?? PONG_DEADLINE_MS;
+    // Check often enough to react promptly, but never slower than the deadline
+    // it is policing (auto-scales when the deadline is tuned down for tests).
+    const checkMs = Math.max(20, Math.min(LIVENESS_CHECK_MS, Math.floor(pongDeadlineMs / 4)));
+
+    const ping = setInterval(() => {
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+      try {
+        ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+      } catch {
+        // a throw here means the socket is already gone; the checker/close handles it
+      }
+    }, pingIntervalMs);
+    (ping as unknown as { unref?: () => void }).unref?.();
+    this.pingTimer = ping;
+
+    const check = setInterval(() => {
+      if (this.ws !== ws) return; // stale timer for a replaced socket — never act
+      if (Date.now() - this.lastPongAt <= pongDeadlineMs) return;
+      // Pongs stopped: the path is dead even though readyState still says OPEN.
+      // terminate() (not close()) — a severed path never answers a close
+      // handshake. This synthesises 'close', which drives the reconnect.
+      try {
+        ws.terminate();
+      } catch {
+        // ignore
+      }
+    }, checkMs);
+    (check as unknown as { unref?: () => void }).unref?.();
+    this.livenessTimer = check;
+  }
+
+  private stopHeartbeat(): void {
+    if (this.pingTimer !== null) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+    if (this.livenessTimer !== null) {
+      clearInterval(this.livenessTimer);
+      this.livenessTimer = null;
+    }
   }
 
   /**
@@ -467,26 +615,21 @@ export class MeshClient {
    *    the ack/remind/list waiters (which have NO timeout) hanging until close().
    */
   private failAllPending(err: Error): void {
-    for (const [, a] of this.pendingAcks) {
-      a.reject(err);
-    }
-    this.pendingAcks.clear();
-    for (const [, r] of this.pendingReminds) {
-      r.reject(err);
-    }
-    this.pendingReminds.clear();
-    for (const [, l] of this.pendingReminderLists) {
-      l.reject(err);
-    }
-    this.pendingReminderLists.clear();
-    for (const [, p] of this.pendingPresenceLists) {
-      p.reject(err);
-    }
-    this.pendingPresenceLists.clear();
-    for (const [, f] of this.pendingFileSends) {
-      f.reject(err);
-    }
-    this.pendingFileSends.clear();
+    // Clearing each waiter's ack-timeout timer matters: without it a rejected
+    // waiter's timer would still be pending, and on a busy client the timers
+    // accumulate across every reconnect.
+    const failMap = <T>(map: Map<string, Settler<T>>): void => {
+      for (const [, s] of map) {
+        if (s.timer !== undefined) clearTimeout(s.timer);
+        s.reject(err);
+      }
+      map.clear();
+    };
+    failMap(this.pendingAcks);
+    failMap(this.pendingReminds);
+    failMap(this.pendingReminderLists);
+    failMap(this.pendingPresenceLists);
+    failMap(this.pendingFileSends);
   }
 
   private emit(event: MeshClientEvent, ...args: any[]): void {
@@ -564,6 +707,7 @@ export class MeshClient {
       this.clearConnectTimeout();
       if (this.ws === ws) {
         this.ws = null;
+        this.stopHeartbeat(); // only tear down timers that belong to THIS socket
       }
       // Fail every in-flight waiter fast on the drop. The server has already
       // (or will) route any response to this now-dead socket, so a reconnect
@@ -631,7 +775,10 @@ export class MeshClient {
         this.onPresenceList(frame);
         return;
       case 'pong':
-        return; // ignored
+        // Liveness proof: the server's frame handler produced this, so the path
+        // AND the server's event loop are alive. Rolls the dead-man deadline.
+        this.lastPongAt = Date.now();
+        return;
       default:
         return;
     }
@@ -640,6 +787,10 @@ export class MeshClient {
   private onAuthOk(_config: ResolvedConfig): void {
     this.clearConnectTimeout();
     this.reconnectAttempt = 0;
+
+    // Start the heartbeat only now: pre-auth frames are rejected, and the
+    // connect timeout already guards the handshake window.
+    if (this.ws !== null) this.startHeartbeat(this.ws);
 
     // replay subscriptions (fire-and-forget; no acks awaited here)
     for (const topic of this.subscribedTopics) {
@@ -670,24 +821,21 @@ export class MeshClient {
   private onAck(frame: AckFrame): void {
     const ref = frame.ref;
     if (ref === undefined) return;
-    const remindWaiter = this.pendingReminds.get(ref);
+    const remindWaiter = this.takeWaiter(this.pendingReminds, ref);
     if (remindWaiter !== undefined) {
-      this.pendingReminds.delete(ref);
       remindWaiter.resolve({
         reminderId: frame.reminder_id ?? '',
         dueAt: frame.due_at ?? 0,
       });
       return;
     }
-    const fileSendWaiter = this.pendingFileSends.get(ref);
+    const fileSendWaiter = this.takeWaiter(this.pendingFileSends, ref);
     if (fileSendWaiter !== undefined) {
-      this.pendingFileSends.delete(ref);
       fileSendWaiter.resolve({ fileId: frame.file_id ?? null });
       return;
     }
-    const waiter = this.pendingAcks.get(ref);
+    const waiter = this.takeWaiter(this.pendingAcks, ref);
     if (waiter !== undefined) {
-      this.pendingAcks.delete(ref);
       waiter.resolve();
     }
   }
@@ -695,9 +843,8 @@ export class MeshClient {
   private onRemindersList(frame: RemindersListFrame): void {
     const ref = frame.ref;
     if (ref === undefined) return;
-    const waiter = this.pendingReminderLists.get(ref);
+    const waiter = this.takeWaiter(this.pendingReminderLists, ref);
     if (waiter === undefined) return;
-    this.pendingReminderLists.delete(ref);
     const reminders: Reminder[] = frame.reminders.map((r) => ({
       id: r.id as string,
       dueAt: r.due_at as number,
@@ -714,17 +861,22 @@ export class MeshClient {
       id: frame.agent_id,
       online: frame.online,
       lastSeen: frame.last_seen,
+      lastAlive: frame.last_alive ?? null,
     } as PresenceEntry);
   }
 
   private onPresenceList(frame: PresenceListFrame): void {
     const ref = frame.ref;
     if (ref === undefined) return;
-    const waiter = this.pendingPresenceLists.get(ref);
+    const waiter = this.takeWaiter(this.pendingPresenceLists, ref);
     if (waiter === undefined) return;
-    this.pendingPresenceLists.delete(ref);
     waiter.resolve(
-      frame.agents.map((a) => ({ id: a.id, online: a.online, lastSeen: a.last_seen }))
+      frame.agents.map((a) => ({
+        id: a.id,
+        online: a.online,
+        lastSeen: a.last_seen,
+        lastAlive: a.last_alive ?? null,
+      }))
     );
   }
 
@@ -751,30 +903,26 @@ export class MeshClient {
       return;
     }
 
-    const remindWaiter = this.pendingReminds.get(ref);
+    const remindWaiter = this.takeWaiter(this.pendingReminds, ref);
     if (remindWaiter !== undefined) {
-      this.pendingReminds.delete(ref);
       remindWaiter.reject(this.makeError(frame));
       return;
     }
 
-    const listWaiter = this.pendingReminderLists.get(ref);
+    const listWaiter = this.takeWaiter(this.pendingReminderLists, ref);
     if (listWaiter !== undefined) {
-      this.pendingReminderLists.delete(ref);
       listWaiter.reject(this.makeError(frame));
       return;
     }
 
-    const fileSendWaiter = this.pendingFileSends.get(ref);
+    const fileSendWaiter = this.takeWaiter(this.pendingFileSends, ref);
     if (fileSendWaiter !== undefined) {
-      this.pendingFileSends.delete(ref);
       fileSendWaiter.reject(this.makeError(frame));
       return;
     }
 
-    const ackWaiter = this.pendingAcks.get(ref);
+    const ackWaiter = this.takeWaiter(this.pendingAcks, ref);
     if (ackWaiter !== undefined) {
-      this.pendingAcks.delete(ref);
       ackWaiter.reject(this.makeError(frame));
       return;
     }

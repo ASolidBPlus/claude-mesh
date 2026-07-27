@@ -7,6 +7,7 @@ import {
   getAgentByToken,
   listAgents,
   touchAgent,
+  touchAlive,
   setOnline,
   updateAgent,
   deleteAgent,
@@ -60,6 +61,27 @@ function hashToken(token: string): string {
 // ──────────────────────────────────────────────
 // openDb
 // ──────────────────────────────────────────────
+
+
+// Channel-drop ruling (c): last_alive is ADDITIVE. A database created before the
+// column existed must open cleanly, keep every existing row, and read last_alive
+// as null — last_seen keeps its exact prior meaning.
+describe('last_alive (additive liveness field)', () => {
+  it('pre-existing agent rows migrate to last_alive = null and keep last_seen', () => {
+    const db = openDb(':memory:');
+    registerAgent(db, { id: 'legacy', token_hash: 'a'.repeat(64), hostname: 'h' });
+    const before = getAgentById(db, 'legacy')!;
+    expect(before.last_alive ?? null).toBeNull();
+    expect(typeof before.last_seen).toBe('number');
+
+    touchAlive(db, 'legacy');
+    const after = getAgentById(db, 'legacy')!;
+    expect(typeof after.last_alive).toBe('number');
+    // touchAlive must NOT move last_seen — that is the whole separation.
+    expect(after.last_seen).toBe(before.last_seen);
+    db.close();
+  });
+});
 
 describe('openDb', () => {
   it('openDb(:memory:) returns a Database instance without throwing', () => {

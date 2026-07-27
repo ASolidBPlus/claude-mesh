@@ -108,6 +108,7 @@ function formatAgent(agent: Agent): Record<string, unknown> {
     namespace: agent.namespace ?? null,
     registered_at: agent.registered_at,
     last_seen: agent.last_seen,
+    last_alive: agent.last_alive ?? null,
   };
 }
 

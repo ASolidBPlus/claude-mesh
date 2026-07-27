@@ -12,7 +12,14 @@ export interface Agent {
   metadata: string;        // raw JSON string, e.g. '{"region":"eu-west"}'
   namespace: string | null; // #41: first-class identity label; null = unnamespaced. No routing/ACL semantics.
   registered_at: number;   // unix ms
-  last_seen: number;       // unix ms
+  last_seen: number;       // unix ms — last TRAFFIC (a message sent/received)
+  /** Last proof-of-life (unix ms): stamped when the node answers the keepalive
+      ping, so it advances for an idle-but-healthy node too. NULL = never seen
+      alive (pre-migration rows, or a node that has not pinged yet).
+      DELIBERATELY separate from last_seen: "when did it last act" and "when was
+      it last alive" are different questions, and overloading last_seen would
+      silently change its meaning for every existing consumer. */
+  last_alive: number | null;
   online: number;          // 0 | 1
 }
 
@@ -25,7 +32,7 @@ export interface AclRow {
 
 export interface Message {
   id: string;
-  kind: string;            // "direct" | "topic" | "request" | "response"
+  kind: string;            // "direct" | "topic" | "file" | "reminder"
   from_agent: string;
   to_agent: string | null;
   topic: string | null;
@@ -215,6 +222,13 @@ export function openDb(path: string): Database {
   // multi-file sends (Telegram media-group model). Existing rows get NULL.
   try { db.exec('ALTER TABLE files ADD COLUMN group_id TEXT'); } catch {}
 
+  // Channel-drop migration: `last_alive` on agents — proof-of-life stamped on
+  // the keepalive ping, so an idle-healthy node is distinguishable from a node
+  // whose channel died (last_seen only advances on TRAFFIC, so the two were
+  // indistinguishable). ADDITIVE: existing rows get NULL and last_seen keeps its
+  // exact current meaning for every consumer.
+  try { db.exec('ALTER TABLE agents ADD COLUMN last_alive INTEGER'); } catch {}
+
   // Sprint 12 migration: drop the deprecated `data` column (base64 blob in
   // SQLite) if it still exists from pre-Sprint-12 databases. It was declared
   // NOT NULL, so insertFile would otherwise fail with a NOT NULL constraint
@@ -285,6 +299,12 @@ export function listAgents(db: Database, onlineOnly?: boolean): Agent[] {
 
 export function touchAgent(db: Database, id: string): void {
   db.prepare('UPDATE agents SET last_seen = ? WHERE id = ?').run(Date.now(), id);
+}
+
+/** Stamp proof-of-life. Called when a node answers the keepalive ping — it does
+    NOT touch last_seen, so "last acted" stays untouched by mere liveness. */
+export function touchAlive(db: Database, id: string): void {
+  db.prepare('UPDATE agents SET last_alive = ? WHERE id = ?').run(Date.now(), id);
 }
 
 export function setOnline(db: Database, id: string, online: boolean): void {
@@ -480,9 +500,9 @@ export function queryMessages(
     // (sentAt, id) under the `sent_at DESC, id DESC` order. The (sent_at, id)
     // composite gives a stable tie-break across rows sharing one sent_at.
     before?: { sentAt: number; id: string };
-    // Restrict to these message kinds (e.g. ['direct','request','response',
-    // 'file']) so a DM/scrollback scan can skip high-volume 'topic' beat rows
-    // and not exhaust its row budget on them. Empty/undefined = all kinds.
+    // Restrict to these message kinds (e.g. ['direct','file']) so a DM/
+    // scrollback scan can skip high-volume 'topic' beat rows and not exhaust
+    // its row budget on them. Empty/undefined = all kinds.
     kinds?: string[];
   }
 ): Message[] {
