@@ -10,7 +10,7 @@ export const TAP_BUFFER_LIMIT_BYTES = 8 * 1024 * 1024; // 8 MB
 export interface TapFrame {
   type: 'tap';
   msg_id: string;
-  kind: string;                       // direct | topic | request | response | file
+  kind: string;                       // direct | topic | file
   from: string;
   to: string | null;
   topic: string | null;

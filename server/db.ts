@@ -25,7 +25,7 @@ export interface AclRow {
 
 export interface Message {
   id: string;
-  kind: string;            // "direct" | "topic" | "request" | "response"
+  kind: string;            // "direct" | "topic" | "file" | "reminder"
   from_agent: string;
   to_agent: string | null;
   topic: string | null;
@@ -480,9 +480,9 @@ export function queryMessages(
     // (sentAt, id) under the `sent_at DESC, id DESC` order. The (sent_at, id)
     // composite gives a stable tie-break across rows sharing one sent_at.
     before?: { sentAt: number; id: string };
-    // Restrict to these message kinds (e.g. ['direct','request','response',
-    // 'file']) so a DM/scrollback scan can skip high-volume 'topic' beat rows
-    // and not exhaust its row budget on them. Empty/undefined = all kinds.
+    // Restrict to these message kinds (e.g. ['direct','file']) so a DM/
+    // scrollback scan can skip high-volume 'topic' beat rows and not exhaust
+    // its row budget on them. Empty/undefined = all kinds.
     kinds?: string[];
   }
 ): Message[] {
