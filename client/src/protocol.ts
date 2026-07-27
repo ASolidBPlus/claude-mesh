@@ -138,13 +138,18 @@ export interface AgentStatusFrame {
   type: 'agent_status';
   agent_id: string;
   online: boolean;
+  /** Last TRAFFIC (unix ms). */
   last_seen: number;
+  /** Last proof-of-life (unix ms), stamped on keepalive pong. null = never.
+      Distinct from last_seen on purpose — an idle-healthy node advances
+      last_alive but not last_seen. */
+  last_alive?: number | null;
 }
 
 export interface PresenceListFrame {
   type: 'presence_list';
   ref?: string;
-  agents: { id: string; online: boolean; last_seen: number }[];
+  agents: { id: string; online: boolean; last_seen: number; last_alive?: number | null }[];
 }
 
 export interface RemindersListFrame {

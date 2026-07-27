@@ -79,6 +79,24 @@ await client.remind({ text: 'stand-up', when: '0 9 * * 1', recurring: true, tz: 
 client.close();                      // stops reconnect, rejects pending work
 ```
 
+### Keepalive / liveness
+
+The client proves the connection is alive rather than trusting it. It sends a
+keepalive ping every `pingIntervalMs` (default 25 s) and, if no pong arrives
+within `pongDeadlineMs` (default 60 s), declares the socket dead and forces a
+reconnect. This is what catches a **half-open** connection — a severed network
+path delivers no close event, so `readyState` would otherwise read `OPEN`
+forever and the client would sit wedged: sends vanishing, nothing inbound.
+
+Every in-flight call is also bounded by `ackTimeoutMs` (default 10 s): a send
+that is never acked **rejects** with `err.code === 'ACK_TIMEOUT'` rather than
+hanging. The SDK never queues outbound messages — a failed send surfaces as an
+error and retry/queue policy is yours.
+
+```ts
+new MeshClient({ /* … */ pingIntervalMs: 25_000, pongDeadlineMs: 60_000, ackTimeoutMs: 10_000 });
+```
+
 Config resolution is `constructor value ?? env var`
 (`MESH_SERVER_URL` / `MESH_AGENT_ID` / `MESH_AGENT_TOKEN`). If any is still
 undefined at `connect()` time, `connect()` rejects with a clear error.
@@ -98,7 +116,7 @@ undefined at `connect()` time, `connect()` rejects with a clear error.
 | `remind(opts)` | `Promise<{ reminderId, dueAt }>` | `opts: { text, when, recurring?, tz? }`. `when` is a duration (`"90s"`, `"2h"`), an ISO datetime, or a cron expression (with `recurring: true`); `tz` is an IANA zone (DST-aware, default UTC). Fires back as an `Inbound{ kind:'reminder' }` and survives server restarts |
 | `listReminders()` | `Promise<Reminder[]>` | your pending reminders |
 | `cancelReminder(id)` | `Promise<void>` | cancel one by id |
-| `listPresence()` | `Promise<PresenceEntry[]>` | roster of self + peers you share a **direct** ACL edge with (either direction), from the registry — each `{ id, online, lastSeen }`. Includes registered peers that have never connected (`online:false`); does **not** include peers reachable only via a shared topic/group (derive those from `GET /acl` + your group model) |
+| `listPresence()` | `Promise<PresenceEntry[]>` | roster of self + peers you share a **direct** ACL edge with (either direction), from the registry — each `{ id, online, lastSeen, lastAlive }`. `lastSeen` = last TRAFFIC; `lastAlive` = last keepalive pong (`null` = never), so an idle-healthy peer is distinguishable from one whose channel died. Includes registered peers that have never connected (`online:false`); does **not** include peers reachable only via a shared topic/group (derive those from `GET /acl` + your group model) |
 | `close()` | `void` | stops reconnect, rejects pending acks |
 
 Errors raised from server rejections carry a `.code` (e.g. `err.code === 'ACL_DENIED'`).

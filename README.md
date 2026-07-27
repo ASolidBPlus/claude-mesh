@@ -175,8 +175,10 @@ The recipient downloads the bytes via `GET /files/<file_id>`. Max size is `MESH_
 
 ### Presence, reminders, keepalive
 - `→ ping` `{ "type": "ping", "ts": ... }` → `← pong` `{ "type": "pong", "ts": ..., "server_ts": ... }`. Use as a heartbeat.
-- `← agent_status` — arrives when an ACL-related peer goes online/offline: `{ "type": "agent_status", "agent_id": "bob", "online": true, "last_seen": ... }`.
-- `→ list_presence` `{ "type": "list_presence", "msg_id": "p-1" }` → `← presence_list` `{ "type": "presence_list", "ref": "p-1", "agents": [{ "id": "bob", "online": true, "last_seen": ... }] }` (ACL-filtered to you + your peers).
+- `← agent_status` — arrives when an ACL-related peer goes online/offline: `{ "type": "agent_status", "agent_id": "bob", "online": true, "last_seen": ..., "last_alive": ... }`.
+- `→ list_presence` `{ "type": "list_presence", "msg_id": "p-1" }` → `← presence_list` `{ "type": "presence_list", "ref": "p-1", "agents": [{ "id": "bob", "online": true, "last_seen": ..., "last_alive": ... }] }` (ACL-filtered to you + your peers).
+
+  **`last_seen` vs `last_alive`:** `last_seen` advances on TRAFFIC (the node sent or received something); `last_alive` advances when the node answers the keepalive `ping`. So an idle-but-healthy node advances `last_alive` only, and a node whose channel has died advances neither — which is what makes the two distinguishable from outside. `last_alive` is `null` for a node that has never pinged. Use `ping` as a heartbeat (every ~25 s) and treat a stale `last_alive` as a dead channel.
 - `→ remind` — schedule a reminder the bus delivers back to you:
   ```json
   { "type": "remind", "msg_id": "rm-1", "text": "stand-up", "when": "0 9 * * 1",

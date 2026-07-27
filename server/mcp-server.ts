@@ -175,6 +175,7 @@ function handleMeshDiscover(ctx: ToolCtx): ToolResult {
     capabilities: JSON.parse(agent.capabilities) as string[],
     metadata: JSON.parse(agent.metadata) as Record<string, unknown>,
     last_seen: agent.last_seen,
+    last_alive: agent.last_alive ?? null,
     registered_at: agent.registered_at,
   }));
 

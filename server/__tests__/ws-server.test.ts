@@ -326,7 +326,13 @@ describe('startWsServer', () => {
     ws.close();
   }, 10000);
 
-  it('after ping, last_seen in DB is >= value after auth_ok', async () => {
+  // Retargeted for the channel-drop work: a keepalive is proof of LIFE, not an
+  // act. It must stamp last_alive and leave last_seen ALONE. The old assertion
+  // here was `last_seen >= previous`, which is true either way — it could not
+  // distinguish the two behaviours. These assert the split directly, which is
+  // the whole point of ruling (c): last_seen keeps its "last acted" meaning for
+  // every existing consumer, and liveness lives in its own field.
+  it('ping stamps last_alive and does NOT advance last_seen', async () => {
     const rawToken = generateToken();
     registerAgent(db, { id: 'agent-ping-ls', token_hash: hashToken(rawToken), hostname: 'host1' });
 
@@ -336,14 +342,46 @@ describe('startWsServer', () => {
     ws.send(JSON.stringify({ type: 'auth', agent_id: 'agent-ping-ls', token: rawToken }));
     await authMsgPromise;
 
-    const lastSeenAfterAuth = getAgentById(db, 'agent-ping-ls')!.last_seen;
+    const afterAuth = getAgentById(db, 'agent-ping-ls')!;
+    const lastSeenAfterAuth = afterAuth.last_seen;
+    expect(afterAuth.last_alive ?? null).toBeNull(); // no ping yet
+
+    await new Promise((r) => setTimeout(r, 5)); // ensure a distinguishable clock tick
 
     const pongPromise = waitForMessage(ws);
     ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
     await pongPromise;
 
-    const lastSeenAfterPing = getAgentById(db, 'agent-ping-ls')!.last_seen;
-    expect(lastSeenAfterPing).toBeGreaterThanOrEqual(lastSeenAfterAuth);
+    const afterPing = getAgentById(db, 'agent-ping-ls')!;
+    // liveness advanced …
+    expect(typeof afterPing.last_alive).toBe('number');
+    expect(afterPing.last_alive!).toBeGreaterThanOrEqual(lastSeenAfterAuth);
+    // … and "last acted" did NOT move
+    expect(afterPing.last_seen).toBe(lastSeenAfterAuth);
+    ws.close();
+  }, 10000);
+
+  it('presence_list carries last_alive alongside last_seen', async () => {
+    const rawToken = generateToken();
+    registerAgent(db, { id: 'agent-pres-alive', token_hash: hashToken(rawToken), hostname: 'host1' });
+
+    const ws = await connectWs(port);
+    const authMsgPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'auth', agent_id: 'agent-pres-alive', token: rawToken }));
+    await authMsgPromise;
+
+    const pongPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+    await pongPromise;
+
+    const listPromise = waitForMessage(ws);
+    ws.send(JSON.stringify({ type: 'list_presence', msg_id: 'pl-1' }));
+    const resp = JSON.parse((await listPromise) as string);
+    expect(resp.type).toBe('presence_list');
+    const self = resp.agents.find((a: { id: string }) => a.id === 'agent-pres-alive');
+    expect(self).toBeDefined();
+    expect(typeof self.last_alive).toBe('number'); // stamped by the ping above
+    expect(typeof self.last_seen).toBe('number');
     ws.close();
   }, 10000);
 

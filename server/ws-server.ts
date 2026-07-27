@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as net from 'net';
-import { getAgentById, setOnline, touchAgent, getPendingMessages, markAcked, aclRelated, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
+import { getAgentById, setOnline, touchAgent, touchAlive, getPendingMessages, markAcked, aclRelated, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
 import { validateToken } from './auth.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
@@ -70,7 +70,16 @@ function handlePing(ctx: FrameCtx): void {
     ws.send(JSON.stringify({ type: 'pong', ts, server_ts: serverTs }));
   } catch (_) { /* ignore */ }
   if (state.agentId !== null) {
-    touchAgent(db, state.agentId);
+    // A keepalive is proof of LIFE, not an act — so it stamps last_alive and
+    // deliberately does NOT touch last_seen.
+    //
+    // This previously called touchAgent(). That was harmless while almost
+    // nothing pinged, but now that the SDK heartbeats every 25s it would make
+    // last_seen advance for every idle agent — silently converting a shipped
+    // field from "last acted" into "last alive" for every consumer (the mesh
+    // fleet views, orchestrator-MCP fleet_list/agent_detail, mesh-chat). Keeping
+    // the two fields distinct is the whole point of last_alive.
+    touchAlive(db, state.agentId);
   }
 }
 
@@ -354,7 +363,7 @@ function handleListPresence(ctx: FrameCtx): void {
   // ACL-filtered roster: agents the caller is ACL-related to, plus self.
   const result = all
     .filter(a => a.id === caller || aclRelated(db, caller, a.id))
-    .map(a => ({ id: a.id, online: a.online === 1, last_seen: a.last_seen }));
+    .map(a => ({ id: a.id, online: a.online === 1, last_seen: a.last_seen, last_alive: a.last_alive ?? null }));
   const resp: { type: string; ref?: string; agents: typeof result } = { type: 'presence_list', agents: result };
   if (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) resp.ref = frame.msg_id;
   try {
@@ -406,7 +415,7 @@ export function startWsServer(
     // Pass the connecting ws as `excludeWs` on connect; null on disconnect (the
     // disconnecting ws is already removed from `registry`).
     function broadcastStatus(agentId: string, online: boolean, lastSeen: number, excludeWs: WebSocket | null) {
-      const statusMsg = JSON.stringify({ type: 'agent_status', agent_id: agentId, online, last_seen: lastSeen });
+      const statusMsg = JSON.stringify({ type: 'agent_status', agent_id: agentId, online, last_seen: lastSeen, last_alive: getAgentById(db, agentId)?.last_alive ?? null });
       for (const [otherWs, otherState] of registry) {
         if (otherWs === excludeWs) continue;
         if (otherState.authed && otherState.agentId !== null && aclRelated(db, agentId, otherState.agentId)) {
