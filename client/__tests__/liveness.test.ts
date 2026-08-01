@@ -200,12 +200,23 @@ describe('channel-drop: liveness + reconnect', () => {
 
   it('4. repeated wedge/reconnect cycles leave no timer accumulation, and close() is clean', async () => {
     client = makeClient(h.port);
+    // Gate each wedge on the CLIENT's view, not the server's. The first
+    // version waited for h.authCount() — the SERVER seeing the auth frame —
+    // and then wedged. The client processes auth_ok strictly later, and a
+    // wedge landing in that gap catches it pre-auth with no heartbeat armed:
+    // recovery then waits on the 10s connect timeout, which outlives this
+    // loop's budget. Sub-ms window locally, wide on a loaded CI runner —
+    // flaked exactly once, on CI, on an unrelated PR. `from` is who sent it,
+    // never who has processed it; same lesson as the alert frames.
+    let connects = 0;
+    client.on('connect', () => { connects++; });
     await client.connect();
+    await until(() => connects >= 1, 8000);
 
     for (let i = 0; i < 3; i++) {
-      const before = h.authCount();
+      const before = connects;
       h.wedge();
-      const ok = await until(() => h.authCount() > before, 8000);
+      const ok = await until(() => connects > before, 8000);
       expect(ok).toBe(true);
     }
     expect(h.authCount()).toBe(4); // 1 initial + 3 recoveries, no extra churn
