@@ -587,6 +587,47 @@ function handleMessagesGet(ctx: AdminCtx): void {
   res.end(JSON.stringify(messages));
 }
 
+/**
+ * RFC 6266/5987 Content-Disposition for an untrusted filename.
+ *
+ * WHY THIS EXISTS (2026-08-01 incident): filenames are agent-supplied and were
+ * interpolated raw into a header. Node/Bun validate header values as latin1 —
+ * one em-dash (U+2014) in a stored filename made writeHead throw
+ * ERR_INVALID_CHAR, which killed the WHOLE server process. The container
+ * stayed "Up" (sleep-style PID 1), so only mesh presence saw it — and the
+ * recipient's inbox auto-refetch turned it into a crash LOOP on every
+ * restart. One filename, whole-mesh DoS, invisible to container health.
+ *
+ * Shape: an ASCII-only `filename="…"` fallback (non-printables and the two
+ * quote-breakers replaced), plus `filename*=UTF-8''…` carrying the real name
+ * percent-encoded per RFC 5987 (encodeURIComponent, then the four chars it
+ * leaves bare that are NOT attr-chars). Every modern client prefers the
+ * starred form, so unicode names round-trip; the fallback cannot contain a
+ * byte writeHead rejects.
+ */
+export function contentDispositionFor(filename: string): string {
+  const ascii = filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  const encoded = encodeURIComponent(filename).replace(
+    /['()*]/g,
+    (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase(),
+  );
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
+/**
+ * Content-Type is the SAME injection vector one line up: it is stored from
+ * whatever the sender's SDK passed as contentType, and a non-latin1 byte in it
+ * kills writeHead identically. A well-formed type/subtype (with optional
+ * parameters, printable-ASCII only) passes through; anything else serves as
+ * octet-stream rather than 500ing a file whose bytes are fine.
+ */
+const SAFE_CONTENT_TYPE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+(?:\s*;\s*[\x20-\x7e]*)?$/;
+
+export function safeContentType(ct: string | null | undefined): string {
+  if (typeof ct === 'string' && ct.length <= 256 && SAFE_CONTENT_TYPE.test(ct)) return ct;
+  return 'application/octet-stream';
+}
+
 async function handleFileById(ctx: AdminCtx): Promise<void> {
   const { res, db, params, auth } = ctx;
   const id = params.id;
@@ -615,8 +656,8 @@ async function handleFileById(ctx: AdminCtx): Promise<void> {
 
   const content = Buffer.from(await bunFile.arrayBuffer());
   res.writeHead(200, {
-    'Content-Type': file.content_type,
-    'Content-Disposition': `attachment; filename="${file.filename}"`,
+    'Content-Type': safeContentType(file.content_type),
+    'Content-Disposition': contentDispositionFor(file.filename),
     'Content-Length': String(content.byteLength),
   });
   res.end(content);
@@ -1041,7 +1082,9 @@ function handleReminderDelete(ctx: AdminCtx): void {
 // the original inline if-chain exactly (exact paths before their `/:id`
 // siblings). A path that matches no (method, matcher) pair falls through to the
 // 404 at the end of dispatch — there is intentionally no 405.
-const ROUTES: Route[] = [
+/** Exported for tests ONLY: the dispatcher-guard test injects a throwing
+    route to prove a handler exception cannot kill the process. */
+export const ROUTES: Route[] = [
   { method: 'POST',   match: exact('/acl'),                          handler: handleAclPost },
   { method: 'DELETE', match: exact('/acl'),                          handler: handleAclDelete },
   { method: 'GET',    match: exact('/acl'),                          handler: handleAclGet },
@@ -1117,7 +1160,22 @@ export function startHttpAdmin(
       }
 
       if (matched) {
-        await matched.handler({ req, res, db, url, params, agentIndex, observerIndex, maxFileBytes, filesDir, auth });
+        // A handler throw here used to become an unhandled rejection (async
+        // createServer callback, no catch) and KILL THE PROCESS — the header
+        // incident was one instance; any future handler bug is another. One
+        // request fails loudly instead of the whole mesh dying quietly: log,
+        // 500 if the head isn't out yet, sever the socket if it is.
+        try {
+          await matched.handler({ req, res, db, url, params, agentIndex, observerIndex, maxFileBytes, filesDir, auth });
+        } catch (err) {
+          console.error(`[http-admin] handler crashed: ${method} ${pathname}:`, err);
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'internal error' }));
+          } else {
+            res.destroy();
+          }
+        }
         return;
       }
 
