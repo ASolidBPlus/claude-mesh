@@ -318,7 +318,11 @@ describe('GET /files/:id', () => {
     });
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toBe('text/plain');
-    expect(res.headers.get('content-disposition')).toBe('attachment; filename="hello.txt"');
+    // RFC 6266 shape since the header-DoS fix: an ASCII fallback plus the
+    // RFC 5987 starred form. For a pure-ASCII name the two are identical.
+    expect(res.headers.get('content-disposition')).toBe(
+      'attachment; filename="hello.txt"; filename*=UTF-8\'\'hello.txt',
+    );
 
     const body = await res.text();
     expect(body).toBe(content);
