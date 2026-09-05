@@ -548,6 +548,10 @@ any future bulk granter — physically cannot grant into one; a deliberate tenan
 grant says so in the request, which is the "explicit, reviewed intent" made a field
 instead of a convention. The release condition collapses from "all writers
 everywhere comply" to "the refusal is deployed" — verifiable from this repo alone.
+The tenancy test reads the bus's own `agents` row (authoritative — never a
+client-supplied field, so no absent-field-read-as-null fail-open), and **fails
+closed**: an endpoint whose tenant cannot be resolved is refused, not defaulted to
+`home`.
 
 The terminology guard (§3) is part of the same finding, not a tidiness item: the
 obligation version required every writer to filter by a field whose name means
