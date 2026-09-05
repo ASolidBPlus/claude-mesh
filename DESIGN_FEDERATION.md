@@ -584,6 +584,24 @@ bus's own `agents` row (authoritative — never a client-supplied field, so no
 absent-field-read-as-null fail-open), and **fails closed**: an endpoint whose
 tenant cannot be resolved is refused, not defaulted to `home`.
 
+Two facts the implementer of this refusal must see together *(lane finding — they
+lived in sections written for different reasons)*: the link lookup **maps `NULL →
+'home'`** before asking "does a link exist for this direction" (`agents.namespace`
+uses `NULL` for home; `federation_links.from_ns/to_ns` are `TEXT NOT NULL` using the
+literal `home`), and that mapping is unambiguous **only because the reserved-word
+validator (§7) refuses `home` as a mintable tenant name**. If a tenant could be
+named `home`, a `('home' → X)` link row would be ambiguous between the home tenant
+and that tenant, and the refusal would consult a link the operator never created for
+the pair in front of it. **The validator is therefore a correctness precondition of
+this refusal, not an observability tidiness item** — Phase 2 must not ship the
+refusal without it.
+
+Kept with the rest of the dialectic because it will recur somewhere unrelated to
+tenants: the link-only draft failed not because links are weak, but because **the
+control's active window was the complement of the threat window** — it refused
+pre-link, when no tenant traffic was possible, and stood down post-link, the only
+time the hazard existed. That is the transferable form.
+
 The terminology guard (§3) is part of the same finding, not a tidiness item: the
 obligation version required every writer to filter by a field whose name means
 something *else* in the very codebase holding the known instance — compliance was
