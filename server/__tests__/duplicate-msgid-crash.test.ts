@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'bun:test';
 import { openDb, registerAgent, aclGrant, getMessage } from '../db.ts';
 import { hashToken } from '../auth.ts';
+import { renderMetrics } from '../metrics.ts';
 import { startWsServer, WsServerHandle, POST_AUTH_HANDLERS } from '../ws-server.ts';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
@@ -28,6 +29,14 @@ import { tmpdir } from 'os';
 let portCounter = 20950;
 function nextPort() { return portCounter++; }
 function wait(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+
+/** Read the sender's accepted-and-routed counter out of the metrics render. */
+function sentCountFor(db: Database, agentId: string): number {
+  const line = renderMetrics(db)
+    .split('\n')
+    .find(l => l.startsWith(`mesh_messages_sent_total{from_agent="${agentId}"}`));
+  return line === undefined ? 0 : Number(line.split(' ').pop());
+}
 
 function connect(port: number): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
@@ -230,5 +239,43 @@ describe('#94: the dispatcher guard is the class fix', () => {
         db.close();
       }
     })();
+  }, 20_000);
+});
+
+describe('#94: a refused duplicate is not counted as traffic', () => {
+  // Pins reason (2) in routeDirect's comment for choosing an explicit lookup
+  // over catching the UNIQUE constraint: the check sits ABOVE the
+  // accepted-and-routed metrics, so a rejected duplicate never counts as a
+  // message the bus carried.
+  //
+  // Written because the FIRST version of that comment gave a different reason
+  // which turned out to be false (it claimed the recipient would already hold
+  // the frame by insert time; insertMessage actually runs before
+  // recipientWs.send). A stated rationale that nothing tests is just a claim,
+  // and that is exactly how the wrong one survived review.
+  it('sender counter advances once for two sends sharing a msg_id', async () => {
+    const { db, handle, port } = await setup();
+    const a = await authConnect(port, 'A', 'ta');
+    try {
+      a.ws.send(JSON.stringify({ type: 'send', to: 'B', payload: 'one', msg_id: 'metric-1' }));
+      await wait(120);
+      const afterFirst = sentCountFor(db, 'A');
+
+      a.ws.send(JSON.stringify({ type: 'send', to: 'B', payload: 'two', msg_id: 'metric-1' }));
+      await wait(150);
+      const afterDuplicate = sentCountFor(db, 'A');
+
+      expect(afterDuplicate).toBe(afterFirst);
+
+      // Positive control: a genuinely new message DOES advance it, so the
+      // assertion above cannot be satisfied by a counter that never moves.
+      a.ws.send(JSON.stringify({ type: 'send', to: 'B', payload: 'three', msg_id: 'metric-2' }));
+      await wait(150);
+      expect(sentCountFor(db, 'A')).toBe(afterFirst + 1);
+    } finally {
+      try { a.ws.close(); } catch { /* ignore */ }
+      await handle.shutdown().catch(() => {});
+      db.close();
+    }
   }, 20_000);
 });

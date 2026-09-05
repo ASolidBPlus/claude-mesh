@@ -99,10 +99,20 @@ export function routeDirect(
   // dispatcher guard, escaped as an uncaught exception and killed the process.
   // An honest SDK retry after a lost ack is enough to do it.
   //
-  // Refused BEFORE any side effect, which is the whole point of doing it here
-  // rather than catching the constraint at the insert: by insert time the
-  // recipient has already been handed the frame on the online path, so a
-  // catch-based fix would deliver the message twice and THEN report an error.
+  // Checked HERE rather than by catching the UNIQUE constraint at the insert,
+  // for two reasons — neither of which is "the recipient would already have
+  // been handed the frame". An earlier version of this comment claimed that,
+  // and it was WRONG: insertMessage runs BEFORE recipientWs.send on the online
+  // path, so a catch-based fix would in fact refuse before any delivery. The
+  // real reasons:
+  //
+  //   1. A caught constraint has to be identified by matching SQLite's error
+  //      text, which would also swallow a UNIQUE violation from any OTHER
+  //      column or index and misreport it as a duplicate msg_id. Refusing on an
+  //      explicit lookup says exactly what was wrong and nothing else.
+  //   2. It refuses before the accepted-and-routed metrics below (incSent,
+  //      incBytes, observePayloadBytes), so a rejected duplicate is not counted
+  //      as traffic the bus carried.
   //
   // Checked against the stored row, so ttl_ms=0 is unaffected: an ephemeral
   // send persists nothing, has no id to collide with, and stays repeatable.
