@@ -70,6 +70,45 @@ describe('getAgentByToken — indexed lookup (#45/#13)', () => {
     expect(getAgentByToken(db, 'tok-alice')?.id).toBe('alice');
   });
 
+  it('★ the final timing-safe compare is LOAD-BEARING under a NOCASE column', () => {
+    // Converting a documented equivalent mutant into a killed one (reviewer's
+    // catch on #75). As written against our BINARY-collation column the final
+    // compare can never fail — the row was found BY `token_hash = ?`, so a
+    // "two rows differing in case" test would pass trivially and assert
+    // nothing. The hazard needs its world built: a column that matches
+    // case-INSENSITIVELY, which is one `COLLATE NOCASE` away and exactly the
+    // kind of schema edit nobody would connect to authentication.
+    //
+    // Verified in SQLite directly: with COLLATE NOCASE, `WHERE h = 'abcdef'`
+    // returns a row stored as 'ABCDEF'. So the SQL layer hands back a row
+    // whose hash is NOT the probe's hash — and only the final compare stops
+    // that becoming a successful authentication as the wrong agent.
+    const nocase = new Database(':memory:');
+    nocase.exec(`
+      CREATE TABLE agents (
+        id            TEXT PRIMARY KEY,
+        token_hash    TEXT NOT NULL COLLATE NOCASE,
+        hostname      TEXT NOT NULL,
+        registered_at INTEGER NOT NULL,
+        last_seen     INTEGER NOT NULL,
+        online        INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    const ins = nocase.prepare(
+      'INSERT INTO agents (id, token_hash, hostname, registered_at, last_seen, online) VALUES (?, ?, ?, ?, ?, 0)',
+    );
+    // Stored uppercase; the real hash is lowercase hex. Under NOCASE these are
+    // "equal" to SQL and different to the compare.
+    ins.run('shouty', hashToken('tok-shouty').toUpperCase(), 'h', Date.now(), Date.now());
+    // Known-positive control in the SAME table: without it, "returns null"
+    // would also pass against a DB that simply doesn't work.
+    ins.run('exact', hashToken('tok-exact'), 'h', Date.now(), Date.now());
+
+    expect(getAgentByToken(nocase, 'tok-exact')?.id).toBe('exact');
+    expect(getAgentByToken(nocase, 'tok-shouty')).toBeNull();
+    nocase.close();
+  });
+
   it('a corrupted stored hash of the wrong length matches nothing', () => {
     db.prepare(
       'INSERT INTO agents (id, token_hash, hostname, registered_at, last_seen, online) VALUES (?, ?, ?, ?, ?, 0)',

@@ -305,10 +305,14 @@ export function getAgentByToken(db: Database, token: string): Agent | null {
   //   SHA-256. So indexing on the hash does not leak the secret.
   //
   //   The timing-safe compare is therefore NOT what protects the index lookup.
-  //   It is kept as the final equality check on the candidate row, because
-  //   removing it would make this function's safety depend on SQLite's `=`
-  //   semantics — an implementation detail we neither control nor test. One
-  //   compare against one row is O(1) and costs nothing.
+  //   It is the final equality check on the candidate row, and it is
+  //   LOAD-BEARING rather than ceremonial: SQLite's `=` honours the column's
+  //   COLLATION, so a single `COLLATE NOCASE` on token_hash — a schema edit
+  //   nobody would connect to authentication — would make the SQL layer hand
+  //   back a row whose hash differs from the probe's in case. Only this
+  //   compare stops that becoming a successful auth as the wrong agent.
+  //   (Verified in SQLite, and pinned by a test that builds exactly that
+  //   column; deleting this line fails it.)
   //
   //   AMBIGUITY FAILS CLOSED. The index is deliberately not UNIQUE (a unique
   //   index cannot be created over pre-existing duplicates, and openDb runs on
