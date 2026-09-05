@@ -2,13 +2,13 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import {
   openDb, registerAgent, aclGrant, insertOutboundPeer, getOutboundPeer,
   drainOutbound, expireStaleOutbound, markMessageFailed, countPendingMessages,
-  listOutboundPeers, getMessage,
+  listOutboundPeers, getMessage, DRAIN_OUTBOUND_SQL,
 } from '../db.ts';
 import { routeDirect, routeRelay, MAX_TTL_MS } from '../router.ts';
 import { RELAY_DEDUPE_MS } from '../cleanup.ts';
-import { startBorder, forwarders, borderEvents } from '../border.ts';
+import { startBorder, forwarders, borderEvents, Forwarder } from '../border.ts';
 import { validateOutboundPeerUrl } from '../http-admin.ts';
-import { renderMetrics, setPeerUpSource } from '../metrics.ts';
+import { renderMetrics, setPeerUpSource, incPeerRelay, incSent, incReceived, incAclDenied, incError, PARTY_FREE_LABELS } from '../metrics.ts';
 import { Database } from 'bun:sqlite';
 import type { WebSocket } from 'ws';
 import { readFileSync, readdirSync, statSync, mkdtempSync } from 'fs';
@@ -64,15 +64,12 @@ describe('F2b: the drain query', () => {
     // The ORDER BY's temp b-tree is EXPECTED and is not a failure: asserting
     // the absence of temp structures would red for a reason unrelated to the
     // property under test, which is that the range does not full-scan.
-    const plan = (db.prepare(
-      `EXPLAIN QUERY PLAN
-       SELECT * FROM messages
-       WHERE to_agent >= ? AND to_agent < ?
-         AND delivered_at IS NULL AND failed_code IS NULL
-         AND (expires_at IS NULL OR expires_at >= ?)
-         AND sent_at >= ?
-       ORDER BY sent_at LIMIT ?`
-    ).all('far:', 'far;', 0, 0, 10) as { detail: string }[]).map(r => r.detail).join(' | ');
+    // EXPLAINs THE EXPORTED CONSTANT — the query drainOutbound actually runs.
+    // This test previously analysed an inline COPY, so mutating drainOutbound
+    // to a LIKE pattern (full scan on every enqueue) left it green: it pinned a
+    // string that never executed.
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${DRAIN_OUTBOUND_SQL}`)
+      .all('far:', 'far;', 0, 0, 10) as { detail: string }[]).map(r => r.detail).join(' | ');
 
     expect(plan).toContain('idx_messages_to_agent');
     expect(plan).not.toContain('SCAN');
@@ -172,29 +169,153 @@ describe('F2b: the boot path — pinned in BOTH directions', () => {
   });
 });
 
-describe('F2b: mesh_peer_up is 0 or 1 for every CONFIGURED peering (#108)', () => {
-  it('emits a 0 series for a configured-but-disconnected peering', () => {
-    // The defect this closes: a gauge emitted only when up VANISHES on
-    // disconnect, and you cannot alert on an absent series — "no data" is
-    // indistinguishable from "never configured". The alert an operator wants
-    // is "this went to 0", which requires the 0 to exist.
-    peering('down-peer');
+describe('F2b: mesh_peer_up (#108) and the peer-label flag', () => {
+  // /metrics is UNAUTHENTICATED. With per-alias series it enumerates the whole
+  // inter-org topology in both directions — and aliases are deliberately
+  // meaningful names, so the labels ARE the disclosure. The exemption that made
+  // unauthenticated /metrics acceptable rests on "the admin port is
+  // internal-only", a DEPLOYMENT claim the code cannot enforce.
+  afterEach(() => { delete process.env.MESH_METRICS_IDENTITY_LABELS; setPeerUpSource(() => []); });
+
+  it('DEFAULT: no peer alias AND no agent id appears anywhere in the bytes', () => {
+    // The flag gates EVERY identity-bearing label, not only peer aliases — the
+    // same unauthenticated reader enumerates LOCAL AGENT IDS from
+    // mesh_agent_up, mesh_messages_sent_total, mesh_messages_received_total and
+    // mesh_acl_denied_total. A label is a disclosure from the READER's
+    // position, not from the labelled party's.
+    peering('secret-partner');
+    registerAgent(db, { id: 'secret-agent', token_hash: 'd'.repeat(64), hostname: 'h' });
     setPeerUpSource(() => listOutboundPeers(db).map(r => ({ alias: r.alias, up: false })));
-    try {
-      expect(renderMetrics(db)).toContain('mesh_peer_up{alias="down-peer"} 0');
-    } finally {
-      setPeerUpSource(() => []);
+    incPeerRelay('secret-partner', 'outbound', 'delivered');
+    incSent('secret-agent'); incReceived('secret-agent'); incAclDenied('secret-agent');
+    // A NON-identity label, counted so the control below is real: it only
+    // emits a series once something has been counted.
+    incError('ACL_DENIED');
+
+    // SERIES LINES ONLY, not the whole document: `# HELP` prose legitimately
+    // contains words like "sender", and an agent may be named that. Matching
+    // prose would make this fail for a reason unrelated to disclosure — the
+    // first run did exactly that. What must not carry an identity is the DATA.
+    const out = renderMetrics(db)
+      .split('\n').filter(l => l.length > 0 && !l.startsWith('#')).join('\n');
+    // Grep the BYTES of those lines for every configured alias and every
+    // registered agent id: a label leaking under an unexpected series name
+    // would pass a per-series check and fail this.
+    for (const alias of listOutboundPeers(db).map(r => r.alias)) {
+      expect(out).not.toContain(alias);
     }
+    for (const row of db.prepare('SELECT id FROM agents').all() as { id: string }[]) {
+      expect(out).not.toContain(row.id);
+    }
+    expect(out).not.toContain('alias=');
+    expect(out).not.toContain('from_agent=');
+    expect(out).not.toContain('to_agent=');
+    expect(out).not.toContain('agent=');
+    // Positive controls: the aggregates ARE present, so "does not contain" is
+    // not satisfied by an empty document — and mesh_errors_total, which carries
+    // no identity, is unaffected by the flag.
+    expect(out).toContain('mesh_peer_up_count');
+    expect(out).toContain('mesh_agent_up_count');
+    expect(out).toContain('mesh_errors_total');
   });
 
-  it('positive control: a connected peering emits 1', () => {
-    peering('up-peer');
+  // CANARY on the allowlist itself. Moving PARTY_FREE_LABELS beside the
+  // emitters buys one authority, but it costs this: the constant is the
+  // walker's ORACLE, so widening the constant makes the walker green — measured,
+  // not assumed (adding 'agent' to it leaves the walk 24/24). The walk cannot
+  // catch that, by construction.
+  //
+  // This pins the contents, so a widening is a deliberate edit to a test that
+  // says why, rather than a silent one-word change that disarms the walk for
+  // that label. It is not a correctness check — it is a speed bump with a
+  // reason attached, and it is the only thing standing behind the walk.
+  it('the party-free allowlist itself is pinned — widening it disarms the walk', () => {
+    expect([...PARTY_FREE_LABELS].sort()).toEqual([
+      'direction', 'error_code', 'kind', 'le', 'outcome', 'state', 'status',
+    ]);
+  });
+
+  // THE PIN. The byte-grep above knows only the identities that exist in THIS
+  // test; it cannot see a NEW labelled series someone adds later. This walks
+  // every series actually emitted with the flag OFF and checks each label KEY
+  // against a closed allowlist of party-free labels.
+  //
+  // "Identity-bearing" is defined as a category — any label whose value names a
+  // party (an agent id or a peer alias) — rather than as a list, because a list
+  // goes stale the moment someone adds a series. A category-shaped name is only
+  // survivable if something enforces the category, and this is that something:
+  // a mutant adding `mesh_x{agent="..."}` ungated reds it.
+  it('DEFAULT: every emitted label key is on the party-free allowlist', () => {
+    // The allowlist is PARTY_FREE_LABELS in metrics.ts, beside the emitters —
+    // deliberately not defined here. A closed list that lives only in its test
+    // gets widened by whoever is unblocking themselves; a list beside the
+    // emitters is met by the person adding the label, and carries the value
+    // domain that earns each entry.
+    const PARTY_FREE = PARTY_FREE_LABELS;
+
+    peering('p-one');
+    registerAgent(db, { id: 'a-one', token_hash: 'e'.repeat(64), hostname: 'h' });
     setPeerUpSource(() => listOutboundPeers(db).map(r => ({ alias: r.alias, up: true })));
-    try {
-      expect(renderMetrics(db)).toContain('mesh_peer_up{alias="up-peer"} 1');
-    } finally {
-      setPeerUpSource(() => []);
+    incPeerRelay('p-one', 'outbound', 'delivered');
+    incSent('a-one'); incReceived('a-one'); incAclDenied('a-one'); incError('ACL_DENIED');
+
+    const rendered = renderMetrics(db).split('\n');
+    const series = rendered.filter(l => l.length > 0 && !l.startsWith('#'));
+
+    const offenders: string[] = [];
+    for (const line of series) {
+      const m = line.match(/^[a-z_]+\{([^}]*)\}/);
+      if (m === null) continue;                 // unlabelled series
+      for (const pair of m[1]!.split(',')) {
+        const key = pair.split('=')[0]!.trim();
+        if (key.length > 0 && !PARTY_FREE.has(key)) offenders.push(`${line.split('{')[0]}: ${key}`);
+      }
     }
+    expect(offenders).toEqual([]);
+
+    // THE WALK'S OWN BLIND SPOT, made loud. A metric with no data emits no
+    // series line, so the walk above simply cannot see its labels — three of
+    // this test's findings (`outcome`, `le`, `status`) only became visible once
+    // other tests in this file had populated their counters, which means a
+    // green here is worth exactly as much as the fixture's coverage.
+    //
+    // So: derive the metric universe from the # TYPE lines, which render
+    // unconditionally, and require every declared metric to be either walked or
+    // named below. A new metric that this fixture does not exercise fails here
+    // with its own name, rather than passing unexamined.
+    const declared = rendered
+      .filter(l => l.startsWith('# TYPE '))
+      .map(l => l.split(' ')[2]!)
+      .sort();
+    const walked = new Set(series.map(l => l.split('{')[0]!.split(' ')[0]!.replace(/_(bucket|sum|count)$/, '')));
+    const unwalked = declared.filter(n => !walked.has(n) && !walked.has(n.replace(/_(bucket|sum|count)$/, '')));
+
+    // Empty is the goal: this fixture drives every declared metric. If a new
+    // metric lands here, EXERCISE it above rather than adding it to this list —
+    // an entry here is a label set nobody has ever checked.
+    expect(unwalked).toEqual([]);
+  });
+
+  it('DEFAULT: #108 alertability survives — both states are always present', () => {
+    // The point of #108 was that a series which only appears when up cannot be
+    // alerted on. Aggregates keep that property: "peerings down" is a value
+    // that moves, not a series that vanishes. What is withheld is WHICH one.
+    peering('a'); peering('b');
+    setPeerUpSource(() => [{ alias: 'a', up: true }, { alias: 'b', up: false }]);
+
+    const out = renderMetrics(db);
+    expect(out).toContain('mesh_peer_up_count{state="up"} 1');
+    expect(out).toContain('mesh_peer_up_count{state="down"} 1');
+  });
+
+  it('FLAG ON: per-alias series appear, 0 and 1 for every configured peering', () => {
+    process.env.MESH_METRICS_IDENTITY_LABELS = '1';
+    peering('down-peer'); peering('up-peer');
+    setPeerUpSource(() => [{ alias: 'down-peer', up: false }, { alias: 'up-peer', up: true }]);
+
+    const out = renderMetrics(db);
+    expect(out).toContain('mesh_peer_up{alias="down-peer"} 0');
+    expect(out).toContain('mesh_peer_up{alias="up-peer"} 1');
   });
 });
 
@@ -406,6 +527,45 @@ describe('F2b (b): ttl is clamped on BOTH branches and negatives are refused', (
       from: 'them', to: 'local-x', payload: 'p', ttl_ms: -1,
     });
     expect(r.ok).toBe(false);
+  });
+});
+
+describe('F2b (a): a remote refusal cannot permanently slow us down', () => {
+  it('the refill rate RECOVERS after a successful ack — asserted by throughput', () => {
+    // Asserted by the QUESTION the system asks — how much may we send in the
+    // next drain — rather than by reading the private field. A restore that
+    // set the field without affecting pacing would pass a field read.
+    //
+    // Halving alone is a ONE-WAY RATCHET the far side controls: 600 -> 300 ->
+    // ... -> 2, and it survives reconnect because MeshClient reconnects
+    // internally so the constructor never re-runs. Restore-on-ack is the only
+    // path back.
+    const f = new Forwarder(db, {
+      alias: 'far', url: 'ws://127.0.0.1:7300', token: 'T', assigned_alias: 'us',
+      kinds: '["direct"]', rate_per_min: 600, enabled: 1, created_at: Date.now(), last_alive: null,
+    }, new Map<string, WebSocket>());
+
+    const probe = f as unknown as {
+      refillPerMin: number;
+      onSendError(row: { id: string }, err: { code?: string }): void;
+      backoff: number;
+    };
+
+    peering('far');
+    aclGrant(db, 'sender', 'far:them', 'admin');
+    for (let i = 0; i < 3; i++) probe.onSendError({ id: `x${i}` }, { code: 'RATE_LIMITED' });
+    expect(probe.refillPerMin).toBe(75);          // 600 -> 300 -> 150 -> 75
+
+    // Now drive the REAL ack path — the same method the relay resolution
+    // calls. Setting the field by hand here would have proved nothing about
+    // whether an ack restores it.
+    queue('far', 'acked');
+    (f as unknown as { onSendAck(row: { id: string }): void })
+      .onSendAck({ id: 'acked' });
+
+    expect(probe.refillPerMin).toBe(600);
+    expect(probe.backoff).toBe(1_000);   // BACKOFF_MIN_MS
+    f.stop();
   });
 });
 

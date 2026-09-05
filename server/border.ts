@@ -64,6 +64,39 @@ const BACKOFF_MAX_MS = 60_000;
  * retry. So we pace to the rate the peering was configured with and treat a
  * RATE_LIMITED as evidence our estimate is too high.
  */
+/**
+ * STATE AN UNTRUSTED INPUT CAN DEGRADE, and what restores it.
+ *
+ * The enumeration exists because F1 was a one-way ratchet hiding beside a
+ * correct fix: `backoff` and `refillPerMin` are two counters in one class, both
+ * degraded by remote refusals, and only `backoff` got its restore. Fixing the
+ * sibling made the pair READ as discharged. So every field is listed with its
+ * restoring event, and "permanent" is written down where it is meant.
+ *
+ *   tokens         spent by our own sends; refilled by refill() over elapsed
+ *                  time. Not degradable by the far side — it only ever spends
+ *                  what we chose to send.
+ *   refillPerMin   HALVED by a remote RATE_LIMITED. Restored to
+ *                  row.rate_per_min on the next successful relay ACK.
+ *                  Restore-on-ack is the ONLY path back: MeshClient reconnects
+ *                  internally, so the constructor never re-runs and a
+ *                  reconnect does not reset it.
+ *   backoff        DOUBLED by any transient failure. Reset to BACKOFF_MIN_MS
+ *                  on a successful relay ACK — never on connect, because a far
+ *                  side that accepts sockets and drops everything would
+ *                  otherwise clear it forever.
+ *   inFlight       grown by sending; every outcome path deletes, including a
+ *                  dropped connection (the SDK rejects in-flight waiters with
+ *                  CONNECTION_RESET). No leak on any branch.
+ *   client         nulled only by stop().
+ *   stopped        PERMANENT BY DESIGN — set by stop(), and stop() is called
+ *                  on fatal AUTH_FAILED. Recovery is an operator action.
+ *   outbound_peers.enabled
+ *                  PERMANENT BY DESIGN — endOutboundPeering sets 0 on fatal
+ *                  AUTH_FAILED. Recoverable by PATCH {enabled:true}; that is a
+ *                  decision, not a ratchet, and D13/§5.6 say why.
+ *   cap            readonly, derived at construction.
+ */
 export class Forwarder {
   private client: PeerClient | null = null;
   private inFlight = new Set<string>();
@@ -190,25 +223,36 @@ export class Forwarder {
       content_type: row.content_type,
       ...(ttl !== undefined ? { ttl_ms: ttl } : {}),
     }).then(
-      () => {
-        this.inFlight.delete(row.id);
-        // delivered_at is set ONLY on the peer's ack — never on send.
-        markDelivered(this.db, row.id);
-        incPeerRelay(this.row.alias, 'outbound', 'delivered');
-        // (a) THE BACKOFF RESETS HERE AND NOWHERE ELSE — on a relay ACK, never
-        // on connect. A far side that accepts the TCP/WS connection and then
-        // drops or refuses everything would otherwise reset the backoff on
-        // every reconnect, defeating it entirely: the forwarder would hammer a
-        // peering that is up in the only sense that costs us nothing to check.
-        // Progress means a message was accepted, not that a socket opened.
-        this.backoff = BACKOFF_MIN_MS;
-        this.drain();
-      },
+      () => this.onSendAck(row),
       (err: { code?: string }) => {
         this.inFlight.delete(row.id);
         this.onSendError(row, err);
       },
     );
+  }
+
+  /** The ACK path, named and symmetrical with onSendError so both outcomes are
+   *  reachable from a test. The restore below is the half F1 was missing, and a
+   *  test that set the field by hand would not have exercised it. */
+  private onSendAck(row: Message): void {
+    this.inFlight.delete(row.id);
+    // delivered_at is set ONLY on the peer's ack — never on send.
+    markDelivered(this.db, row.id);
+    incPeerRelay(this.row.alias, 'outbound', 'delivered');
+    // (a) BOTH pacing states reset HERE and nowhere else — on a relay ACK,
+    // never on connect. A far side that accepts the socket and then drops
+    // or refuses everything would otherwise reset them on every reconnect,
+    // defeating both: the forwarder would hammer a peering that is "up" in
+    // the only sense that costs us nothing to check. Progress means a
+    // message was ACCEPTED, not that a socket opened.
+    this.backoff = BACKOFF_MIN_MS;
+    // The refill restore is the half that was MISSING: halving on
+    // RATE_LIMITED without it is a one-way ratchet, so 600 -> 300 -> ... -> 2
+    // and an ack leaves it at 2 forever. A receiving mesh could then
+    // permanently halve our throughput, repeatedly, by refusing a few
+    // relays. The comment said "until the next success"; this is that.
+    this.refillPerMin = this.row.rate_per_min;
+    this.drain();
   }
 
   private onSendError(row: Message, err: { code?: string }): void {
@@ -233,8 +277,9 @@ export class Forwarder {
 
     if (code === 'RATE_LIMITED') {
       // Our estimate of the receiver's capacity is too high. Halve the local
-      // refill until the next success rather than retrying at the same rate —
-      // otherwise an over-stated rate_per_min loops instead of converging.
+      // refill UNTIL THE NEXT SUCCESSFUL ACK, which restores it to the
+      // configured rate — see the ack path. Halving alone would be a one-way
+      // ratchet the far side controls.
       this.refillPerMin = Math.max(1, Math.floor(this.refillPerMin / 2));
       incPeerRelay(this.row.alias, 'outbound', 'rate_limited');
       this.scheduleRetry();

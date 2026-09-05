@@ -1101,6 +1101,27 @@ export function listOutboundPeers(db: Database): OutboundPeer[] {
  * once now and once by whatever already arrived. The two bounds are the same
  * constant on purpose, and a row past it is expired rather than sent.
  */
+/**
+ * The drain SQL, EXPORTED so the EXPLAIN test can analyse THE QUERY THAT RUNS.
+ *
+ * It was a copy: the test EXPLAINed an inline duplicate while drainOutbound
+ * held the real one. Mutating drainOutbound alone to a LIKE pattern turned the
+ * index seek into a full SCAN of `messages` on every enqueue and every backstop
+ * tick — and the test stayed green, because it was pinning a string that never
+ * executes.
+ *
+ * This is (g)'s own argument turned on the test that asserts it: two copies of
+ * a query is one query and one hole, and here the hole was the one under test.
+ */
+export const DRAIN_OUTBOUND_SQL =
+  `SELECT * FROM messages
+   WHERE to_agent >= ? AND to_agent < ?
+     AND delivered_at IS NULL
+     AND failed_code IS NULL
+     AND (expires_at IS NULL OR expires_at >= ?)
+     AND sent_at >= ?
+   ORDER BY sent_at LIMIT ?`;
+
 export function drainOutbound(
   db: Database,
   alias: string,
@@ -1108,15 +1129,8 @@ export function drainOutbound(
   dedupeMs: number,
   limit: number
 ): Message[] {
-  return db.prepare(
-    `SELECT * FROM messages
-     WHERE to_agent >= ? AND to_agent < ?
-       AND delivered_at IS NULL
-       AND failed_code IS NULL
-       AND (expires_at IS NULL OR expires_at >= ?)
-       AND sent_at >= ?
-     ORDER BY sent_at LIMIT ?`
-  ).all(`${alias}:`, `${alias};`, now, now - dedupeMs, limit) as Message[];
+  return db.prepare(DRAIN_OUTBOUND_SQL)
+    .all(`${alias}:`, `${alias};`, now, now - dedupeMs, limit) as Message[];
 }
 
 /** Rows past the receiver's dedupe window: undeliverable, so expired rather
