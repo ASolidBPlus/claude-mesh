@@ -3,6 +3,14 @@
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    // #18: the whole tree imports with explicit .ts extensions (Bun resolves
+    // them natively). Without this flag tsc rejects every such import with
+    // TS5097 — 218 errors on server/ alone, none of them real — which is why
+    // tsc could not be used as a gate at all.
+    "allowImportingTsExtensions": true,
+    // Required by the flag above: it is only legal when tsc emits nothing,
+    // which is already how this repo runs (Bun executes the .ts directly).
+    "noEmit": true,
     "strict": true,
     "noImplicitAny": true,
     "strictNullChecks": true,
