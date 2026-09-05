@@ -546,25 +546,39 @@ multiplying any cross-tenant edge it sees), three with no tenant filter — and 
 are not all the same kind of decision, which no per-writer filter or per-request
 flag can express.
 
-**The bus owns the ACL table, so the rule is a refusal keyed on the design's own
-intent artifact** (lands in Phase 2, with the links API): **the shared grant path
-(`aclGrant` — reached from both `POST /acl` and the MCP grant tool) refuses any edge
-where `ns(from) ≠ ns(to)` unless a `federation_links` row already exists for that
-direction.** The link is the operator's tenant-level decision (admin-only, §5.3);
-the pair edge created under it **is** the deliberate per-pair second decision C4
-requires — whoever writes it. A consent flow or mirror that doesn't know about
-tenants physically cannot create a cross-tenant edge, because no flag it could
-cargo-cult exists — the only way through is the operator having linked those two
-tenants first. (An earlier draft used a `tenant_grant: true` request field; dropped
-because a flag is exactly the kind of thing an automation copies — an existing
-operator artifact cannot be asserted into being.) Same-tenant edges are unaffected:
-intra-tenant granting stays exactly as today, which is what C5 requires. The release
-condition collapses from "all writers everywhere comply" to "the refusal is
-deployed" — verifiable from this repo alone, and the fleet operator can key its
-link-creation gate on that one landing. The tenancy test reads the bus's own
-`agents` row (authoritative — never a client-supplied field, so no
-absent-field-read-as-null fail-open), and **fails closed**: an endpoint whose tenant
-cannot be resolved is refused, not defaulted to `home`.
+**The bus owns the ACL table, so the rule is a refusal requiring BOTH conditions**
+(lands in Phase 2, with the links API): **the shared grant path (`aclGrant` —
+reached from both `POST /acl` and the MCP grant tool) refuses any edge where
+`ns(from) ≠ ns(to)` unless (a) a `federation_links` row already exists for that
+direction AND (b) the request carries an explicit `tenant_grant: true` marker.**
+The two conditions are independent and each closes the other's gap — this section
+went through both single-condition designs and each failed:
+
+- *Marker only* (first draft): a flag is exactly the kind of thing an automation
+  copies — it can be asserted into being by any writer, with or without operator
+  intent.
+- *Link only* (second draft): once the operator links two tenants, unfiltered
+  automation fills in every pair across the link — mesh-chat's census (below) has
+  three writers that would do so on day one, and the rule would have *defined* that
+  auto-grant as "the deliberate decision". The refusal would have been active
+  exactly when the hazard isn't (pre-link, when no tenant traffic is possible
+  anyway) and inactive exactly when it is. Damage was bounded by the link's `kinds`
+  at the admission points — but `kinds` bounds *what*, C4's pair layer bounds
+  *which pairs*, and only one would have survived.
+
+Under AND: a copied flag buys nothing without an operator link; automation that
+doesn't know about tenants passes no marker, so it creates nothing even after the
+link lands — a consent flow or webhook mirror physically cannot create a
+cross-tenant edge, for two reasons, the second of which holds at the only time it
+ever mattered. "Two decisions" (C4) is now literally two artifacts: the operator's
+link, and a grant request that says what it is doing. Same-tenant edges are
+unaffected: intra-tenant granting stays exactly as today, which is what C5
+requires. The release condition collapses from "all writers everywhere comply" to
+"the refusal is deployed" — verifiable from this repo alone, and the fleet operator
+can key its link-creation gate on that one landing. The tenancy test reads the
+bus's own `agents` row (authoritative — never a client-supplied field, so no
+absent-field-read-as-null fail-open), and **fails closed**: an endpoint whose
+tenant cannot be resolved is refused, not defaulted to `home`.
 
 The terminology guard (§3) is part of the same finding, not a tidiness item: the
 obligation version required every writer to filter by a field whose name means
