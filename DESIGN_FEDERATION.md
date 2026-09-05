@@ -103,8 +103,7 @@ CREATE TABLE registration_keys (
   key_hash     TEXT NOT NULL,                -- sha256 of raw secret; raw shown once
   namespace    TEXT NOT NULL,                -- tenant it mints into; never 'home'
   capabilities TEXT NOT NULL DEFAULT '["send:direct"]',  -- JSON array, §3
-  max_agents   INTEGER NOT NULL DEFAULT 16,  -- lifetime mint count
-  minted_count INTEGER NOT NULL DEFAULT 0,
+  max_agents   INTEGER NOT NULL DEFAULT 16,  -- cap on LIVE (enabled) minted agents, not lifetime (F2)
   expires_at   INTEGER,                      -- gates future REGISTRATIONS only
   revoked_at   INTEGER,                      -- kills the key AND its minted agents (§5.4)
   note         TEXT,
@@ -133,12 +132,34 @@ Key secrets are generated and hashed exactly like agent tokens
 (`generateToken`/`hashToken`, `server/auth.ts:6-17`): 256-bit random, SHA-256 stored,
 raw value returned once in the creation response.
 
-**Federated agent ids are namespace-prefixed**: an agent minted by a key for namespace
-`ns` MUST have id `ns:<name>` (server-enforced at registration). This prevents an
-external tenant from claiming fleet-meaningful names (`deploy-helper`, …) — id squatting
-is refused at mint time, and a colon-prefixed id is immediately legible in logs and
-provenance. Existing home ids contain no `:`; `POST /agents` (admin) additionally
-refuses new ids containing `:` unless they match the agent's declared namespace.
+**Federated agent ids are namespace-prefixed at the bus level, tenant-relative in
+use** *(amended after runtime review — F1)*: an agent minted by a key for namespace
+`ns` has fully-qualified (FQ) id `ns:<name>` (server-enforced at registration;
+`<name>` follows the existing bare-id grammar). This prevents an external tenant from
+claiming fleet-meaningful names (`deploy-helper`, …) — id squatting is refused at mint
+time, and a colon-prefixed id is immediately legible in logs and provenance. Existing
+home ids contain no `:`; `POST /agents` (admin) additionally refuses new ids containing
+`:` unless they match the agent's declared namespace.
+
+**Short-name resolution (tenant-relative addressing).** The tenant prefix must never
+leak into agent-visible text: the mesh-agent runtime validates ids against
+`^[a-z0-9-]+$` (a colon fails outright), personas reference bare ids literally, and a
+tenant-dependent prompt prefix destroys the byte-identical cross-org prompt caching the
+runtime depends on. So:
+
+- A sender in tenant `ns` addressing bare `dana` resolves server-side to `ns:dana` —
+  and ONLY that. On miss: `AGENT_NOT_FOUND`. Bare names never resolve cross-tenant and
+  never fall through to home (C2: no ambiguity, no squat leverage).
+- Cross-tenant sends use the FQ form (`other-ns:name`, or the bare home id for linked
+  home targets) and still pass the full admit rule (§6).
+- Same-tenant deliveries present **short** names in the deliver frame (shared prefix
+  stripped from `from`/`to`); cross-tenant deliveries present FQ names. Home-tenant
+  agents (NULL) see today's behaviour byte-for-byte.
+- The FQ form is canonical everywhere operator-facing: DB rows, admin API, observer
+  tap, logs, metrics.
+
+Net effect: the same authored scenario spins up unchanged for N orgs, and a tenant's
+agents never see their own prefix.
 
 ---
 
@@ -150,12 +171,22 @@ Refuses `namespace: "home"` (C2) and malformed capability strings.
 201 → `{ id, key: "<raw shown once>", namespace, capabilities, max_agents, expires_at }`.
 
 ### 5.2 `POST /register` — **authenticates with a registration key**, not admin
-`Authorization: Bearer <raw key>`. Body: `{ id, hostname }`.
+`Authorization: Bearer <raw key>`. Body: `{ id, hostname }` (`id` is the bare name;
+the server prefixes it — the key holder never writes its own namespace).
 Server-side checks, in order: key exists (hash lookup) → not revoked → not expired →
-`minted_count < max_agents` → `id` starts with `<key.namespace>:` and is not taken.
+live-population check (`COUNT(*)` of enabled agents with `minted_by_key = key.id` `<
+max_agents` — a count, not a counter, so it cannot drift; F2) → resulting FQ id free
+*or previously minted by this same key*.
 On success: creates the agent with `namespace = key.namespace`,
-`minted_by_key = key.id`, increments `minted_count`, and returns the standard
-one-time agent token (same shape as `POST /agents`, `server/http-admin.ts:422-427`).
+`minted_by_key = key.id`, and returns the standard one-time agent token (same shape as
+`POST /agents`, `server/http-admin.ts:422-427`).
+
+**Re-registration is idempotent per key** *(F2)*: presenting the same key for an FQ id
+that key already minted rotates the agent's token (old token invalidated) and clears
+`disabled`. This is the scenario-reset path — spin-down/spin-up cycles on the same ids
+cost nothing and never exhaust the key; only *distinct live* identities count against
+`max_agents`. An id minted by a *different* key is `403` (no cross-key capture).
+
 **The key holder never chooses its namespace or capabilities — they come from the key
 (C1).** Failures are uniform 403s (no oracle distinguishing "revoked" from "expired"
 to an unauthenticated caller; details go to the server log).
@@ -168,7 +199,10 @@ like ACL. Links are directional; inter-org A↔B needs two.
 
 ### 5.4 `DELETE /registration-keys/:id` — admin only — **revocation, R6**
 Sets `revoked_at` and, in the same transaction, `disabled = 1` on every agent with
-`minted_by_key = :id`. One call tears down a tenant's whole minted population.
+`minted_by_key = :id`. One call tears down a tenant's whole minted population. Key
+revocation is **terminal** — it is the kill switch, not the routine teardown. Routine
+scenario churn uses per-agent disable + idempotent re-registration (§5.2), which keeps
+the key alive across unlimited cycles (F2/R6).
 `PATCH /agents/:id {disabled}` (admin) covers single-agent revocation.
 Enforcement of `disabled`: refused at WS auth (`server/ws-server.ts:500-515`, alongside
 the existing `getAgentById`/`validateToken` checks — and the server closes any live
@@ -186,8 +220,22 @@ the timing-safe compare stays for the final equality check.)
 
 ## 6. Enforcement — the admit rule
 
-One rule, applied at every point where the server decides "may a message/event from A
-reach B":
+One rule, applied at every point where the server decides "may a message/event from
+**agent** A reach B":
+
+**System-originated deliveries are exempt** *(amended after runtime review — F3)*. The
+reminder scheduler bypasses the router entirely: it inserts and delivers directly with
+the synthetic sender `from_agent = 'mesh'`, which has no agent row
+(`server/reminder-scheduler.ts:33-45` — "trusted system sender", delivery at :55-66,
+queued drain via `drainQueue`). `ns('mesh')` is therefore *undefined*, and the admit
+rule below applies **only to traffic between registered agents**. Explicit rule for
+implementers: deliveries whose `from_agent` is the reserved system sender (`'mesh'` —
+reminders today, any future system notices) are never tenant-gated, capability-gated,
+or ACL-gated; they are addressed to exactly one agent by the server itself. If message
+delivery is ever centralized behind one choke point, this exemption must move with it —
+a federated tenant silently losing its durable reminders is the failure mode this
+paragraph exists to prevent. (`'mesh'` is accordingly a reserved id: registration of
+an agent named `mesh`, or any FQ id whose bare name is `mesh`, is refused.)
 
 ```
 admit(A → B, kind):
@@ -328,24 +376,32 @@ numbers, and go through the normal review lane; I do not implement.
 - **D3** Scoped tap sees its own agents' cross-tenant traffic (`from ∈ ns OR to ∈ ns`),
   recommended in §7.
 - **D4** Registration failures are uniform 403s; detail only in server logs.
-- **Q1 (product, for the owner):** will federated projects' nodes connect from the same
-  Docker host/network, or remotely over the internet? Remote ⇒ the `wss://` ingress
-  prerequisite (§8-P2) must land before the first real tenant; same-host ⇒ it can wait.
+- **D5** *(was Q1 — answered by the owner 2026-09-05: "potentially over the
+  internet")*: remote tenants are in scope ⇒ the `wss://` TLS-terminating ingress
+  (§8-P2) is a **hard prerequisite before the first real tenant connects**. Ops-level
+  work (reverse proxy in front of the WS port), not bus code; joins Phase 0.
 - **Q2 (product, for the owner):** default capability set for a new key — proposal is
   `["send:direct"]` (everything else opt-in per key). Confirm or broaden.
 
 ## 13. Success criteria (runnable once implemented; per-phase)
 
 Phase 1: `bun test server/__tests__/registration-keys.test.ts` — mint/register/limits/
-revoke-cascade paths; plus: register with revoked key → 403; 17th mint on max 16 → 403;
-`id` without `ns:` prefix → 403; disabled agent WS auth → `AUTH_FAILED`.
+revoke-cascade paths; plus: register with revoked key → 403; 17th *live* mint on max 16
+→ 403, but disable one then mint → succeeds (live-count, not lifetime — F2);
+re-register an id minted by the same key → new token, old token dead, `disabled`
+cleared; re-register an id minted by a different key → 403; registering bare name
+`mesh` → 403 (reserved); disabled agent WS auth → `AUTH_FAILED`.
 
 Phase 2: `bun test server/__tests__/tenant-gate.test.ts` — cross-tenant direct without
 link → `TENANT_DENIED`; with link but no ACL → `ACL_DENIED`; with both → delivered;
 same-tenant unaffected; home↔home (NULL) completely unchanged against the existing
 suite (`bun test` green with zero modified existing tests — the regression criterion
 for C5); topic publish crosses tenants only via link (R4); capability-stripped agent
-`publish` → `CAPABILITY_DENIED`; presence does not cross unlinked tenants.
+`publish` → `CAPABILITY_DENIED`; presence does not cross unlinked tenants; bare-name
+send within a tenant resolves and delivers with short names in the frame, bare-name
+send to another tenant's agent → `AGENT_NOT_FOUND` even when a link + ACL exist (F1);
+a reminder set by a federated agent fires and is delivered to it with no link to home
+(F3 — the system-sender exemption regression test).
 
 Phase 3: scoped observer receives own-tenant + own-agents' link traffic, and nothing
 else (`server/__tests__/observer-scope.test.ts`).
