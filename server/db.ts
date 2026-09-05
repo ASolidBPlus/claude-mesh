@@ -488,6 +488,19 @@ export function aclRelated(db: Database, agentA: string, agentB: string): boolea
  * one per registered agent per call, so a presence change on an N-agent mesh
  * cost N queries to answer a question that is one query wide.
  *
+ * CORRECTNESS IS CONTINGENT ON A SCHEMA FACT, stated because the next schema
+ * change is where it breaks. This set is exactly what per-peer aclRelated()
+ * returned ONLY because `acl` has no expiry, no revoked flag and no status
+ * column: a row's EXISTENCE is the whole relationship, so a UNION over rows
+ * cannot return an edge the predicate would have filtered out.
+ *
+ * The day someone adds `revoked_at` (or `expires_at`, or a status), this
+ * function silently starts reporting revoked relationships as live — no test
+ * here fails, because every test builds edges that are live by construction.
+ * Whoever adds that column must add the same condition HERE, not only to
+ * aclCheck. It is the kind of break that looks like a presence bug months
+ * later rather than an ACL bug on the day.
+ *
  * SELF IS EXCLUDED. Call sites that need the subject add it back explicitly:
  * handleListPresence does (its roster includes the caller), broadcastStatus
  * deliberately does not (you do not need your own presence event).
