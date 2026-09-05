@@ -67,10 +67,17 @@ or `/files/:id` is an unconstrained-read route for anyone holding or guessing
 honoured on an exposed route", and the proxy cannot see inside the bearer. Required
 change (lands with federation Phase 1, since it pairs with `/register`): a
 **dedicated tenant listener** — a third HTTP listener on its own port serving
-*exactly* the three tenant routes, authenticating agent tokens and registration keys
-**only**; a bearer matching the admin token gets the same uniform 401 as any invalid
-token (no oracle). The proxy targets this listener; the admin port (`:7433`) is never
-proxied at all. This also gives the R-a allowlist defense-in-depth: even a
+*exactly* the three tenant routes. Its auth **derives from `resolveAuth` with the
+admin branch omitted** — shared code path, not a reimplementation, so the verified
+properties (hashed lookup, timing-safe compare, uniform 401 fallthrough) are
+*inherited* rather than re-earned, and a future token-handling fix lands in one place.
+**The listener has no admin branch** — a structural absence, not a check: an admin
+bearer simply falls through to `getAgentByToken`, matches nothing, and receives the
+same 401 as any unknown token — uniform by construction, with **no comparison against
+the admin secret ever performed on the internet-facing path**. (A detect-and-reject
+implementation — "is this the admin token? → 401" — would itself be the oracle this
+section removes; do not build it that way.) The proxy targets this listener; the
+admin port (`:7433`) is never proxied at all. This also gives the R-a allowlist defense-in-depth: even a
 misconfigured proxy route can only reach the three tenant routes. (A per-Host flag on
 the existing listener was considered and rejected: Host is client-influenced unless
 the proxy pins it, and a separate listener is the same amount of code with none of
@@ -123,7 +130,7 @@ design precludes adding it then.
 | Anonymous internet | TLS handshake; 404s; header-less requests dropped at edge; pre-auth sockets for ≤5 s within rate caps | Any bus logic, `/metrics`, any admin route, any unauthenticated read |
 | **Stolen registration key** | Mint up to `max_agents` identities in that ONE tenant, with that key's capabilities (default: DMs only); tenant is default-deny isolated, so reach ends at whatever links/ACLs the operator granted that tenant | Other tenants, the home fleet (no link ⇒ unreachable, and probes get `AGENT_NOT_FOUND`), topic creation, observation. **Detection** *(reviewer finding: a polled count with no baseline detects nothing — nobody polls until they already suspect)*: every successful `/register` — including re-registrations — writes a structured log line and increments a per-key mint counter on `/metrics` (internal-only, so this leaks nothing), giving the operator's existing scrape an alertable **delta** against the expected population per key. **Response:** one revoke call cascade-disables everything it minted |
 | **Stolen agent token** | That one agent's sends (its capabilities), its own node-scoped reads | Anything another agent or tenant can do; token rotates on re-registration |
-| **Stolen/guessed admin token, from the internet** | **Nothing** — the tenant listener (R-b2) refuses admin-token auth with a uniform 401, and no admin route is proxied. Without R-b2 this row would read "unconstrained read of all messages/files", which is why R-b2 is a blocker | The admin surface in any form; the admin token never traverses this ingress |
+| **Stolen/guessed admin token, from the internet** | **Nothing** — the tenant listener (R-b2) has no admin branch, so an admin bearer is indistinguishable from any unknown token, and no admin route is proxied. Without R-b2 this row would read "unconstrained read of all messages/files", which is why R-b2 is a blocker | The admin surface in any form; the admin token is never compared against on the exposed path |
 | **Compromised tenant runtime** | Same as stolen key + tokens for its own tenant | Cross-tenant anything; the admin surface |
 
 **Disclosure owed to real third-party tenants** (not an attacker row, but it belongs
