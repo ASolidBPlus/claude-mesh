@@ -538,20 +538,33 @@ edges — tenant-minted agents would be auto-granted to every orchestrator-tier 
 The first version of this gate read "no link until *every* bulk `granted_by` writer
 filters to the home tenant" — a universal quantifier over an unenumerated set,
 spanning repositories the link-creator cannot read, held by a person, with no
-mechanism. It could only ever be believed released, not proven released. **The bus
-owns the ACL table, so the rule is a refusal instead** (lands in Phase 2, before the
-links API): **the shared grant path (`aclGrant` — reached from both `POST /acl` and
-the MCP grant tool) refuses any edge whose endpoint is a non-home-tenant agent
-unless the request carries an explicit `tenant_grant: true` field.** A writer that
-doesn't know about tenants — today's reconciler, any spawner:lifecycle-class writer,
-any future bulk granter — physically cannot grant into one; a deliberate tenant
-grant says so in the request, which is the "explicit, reviewed intent" made a field
-instead of a convention. The release condition collapses from "all writers
-everywhere comply" to "the refusal is deployed" — verifiable from this repo alone.
-The tenancy test reads the bus's own `agents` row (authoritative — never a
-client-supplied field, so no absent-field-read-as-null fail-open), and **fails
-closed**: an endpoint whose tenant cannot be resolved is refused, not defaulted to
-`home`.
+mechanism. It could only ever be believed released, not proven released. The
+consumer-side census that killed it: mesh-chat alone writes ACL from **four** places
+(group reconciler, manual admin grants, visibility consent, and a webhook mirror
+that *copies an owner's reach to a second node under a different stamp* —
+multiplying any cross-tenant edge it sees), three with no tenant filter — and they
+are not all the same kind of decision, which no per-writer filter or per-request
+flag can express.
+
+**The bus owns the ACL table, so the rule is a refusal keyed on the design's own
+intent artifact** (lands in Phase 2, with the links API): **the shared grant path
+(`aclGrant` — reached from both `POST /acl` and the MCP grant tool) refuses any edge
+where `ns(from) ≠ ns(to)` unless a `federation_links` row already exists for that
+direction.** The link is the operator's tenant-level decision (admin-only, §5.3);
+the pair edge created under it **is** the deliberate per-pair second decision C4
+requires — whoever writes it. A consent flow or mirror that doesn't know about
+tenants physically cannot create a cross-tenant edge, because no flag it could
+cargo-cult exists — the only way through is the operator having linked those two
+tenants first. (An earlier draft used a `tenant_grant: true` request field; dropped
+because a flag is exactly the kind of thing an automation copies — an existing
+operator artifact cannot be asserted into being.) Same-tenant edges are unaffected:
+intra-tenant granting stays exactly as today, which is what C5 requires. The release
+condition collapses from "all writers everywhere comply" to "the refusal is
+deployed" — verifiable from this repo alone, and the fleet operator can key its
+link-creation gate on that one landing. The tenancy test reads the bus's own
+`agents` row (authoritative — never a client-supplied field, so no
+absent-field-read-as-null fail-open), and **fails closed**: an endpoint whose tenant
+cannot be resolved is refused, not defaulted to `home`.
 
 The terminology guard (§3) is part of the same finding, not a tidiness item: the
 obligation version required every writer to filter by a field whose name means
