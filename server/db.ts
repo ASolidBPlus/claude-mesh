@@ -243,6 +243,17 @@ export function openDb(path: string): Database {
   // exact current meaning for every consumer.
   try { db.exec('ALTER TABLE agents ADD COLUMN last_alive INTEGER'); } catch {}
 
+  // #11 migration: reverse ACL index. The acl PK is (from_agent, to_agent), so
+  // every from_agent-leading lookup is already served — INCLUDING both arms of
+  // aclRelated, whose second arm swaps the ARGUMENTS, not the columns, and so
+  // is not the unindexed case it looks like. What genuinely scanned without
+  // this index is the to_agent-leading direction: listInboundAcl (a bare
+  // `SCAN acl` on main) and the inbound half of the presence peer-set UNION
+  // below. Verified by EXPLAIN QUERY PLAN both ways, because an index added on
+  // an assumed-unindexed query is an index whose benefit nobody can show.
+  // ADDITIVE and idempotent: pure acceleration, no behaviour depends on it.
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_acl_reverse ON acl(to_agent, from_agent)'); } catch {}
+
   // Sprint 12 migration: drop the deprecated `data` column (base64 blob in
   // SQLite) if it still exists from pre-Sprint-12 databases. It was declared
   // NOT NULL, so insertFile would otherwise fail with a NOT NULL constraint
@@ -461,11 +472,67 @@ export function aclCheck(db: Database, from_agent: string, to_agent: string): bo
   return row !== null;
 }
 
+/**
+ * DELIBERATELY RETAINED as the test oracle for listAclPeers
+ * (presence-acl-queries.test.ts). DO NOT REMOVE AS UNUSED.
+ *
+ * Since #11 this has ZERO production callers — presence was the last one. A
+ * dead-code sweep would delete it, the differential test that compares the
+ * UNION against this pairwise predicate would go with it, and the UNION would
+ * lose its only independent cross-check WITHOUT ANYTHING GOING RED.
+ *
+ * That compounds with the schema-contingency note on listAclPeers: if this is
+ * tidied away first, both the oracle and the cross-check are gone before the
+ * day that note was written for. Its value is precisely that it computes the
+ * same answer a different way.
+ */
 export function aclRelated(db: Database, agentA: string, agentB: string): boolean {
   const row = db.prepare(
     'SELECT 1 FROM acl WHERE (from_agent = ? AND to_agent = ?) OR (from_agent = ? AND to_agent = ?)'
   ).get(agentA, agentB, agentB, agentA);
   return row !== null;
+}
+
+/**
+ * Every agent ACL-related to `agentId`, in ONE query — the union of its
+ * outbound edges (from_agent = id) and its inbound edges (to_agent = id).
+ *
+ * Replaces the per-peer aclRelated() loop in presence (#11): broadcastStatus
+ * ran one query per connected peer per presence event, and list_presence ran
+ * one per registered agent per call, so a presence change on an N-agent mesh
+ * cost N queries to answer a question that is one query wide.
+ *
+ * CORRECTNESS IS CONTINGENT ON A SCHEMA FACT, stated because the next schema
+ * change is where it breaks. This set is exactly what per-peer aclRelated()
+ * returned ONLY because `acl` has no expiry, no revoked flag and no status
+ * column: a row's EXISTENCE is the whole relationship, so a UNION over rows
+ * cannot return an edge the predicate would have filtered out.
+ *
+ * The day someone adds `revoked_at` (or `expires_at`, or a status), this
+ * function silently starts reporting revoked relationships as live — no test
+ * here fails, because every test builds edges that are live by construction.
+ * Whoever adds that column must add the same condition HERE, not only to
+ * aclCheck. It is the kind of break that looks like a presence bug months
+ * later rather than an ACL bug on the day.
+ *
+ * SELF IS EXCLUDED. Call sites that need the subject add it back explicitly:
+ * handleListPresence does (its roster includes the caller), broadcastStatus
+ * deliberately does not (you do not need your own presence event).
+ *
+ * That exclusion is a real behaviour delta, not a tidy-up — see the note in
+ * ws-server's broadcastStatus. Replacing a pairwise predicate with set
+ * membership is exact only OFF the diagonal, and the diagonal is where a
+ * self-referential acl row lives.
+ */
+export function listAclPeers(db: Database, agentId: string): Set<string> {
+  const rows = db.prepare(
+    `SELECT to_agent AS peer FROM acl WHERE from_agent = ?
+     UNION
+     SELECT from_agent AS peer FROM acl WHERE to_agent = ?`
+  ).all(agentId, agentId) as { peer: string }[];
+  const peers = new Set<string>();
+  for (const r of rows) if (r.peer !== agentId) peers.add(r.peer);
+  return peers;
 }
 
 export function listInboundAcl(db: Database, id: string): AclRow[] {
