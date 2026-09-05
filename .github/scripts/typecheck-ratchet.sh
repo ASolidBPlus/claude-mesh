@@ -56,13 +56,48 @@ for pkg in server client; do
   fi
   count=$(echo "$output" | grep -c "error TS" || true)
 
+  # Error IDENTITIES (file:line:code), sorted — the interim half of #80. The
+  # gate is still the COUNT; this exists so a DROP is legible. Recorded here
+  # rather than only compared, because "what vanished" cannot be reconstructed
+  # from two integers.
+  identity_file=".github/typecheck-identities-${pkg}.txt"
+  current_ids=$(echo "$output" | grep -oE '^[^(]+\([0-9]+,[0-9]+\): error TS[0-9]+' \
+    | sed -E 's/\(([0-9]+),[0-9]+\): error (TS[0-9]+)/:\1:\2/' | sort)
+
   if [ "$count" -gt "$baseline" ]; then
     echo "::error::${pkg}: typecheck errors went UP — ${baseline} → ${count}. New code must not add type errors."
     echo "$output" | grep "error TS" | head -40
     status=1
   elif [ "$count" -lt "$baseline" ]; then
-    echo "::notice::${pkg}: typecheck errors went DOWN — ${baseline} → ${count}. Lower the baseline in ${baseline_file} to lock it in."
-    echo "${pkg}: ${count} (baseline ${baseline}) ✅ improved"
+    # ── A DROP IS NOT NEWS UNTIL YOU KNOW WHAT LEFT ────────────────────────
+    # Demonstrated on the merged head: one `// @ts-nocheck` at the top of a
+    # test file takes server 117 → 89, and the old version of this branch
+    # printed "✅ improved" plus "lower the baseline to lock it in".
+    #
+    # The suppression was not the dangerous part; THE ADVICE WAS. Follow it
+    # and the floor becomes 89 permanently — after which REMOVING the
+    # @ts-nocheck reads as a regression (89 → 117) and fails CI. The tool
+    # would then be defending the edit that made things worse, and the
+    # person restoring the checking would be the one CI blames.
+    #
+    # So: no advice, and the disappeared identities are NAMED. "28 vanished
+    # from mcp-server.test.ts" is instantly legible as suppression; "117 → 89"
+    # is not. (#80 makes the identity set the GATE — comparing which errors
+    # exist, which also catches an equal-count swap. This only makes the drop
+    # readable, which is the part that could not wait.)
+    echo "${pkg}: ${count} (baseline ${baseline}) — errors went DOWN"
+    if [ -f "$identity_file" ]; then
+      vanished=$(comm -23 "$identity_file" <(echo "$current_ids") || true)
+      if [ -n "$vanished" ]; then
+        echo "  these stopped being reported — CONFIRM each is a real fix, not a file that stopped being checked:"
+        echo "$vanished" | sed 's/^/    - /' | head -40
+        echo "$vanished" | awk -F: '{print $1}' | sort | uniq -c | sort -rn \
+          | awk '{printf "    %s error(s) from %s\n", $1, $2}' | head -10
+      fi
+    else
+      echo "  (no identity baseline recorded yet — ${identity_file} will be written the first time this is refreshed)"
+    fi
+    echo "::notice::${pkg}: ${baseline} → ${count}. Do NOT lower the baseline until the disappeared list above is confirmed as real fixes; a suppressed or unchecked file looks identical to progress here."
   else
     echo "${pkg}: ${count} (baseline ${baseline}) ✅ held"
   fi
