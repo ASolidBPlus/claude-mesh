@@ -1335,6 +1335,42 @@ export function fileAccessAuthorized(
   }
 }
 
+/**
+ * The dispatcher's whole auth decision, in one place, keyed on the route's
+ * declared mode. Returns null when it has already written a 401.
+ *
+ * Extracted so the 'handler' arm is TESTABLE. The first version of this fix
+ * left the assignment inline, and a mutant that restored the old
+ * { mode: 'admin' } placeholder passed every test and every typecheck — the
+ * predicate was proven to refuse 'unauthenticated' while nothing proved the
+ * dispatcher ever produced it. A grant is only as good as the value that
+ * reaches it.
+ */
+export function resolveRouteAuth(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  db: Database,
+  adminToken: string,
+  mode: Route['auth'] | undefined
+): AuthResult | null {
+  if (mode === 'handler') {
+    // No dispatcher-level credential BY DESIGN: this route's handler owns its
+    // authentication and must refuse uniformly (see handleRegister). The ctx
+    // says 'unauthenticated' because that is the TRUTH here — the handler's own
+    // check is invisible to the dispatcher, so nothing it hands the handler may
+    // function as a grant.
+    return { mode: 'unauthenticated' };
+  }
+  if (mode === 'agentOrAdmin') {
+    return resolveAuth(req, res, db, adminToken);
+  }
+  // 'admin' and the no-route case: unmatched paths still require the admin
+  // token before the 404, so an unauthenticated caller cannot probe which
+  // routes exist.
+  if (!requireAdmin(req, res, adminToken)) return null;
+  return { mode: 'admin' };
+}
+
 function closeAgentSocket(ctx: AdminCtx, agentId: string, reason: string): void {
   const ws = ctx.agentIndex.get(agentId);
   if (ws === undefined) return;
@@ -1566,22 +1602,8 @@ export function startHttpAdmin(
         break;
       }
 
-      let auth: AuthResult;
-      if (matched && matched.auth === 'handler') {
-        // No dispatcher-level credential BY DESIGN: this route's handler owns
-        // its authentication and must refuse uniformly (see handleRegister).
-        // The ctx says 'unauthenticated' because that is the TRUTH here — the
-        // handler's own check is invisible to the dispatcher, so nothing it
-        // hands the handler may function as a grant.
-        auth = { mode: 'unauthenticated' };
-      } else if (matched && matched.auth === 'agentOrAdmin') {
-        const resolved = resolveAuth(req, res, db, adminToken);
-        if (resolved === null) return; // 401 already written
-        auth = resolved;
-      } else {
-        if (!requireAdmin(req, res, adminToken)) return;
-        auth = { mode: 'admin' };
-      }
+      const auth = resolveRouteAuth(req, res, db, adminToken, matched?.auth);
+      if (auth === null) return; // 401 already written
 
       if (matched) {
         // A handler throw here used to become an unhandled rejection (async
