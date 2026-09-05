@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as net from 'net';
-import { getAgentById, setOnline, clearAllOnline, touchAgent, touchAlive, getPendingMessages, markAcked, aclRelated, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
+import { getAgentById, setOnline, clearAllOnline, touchAgent, touchAlive, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
 import { validateToken } from './auth.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
@@ -365,8 +365,10 @@ function handleListPresence(ctx: FrameCtx): void {
   const caller = state.agentId!;
   const all = listAgents(db);
   // ACL-filtered roster: agents the caller is ACL-related to, plus self.
+  // #11: one ACL query for the whole roster rather than one per agent.
+  const peers = listAclPeers(db, caller);
   const result = all
-    .filter(a => a.id === caller || aclRelated(db, caller, a.id))
+    .filter(a => a.id === caller || peers.has(a.id))
     .map(a => ({ id: a.id, online: a.online === 1, last_seen: a.last_seen, last_alive: a.last_alive ?? null }));
   const resp: { type: string; ref?: string; agents: typeof result } = { type: 'presence_list', agents: result };
   if (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) resp.ref = frame.msg_id;
@@ -434,11 +436,17 @@ export function startWsServer(
     // that are ACL-related to `agentId`. ACL is re-checked LIVE at fire time.
     // Pass the connecting ws as `excludeWs` on connect; null on disconnect (the
     // disconnecting ws is already removed from `registry`).
+    //
+    // #11: ONE ACL query per presence event, not one per connected peer. The
+    // recipient set is computed up front and the registry is filtered in
+    // memory; "live at fire time" is unchanged, since the single query runs at
+    // fire time too. Previously an N-peer mesh cost N queries per event.
     function broadcastStatus(agentId: string, online: boolean, lastSeen: number, excludeWs: WebSocket | null) {
       const statusMsg = JSON.stringify({ type: 'agent_status', agent_id: agentId, online, last_seen: lastSeen, last_alive: getAgentById(db, agentId)?.last_alive ?? null });
+      const peers = listAclPeers(db, agentId);
       for (const [otherWs, otherState] of registry) {
         if (otherWs === excludeWs) continue;
-        if (otherState.authed && otherState.agentId !== null && aclRelated(db, agentId, otherState.agentId)) {
+        if (otherState.authed && otherState.agentId !== null && peers.has(otherState.agentId)) {
           try { otherWs.send(statusMsg); } catch (_) { /* ignore */ }
         }
       }

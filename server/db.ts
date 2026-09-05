@@ -243,6 +243,17 @@ export function openDb(path: string): Database {
   // exact current meaning for every consumer.
   try { db.exec('ALTER TABLE agents ADD COLUMN last_alive INTEGER'); } catch {}
 
+  // #11 migration: reverse ACL index. The acl PK is (from_agent, to_agent), so
+  // every from_agent-leading lookup is already served — INCLUDING both arms of
+  // aclRelated, whose second arm swaps the ARGUMENTS, not the columns, and so
+  // is not the unindexed case it looks like. What genuinely scanned without
+  // this index is the to_agent-leading direction: listInboundAcl (a bare
+  // `SCAN acl` on main) and the inbound half of the presence peer-set UNION
+  // below. Verified by EXPLAIN QUERY PLAN both ways, because an index added on
+  // an assumed-unindexed query is an index whose benefit nobody can show.
+  // ADDITIVE and idempotent: pure acceleration, no behaviour depends on it.
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_acl_reverse ON acl(to_agent, from_agent)'); } catch {}
+
   // Sprint 12 migration: drop the deprecated `data` column (base64 blob in
   // SQLite) if it still exists from pre-Sprint-12 databases. It was declared
   // NOT NULL, so insertFile would otherwise fail with a NOT NULL constraint
@@ -466,6 +477,29 @@ export function aclRelated(db: Database, agentA: string, agentB: string): boolea
     'SELECT 1 FROM acl WHERE (from_agent = ? AND to_agent = ?) OR (from_agent = ? AND to_agent = ?)'
   ).get(agentA, agentB, agentB, agentA);
   return row !== null;
+}
+
+/**
+ * Every agent ACL-related to `agentId`, in ONE query — the union of its
+ * outbound edges (from_agent = id) and its inbound edges (to_agent = id).
+ *
+ * Replaces the per-peer aclRelated() loop in presence (#11): broadcastStatus
+ * ran one query per connected peer per presence event, and list_presence ran
+ * one per registered agent per call, so a presence change on an N-agent mesh
+ * cost N queries to answer a question that is one query wide.
+ *
+ * Excludes self: an agent is not ACL-related to itself, and callers that want
+ * to include the subject add it explicitly (list_presence does).
+ */
+export function listAclPeers(db: Database, agentId: string): Set<string> {
+  const rows = db.prepare(
+    `SELECT to_agent AS peer FROM acl WHERE from_agent = ?
+     UNION
+     SELECT from_agent AS peer FROM acl WHERE to_agent = ?`
+  ).all(agentId, agentId) as { peer: string }[];
+  const peers = new Set<string>();
+  for (const r of rows) if (r.peer !== agentId) peers.add(r.peer);
+  return peers;
 }
 
 export function listInboundAcl(db: Database, id: string): AclRow[] {
