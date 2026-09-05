@@ -136,21 +136,47 @@ export function rebuildAclFkLess(db: Database): void {
       "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='acl' AND sql IS NOT NULL"
     ).all() as { sql: string }[]).map((r) => r.sql);
 
+    // The pragma is set OUTSIDE the transaction (it is ignored inside one, see
+    // the guard above) and the four DDL statements run INSIDE one.
+    //
+    // Un-transactioned, a process death between DROP and RENAME was TOTAL,
+    // SILENT ACL LOSS — measured, not theorised:
+    //   grants before: 2
+    //   crashed as intended: simulated process death after DROP
+    //   grants after crash + reboot: 0
+    //   acl_new orphan present: true (2 rows stranded)
+    // The next boot's `CREATE TABLE IF NOT EXISTS acl` recreates acl EMPTY
+    // before this function runs, the zero-FK early return then no-ops, and the
+    // server starts clean with every grant gone and the real rows sitting in a
+    // table nothing reads. Fail-closed in the worst way: it looks like success.
+    //
+    // SQLite DDL is transactional, so BEGIN/COMMIT makes the four statements
+    // atomic and a crash anywhere inside leaves the ORIGINAL FK-ful table with
+    // every row. Index replay is inside too — a crash between RENAME and the
+    // index DDL would otherwise silently drop idx_acl_reverse (#11).
     db.exec('PRAGMA foreign_keys = OFF');
-    db.exec(`
-      CREATE TABLE acl_new (
-        from_agent   TEXT NOT NULL,
-        to_agent     TEXT NOT NULL,
-        granted_at   INTEGER NOT NULL,
-        granted_by   TEXT NOT NULL,
-        PRIMARY KEY (from_agent, to_agent)
-      );
-    `);
-    db.exec('INSERT INTO acl_new SELECT from_agent, to_agent, granted_at, granted_by FROM acl');
-    db.exec('DROP TABLE acl');
-    db.exec('ALTER TABLE acl_new RENAME TO acl');
-    for (const ddl of indexDdl) db.exec(ddl);
-    db.exec('PRAGMA foreign_keys = ON');
+    try {
+      db.transaction(() => {
+        db.exec(`
+          CREATE TABLE acl_new (
+            from_agent   TEXT NOT NULL,
+            to_agent     TEXT NOT NULL,
+            granted_at   INTEGER NOT NULL,
+            granted_by   TEXT NOT NULL,
+            PRIMARY KEY (from_agent, to_agent)
+          );
+        `);
+        db.exec('INSERT INTO acl_new SELECT from_agent, to_agent, granted_at, granted_by FROM acl');
+        db.exec('DROP TABLE acl');
+        db.exec('ALTER TABLE acl_new RENAME TO acl');
+        for (const ddl of indexDdl) db.exec(ddl);
+      })();
+    } finally {
+      // Restored on BOTH paths: leaving foreign_keys OFF after a failed rebuild
+      // would silently disable FK enforcement for every other table for the
+      // life of the process.
+      db.exec('PRAGMA foreign_keys = ON');
+    }
 
     console.log(JSON.stringify({ evt: 'db.acl_rebuilt_fkless', indexes_restored: indexDdl.length, at: Date.now() }));
   } catch (err) {
@@ -567,8 +593,19 @@ export function aclGrant(
     .get(from_agent, to_agent) as AclRow;
 }
 
-export function aclRevoke(db: Database, from_agent: string, to_agent: string): void {
-  db.prepare('DELETE FROM acl WHERE from_agent = ? AND to_agent = ?').run(from_agent, to_agent);
+/**
+ * Revoke one edge. Returns the number of rows removed (0 or 1).
+ *
+ * F0a: the count is now RETURNED rather than discarded, because the rule for
+ * revoke is EDGE existence, not endpoint existence. The HTTP door used to
+ * pre-check that both endpoints were local agents — which under F0 makes an
+ * edge granted to a remote id unrevokable, since the gate refuses before the
+ * DELETE ever runs. An endpoint check cannot express "this edge is not here",
+ * and that is the only thing revoke actually needs to know.
+ */
+export function aclRevoke(db: Database, from_agent: string, to_agent: string): number {
+  return db.prepare('DELETE FROM acl WHERE from_agent = ? AND to_agent = ?')
+    .run(from_agent, to_agent).changes;
 }
 
 export function aclCheck(db: Database, from_agent: string, to_agent: string): boolean {

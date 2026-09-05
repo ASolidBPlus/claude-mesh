@@ -192,6 +192,65 @@ describe('migration chain — openDb over databases that predate the current sch
     ok.close();
   });
 
+  // Failure injection: a Proxy on db.exec that throws when the RENAME runs —
+  // i.e. process death in the window between DROP TABLE acl and the rename of
+  // acl_new. No production seam; the injection is entirely in the test.
+  function dbThatDiesAtRename(path: string): Database {
+    const db = new Database(path);
+    const realExec = db.exec.bind(db);
+    (db as unknown as { exec: (sql: string) => unknown }).exec = (sql: string) => {
+      if (sql.includes('RENAME TO acl')) throw new Error('simulated process death after DROP');
+      return realExec(sql);
+    };
+    return db;
+  }
+
+  it('★ F0a: a crash mid-rebuild leaves the acl table INTACT — rows and FKs', () => {
+    // Un-transactioned this was TOTAL, SILENT loss, measured before the fix:
+    //   grants before: 2 → grants after crash + reboot: 0, with the real rows
+    //   stranded in acl_new and the server booting clean.
+    // The next boot's CREATE TABLE IF NOT EXISTS recreates acl EMPTY before
+    // this function runs, and the zero-FK early return then no-ops — so the
+    // damage is invisible from every angle a boot check would look at.
+    const path = tmpDb('aclcrash');
+    preFederationDb(path);
+
+    const dying = dbThatDiesAtRename(path);
+    expect(() => rebuildAclFkLess(dying)).toThrow(/simulated process death/);
+    dying.close();
+
+    // Reopen exactly as a restart would.
+    const after = openDb(path);
+    expect(aclRows(after).length).toBe(2);          // every grant survived
+    expect(after.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='acl_new'").get())
+      .toBeNull();                                   // no orphan half-table
+    after.close();
+  });
+
+  it('★ F0a: positive control — the SAME injection without a transaction loses the rows', () => {
+    // Without this the test above cannot distinguish "the transaction saved
+    // the rows" from "the injection never fired". Runs the un-transactioned
+    // sequence by hand and shows the loss the fix prevents.
+    const path = tmpDb('aclcrashctl');
+    preFederationDb(path);
+
+    const db = new Database(path);
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec(`CREATE TABLE acl_new (
+      from_agent TEXT NOT NULL, to_agent TEXT NOT NULL,
+      granted_at INTEGER NOT NULL, granted_by TEXT NOT NULL,
+      PRIMARY KEY (from_agent, to_agent));`);
+    db.exec('INSERT INTO acl_new SELECT from_agent, to_agent, granted_at, granted_by FROM acl');
+    db.exec('DROP TABLE acl');
+    // <-- process dies here; no RENAME
+    db.close();
+
+    const after = openDb(path);
+    expect(aclRows(after).length).toBe(0);           // the loss, demonstrated
+    expect(after.prepare("SELECT COUNT(*) AS n FROM acl_new").get()).toEqual({ n: 2 }); // stranded
+    after.close();
+  });
+
   it('★ F0a: the rebuild restores secondary indexes — idx_acl_reverse survives', () => {
     // The table is dropped, so its indexes go with it. #11's reverse index is
     // a performance guarantee that would vanish silently: nothing fails, the

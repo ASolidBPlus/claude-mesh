@@ -77,7 +77,9 @@ describe('http-admin', () => {
     });
     expect(res.status).toBe(404);
     const body = await res.json() as Record<string, unknown>;
-    expect(body.error).toBe('from_agent not found');
+    // F0a: one rule at the chokepoint means one refusal shape. The status is
+    // unchanged; only the body no longer names which side was missing.
+    expect(body.error).toBe('agent not found');
   });
 
   it('404 if to_agent not in registry', async () => {
@@ -89,7 +91,7 @@ describe('http-admin', () => {
     });
     expect(res.status).toBe(404);
     const body = await res.json() as Record<string, unknown>;
-    expect(body.error).toBe('to_agent not found');
+    expect(body.error).toBe('agent not found'); // F0a: uniform shape, see above
   });
 
   it('POST /acl — 201 and creates ACL entry', async () => {
@@ -143,7 +145,43 @@ describe('http-admin', () => {
     expect(aclCheck(db, 'agent-a', 'agent-b')).toBe(false);
   });
 
-  it('DELETE /acl — 200 even if entry did not exist', async () => {
+  // F0a §5.4 — ONE RULE AT THE CHOKEPOINT. Before this, the HTTP door 404'd a
+  // remote endpoint while the MCP door accepted it: two doors, two rules, on
+  // the exact pair #82 pinned for door parity.
+  it('POST /acl accepts a REMOTE endpoint that is not a local agent', async () => {
+    registerAgent(db, { id: 'agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
+    const res = await fetch(`${base}/acl`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_agent: 'agent-a', to_agent: 'othermesh:their-agent' }),
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it('DELETE /acl can revoke an edge to a REMOTE endpoint', async () => {
+    // The gate that used to sit here made such an edge PERMANENTLY
+    // UNREVOKABLE over HTTP: grantable, never withdrawable.
+    registerAgent(db, { id: 'agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
+    await fetch(`${base}/acl`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_agent: 'agent-a', to_agent: 'othermesh:their-agent' }),
+    });
+    const res = await fetch(`${base}/acl`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_agent: 'agent-a', to_agent: 'othermesh:their-agent' }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json() as Record<string, unknown>).ok).toBe(true);
+  });
+
+  // F0a — DELIBERATE CONTRACT CHANGE, and this test pinned the old contract.
+  // DELETE used to 200 on a nonexistent edge because its only 404 was an
+  // ENDPOINT check. That check had to go: it made an edge granted to a remote
+  // id permanently unrevokable. 404 now means what it should have meant here —
+  // no such edge.
+  it('DELETE /acl — 404 when the edge does not exist', async () => {
     registerAgent(db, { id: 'agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
     registerAgent(db, { id: 'agent-b', token_hash: 'b'.repeat(64), hostname: 'host2' });
 
@@ -152,9 +190,9 @@ describe('http-admin', () => {
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ from_agent: 'agent-a', to_agent: 'agent-b' }),
     });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(404);
     const body = await res.json() as Record<string, unknown>;
-    expect(body.ok).toBe(true);
+    expect(body.error).toBe('edge not found');
   });
 
   // GET /acl — with no selector at all it's still a 400 (message widened in #38

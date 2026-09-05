@@ -375,7 +375,23 @@ function handleMeshAclDeny(ctx: ToolCtx): ToolResult {
     agent_id: string; as_agent: string; admin_token?: unknown;
   };
   if (!adminTokenOk(admin_token, adminToken)) return unauthorizedResult();
-  aclRevoke(db, agent_id, as_agent);
+  // F0a — DELIBERATE SHAPE CHANGE, the second in this PR. Same rule as the
+  // HTTP door: revoke is about EDGE existence, and a remote endpoint is never
+  // refused. This tool previously reported success whether or not anything was
+  // withdrawn, so a caller could not tell "grant removed" from "there was
+  // nothing there" — and the two doors disagreed on what a no-op revoke means.
+  //
+  // A caller that treated every deny as success now sees an error where it
+  // previously saw ok:true. That is the point (an operator revoking a typo'd
+  // edge was told it worked), but it is a change, not a fix, and consumers
+  // matching on isError see it.
+  const removed = aclRevoke(db, agent_id, as_agent);
+  if (removed === 0) {
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ error: 'EDGE_NOT_FOUND' }) }],
+      isError: true,
+    };
+  }
   return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true }) }], isError: false };
 }
 
