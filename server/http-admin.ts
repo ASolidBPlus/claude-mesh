@@ -93,18 +93,30 @@ type AuthResult = { mode: 'admin' } | { mode: 'agent'; agentId: string };
 // as an agent token (SHA-256 hashed, then matched against agents.token_hash —
 // the raw token is never byte-compared against a stored secret). Returns null
 // and writes 401 when neither matches.
-function resolveAuth(
+/**
+ * The AGENT half of resolveAuth, split out so the tenant listener can use the
+ * SAME code path with the admin branch STRUCTURALLY ABSENT (R-b2).
+ *
+ * The distinction is the requirement: a tenant listener that DETECTED the
+ * admin token and rejected it would be one forgotten branch away from
+ * honouring it, and the check would live in the place most likely to be
+ * "simplified" later. Here the admin comparison is not skipped — it is not in
+ * the call path at all. An admin bearer arriving on the tenant port simply
+ * fails to match any agent token and gets the ordinary uniform 401.
+ *
+ * Everything the admin path verified stays inherited rather than re-earned:
+ * hashed indexed lookup, ambiguity refusal, the final timing-safe compare, the
+ * disabled check, and the uniform 401 fallthrough. A future token-handling fix
+ * lands once, here.
+ */
+function resolveAgentAuth(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   db: Database,
-  adminToken: string
 ): AuthResult | null {
   const header = req.headers['authorization'];
   if (typeof header === 'string' && header.startsWith('Bearer ')) {
     const token = header.slice('Bearer '.length);
-    if (timingSafeEqual(token, adminToken)) {
-      return { mode: 'admin' };
-    }
     const agent = getAgentByToken(db, token);
     // §5.4: a disabled agent's token is dead. Enforced HERE rather than at
     // each route, because revocation that depends on remembering to check is
@@ -118,6 +130,25 @@ function resolveAuth(
   res.writeHead(401, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'unauthorized' }));
   return null;
+}
+
+/** Admin-or-agent, for the ADMIN listener. Admin is checked first (exact,
+    timing-safe); everything else delegates to the agent path above, so the two
+    listeners cannot drift on what an agent token means. */
+function resolveAuth(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  db: Database,
+  adminToken: string
+): AuthResult | null {
+  const header = req.headers['authorization'];
+  if (typeof header === 'string' && header.startsWith('Bearer ')) {
+    const token = header.slice('Bearer '.length);
+    if (timingSafeEqual(token, adminToken)) {
+      return { mode: 'admin' };
+    }
+  }
+  return resolveAgentAuth(req, res, db);
 }
 
 function formatAgent(agent: Agent): Record<string, unknown> {
@@ -1472,6 +1503,112 @@ export const ROUTES: Route[] = [
   { method: 'DELETE', match: idMatch(/^\/reminders\/([^/]+)$/),      handler: handleReminderDelete },
 ];
 
+/**
+ * The TENANT listener (R-b2) — a separate HTTP server on its own port serving
+ * EXACTLY the three routes a federated tenant needs.
+ *
+ * WHY A SEPARATE LISTENER AND NOT A PROXY RULE: `resolveAuth` honours the
+ * admin token first, so an internet-exposed `/messages` or `/files/:id` on the
+ * admin port is an unconstrained read for anyone holding or guessing
+ * MESH_ADMIN_TOKEN — and a proxy cannot see inside a bearer to tell the
+ * difference. "No unauthenticated route" does not cover "admin credential
+ * honoured on an exposed route".
+ *
+ * THE ADMIN BRANCH IS ABSENT, NOT REFUSED. This dispatcher calls
+ * resolveAgentAuth, which has no admin comparison in it. A listener that
+ * detected the admin token and rejected it would be one forgotten branch away
+ * from honouring it; this one cannot honour a credential it never consults.
+ * An admin bearer here is simply a token that matches no agent → the ordinary
+ * uniform 401, byte-identical to any unknown token.
+ *
+ * THE ROUTE SET IS AN ALLOWLIST, not a filter over ROUTES: `POST /files`
+ * (upload — one method qualifier from the allowed `GET /files/:id`) and
+ * `GET /metrics` (the full fleet topology, unauthenticated on the admin port)
+ * are ABSENT here rather than blocked. The proxy allowlist is belt; this is
+ * braces, and braces that work when someone edits the belt.
+ */
+export const TENANT_ROUTES: Route[] = [
+  { method: 'POST', match: exact('/register'),                handler: handleRegister,  auth: 'handler' },
+  { method: 'GET',  match: idMatch(/^\/files\/([^/]+)$/),      handler: handleFileById,  auth: 'agentOrAdmin' },
+  { method: 'GET',  match: exact('/messages'),                handler: handleMessagesGet, auth: 'agentOrAdmin' },
+];
+
+export function startTenantListener(
+  port: number,
+  db: Database,
+  maxFileBytes: number = 10_485_760,
+  filesDir: string = '/data/files',
+  agentIndex: Map<string, WebSocket> = new Map(),
+  observerIndex: Map<string, WebSocket> = new Map(),
+): Promise<HttpAdminHandle> {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer(async (req, res) => {
+      const url = new URL(req.url!, 'http://localhost');
+      const pathname = url.pathname;
+      const method = req.method;
+
+      let matched: Route | undefined;
+      let params: Record<string, string> = {};
+      for (const route of TENANT_ROUTES) {
+        if (route.method !== method) continue;
+        const p = route.match(pathname);
+        if (p === null) continue;
+        matched = route;
+        params = p;
+        break;
+      }
+
+      // Unmatched paths 404 rather than 401: on this listener an unknown path
+      // genuinely does not exist, and answering 401 would tell an unauthenticated
+      // caller that something IS there — a topology oracle for the price of a
+      // wrong guess. (The admin listener answers 401 by design; its unknown
+      // paths are behind a credential either way.)
+      if (matched === undefined) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'not found' }));
+        return;
+      }
+
+      let auth: AuthResult;
+      if (matched.auth === 'handler') {
+        auth = { mode: 'admin' }; // handler authenticates; see handleRegister
+      } else {
+        // resolveAgentAuth — NO admin branch exists on this path.
+        const resolved = resolveAgentAuth(req, res, db);
+        if (resolved === null) return; // 401 already written
+        auth = resolved;
+      }
+
+      try {
+        await matched.handler({
+          req, res, db, url, params, agentIndex, observerIndex,
+          maxFileBytes, filesDir, auth,
+        });
+      } catch (err) {
+        console.error(`[tenant] handler crashed: ${method} ${pathname}:`, err);
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'internal error' }));
+        } else {
+          res.destroy();
+        }
+      }
+    });
+
+    server.on('error', reject);
+    server.listen(port, () => {
+      resolve({
+        server,
+        shutdown(): Promise<void> {
+          return new Promise((res2, rej) => {
+            server.close((err) => (err ? rej(err) : res2()));
+          });
+        },
+      });
+    });
+  });
+}
+
 export function startHttpAdmin(
   port: number,
   db: Database,
@@ -1483,8 +1620,13 @@ export function startHttpAdmin(
 ): Promise<HttpAdminHandle> {
   return new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
-      // /metrics is unauthenticated by design — this listener binds to the admin port
-      // which is internal-only (not exposed publicly). Read-only Prometheus exposition.
+      // /metrics is unauthenticated by design — this listener binds to the ADMIN
+      // port, which is internal-only and MUST NEVER be exposed through any
+      // ingress: it serves every agent id, per-agent traffic counters and
+      // ACL-denied counts with no credential (#9), i.e. the full fleet topology.
+      // Federated tenants reach the bus through the TENANT listener
+      // (startTenantListener / MESH_TENANT_PORT), where /metrics does not exist
+      // at all. Read-only Prometheus exposition.
       if (req.method === 'GET' && new URL(req.url!, 'http://localhost').pathname === '/metrics') {
         try {
           const body = renderMetrics(db);

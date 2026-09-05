@@ -1,7 +1,7 @@
 import { openDb } from './db.ts';
 import { startWsServer, WsServerHandle } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
-import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
+import { startHttpAdmin, startTenantListener, HttpAdminHandle } from './http-admin.ts';
 import { startCleanup, CleanupHandle } from './cleanup.ts';
 import { startReminderScheduler, ReminderSchedulerHandle } from './reminder-scheduler.ts';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -13,6 +13,10 @@ export interface Config {
   dbPath: string;
   wsPort: number;
   adminPort: number;
+  /** R-b2: the tenant-facing listener's port. UNSET = not started, which is
+      today's behaviour exactly — the listener is opt-in infrastructure, not a
+      new surface every deployment acquires by upgrading. */
+  tenantPort: number | null;
   adminToken: string;
   cleanupIntervalMs: number;
   maxFileBytes: number;
@@ -52,6 +56,24 @@ export function loadConfig(): Config {
       process.exit(1);
     }
     adminPort = parsed;
+  }
+
+  let tenantPort: number | null = null;
+  const tenantPortStr = process.env.MESH_TENANT_PORT;
+  if (tenantPortStr !== undefined && tenantPortStr !== '') {
+    const parsed = parseInt(tenantPortStr, 10);
+    if (Number.isNaN(parsed) || parsed < 1 || parsed > 65535) {
+      process.stderr.write(`MESH_TENANT_PORT is invalid: ${tenantPortStr}\n`);
+      process.exit(1);
+    }
+    if (parsed === adminPort) {
+      // Same port would mean the tenant routes land on the ADMIN dispatcher —
+      // which honours the admin token and serves /metrics. The whole point of
+      // R-b2 is that those two surfaces are different listeners.
+      process.stderr.write('MESH_TENANT_PORT must differ from MESH_ADMIN_PORT\n');
+      process.exit(1);
+    }
+    tenantPort = parsed;
   }
 
   let cleanupIntervalMs = 60_000;
@@ -121,7 +143,7 @@ export function loadConfig(): Config {
     retentionMs = parsed;
   }
 
-  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs };
+  return { dbPath, wsPort, adminPort, tenantPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs };
 }
 
 async function main() {
@@ -156,6 +178,22 @@ async function main() {
 
   const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, observerIndex);
 
+  // R-b2: the tenant-facing listener, opt-in via MESH_TENANT_PORT. Unset means
+  // not started — upgrading does not silently open a new surface. It serves
+  // exactly POST /register, GET /files/:id and GET /messages, with NO admin
+  // branch in its auth path and no /metrics route in existence.
+  let tenantHandle: HttpAdminHandle | null = null;
+  if (config.tenantPort !== null) {
+    tenantHandle = await startTenantListener(
+      config.tenantPort, db, config.maxFileBytes, config.filesDir,
+      wsHandle.agentIndex, observerIndex,
+    );
+    console.log(JSON.stringify({
+      evt: 'tenant_listener.started', port: config.tenantPort,
+      routes: ['POST /register', 'GET /files/:id', 'GET /messages'], at: Date.now(),
+    }));
+  }
+
   let cleanupHandle: CleanupHandle | null = null;
   let reminderHandle: ReminderSchedulerHandle | null = null;
 
@@ -174,6 +212,7 @@ async function main() {
       reminderHandle?.stop();
       await wsHandle.shutdown();
       await httpHandle.shutdown();
+      if (tenantHandle !== null) await tenantHandle.shutdown();
       await mcpHandle.shutdown();
       db.close();
       process.stdout.write('mesh-server stopped\n');
