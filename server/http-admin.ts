@@ -169,13 +169,18 @@ interface Route {
   handler: AdminHandler;
   // 'admin' (default) requires the admin token; 'agentOrAdmin' also accepts an
   // agent's own bearer token (self-scoped in the handler).
-  //   'public' — the route authenticates ITSELF and the dispatcher applies no
-  //   credential check. Exactly one route uses it: POST /register, whose
-  //   credential is a registration KEY (§5.2), which is neither the admin
-  //   token nor an agent token. Naming it here rather than special-casing the
-  //   path in the dispatcher keeps auth a property of the route table, where
-  //   it can be read off in one place.
-  auth?: 'admin' | 'agentOrAdmin' | 'public';
+  //   'handler' — the dispatcher applies NO credential check; the handler MUST
+  //   authenticate. Currently one route: POST /register, by registration key
+  //   (§5.2), which is neither the admin token nor an agent token.
+  //
+  //   Named for what the ROUTE is, not for what the dispatcher does. 'public'
+  //   would have been the honest description of the dispatcher's behaviour and
+  //   a lie about the route — a reader scanning this table would see 'public'
+  //   and conclude "unauthenticated", which is the label-describes-a-part
+  //   failure this codebase keeps paying for. The name has to carry the
+  //   obligation, because the obligation is what the next reader must not
+  //   accidentally drop.
+  auth?: 'admin' | 'agentOrAdmin' | 'handler';
 }
 
 // Path matchers: `exact` for a literal path, `idMatch` to capture a single
@@ -1441,7 +1446,7 @@ export const ROUTES: Route[] = [
   // Authenticated by a registration KEY, not the admin token — so it is not
   // 'admin' auth, and it must not be 'agentOrAdmin' either (an agent token
   // must not mint identities). The handler does its own auth entirely.
-  { method: 'POST',   match: exact('/register'),                     handler: handleRegister, auth: 'public' },
+  { method: 'POST',   match: exact('/register'),                     handler: handleRegister, auth: 'handler' },
   { method: 'POST',   match: exact('/registration-keys'),            handler: handleRegistrationKeyPost },
   { method: 'DELETE', match: idMatch(/^\/registration-keys\/([^/]+)$/), handler: handleRegistrationKeyDelete },
   { method: 'GET',    match: exact('/registration-keys'),            handler: handleRegistrationKeyGet },
@@ -1510,9 +1515,9 @@ export function startHttpAdmin(
       }
 
       let auth: AuthResult;
-      if (matched && matched.auth === 'public') {
-        // No dispatcher-level credential. The handler is responsible for its
-        // own auth and must refuse uniformly (see handleRegister).
+      if (matched && matched.auth === 'handler') {
+        // No dispatcher-level credential BY DESIGN: this route's handler owns
+        // its authentication and must refuse uniformly (see handleRegister).
         auth = { mode: 'admin' };
       } else if (matched && matched.auth === 'agentOrAdmin') {
         const resolved = resolveAuth(req, res, db, adminToken);
