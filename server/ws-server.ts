@@ -605,10 +605,24 @@ export function startWsServer(
               state.peerAlias = agentId;
               clearTimeout(authTimer);
 
-              // NEWER WINS (D11): close the older socket BEFORE the index is
-              // overwritten, so the close handler's identity guard sees that it
-              // is no longer the indexed socket and leaves the new one alone.
+              // NEWER WINS (D11). ORDER IS LOAD-BEARING: index the new socket
+              // FIRST, then close the old one.
+              //
+              // Measured, because the obvious order is wrong: closing first
+              // fires the old socket's close handler BEFORE the set, at which
+              // point the old socket is still the indexed one — so the close
+              // path's identity guard passes, deletes, and the set immediately
+              // re-adds. The guard becomes INERT, and a mutant removing it
+              // survives (it did). Indexing first means the guard is doing real
+              // work on the common path: the old socket sees that it is no
+              // longer indexed and leaves the new one alone.
+              //
+              // It is also the order that survives the case the guard exists
+              // for — a peer reconnecting because its old socket died, where
+              // the dead socket's close event can arrive AFTER the new one has
+              // authenticated and indexed.
               const existing = peerIndex.get(agentId);
+              peerIndex.set(agentId, ws);
               if (existing !== undefined && existing !== ws) {
                 try {
                   existing.send(JSON.stringify({
@@ -618,7 +632,6 @@ export function startWsServer(
                 } catch (_) { /* ignore */ }
                 try { existing.close(1008, 'peer replaced'); } catch (_) { /* ignore */ }
               }
-              peerIndex.set(agentId, ws);
               touchPeer(db, agentId);
 
               console.log(JSON.stringify({ evt: 'peer.connected', alias: agentId, at: Date.now() }));
