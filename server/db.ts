@@ -854,6 +854,23 @@ export function getPeerByAlias(db: Database, alias: string): Peer | null {
   return db.prepare('SELECT * FROM peers WHERE alias = ?').get(alias) as Peer | null;
 }
 
+/**
+ * Ids that name BOTH a local agent and a peer (registered, or holding a live
+ * key). Backs the boot report — the gates prevent NEW collisions and can do
+ * nothing about one already on disk.
+ *
+ * Extracted so the query is testable. NOTE the limit: this pins WHAT the report
+ * finds, not that main() calls it. Same coverage as the legacy ':' report
+ * beside it, and stated rather than implied.
+ */
+export function findPeerAliasCollisions(db: Database): string[] {
+  return (db.prepare(
+    `SELECT a.id FROM agents a
+     WHERE a.id IN (SELECT alias FROM peers)
+        OR a.id IN (SELECT alias FROM peer_keys WHERE revoked_at IS NULL)`
+  ).all() as { id: string }[]).map(r => r.id);
+}
+
 export function listPeers(db: Database): Peer[] {
   return db.prepare('SELECT * FROM peers ORDER BY alias').all() as Peer[];
 }

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import {
   openDb, registerAgent, getPeerByAlias, getPeerKeyBySecret, insertPeerKey,
-  listPeers, revokePeerKey, upsertPeer,
+  listPeers, revokePeerKey, upsertPeer, findPeerAliasCollisions,
 } from '../db.ts';
 import { hashToken, generateToken } from '../auth.ts';
 import { startHttpAdmin, HttpAdminHandle, resolveRouteAuth, fileAccessAuthorized, type AuthResult } from '../http-admin.ts';
@@ -306,15 +306,34 @@ describe('F0b: local id rules bind NEW agents only (§6)', () => {
       body: JSON.stringify({ id, hostname: 'h' }),
     });
 
-  it("refuses ':' , the reserved id, and a peer-alias collision", async () => {
+  // Split one condition per test: this gate now has four, and a single unit
+  // covering all of them goes red without saying WHICH rule broke.
+  it("refuses an id containing ':'", async () => {
     expect((await postAgent('remote:agent')).status).toBe(400);
-    expect((await postAgent('mesh')).status).toBe(400);
+  });
 
+  it('refuses the reserved id', async () => {
+    expect((await postAgent('mesh')).status).toBe(400);
+  });
+
+  it('refuses an id colliding with a REGISTERED peer', async () => {
     upsertPeer(db, { alias: 'peermesh', token_hash: 'x'.repeat(64), minted_by_key: 'k', kinds: '["direct"]', rate_per_min: 600 });
     expect((await postAgent('peermesh')).status).toBe(409);
+  });
 
-    // Positive control: an ordinary id is still accepted, so the refusals above
-    // are not a route that rejects everything.
+  it('refuses an id colliding with a LIVE PEER KEY that has not registered yet', async () => {
+    // The state the original gate could not see: peer_keys populated, peers empty.
+    insertPeerKey(db, {
+      id: 'k-unreg', key_hash: hashToken('unreg'), alias: 'not-yet',
+      kinds: '["direct"]', rate_per_min: 600, created_at: Date.now(),
+    });
+    expect(getPeerByAlias(db, 'not-yet')).toBeNull();
+    expect((await postAgent('not-yet')).status).toBe(409);
+  });
+
+  it('positive control: an ordinary id is still accepted', async () => {
+    // Without this, the four refusals above are satisfied by a route that
+    // rejects everything.
     expect((await postAgent('ordinary-agent')).status).toBe(201);
   });
 
@@ -325,6 +344,100 @@ describe('F0b: local id rules bind NEW agents only (§6)', () => {
     registerAgent(db, { id: 'legacy:agent', token_hash: 'b'.repeat(64), hostname: 'h' });
     const found = db.prepare("SELECT id FROM agents WHERE id LIKE '%:%'").all() as { id: string }[];
     expect(found.map(r => r.id)).toEqual(['legacy:agent']);
+  });
+});
+
+describe('F0b: one id cannot name two identities', () => {
+  let db: Database;
+  let handle: HttpAdminHandle;
+  let base: string;
+
+  beforeEach(async () => {
+    db = openDb(':memory:');
+    handle = await startHttpAdmin(0, db, ADMIN, 10_485_760, mkdtempSync(join(tmpdir(), 'mesh-f0b-c-')), new Map());
+    base = `http://localhost:${(handle.server.address() as net.AddressInfo).port}`;
+  });
+  afterEach(async () => {
+    await handle.shutdown().catch(() => {});
+    db.close();
+  });
+
+  const adminPost = (path: string, body: unknown) =>
+    fetch(`${base}${path}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${ADMIN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  // THE SEQUENCE. A minted-but-unregistered key lives only in peer_keys, which
+  // the agent gate did not consult — so this ran end to end with no error at
+  // any step and produced one id with two identities:
+  //   mint "shared" -> register agent "shared" -> peer registers -> both exist.
+  it('a minted key blocks an agent registration for the same id', async () => {
+    const minted = await (await adminPost('/peer-keys', { alias: 'shared-name' })).json() as { key: string };
+    // The peer has NOT registered yet: peers is empty, only peer_keys has it.
+    expect(getPeerByAlias(db, 'shared-name')).toBeNull();
+
+    const res = await adminPost('/agents', { id: 'shared-name', hostname: 'h' });
+    expect(res.status).toBe(409);
+
+    // And the peer can still complete, holding the id alone.
+    expect((await adminPost('/peers/register', { key: minted.key })).status).toBe(201);
+    expect(getPeerByAlias(db, 'shared-name')).not.toBeNull();
+  });
+
+  it('the reverse order is still refused — agent first, then the mint', async () => {
+    expect((await adminPost('/agents', { id: 'taken', hostname: 'h' })).status).toBe(201);
+    expect((await adminPost('/peer-keys', { alias: 'taken' })).status).toBe(409);
+  });
+
+  it('registration itself refuses an alias that already names a local agent', async () => {
+    // Defence in depth: the gates above should make this unreachable, so the
+    // collision is constructed directly to prove the last line holds.
+    const secret = 'direct-seeded-secret';
+    insertPeerKey(db, {
+      id: 'seeded', key_hash: hashToken(secret), alias: 'collider',
+      kinds: '["direct"]', rate_per_min: 600, created_at: Date.now(),
+    });
+    registerAgent(db, { id: 'collider', token_hash: 'c'.repeat(64), hostname: 'h' });
+
+    const res = await adminPost('/peers/register', { key: secret });
+    expect(res.status).toBe(409);
+    expect(getPeerByAlias(db, 'collider')).toBeNull();
+  });
+
+  it('the boot report names a pre-seeded collision', () => {
+    // A collision already on disk cannot be gated away — it predates the
+    // gates. It must be visible instead. Pins WHAT the report finds; that
+    // main() calls it is not covered here (same as the legacy ':' report).
+    insertPeerKey(db, {
+      id: 'seed2', key_hash: hashToken('s2'), alias: 'both-things',
+      kinds: '["direct"]', rate_per_min: 600, created_at: Date.now(),
+    });
+    registerAgent(db, { id: 'both-things', token_hash: 'd'.repeat(64), hostname: 'h' });
+    registerAgent(db, { id: 'innocent', token_hash: 'e'.repeat(64), hostname: 'h' });
+
+    expect(findPeerAliasCollisions(db)).toEqual(['both-things']);
+  });
+
+  it('a REVOKED key is not reported as a collision', () => {
+    // Revoked keys cannot be used to register, so an agent may legitimately
+    // take that id back. Reporting it would train operators to ignore the log.
+    insertPeerKey(db, {
+      id: 'seed3', key_hash: hashToken('s3'), alias: 'freed-name',
+      kinds: '["direct"]', rate_per_min: 600, created_at: Date.now(),
+    });
+    revokePeerKey(db, 'seed3');
+    registerAgent(db, { id: 'freed-name', token_hash: 'f'.repeat(64), hostname: 'h' });
+
+    expect(findPeerAliasCollisions(db)).toEqual([]);
+  });
+
+  it('positive control: an uncolliding mint and agent both still succeed', async () => {
+    // Without this, the three refusals above are satisfied by gates that refuse
+    // everything.
+    expect((await adminPost('/peer-keys', { alias: 'peer-one' })).status).toBe(201);
+    expect((await adminPost('/agents', { id: 'agent-one', hostname: 'h' })).status).toBe(201);
   });
 });
 

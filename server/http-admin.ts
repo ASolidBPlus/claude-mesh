@@ -465,9 +465,28 @@ async function handleAgentPost(ctx: AdminCtx): Promise<void> {
     res.end(JSON.stringify({ error: `agent id '${RESERVED_ALIAS}' is reserved` }));
     return;
   }
-  if (getPeerByAlias(db, id) !== null) {
-    // Same collision as the mint-side check, from the other direction: whichever
-    // is created second is the one refused.
+  // Same collision as the mint-side check, from the other direction: whichever
+  // is created second is the one refused.
+  //
+  // TABLES READ, and why their union covers the state space: `peers` (a peer
+  // that has registered) and `peer_keys` (one that has been minted but not yet
+  // registered). A peer alias can only exist in those two states, so together
+  // they are total. The mint-side gate reads `agents` and `peer_keys`, which is
+  // the same argument from the other side.
+  //
+  // The gap this closes was NOT an unpinned gate — both gates were pinned. It
+  // was two pinned gates whose union missed a state, which mutation cannot
+  // find: every mutant of either gate died correctly while the hole stayed
+  // open. It was found by asking what tables each gate reads.
+  //
+  // BOTH tables are consulted, and the peer_keys half is the one that matters:
+  // a MINTED-but-not-yet-registered key lives only in peer_keys, so a gate that
+  // looked at `peers` alone let this sequence through —
+  //   mint key "x" -> register agent "x" (gate passes, peers is empty)
+  //     -> peer registers with its key -> upsertPeer("x") succeeds
+  // producing ONE id with TWO identities and no error at any step. Minting IS a
+  // creation, so under the rule above the agent is the one refused.
+  if (getPeerByAlias(db, id) !== null || getLivePeerKeyForAlias(db, id, Date.now()) !== null) {
     res.writeHead(409, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'agent id collides with an existing peer alias' }));
     return;
@@ -1369,6 +1388,20 @@ async function handlePeerRegister(ctx: AdminCtx): Promise<void> {
   if (key.revoked_at !== null) { refusePeerRegistration(res, 'revoked_key', key.alias); return; }
   if (key.expires_at !== null && key.expires_at <= Date.now()) {
     refusePeerRegistration(res, 'expired_key', key.alias); return;
+  }
+
+  // Defence in depth, at the moment the collision becomes REAL rather than
+  // latent: the mint-side and agent-side gates should have made this
+  // impossible, but a key minted before those gates existed — or any future
+  // path that writes peer_keys without them — would otherwise create a second
+  // identity for an id that already names a local agent.
+  if (getAgentById(db, key.alias) !== null) {
+    console.error(JSON.stringify({
+      evt: 'peer.register_alias_collision', alias: key.alias, key_id: key.id, at: Date.now(),
+    }));
+    res.writeHead(409, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'alias collides with an existing local agent id' }));
+    return;
   }
 
   const token = generateToken();
