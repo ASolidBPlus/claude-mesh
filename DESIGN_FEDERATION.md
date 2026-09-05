@@ -158,8 +158,29 @@ runtime depends on. So:
 - The FQ form is canonical everywhere operator-facing: DB rows, admin API, observer
   tap, logs, metrics.
 
-Net effect: the same authored scenario spins up unchanged for N orgs, and a tenant's
-agents never see their own prefix.
+**Own identity is short too** *(F1 follow-up)*. The invariant is: **a tenant agent
+never sees a tenant prefix on ANY agent-facing wire surface — its own id included.**
+Concretely:
+
+- `POST /register` returns both forms (`{ id: "dana", fq_id: "po-red:dana", token }`);
+  the runtime is provisioned with the **short** id as its own name.
+- WS auth accepts the short form: the server resolves the agent **by token** (unique
+  per agent; the hash-indexed lookup from §5.5 makes this the natural primary key)
+  and verifies the presented `agent_id` matches the resolved agent's short or FQ form.
+  `auth_ok` echoes the short form.
+- Every agent-facing emission is tenant-relative: deliver frames both directions,
+  presence events, acks/errors that echo ids, and reminder deliveries. One
+  normalization point server-side (strip-own-ns on egress to a tenant socket), not
+  per-surface special cases.
+- Cross-tenant peers are the single exception: they arrive FQ (`other-ns:name`) by
+  design — a distinct grammar is *correct* there, since they are a different kind of
+  correspondent and per-tenant runtimes may need to widen their id validation only if
+  they opt into cross-tenant contact.
+
+Net effect: the same authored scenario spins up unchanged for N orgs, a tenant's
+agents never see their own prefix, and self-loop guards / per-peer keying in consumers
+(which compare their configured id against inbound `from`) keep working because both
+sides of the comparison live in the same short grammar.
 
 ---
 
