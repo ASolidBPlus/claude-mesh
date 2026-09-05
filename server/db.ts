@@ -628,9 +628,21 @@ function assertLocalEndpointExists(db: Database, endpoint: string): void {
 /**
  * F1b (§5.4) — the PEERING rule, in the chokepoint so no handler branches on it.
  *
- * An endpoint containing ':' is remote BY GRAMMAR, not by lookup: local agent
- * ids cannot contain ':' (refused at POST /agents since F0b) and PEER_ALIAS_RE
- * cannot produce one, so the character is decisive without consulting anything.
+ * An endpoint is REMOTE iff it contains ':' AND is not an existing local
+ * agent. The second clause is not belt-and-braces — it is the whole
+ * difference between a rule that works and one that breaks live agents.
+ *
+ * Grammar alone is true for ids created from F0b onward (POST /agents refuses
+ * ':') and FALSE for the population F0b deliberately preserved: legacy colon
+ * ids are REPORTED at boot and never rejected, precisely because they exist.
+ * Treating ':' as decisive made aclGrant refuse NO_PEERING for two ordinary
+ * local agents — reproduced:
+ *   local-a -> legacy:node   NO_PEERING (no outbound peering for legacy)
+ *   legacy:node -> local-a   NO_PEERING (no inbound peering for legacy)
+ *
+ * BOUNDED TO GRANT. aclCheck is a SELECT and aclRevoke a bare DELETE, neither
+ * consulting this rule, so existing legacy edges kept working and remained
+ * revocable throughout — the defect was creation only.
  *
  * TABLES READ: `peers` only (via hasInboundPeer). That is total for the inbound
  * direction because a peer can relay to us only if it has registered, and
@@ -644,8 +656,10 @@ function assertPeeringAllowed(db: Database, from_agent: string, to_agent: string
     err.code = 'NO_PEERING';
     throw err;
   };
-  const fromRemote = from_agent.includes(':');
-  const toRemote = to_agent.includes(':');
+  // The lookup is what distinguishes a remote id from a legacy local one.
+  const isRemote = (endpoint: string) => endpoint.includes(':') && getAgentById(db, endpoint) === null;
+  const fromRemote = isRemote(from_agent);
+  const toRemote = isRemote(to_agent);
 
   if (fromRemote) {
     const alias = from_agent.slice(0, from_agent.indexOf(':'));

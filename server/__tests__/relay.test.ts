@@ -262,6 +262,36 @@ describe('F1b: the peering rule lives in the chokepoint, both doors map it', () 
     db.close();
   });
 
+  it('a LEGACY colon-id local agent takes the LOCAL path, both directions', () => {
+    // F0b preserves ids containing ':' that already existed — they are reported
+    // at boot, never rejected, precisely because they exist. So ':' alone
+    // cannot decide remoteness: it is true for ids created since F0b and FALSE
+    // for the population F0b deliberately kept.
+    //
+    // Grammar-only refused NO_PEERING for two ORDINARY LOCAL AGENTS.
+    const db = openDb(':memory:');
+    registerAgent(db, { id: 'local-a', token_hash: 'a'.repeat(64), hostname: 'h' });
+    registerAgent(db, { id: 'legacy:node', token_hash: 'b'.repeat(64), hostname: 'h' });
+
+    expect(() => aclGrant(db, 'local-a', 'legacy:node', 'admin')).not.toThrow();
+    expect(() => aclGrant(db, 'legacy:node', 'local-a', 'admin')).not.toThrow();
+    db.close();
+  });
+
+  it('positive control: a colon id that is NOT a local agent is still remote', () => {
+    // Without this, the fix is satisfied by dropping the peering rule entirely.
+    const db = openDb(':memory:');
+    registerAgent(db, { id: 'local-a', token_hash: 'a'.repeat(64), hostname: 'h' });
+    expect(() => aclGrant(db, 'nopeer:someone', 'local-a', 'admin')).toThrow(/inbound peering/);
+
+    upsertPeer(db, {
+      alias: 'nopeer', token_hash: 'z'.repeat(64), minted_by_key: 'k',
+      kinds: '["direct"]', rate_per_min: 600,
+    });
+    expect(() => aclGrant(db, 'nopeer:someone', 'local-a', 'admin')).not.toThrow();
+    db.close();
+  });
+
   it('a DISABLED peer is not a peering', () => {
     const db = setup();
     db.prepare('UPDATE peers SET disabled = 1 WHERE alias = ?').run('othermesh');
