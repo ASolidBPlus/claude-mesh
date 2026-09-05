@@ -436,6 +436,14 @@ The image (`oven/bun:1-alpine`, entrypoint `bun server.ts`) sets `MESH_WS_PORT=7
 
 **Deploy model:** a single container with its SQLite DB on a mounted volume. A deploy is *pull latest → rebuild image → restart* (some deployments instead git-pull the source and run `bun server.ts` directly — either works; the point is the volume outlives the restart). Restarting flaps WS connections briefly, so clients should reconnect-with-backoff; the DB carries registry, ACL, history, and reminders across the restart.
 
+**Deploy contract** (the rules the deploy model implies — see #71, companion to #23):
+
+- **Restart = deploy.** A deployment that git-pulls the source runs `main` as of its last container start, and *any* merge to `main` goes live on the next restart — planned or not, host reboots included. Treat `main` as production.
+- **The boot wrapper must fail-soft to the last-good checkout.** If the fetch fails (GitHub, DNS, or token outage) but a valid checkout exists, log loudly and boot the HEAD you already have; crash-loop only when there is no checkout at all. A fail-hard wrapper (`set -e` around the fetch) turns a transient blip at host reboot — exactly when every client is reconnecting — into a mesh-wide crash-loop.
+- **Fetch credentials must track the repo's home.** If this repo moves orgs, the token baked into the wrapper moves with it, or the next restart crash-loops.
+
+The wrapper itself lives in the operator's deployment config, not in this repo: the image entrypoint is a plain `bun server.ts`.
+
 ---
 
 ## Quick map of the code
