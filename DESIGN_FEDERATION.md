@@ -571,7 +571,11 @@ doesn't know about tenants passes no marker, so it creates nothing even after th
 link lands — a consent flow or webhook mirror physically cannot create a
 cross-tenant edge, for two reasons, the second of which holds at the only time it
 ever mattered. "Two decisions" (C4) is now literally two artifacts: the operator's
-link, and a grant request that says what it is doing. Same-tenant edges are
+link, and a grant request that says what it is doing. Norm for any consumer that
+ever sends the marker (the bus cannot enforce this; stating it is what makes it
+reviewable): `tenant_grant: true` is sent only behind an explicit operator
+confirmation for that specific pair — never by default, never by policy expansion.
+A marker-sender that automates the marker has reintroduced the hole by hand. Same-tenant edges are
 unaffected: intra-tenant granting stays exactly as today, which is what C5
 requires. The release condition collapses from "all writers everywhere comply" to
 "the refusal is deployed" — verifiable from this repo alone, and the fleet operator
