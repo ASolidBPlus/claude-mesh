@@ -1422,10 +1422,15 @@ function handlePeerKeyDelete(ctx: AdminCtx): void {
   res.end(JSON.stringify({ revoked: true, id }));
 }
 
-/** Every registration refusal returns THIS — one body, one status, no detail.
-    A peer presenting a wrong, revoked, expired, or nonexistent key learns only
-    that it was refused: distinguishing them would turn this endpoint into an
-    oracle for which keys exist. */
+/** UNIFORM PER C9 — one 403 body for every cause, the reason to the LOG only.
+ *  This door is reached by a caller outside the trust boundary presenting a
+ *  secret, so distinguishing "unknown key" from "revoked" from "expired" would
+ *  make it an oracle for which keys exist. The operator still gets the reason,
+ *  because a structured log is not the prober-reachable surface.
+ *
+ *  Every registration refusal returns THIS — one body, one status, no detail.
+ *  A peer presenting a wrong, revoked, expired, or nonexistent key learns only
+ *  that it was refused. */
 /** Why a presented key was not live, FOR THE LOG LINE ONLY. Reads the columns
  *  directly and deliberately: it feeds a diagnostic string and never a branch,
  *  so it cannot become a second authority on liveness. The 403 body is uniform
