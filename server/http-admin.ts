@@ -3,6 +3,11 @@ import * as http from 'http';
 import * as net from 'net';
 import { WebSocket } from 'ws';
 import {
+  revokeRegistrationKey,
+  setAgentDisabled,
+  getRegistrationKeyBySecret,
+  purgeAgentConversationState,
+  rotateAgentToken,
   newRegistrationKeyId,
   insertRegistrationKey,
   listRegistrationKeys,
@@ -42,8 +47,11 @@ import {
 import { generateToken, hashToken, timingSafeEqual } from './auth.ts';
 import {
   checkTenantName,
+  checkAgentShortName,
+  checkHomeAgentId,
   checkCapabilities,
   DEFAULT_CAPABILITIES,
+  fqId,
 } from './tenant-names.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
@@ -98,7 +106,12 @@ function resolveAuth(
       return { mode: 'admin' };
     }
     const agent = getAgentByToken(db, token);
-    if (agent !== null) {
+    // §5.4: a disabled agent's token is dead. Enforced HERE rather than at
+    // each route, because revocation that depends on remembering to check is
+    // revocation that one new route silently undoes. The refusal is the SAME
+    // 401 as an unknown token — a revoked holder learns nothing about whether
+    // its identity still exists.
+    if (agent !== null && agent.disabled === 0) {
       return { mode: 'agent', agentId: agent.id };
     }
   }
@@ -156,7 +169,13 @@ interface Route {
   handler: AdminHandler;
   // 'admin' (default) requires the admin token; 'agentOrAdmin' also accepts an
   // agent's own bearer token (self-scoped in the handler).
-  auth?: 'admin' | 'agentOrAdmin';
+  //   'public' — the route authenticates ITSELF and the dispatcher applies no
+  //   credential check. Exactly one route uses it: POST /register, whose
+  //   credential is a registration KEY (§5.2), which is neither the admin
+  //   token nor an agent token. Naming it here rather than special-casing the
+  //   path in the dispatcher keeps auth a property of the route table, where
+  //   it can be read off in one place.
+  auth?: 'admin' | 'agentOrAdmin' | 'public';
 }
 
 // Path matchers: `exact` for a literal path, `idMatch` to capture a single
@@ -416,6 +435,17 @@ async function handleAgentPost(ctx: AdminCtx): Promise<void> {
     return;
   }
 
+  // §4: POST /agents keeps its permissive id grammar for home agents — the bus
+  // has no id grammar today and tightening it would break existing fleet ids —
+  // but gains the two refusals that protect the FQ split: no ':' (which would
+  // forge tenant membership) and no bare reserved word.
+  const idCheck = checkHomeAgentId(id);
+  if (!idCheck.ok) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid agent id', message: idCheck.reason }));
+    return;
+  }
+
   // Optional namespace (#41): a string sets it, absent leaves it null. The bus
   // attaches no semantics to the value.
   let namespace: string | null = null;
@@ -424,6 +454,17 @@ async function handleAgentPost(ctx: AdminCtx): Promise<void> {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'namespace must be a string or null' }));
       return;
+    }
+    // The ONE validator, second call site (§7): a namespace written here must
+    // obey the same grammar and reserved words as one minted through a key,
+    // or `home` would simply be creatable by the other door.
+    if (body.namespace !== null && body.namespace !== undefined) {
+      const nsCheck = checkTenantName(body.namespace);
+      if (!nsCheck.ok) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid namespace', message: nsCheck.reason }));
+        return;
+      }
     }
     namespace = body.namespace as string | null;
   }
@@ -524,7 +565,45 @@ async function handleAgentPatch(ctx: AdminCtx): Promise<void> {
       res.end(JSON.stringify({ error: 'namespace must be a string or null' }));
       return;
     }
+    // §4: FROZEN for minted agents. The `ns:` id prefix and the namespace
+    // column must agree — short-name resolution and Phase 2's tenant
+    // resolution both read one and trust the other, so a PATCH that moved a
+    // minted agent between tenants would leave an id claiming one tenant and a
+    // column claiming another, with no way to tell which is right.
+    const target = getAgentById(db, id);
+    if (target !== null && target.minted_by_key !== null) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: 'namespace is frozen',
+        message: `agent '${id}' was minted by registration key ${target.minted_by_key}; its tenant cannot be changed (re-register with a different key instead)`,
+      }));
+      return;
+    }
+    // The ONE validator, third call site (§7). null is still allowed here —
+    // that is "home", the absence of a tenant, not a tenant named home.
+    if (body.namespace !== null) {
+      const nsCheck = checkTenantName(body.namespace);
+      if (!nsCheck.ok) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid namespace', message: nsCheck.reason }));
+        return;
+      }
+    }
     fields.namespace = body.namespace as string | null;
+  }
+
+  // §5.4: single-agent disable/enable — the non-cascade half of revocation.
+  if (Object.prototype.hasOwnProperty.call(body, 'disabled')) {
+    if (typeof body.disabled !== 'boolean') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'disabled must be a boolean' }));
+      return;
+    }
+    setAgentDisabled(db, id, body.disabled);
+    console.log(JSON.stringify({
+      evt: 'agent.disabled_set', agent_id: id, disabled: body.disabled, at: Date.now(),
+    }));
+    if (body.disabled) closeAgentSocket(ctx, id, 'disabled');
   }
 
   const updated = updateAgent(db, id, fields);
@@ -1194,8 +1273,177 @@ function handleRegistrationKeyGet(ctx: AdminCtx): void {
   res.end(JSON.stringify(listRegistrationKeys(db).map((k) => publicKeyFields(db, k))));
 }
 
+/** Close a live socket for an agent whose identity was just revoked or
+    disabled. Revocation that leaves an existing connection alive is revocation
+    that only applies to the next reconnect — the actuator has to reach the
+    socket, not just the row. Best-effort by nature: no socket is the normal
+    case, and a close that fails must not fail the revocation. */
+function closeAgentSocket(ctx: AdminCtx, agentId: string, reason: string): void {
+  const ws = ctx.agentIndex.get(agentId);
+  if (ws === undefined) return;
+  try {
+    ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'identity revoked' }));
+  } catch { /* ignore */ }
+  try {
+    ws.close(1008, reason);
+  } catch { /* ignore */ }
+}
+
+// ─── DELETE /registration-keys/:id (§5.4) — revocation, admin only ──────────
+
+function handleRegistrationKeyDelete(ctx: AdminCtx): void {
+  const { res, db, params } = ctx;
+  const id = params.id as string;
+  // ONE transaction inside revokeRegistrationKey: a half-applied revocation
+  // (key dead, its agents still live) is precisely the state this exists to
+  // prevent, and it is the state a two-statement version produces on a crash.
+  const disabledIds = revokeRegistrationKey(db, id);
+  if (disabledIds === null) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'registration key not found' }));
+    return;
+  }
+  // The row is authoritative; the sockets are the actuator. Closing them is
+  // best-effort AFTER the transaction, so a socket that refuses to close
+  // cannot roll back the revocation.
+  for (const agentId of disabledIds) closeAgentSocket(ctx, agentId, 'key revoked');
+  console.log(JSON.stringify({
+    evt: 'registration_key.revoked', key_id: id,
+    disabled_agents: disabledIds, count: disabledIds.length, at: Date.now(),
+  }));
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, key_id: id, disabled_agents: disabledIds }));
+}
+
+// ─── POST /register (§5.2) — authenticated by a registration KEY ────────────
+
+/**
+ * Every refusal on this route is the SAME 403 with the same body (D4). The
+ * caller is unauthenticated by definition, so distinguishing "revoked" from
+ * "expired" from "cap reached" would hand an attacker an oracle for probing
+ * key state.
+ *
+ * The information is not destroyed, it is REDIRECTED: one structured server
+ * log line per refusal carries the discriminator, the key id, the FQ id and
+ * the source, in the same shape as the mint line — so an operator debugging a
+ * legitimately-failing tenant greps one format, while the caller learns
+ * nothing. "Uniform to the client" must not mean "uniform in the logs", or
+ * the next outage is undiagnosable by construction.
+ */
+function refuseRegistration(
+  res: http.ServerResponse,
+  reason: string,
+  detail: Record<string, unknown>,
+): void {
+  console.warn(JSON.stringify({ evt: 'register.refused', reason, ...detail, at: Date.now() }));
+  res.writeHead(403, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'registration refused' }));
+}
+
+async function handleRegister(ctx: AdminCtx): Promise<void> {
+  const { req, res, db } = ctx;
+
+  const header = req.headers['authorization'];
+  const secret = typeof header === 'string' && header.startsWith('Bearer ')
+    ? header.slice('Bearer '.length)
+    : '';
+
+  const raw = await readBody(req);
+  let body: Record<string, unknown>;
+  try { body = JSON.parse(raw); }
+  catch { res.writeHead(400, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:'invalid JSON'})); return; }
+
+  // Grammar is a 400, not a 403: it is a property of the REQUEST, not of the
+  // key, so refusing it loudly leaks nothing about key state.
+  const nameCheck = checkAgentShortName(body.id);
+  if (!nameCheck.ok) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid id', message: nameCheck.reason }));
+    return;
+  }
+  const shortName = body.id as string;
+  const hostname = typeof body.hostname === 'string' && body.hostname.length > 0 ? body.hostname : shortName;
+
+  // ── The five checks, in §5.2's order ──────────────────────────────────────
+  if (secret === '') return refuseRegistration(res, 'no_key_presented', { fq_id: null });
+
+  const key = getRegistrationKeyBySecret(db, secret);
+  if (key === null) return refuseRegistration(res, 'key_not_found', { fq_id: null });
+  if (key.revoked_at !== null) return refuseRegistration(res, 'key_revoked', { key_id: key.id, tenant: key.namespace });
+  if (key.expires_at !== null && key.expires_at <= Date.now()) {
+    return refuseRegistration(res, 'key_expired', { key_id: key.id, tenant: key.namespace, expires_at: key.expires_at });
+  }
+
+  const fq = fqId(key.namespace, shortName);
+  const existing = getAgentById(db, fq);
+
+  // An id this key already minted is a RE-registration and does not consume a
+  // slot; anything else is a new identity and must fit under the cap. Checking
+  // the cap before that distinction would make re-registration fail at the
+  // cap — the scenario-reset path breaking exactly when it is most needed.
+  const isReRegistration = existing !== null && existing.minted_by_key === key.id;
+
+  if (existing !== null && !isReRegistration) {
+    // Either a home agent owns the name, or ANOTHER key minted it. Both are
+    // refusals; cross-key capture is the one that matters (§5.2).
+    return refuseRegistration(res, 'id_taken_other_key', {
+      key_id: key.id, tenant: key.namespace, fq_id: fq,
+      owner_key: existing.minted_by_key ?? 'home',
+    });
+  }
+
+  if (!isReRegistration) {
+    // A COUNT, not a counter (F2): a stored counter drifts, a count cannot.
+    const live = countLiveMintedAgents(db, key.id);
+    if (live >= key.max_agents) {
+      return refuseRegistration(res, 'population_cap', {
+        key_id: key.id, tenant: key.namespace, fq_id: fq, live, max_agents: key.max_agents,
+      });
+    }
+  }
+
+  const rawToken = generateToken();
+  const token_hash = hashToken(rawToken);
+
+  let purged: ReturnType<typeof purgeAgentConversationState> | null = null;
+  if (isReRegistration) {
+    // ONE transaction: a rotation that landed without its purge would leave a
+    // "fresh" agent holding its predecessor's mailbox — which is the leak the
+    // amendment exists to close.
+    const tx = db.transaction(() => {
+      purged = purgeAgentConversationState(db, fq);
+      rotateAgentToken(db, fq, token_hash);
+    });
+    tx();
+  } else {
+    registerAgent(db, { id: fq, token_hash, hostname, namespace: key.namespace });
+    db.prepare('UPDATE agents SET minted_by_key = ? WHERE id = ?').run(key.id, fq);
+  }
+
+  console.log(JSON.stringify({
+    evt: 'register.ok', key_id: key.id, tenant: key.namespace, fq_id: fq,
+    re_registration: isReRegistration, purged, at: Date.now(),
+  }));
+
+  res.writeHead(isReRegistration ? 200 : 201, { 'Content-Type': 'application/json' });
+  // The tenant prefix appears as `fq_id`, never as `id` — §4's short/FQ split.
+  // Agent-visible text uses the bare name the caller asked for.
+  res.end(JSON.stringify({
+    id: shortName,
+    fq_id: fq,
+    tenant: key.namespace,
+    capabilities: JSON.parse(key.capabilities) as string[],
+    token: rawToken,
+  }));
+}
+
 export const ROUTES: Route[] = [
+  // Authenticated by a registration KEY, not the admin token — so it is not
+  // 'admin' auth, and it must not be 'agentOrAdmin' either (an agent token
+  // must not mint identities). The handler does its own auth entirely.
+  { method: 'POST',   match: exact('/register'),                     handler: handleRegister, auth: 'public' },
   { method: 'POST',   match: exact('/registration-keys'),            handler: handleRegistrationKeyPost },
+  { method: 'DELETE', match: idMatch(/^\/registration-keys\/([^/]+)$/), handler: handleRegistrationKeyDelete },
   { method: 'GET',    match: exact('/registration-keys'),            handler: handleRegistrationKeyGet },
   { method: 'POST',   match: exact('/acl'),                          handler: handleAclPost },
   { method: 'DELETE', match: exact('/acl'),                          handler: handleAclDelete },
@@ -1262,7 +1510,11 @@ export function startHttpAdmin(
       }
 
       let auth: AuthResult;
-      if (matched && matched.auth === 'agentOrAdmin') {
+      if (matched && matched.auth === 'public') {
+        // No dispatcher-level credential. The handler is responsible for its
+        // own auth and must refuse uniformly (see handleRegister).
+        auth = { mode: 'admin' };
+      } else if (matched && matched.auth === 'agentOrAdmin') {
         const resolved = resolveAuth(req, res, db, adminToken);
         if (resolved === null) return; // 401 already written
         auth = resolved;

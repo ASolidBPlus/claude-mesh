@@ -514,6 +514,20 @@ export function startWsServer(
               return;
             }
 
+            // §5.4: disabled is the revocation actuator, and the bus is the
+            // plane that matters — an agent whose key was revoked must not be
+            // able to hold a live socket. Checked AFTER the token so a valid
+            // token for a disabled agent and an invalid token are the same
+            // AUTH_FAILED from outside: a revoked holder learns nothing about
+            // whether its identity still exists.
+            if (agent.disabled !== 0) {
+              try {
+                ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'invalid token' }));
+              } catch (_) { /* ignore */ }
+              ws.close(1008, 'auth failed');
+              return;
+            }
+
             const connectTime = Date.now();
             setOnline(db, agentId, true);
 

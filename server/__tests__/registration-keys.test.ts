@@ -4,7 +4,10 @@ import * as net from 'net';
 import { mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { openDb, getRegistrationKeyBySecret, registerAgent, countLiveMintedAgents } from '../db.ts';
+import {
+  openDb, getRegistrationKeyBySecret, registerAgent, countLiveMintedAgents,
+  getAgentById, getAgentByToken, aclGrant, aclCheck,
+} from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
 
@@ -182,5 +185,217 @@ describe('getRegistrationKeyBySecret — the /register auth path (#75 pattern)',
     expect(getRegistrationKeyBySecret(nocase, 'tok-exact')?.id).toBe('regk_exact');
     expect(getRegistrationKeyBySecret(nocase, 'tok-shouty')).toBeNull();
     nocase.close();
+  });
+});
+
+// ─── §5.2 POST /register + §5.4 revocation ──────────────────────────────────
+
+describe('POST /register (§5.2) + revocation (§5.4)', () => {
+  let db: Database;
+  let handle: HttpAdminHandle;
+  let base: string;
+  const ADMIN = 'admin-secret';
+
+  beforeEach(async () => {
+    db = openDb(':memory:');
+    handle = await startHttpAdmin(0, db, ADMIN, 1024, mkdtempSync(join(tmpdir(), 'register-')), new Map());
+    base = `http://localhost:${(handle.server.address() as net.AddressInfo).port}`;
+  });
+  afterEach(async () => { await handle.shutdown().catch(() => {}); db.close(); });
+
+  const mintKey = async (body: Record<string, unknown> = { namespace: 'acme' }) =>
+    await (await fetch(`${base}/registration-keys`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${ADMIN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })).json() as any;
+
+  const register = (secret: string, id: string, hostname = 'h') =>
+    fetch(`${base}/register`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, hostname }),
+    });
+
+  it('mints an agent into the key\'s tenant, returning short id AND fq_id', async () => {
+    const key = await mintKey();
+    const res = await register(key.key, 'worker-1');
+    expect(res.status).toBe(201);
+    const body = await res.json() as any;
+    // §4's short/FQ split: the bare name the caller asked for, plus the
+    // server-composed FQ id. The tenant prefix is never smuggled into `id`.
+    expect(body.id).toBe('worker-1');
+    expect(body.fq_id).toBe('acme:worker-1');
+    expect(body.tenant).toBe('acme');
+    expect(body.capabilities).toEqual(['send:direct']);
+    expect(typeof body.token).toBe('string');
+
+    const agent = getAgentByToken(db, body.token);
+    expect(agent?.id).toBe('acme:worker-1');
+    expect(agent?.namespace).toBe('acme');
+    expect(agent?.minted_by_key).toBe(key.id);
+  });
+
+  it('★ the key holder never chooses its tenant — a namespace in the body is ignored', async () => {
+    const key = await mintKey();
+    const res = await fetch(`${base}/register`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key.key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 'worker-1', hostname: 'h', namespace: 'evil', capabilities: ['publish'] }),
+    });
+    const body = await res.json() as any;
+    expect(body.tenant).toBe('acme');            // from the KEY (C1)
+    expect(body.capabilities).toEqual(['send:direct']); // from the KEY, not the body
+    expect(getAgentById(db, 'evil:worker-1')).toBeNull();
+  });
+
+  it('revoked key → 403; expired key → 403; unknown key → 403 — all identical', async () => {
+    const revoked = await mintKey({ namespace: 'r1' });
+    await fetch(`${base}/registration-keys/${revoked.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${ADMIN}` } });
+    const expired = await mintKey({ namespace: 'e1', expires_at: Date.now() - 1000 });
+
+    const bodies: string[] = [];
+    for (const [secret, name] of [[revoked.key, 'a'], [expired.key, 'b'], ['not-a-key', 'c']] as const) {
+      const res = await register(secret, name);
+      expect(res.status).toBe(403);
+      bodies.push(await res.text());
+    }
+    // D4: no oracle. The three refusals must be BYTE-IDENTICAL to the caller —
+    // a difference in wording is a probe for key state.
+    expect(new Set(bodies).size).toBe(1);
+  });
+
+  it('★ 17th LIVE mint on max 16 → 403, but disable one and the next succeeds (F2)', async () => {
+    const key = await mintKey({ namespace: 'acme', max_agents: 16 });
+    for (let i = 0; i < 16; i++) {
+      expect((await register(key.key, `w${i}`)).status).toBe(201);
+    }
+    expect((await register(key.key, 'w16')).status).toBe(403);
+
+    // The cap is on LIVE agents, not lifetime mints: disabling frees a slot.
+    await fetch(`${base}/agents/acme:w0`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${ADMIN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ disabled: true }),
+    });
+    expect((await register(key.key, 'w16')).status).toBe(201);
+  });
+
+  it('★ re-registration rotates the token, clears disabled, PURGES conversation, KEEPS acl', async () => {
+    const key = await mintKey();
+    const first = await (await register(key.key, 'worker-1')).json() as any;
+    const fq = 'acme:worker-1';
+
+    // Predecessor state: an undelivered message, a pending reminder, a
+    // subscription, and an ACL edge.
+    registerAgent(db, { id: 'peer', token_hash: hashToken('peer-tok'), hostname: 'h' });
+    db.prepare(`INSERT INTO messages (id, from_agent, to_agent, kind, payload, content_type, sent_at, delivered_at)
+                VALUES ('m1','peer',?, 'direct','hi','text/plain',?,NULL)`).run(fq, Date.now());
+    db.prepare(`INSERT INTO reminders (id, agent_id, due_at, schedule, payload, created_at, status, last_fired_at, tz)
+                VALUES ('r1', ?, ?, NULL, 'wake', ?, 'pending', NULL, NULL)`).run(fq, Date.now() + 60_000, Date.now());
+    db.prepare('INSERT INTO topics (name, created_at, created_by) VALUES (?,?,?)').run('t1', Date.now(), 'peer');
+    db.prepare('INSERT INTO subscriptions (agent_id, topic, subscribed_at) VALUES (?,?,?)').run(fq, 't1', Date.now());
+    aclGrant(db, 'peer', fq, 'admin');
+    db.prepare('UPDATE agents SET disabled = 1 WHERE id = ?').run(fq);
+
+    const again = await register(key.key, 'worker-1');
+    expect(again.status).toBe(200); // re-registration, not a create
+    const second = await again.json() as any;
+
+    // Token rotated: the old one is dead, the new one works.
+    expect(second.token).not.toBe(first.token);
+    expect(getAgentByToken(db, first.token)).toBeNull();
+    expect(getAgentByToken(db, second.token)?.id).toBe(fq);
+    expect(getAgentById(db, fq)?.disabled).toBe(0); // disabled cleared
+
+    // Conversation state GONE — without this a "fresh" incarnation drains its
+    // predecessor's backlog on first connect (queued reminders never expire).
+    expect((db.prepare('SELECT COUNT(*) n FROM messages WHERE to_agent = ?').get(fq) as any).n).toBe(0);
+    expect((db.prepare("SELECT COUNT(*) n FROM reminders WHERE agent_id = ? AND status='pending'").get(fq) as any).n).toBe(0);
+    expect((db.prepare('SELECT COUNT(*) n FROM subscriptions WHERE agent_id = ?').get(fq) as any).n).toBe(0);
+    // Topology KEPT — ACL is admin-granted tenant shape, not conversation.
+    expect(aclCheck(db, 'peer', fq)).toBe(true);
+  });
+
+  it('★ re-registration does NOT consume a cap slot', async () => {
+    const key = await mintKey({ namespace: 'acme', max_agents: 1 });
+    expect((await register(key.key, 'only')).status).toBe(201);
+    expect((await register(key.key, 'only')).status).toBe(200); // same id, same key
+    expect((await register(key.key, 'other')).status).toBe(403); // cap still 1
+  });
+
+  it('★ a DIFFERENT key cannot capture an id — no cross-key capture', async () => {
+    const k1 = await mintKey({ namespace: 'acme' });
+    const k2 = await mintKey({ namespace: 'acme' }); // same tenant, different key
+    expect((await register(k1.key, 'shared')).status).toBe(201);
+    expect((await register(k2.key, 'shared')).status).toBe(403);
+    expect(getAgentById(db, 'acme:shared')?.minted_by_key).toBe(k1.id);
+  });
+
+  it('id grammar is a 400 (a property of the request), not a 403', async () => {
+    const key = await mintKey();
+    for (const bad of ['Worker', 'a:b', 'home', '', 'x'.repeat(64)]) {
+      expect((await register(key.key, bad)).status).toBe(400);
+    }
+  });
+
+  it('★ revocation cascades: key dead AND every minted agent disabled, in one call', async () => {
+    const key = await mintKey();
+    const a = await (await register(key.key, 'w1')).json() as any;
+    const b = await (await register(key.key, 'w2')).json() as any;
+
+    const res = await fetch(`${base}/registration-keys/${key.id}`, {
+      method: 'DELETE', headers: { Authorization: `Bearer ${ADMIN}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json() as any).disabled_agents.sort()).toEqual(['acme:w1', 'acme:w2']);
+
+    // The agents' tokens are dead at the HTTP auth site…
+    for (const t of [a.token, b.token]) {
+      const r = await fetch(`${base}/messages`, { headers: { Authorization: `Bearer ${t}` } });
+      expect(r.status).toBe(401);
+    }
+    // …and the key can mint nothing further.
+    expect((await register(key.key, 'w3')).status).toBe(403);
+  });
+
+  it('a disabled agent is refused identically to an unknown token (no oracle)', async () => {
+    const key = await mintKey();
+    const agent = await (await register(key.key, 'w1')).json() as any;
+    const before = await fetch(`${base}/messages`, { headers: { Authorization: `Bearer ${agent.token}` } });
+    expect(before.status).toBe(200);
+
+    await fetch(`${base}/agents/acme:w1`, {
+      method: 'PATCH', headers: { Authorization: `Bearer ${ADMIN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ disabled: true }),
+    });
+    const after = await fetch(`${base}/messages`, { headers: { Authorization: `Bearer ${agent.token}` } });
+    const unknown = await fetch(`${base}/messages`, { headers: { Authorization: 'Bearer nonsense' } });
+    expect(after.status).toBe(401);
+    expect(await after.text()).toBe(await unknown.text());
+  });
+
+  it('★ PATCH cannot move a minted agent between tenants — the id/column split', async () => {
+    const key = await mintKey();
+    await register(key.key, 'w1');
+    const res = await fetch(`${base}/agents/acme:w1`, {
+      method: 'PATCH', headers: { Authorization: `Bearer ${ADMIN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ namespace: 'other' }),
+    });
+    expect(res.status).toBe(403);
+    expect(getAgentById(db, 'acme:w1')?.namespace).toBe('acme');
+  });
+
+  it('★ POST /agents refuses a forged FQ id and the bare reserved words', async () => {
+    const post = (id: string) => fetch(`${base}/agents`, {
+      method: 'POST', headers: { Authorization: `Bearer ${ADMIN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, hostname: 'h' }),
+    });
+    expect((await post('acme:forged')).status).toBe(400); // would claim a tenant
+    expect((await post('home')).status).toBe(400);
+    expect((await post('mesh')).status).toBe(400);
+    // …while the permissive grammar still admits existing fleet id shapes.
+    expect((await post('mesh-builder')).status).toBe(201);
+    expect((await post('spawner_backend')).status).toBe(201);
   });
 });

@@ -11,6 +11,14 @@ export interface Agent {
   capabilities: string;    // raw JSON string, e.g. '["file-transfer","broadcast"]'
   metadata: string;        // raw JSON string, e.g. '{"region":"eu-west"}'
   namespace: string | null; // #41: first-class identity label; null = unnamespaced. No routing/ACL semantics.
+  /** §4 (Phase 1): the registration key that minted this agent; NULL = home
+      or admin-minted, which is every pre-federation row. The correspondence
+      with the `ns:` id prefix is what makes namespace frozen for minted
+      agents — see PATCH /agents/:id. */
+  minted_by_key: string | null;
+  /** §5.4: revocation actuator, enforced at BOTH auth sites (WS auth and HTTP
+      resolveAuth) rather than being a label. 0 for every pre-migration row. */
+  disabled: number;
   registered_at: number;   // unix ms
   last_seen: number;       // unix ms — last TRAFFIC (a message sent/received)
   /** Last proof-of-life (unix ms): stamped when the node answers the keepalive
@@ -1042,4 +1050,74 @@ export function countLiveMintedAgents(db: Database, keyId: string): number {
     .prepare('SELECT COUNT(*) AS n FROM agents WHERE minted_by_key = ? AND disabled = 0')
     .get(keyId) as { n: number };
   return row.n;
+}
+
+/**
+ * Re-registration purge (§5.2 evaluator amendment): drop the CONVERSATION
+ * state a re-minted identity would otherwise inherit, keep the TOPOLOGY.
+ *
+ * The failure it prevents is concrete: queued reminders never expire
+ * (expires_at = null, reminder-scheduler.ts), so without this a "fresh"
+ * scenario incarnation drains its predecessor's backlog on first connect —
+ * cross-run information leakage into an agent that is supposed to be new.
+ *
+ * ACL edges are KEPT and that is not an oversight: they are admin-granted
+ * tenant topology, not conversation, and purging them would make every
+ * scenario reset an admin ceremony again (R6). A fresh-ACL reset is key
+ * revocation plus a new key — the terminal path, deliberately more expensive.
+ *
+ * Returns what it removed, so the caller can log it: a purge that silently
+ * removed nothing (wrong id, wrong column) would look exactly like a purge
+ * that had nothing to remove.
+ */
+export function purgeAgentConversationState(
+  db: Database,
+  agentId: string,
+): { messages: number; files: number; reminders: number; subscriptions: number } {
+  // UNDELIVERED only for messages/files: delivered history is the recipient's
+  // record of what happened, not the new incarnation's inbox.
+  const messages = db
+    .prepare('DELETE FROM messages WHERE to_agent = ? AND delivered_at IS NULL')
+    .run(agentId).changes;
+  const files = db
+    .prepare('DELETE FROM files WHERE to_agent = ? AND delivered_at IS NULL')
+    .run(agentId).changes;
+  const reminders = db
+    .prepare("DELETE FROM reminders WHERE agent_id = ? AND status = 'pending'")
+    .run(agentId).changes;
+  const subscriptions = db
+    .prepare('DELETE FROM subscriptions WHERE agent_id = ?')
+    .run(agentId).changes;
+  return { messages, files, reminders, subscriptions };
+}
+
+/** Token rotation for a re-registered agent: new hash, `disabled` cleared.
+    Kept beside the purge because §5.2 requires both in ONE transaction. */
+export function rotateAgentToken(db: Database, agentId: string, tokenHash: string): void {
+  db.prepare('UPDATE agents SET token_hash = ?, disabled = 0, last_seen = ? WHERE id = ?')
+    .run(tokenHash, Date.now(), agentId);
+}
+
+/** §5.4 revocation cascade: kill the key and disable every agent it minted,
+    in ONE transaction — a half-applied revocation (key dead, agents live) is
+    the state the whole mechanism exists to prevent. Returns the disabled ids
+    so the caller can close their sockets and log what actually changed. */
+export function revokeRegistrationKey(db: Database, keyId: string): string[] | null {
+  const key = getRegistrationKeyById(db, keyId);
+  if (key === null) return null;
+  const ids = (db
+    .prepare('SELECT id FROM agents WHERE minted_by_key = ? AND disabled = 0')
+    .all(keyId) as { id: string }[]).map((r) => r.id);
+  const tx = db.transaction(() => {
+    db.prepare('UPDATE registration_keys SET revoked_at = ? WHERE id = ?').run(Date.now(), keyId);
+    db.prepare('UPDATE agents SET disabled = 1 WHERE minted_by_key = ?').run(keyId);
+  });
+  tx();
+  return ids;
+}
+
+/** Single-agent disable/enable (§5.4, PATCH /agents/:id {disabled}). */
+export function setAgentDisabled(db: Database, agentId: string, disabled: boolean): boolean {
+  return db.prepare('UPDATE agents SET disabled = ? WHERE id = ?')
+    .run(disabled ? 1 : 0, agentId).changes > 0;
 }
