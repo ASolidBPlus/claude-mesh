@@ -95,6 +95,11 @@ concurrency (#41's consumer) without a second isolation mechanism:
 - **Capabilities.** A per-key (inherited per-agent) allowlist of bus operations:
   `send:direct`, `send:file`, `publish`, `subscribe`. Home-tenant agents
   (`minted_by_key IS NULL`) are unrestricted, as today.
+- **Terminology guard** *(consumer-review amendment)*: in this design,
+  `agents.namespace` means **tenant** — and "tenant" is the word to use in every
+  builder brief. mesh-chat's codebase already uses "namespace" for something else
+  (the `granted_by` *prefix* convention, `mesh-chat:group:*`); briefs that say
+  "namespace" near mesh-chat or its reconciler will get the wrong field filtered.
 
 ---
 
@@ -398,6 +403,21 @@ same in-memory id→namespace lookup the router's tenant gate needs anyway (one 
 maintained at register/patch time, shared by both consumers — not a per-emit DB
 query).
 
+**The home tenant is scopable too** *(consumer-review amendment)*: `namespace` may be
+the reserved word `home`, scoping a tap to home-tenant traffic (`ns = NULL` endpoints)
+under the same D3 rule. Without this, `NULL` = global is the *only* way to observe the
+fleet — meaning the fleet god view necessarily sees every tenant's intra-org traffic.
+With it, the operator chooses per grant: `home`-scoped for fleet observability,
+global (`NULL`) only where cross-tenant visibility is actually wanted.
+
+**Disclosure owed to third-party tenants** — stated here because it is a property of
+the design, not a bug: a **global tap exists** and the host operator can hold one, so
+the operator *can* observe all bus traffic, including a tenant's intra-org messages;
+and **topic names are globally visible** (any consumer that lists topics — e.g. a
+channel directory — shows every tenant's topic names; content is gated, names are
+not; never encode secrets in a topic name). Any real external org must be told both
+at onboarding.
+
 Grant surface: `POST /observers` gains an optional `namespace` field. Admin-only, as
 today (`server/http-admin.ts` observer routes).
 
@@ -496,6 +516,19 @@ layer do the isolation. One primitive, two consumers.
 | 2 | `federation_links` API + the admit rule at the four sites + presence + capabilities (§6). Inert while no non-NULL-namespace agent has ever been minted | 1 |
 | 3 | Scoped observers (§7) | 1 |
 | 4 | README §federation + deploy-contract cross-ref (#71); worked example | 2,3 |
+
+**Link-creation gate** *(consumer-review amendment — this class of hazard would
+silently defeat C4)*: consumers that hold the admin token and write ACL edges in bulk
+can auto-satisfy the "per-pair ACL on top" layer for a whole tenant the moment a link
+exists. The known instance: mesh-chat's ACL reconciler expands orchestrator-role
+groups against the entire `GET /agents` roster and grants bidirectional user↔agent
+edges — tenant-minted agents would be auto-granted to every orchestrator-tier user.
+**Rule: no federation link may be created until every bulk `granted_by` writer
+(mesh-chat reconciler — fix in flight: "mesh-chat reconciler home-tenant filter
+(#72 C4)", chat-planner will supply the PR number; and any spawner:lifecycle-class
+writer) filters its grant targets to the home tenant (`namespace IS NULL`).** The
+fleet operator holds this gate. New bulk ACL writers inherit the same obligation:
+grant into `home` only, unless a tenant grant is the explicit, reviewed intent.
 
 Builder briefs will be functionality-framed per fleet convention, cite this doc + ticket
 numbers, and go through the normal review lane; I do not implement.
