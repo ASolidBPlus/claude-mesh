@@ -180,20 +180,30 @@ async function handleAclPost(ctx: AdminCtx): Promise<void> {
     return;
   }
 
-  if (getAgentById(db, from_agent) === null) {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'from_agent not found' }));
-    return;
-  }
-
-  if (getAgentById(db, to_agent) === null) {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'to_agent not found' }));
-    return;
-  }
-
   const granted_by = typeof body.granted_by === 'string' ? body.granted_by : 'system';
-  const row = aclGrant(db, from_agent, to_agent, granted_by);
+  // F0a: local-endpoint existence is enforced by aclGrant — ONE rule at the
+  // chokepoint, not a copy per door.
+  //
+  // This route used to pre-check both endpoints with getAgentById and 404 on
+  // null. Those gates are DELETED rather than given their own ':' exemption:
+  // with them in place the HTTP door 404'd a remote id while the MCP door
+  // accepted it, which is two doors with two rules on the pair #82 pinned for
+  // exactly that. A second exemption would have kept the duplication and made
+  // the rules agree only for as long as someone maintained both.
+  //
+  // The refusal a caller sees is unchanged for a bare unknown id: aclGrant
+  // throws AGENT_NOT_FOUND and it maps to the same 404 below.
+  let row;
+  try {
+    row = aclGrant(db, from_agent, to_agent, granted_by);
+  } catch (err) {
+    if ((err as { code?: string }).code === 'AGENT_NOT_FOUND') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'agent not found' }));
+      return;
+    }
+    throw err; // anything else is a real fault — let the dispatcher guard log it
+  }
 
   res.writeHead(201, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(row));
@@ -220,19 +230,21 @@ async function handleAclDelete(ctx: AdminCtx): Promise<void> {
     return;
   }
 
-  if (getAgentById(db, from_agent) === null) {
+  // F0a: the rule for revoke is EDGE existence, not endpoint existence.
+  //
+  // These two gates used to 404 on an endpoint that was not a local agent —
+  // which since aclGrant accepts remote ids would make an edge to `remote:x`
+  // PERMANENTLY UNREVOKABLE over HTTP: the gate refuses before the DELETE runs,
+  // so the grant can be created and never withdrawn. A revoke you cannot
+  // perform is worse than one that reports nothing to do.
+  //
+  // 404 now means what it should have meant here all along — no such edge.
+  const removed = aclRevoke(db, from_agent, to_agent);
+  if (removed === 0) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'from_agent not found' }));
+    res.end(JSON.stringify({ error: 'edge not found' }));
     return;
   }
-
-  if (getAgentById(db, to_agent) === null) {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'to_agent not found' }));
-    return;
-  }
-
-  aclRevoke(db, from_agent, to_agent);
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ok: true }));
@@ -710,6 +722,11 @@ async function handleFilePost(ctx: AdminCtx): Promise<void> {
       return;
     }
 
+  // DELIBERATELY LOCAL-ONLY, and NOT part of the acl chokepoint migration
+  // (F0a). File delivery has no remote endpoint in F0 — cross-mesh transfer is
+  // later work — so these two gates are load-bearing here rather than a
+  // leftover copy of the idiom aclGrant now owns. The next "one rule at the
+  // chokepoint" sweep must skip them.
     if (getAgentById(db, from_agent) === null) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'from_agent not found' }));

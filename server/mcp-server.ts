@@ -292,7 +292,25 @@ function handleMeshAclAllow(ctx: ToolCtx): ToolResult {
   };
   // Checked BEFORE the write, so a refusal cannot leave a half-applied grant.
   if (!adminTokenOk(admin_token, adminToken)) return unauthorizedResult();
-  const row = aclGrant(db, agent_id, as_agent, as_agent);
+  // F0a — DELIBERATE SHAPE CHANGE, the one in this PR. aclGrant now throws
+  // AGENT_NOT_FOUND for a bare endpoint that is not a local agent. Previously
+  // this tool had no such case: the acl foreign key raised a raw SQLite error
+  // that escaped as an MCP -32603 internal error, i.e. a caller naming a
+  // typo'd agent was told the server broke. It is now a normal tool error the
+  // caller can act on. Stated rather than slipped in: any consumer matching on
+  // -32603 for this case sees a different result.
+  let row;
+  try {
+    row = aclGrant(db, agent_id, as_agent, as_agent);
+  } catch (err) {
+    if ((err as { code?: string }).code === 'AGENT_NOT_FOUND') {
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ error: 'AGENT_NOT_FOUND' }) }],
+        isError: true,
+      };
+    }
+    throw err;
+  }
   return { content: [{ type: 'text' as const, text: JSON.stringify(row) }], isError: false };
 }
 
@@ -357,7 +375,23 @@ function handleMeshAclDeny(ctx: ToolCtx): ToolResult {
     agent_id: string; as_agent: string; admin_token?: unknown;
   };
   if (!adminTokenOk(admin_token, adminToken)) return unauthorizedResult();
-  aclRevoke(db, agent_id, as_agent);
+  // F0a — DELIBERATE SHAPE CHANGE, the second in this PR. Same rule as the
+  // HTTP door: revoke is about EDGE existence, and a remote endpoint is never
+  // refused. This tool previously reported success whether or not anything was
+  // withdrawn, so a caller could not tell "grant removed" from "there was
+  // nothing there" — and the two doors disagreed on what a no-op revoke means.
+  //
+  // A caller that treated every deny as success now sees an error where it
+  // previously saw ok:true. That is the point (an operator revoking a typo'd
+  // edge was told it worked), but it is a change, not a fix, and consumers
+  // matching on isError see it.
+  const removed = aclRevoke(db, agent_id, as_agent);
+  if (removed === 0) {
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ error: 'EDGE_NOT_FOUND' }) }],
+      isError: true,
+    };
+  }
   return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true }) }], isError: false };
 }
 

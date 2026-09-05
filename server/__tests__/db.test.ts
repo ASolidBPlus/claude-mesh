@@ -12,6 +12,7 @@ import {
   updateAgent,
   deleteAgent,
   aclGrant,
+  aclRelated,
   aclRevoke,
   aclCheck,
   listInboundAcl,
@@ -857,22 +858,52 @@ describe('subscribe / unsubscribe / getTopicSubscribers / getAgentSubscriptions'
 // ──────────────────────────────────────────────
 
 describe('Referential integrity (FK enforcement)', () => {
-  it('inserting an ACL row with a non-existent from_agent throws a FK violation', () => {
+  // F0a: these two asserted the acl FOREIGN KEY, which is deliberately gone —
+  // an acl endpoint will soon name a remote id that has no agents(id) row.
+  // The guarantee moved to aclGrant rather than disappearing, so the tests are
+  // RE-POINTED at the layer that now owns it rather than deleted. They test a
+  // strictly stronger thing than before: a raw INSERT could always bypass the
+  // FK from inside the process, whereas every caller goes through aclGrant.
+  it('aclGrant refuses a non-existent from_agent', () => {
     const db = freshDb();
     makeAgent(db, 'real-agent');
-    expect(() => {
-      db.prepare('INSERT INTO acl (from_agent, to_agent, granted_at, granted_by) VALUES (?, ?, ?, ?)')
-        .run('ghost', 'real-agent', Date.now(), 'system');
-    }).toThrow();
+    expect(() => aclGrant(db, 'ghost', 'real-agent', 'system')).toThrow();
+    // The row must not exist afterwards — a throw that still wrote would be
+    // worse than no check at all.
+    expect(aclRelated(db, 'ghost', 'real-agent')).toBe(false);
   });
 
-  it('inserting an ACL row with a non-existent to_agent throws a FK violation', () => {
+  it('aclGrant refuses a non-existent to_agent', () => {
     const db = freshDb();
     makeAgent(db, 'real-agent');
-    expect(() => {
-      db.prepare('INSERT INTO acl (from_agent, to_agent, granted_at, granted_by) VALUES (?, ?, ?, ?)')
-        .run('real-agent', 'ghost', Date.now(), 'system');
-    }).toThrow();
+    expect(() => aclGrant(db, 'real-agent', 'ghost', 'system')).toThrow();
+    expect(aclRelated(db, 'real-agent', 'ghost')).toBe(false);
+  });
+
+  // THE F0a POINT. The foreign key was removed so an acl endpoint can name a
+  // REMOTE id, which has no agents(id) row and never will. If the local-
+  // existence check applied to it, the FK would have been traded for a check
+  // that rejects exactly the same thing — the whole change would be inert.
+  //
+  // Added because the mutant that deletes the ':' carve-out SURVIVED the rest
+  // of this suite: every other test here would pass with remote ids broken.
+  it('aclGrant accepts a REMOTE endpoint that is not a local agent', () => {
+    const db = freshDb();
+    makeAgent(db, 'local-one');
+    expect(() => aclGrant(db, 'local-one', 'othermesh:their-agent', 'system')).not.toThrow();
+    expect(aclRelated(db, 'local-one', 'othermesh:their-agent')).toBe(true);
+    // And in the from position, which is a different argument to the check.
+    expect(() => aclGrant(db, 'othermesh:their-agent', 'local-one', 'system')).not.toThrow();
+    // Negative control on the same test: a BARE unknown id is still refused,
+    // so this is not passing because the check stopped working entirely.
+    expect(() => aclGrant(db, 'local-one', 'no-such-agent', 'system')).toThrow();
+  });
+
+  it('aclGrant still accepts two existing agents — the positive control', () => {
+    const db = freshDb();
+    makeAgent(db, 'a'); makeAgent(db, 'b');
+    expect(() => aclGrant(db, 'a', 'b', 'system')).not.toThrow();
+    expect(aclRelated(db, 'a', 'b')).toBe(true);
   });
 
   it('inserting a subscription row with a non-existent agent_id throws a FK violation', () => {

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { openDb, registerAgent, getAgentByToken } from '../db.ts';
+import { openDb, registerAgent, getAgentByToken, deleteAgent, rebuildAclFkLess } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { mkdtempSync } from 'fs';
 import { join } from 'path';
@@ -64,12 +64,28 @@ function preFederationDb(path: string): void {
     CREATE TABLE observers (
       agent_id TEXT PRIMARY KEY, granted_at INTEGER NOT NULL, granted_by TEXT NOT NULL
     );
+    -- The acl shape as it was BEFORE F0a: with the foreign keys, which is what
+    -- every database on disk still has.
+    CREATE TABLE acl (
+      from_agent   TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      to_agent     TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      granted_at   INTEGER NOT NULL,
+      granted_by   TEXT NOT NULL,
+      PRIMARY KEY (from_agent, to_agent)
+    );
+    CREATE INDEX idx_acl_reverse ON acl(to_agent, from_agent);
   `);
   db.prepare(
     'INSERT INTO agents (id, token_hash, hostname, registered_at, last_seen) VALUES (?,?,?,?,?)',
   ).run('prod-agent', hashToken('prod-token'), 'prod-host', 1, 1);
   db.prepare('INSERT INTO observers (agent_id, granted_at, granted_by) VALUES (?,?,?)')
     .run('prod-agent', 1, 'admin');
+  db.prepare('INSERT INTO agents (id, token_hash, hostname, registered_at, last_seen) VALUES (?,?,?,?,?)')
+    .run('peer-agent', hashToken('peer-token'), 'peer-host', 1, 1);
+  db.prepare('INSERT INTO acl (from_agent, to_agent, granted_at, granted_by) VALUES (?,?,?,?)')
+    .run('prod-agent', 'peer-agent', 11, 'admin');
+  db.prepare('INSERT INTO acl (from_agent, to_agent, granted_at, granted_by) VALUES (?,?,?,?)')
+    .run('peer-agent', 'prod-agent', 22, 'system');
   db.close();
 }
 
@@ -127,6 +143,161 @@ describe('migration chain — openDb over databases that predate the current sch
     preFederationDb(path);
     openDb(path).close();
     const db = openDb(path); // must not throw on the second pass
+    expect(getAgentByToken(db, 'prod-token')?.id).toBe('prod-agent');
+    db.close();
+  });
+
+  // ── F0a: the acl FK-less rebuild ────────────────────────────────────────
+
+  const aclRows = (db: Database) =>
+    db.prepare('SELECT from_agent, to_agent, granted_at, granted_by FROM acl ORDER BY from_agent').all();
+
+  it('★ F0a: an upgraded acl table loses its foreign keys and keeps every row', () => {
+    const path = tmpDb('aclfk');
+    preFederationDb(path);
+
+    const before = (() => { const d = new Database(path); const r = aclRows(d); d.close(); return r; })();
+    expect(before.length).toBe(2);
+
+    const db = openDb(path);
+    // The point of the rebuild: no foreign keys left, so an acl endpoint can
+    // name something that is not a local agent row.
+    expect((db.prepare('PRAGMA foreign_key_list(acl)').all() as unknown[]).length).toBe(0);
+    // EDGE FOR EDGE, including granted_at/granted_by — a rebuild that kept the
+    // pairs but reset the provenance would pass a count-only assertion.
+    expect(aclRows(db)).toEqual(before);
+    db.close();
+  });
+
+  it('★ F0a: the rebuild REFUSES to run inside a transaction', () => {
+    // The precondition is that PRAGMA foreign_keys = OFF is a silent no-op
+    // inside a transaction. Documented, it is the weakest form there is: a
+    // future tidy-up wrapping the migration section in db.transaction() would
+    // make the pragma no-op, run the DROP/RENAME under FK enforcement, and
+    // produce a server that will not start on every boot. So it throws.
+    const path = tmpDb('acltx');
+    preFederationDb(path);
+    const db = new Database(path);
+    expect(() => db.transaction(() => rebuildAclFkLess(db))()).toThrow(/outside a transaction/);
+    // And the table is untouched — a guard that threw halfway would be worse
+    // than none.
+    expect((db.prepare('PRAGMA foreign_key_list(acl)').all() as unknown[]).length).toBeGreaterThan(0);
+    db.close();
+
+    // Positive control: the SAME call outside a transaction succeeds, so the
+    // throw above is the precondition and not the function being broken.
+    const ok = new Database(path);
+    expect(() => rebuildAclFkLess(ok)).not.toThrow();
+    expect((ok.prepare('PRAGMA foreign_key_list(acl)').all() as unknown[]).length).toBe(0);
+    ok.close();
+  });
+
+  // Failure injection: a Proxy on db.exec that throws when the RENAME runs —
+  // i.e. process death in the window between DROP TABLE acl and the rename of
+  // acl_new. No production seam; the injection is entirely in the test.
+  function dbThatDiesAtRename(path: string): Database {
+    const db = new Database(path);
+    const realExec = db.exec.bind(db);
+    (db as unknown as { exec: (sql: string) => unknown }).exec = (sql: string) => {
+      if (sql.includes('RENAME TO acl')) throw new Error('simulated process death after DROP');
+      return realExec(sql);
+    };
+    return db;
+  }
+
+  it('★ F0a: a crash mid-rebuild leaves the acl table INTACT — rows and FKs', () => {
+    // Un-transactioned this was TOTAL, SILENT loss, measured before the fix:
+    //   grants before: 2 → grants after crash + reboot: 0, with the real rows
+    //   stranded in acl_new and the server booting clean.
+    // The next boot's CREATE TABLE IF NOT EXISTS recreates acl EMPTY before
+    // this function runs, and the zero-FK early return then no-ops — so the
+    // damage is invisible from every angle a boot check would look at.
+    const path = tmpDb('aclcrash');
+    preFederationDb(path);
+
+    const dying = dbThatDiesAtRename(path);
+    expect(() => rebuildAclFkLess(dying)).toThrow(/simulated process death/);
+    dying.close();
+
+    // Reopen exactly as a restart would.
+    const after = openDb(path);
+    expect(aclRows(after).length).toBe(2);          // every grant survived
+    expect(after.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='acl_new'").get())
+      .toBeNull();                                   // no orphan half-table
+    after.close();
+  });
+
+  it('★ F0a: positive control — the SAME injection without a transaction loses the rows', () => {
+    // Without this the test above cannot distinguish "the transaction saved
+    // the rows" from "the injection never fired". Runs the un-transactioned
+    // sequence by hand and shows the loss the fix prevents.
+    const path = tmpDb('aclcrashctl');
+    preFederationDb(path);
+
+    const db = new Database(path);
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec(`CREATE TABLE acl_new (
+      from_agent TEXT NOT NULL, to_agent TEXT NOT NULL,
+      granted_at INTEGER NOT NULL, granted_by TEXT NOT NULL,
+      PRIMARY KEY (from_agent, to_agent));`);
+    db.exec('INSERT INTO acl_new SELECT from_agent, to_agent, granted_at, granted_by FROM acl');
+    db.exec('DROP TABLE acl');
+    // <-- process dies here; no RENAME
+    db.close();
+
+    const after = openDb(path);
+    expect(aclRows(after).length).toBe(0);           // the loss, demonstrated
+    expect(after.prepare("SELECT COUNT(*) AS n FROM acl_new").get()).toEqual({ n: 2 }); // stranded
+    after.close();
+  });
+
+  it('★ F0a: the rebuild restores secondary indexes — idx_acl_reverse survives', () => {
+    // The table is dropped, so its indexes go with it. #11's reverse index is
+    // a performance guarantee that would vanish silently: nothing fails, the
+    // query just scans again. Captured DDL is replayed after the rename.
+    const path = tmpDb('aclidx');
+    preFederationDb(path);
+    const db = openDb(path);
+
+    const idx = (db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='acl'").all() as { name: string }[])
+      .map(r => r.name);
+    expect(idx).toContain('idx_acl_reverse');
+
+    const plan = (db.prepare(
+      'EXPLAIN QUERY PLAN SELECT * FROM acl WHERE to_agent = ?'
+    ).all('x') as { detail: string }[]).map(r => r.detail).join(' | ');
+    expect(plan).toContain('idx_acl_reverse');
+    db.close();
+  });
+
+  it('★ F0a: a second openDb does NOT rebuild — the probe makes it idempotent', () => {
+    const path = tmpDb('aclidem');
+    preFederationDb(path);
+    openDb(path).close();
+
+    const db = openDb(path);
+    expect((db.prepare('PRAGMA foreign_key_list(acl)').all() as unknown[]).length).toBe(0);
+    expect(aclRows(db).length).toBe(2);
+    // A rebuild that ran again would still LOOK correct here, so assert the
+    // thing that distinguishes them: the rebuild recreates the table, which
+    // resets its rootpage. Same rootpage across the second boot = untouched.
+    const root = (n: string) => (db.prepare("SELECT rootpage FROM sqlite_master WHERE type='table' AND name=?").get(n) as { rootpage: number }).rootpage;
+    const first = root('acl');
+    openDb(path).close();
+    expect(root('acl')).toBe(first);
+    db.close();
+  });
+
+  it('★ F0a: deleteAgent still clears the agent\'s acl rows without the cascade', () => {
+    const path = tmpDb('acldel');
+    preFederationDb(path);
+    const db = openDb(path);
+
+    expect(aclRows(db).length).toBe(2);
+    deleteAgent(db, 'peer-agent');
+    // Both directions gone: the cascade covered from_agent AND to_agent, and
+    // the explicit delete must not quietly cover only one.
+    expect(aclRows(db).length).toBe(0);
     expect(getAgentByToken(db, 'prod-token')?.id).toBe('prod-agent');
     db.close();
   });
