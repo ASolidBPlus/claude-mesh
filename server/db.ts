@@ -160,6 +160,20 @@ export function openDb(path: string): Database {
     CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at) WHERE expires_at IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_messages_sent_at ON messages(sent_at);
     CREATE INDEX IF NOT EXISTS idx_agents_last_seen ON agents(last_seen);
+    -- #45/#13: token_hash is the auth path's lookup key on EVERY agentOrAdmin
+    -- HTTP request and every WS auth. Federation multiplies identity count
+    -- (DESIGN_FEDERATION §5.5), which is why this stopped being a someday-perf
+    -- ticket.
+    --
+    -- NOT UNIQUE, deliberately. A UNIQUE index is the tempting stronger
+    -- statement — two agents sharing a token_hash is nonsense the token model
+    -- already forbids — but creating a UNIQUE index FAILS on an existing table
+    -- that already contains a duplicate, and this runs inside openDb() on the
+    -- live database. That converts an unlikely data condition into a server
+    -- that will not start, i.e. a self-inflicted mesh outage, to enforce an
+    -- invariant we can enforce in the lookup instead — where an ambiguous
+    -- hash refuses to authenticate anyone (see getAgentByToken).
+    CREATE INDEX IF NOT EXISTS idx_agents_token_hash ON agents(token_hash);
 
     CREATE TABLE IF NOT EXISTS files (
       id              TEXT PRIMARY KEY,
@@ -276,18 +290,49 @@ export function getAgentById(db: Database, id: string): Agent | null {
 }
 
 export function getAgentByToken(db: Database, token: string): Agent | null {
-  // Hash the raw token with SHA-256
+  // #45/#13. The scan this replaces read EVERY agent row and ran a timing-safe
+  // compare per row, on every agentOrAdmin HTTP request and every WS auth —
+  // O(agents) per authentication, which federation multiplies (R1/R6,
+  // DESIGN_FEDERATION §5.5).
+  //
+  // WHAT THE INDEX DOES AND DOES NOT BUY, because the distinction is the whole
+  // security question here:
+  //
+  //   The SECRET is the raw token; `hash` is SHA-256 of it. An attacker who
+  //   could measure our lookup time learns, at most, something about which
+  //   HASH row was probed — and to exploit that they would need to choose a
+  //   raw token whose hash lands where they want it, i.e. invert or collide
+  //   SHA-256. So indexing on the hash does not leak the secret.
+  //
+  //   The timing-safe compare is therefore NOT what protects the index lookup.
+  //   It is kept as the final equality check on the candidate row, because
+  //   removing it would make this function's safety depend on SQLite's `=`
+  //   semantics — an implementation detail we neither control nor test. One
+  //   compare against one row is O(1) and costs nothing.
+  //
+  //   AMBIGUITY FAILS CLOSED. The index is deliberately not UNIQUE (a unique
+  //   index cannot be created over pre-existing duplicates, and openDb runs on
+  //   the live DB — see the DDL comment). So the lookup asks for TWO rows: one
+  //   match authenticates, zero is "no such token", and two or more means the
+  //   table cannot say who this token belongs to — which must authenticate
+  //   NOBODY rather than pick the first row and hand an attacker whichever
+  //   identity SQLite happened to return. That state is impossible by
+  //   construction today; it is refused loudly rather than assumed away.
   const hash = hashToken(token);
-  const agents = db.prepare('SELECT * FROM agents').all() as Agent[];
-
-  // Timing-safe comparison: compare all rows
-  let found: Agent | null = null;
-  for (const agent of agents) {
-    if (timingSafeEqual(agent.token_hash, hash)) {
-      found = agent;
-    }
+  const rows = db
+    .prepare('SELECT * FROM agents WHERE token_hash = ? LIMIT 2')
+    .all(hash) as Agent[];
+  if (rows.length === 0) return null;
+  if (rows.length > 1) {
+    console.error(
+      `[db] AMBIGUOUS token_hash — ${rows.length}+ agents share one token hash (${rows
+        .map((r) => r.id)
+        .join(', ')}); refusing to authenticate any of them`,
+    );
+    return null;
   }
-  return found;
+  const candidate = rows[0]!;
+  return timingSafeEqual(candidate.token_hash, hash) ? candidate : null;
 }
 
 export function listAgents(db: Database, onlineOnly?: boolean): Agent[] {
