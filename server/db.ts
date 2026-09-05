@@ -1117,6 +1117,14 @@ export function revokeRegistrationKey(db: Database, keyId: string): string[] | n
 }
 
 /** Single-agent disable/enable (§5.4, PATCH /agents/:id {disabled}). */
+// §5.4 — ids of every disabled agent, for the cleanup sweep that closes any
+// socket a revoked identity is still holding. Cheap: `disabled` is a small
+// flag column and the revoked set is expected to be near-empty.
+export function listDisabledAgentIds(db: Database): string[] {
+  const rows = db.prepare('SELECT id FROM agents WHERE disabled = 1').all() as { id: string }[];
+  return rows.map(r => r.id);
+}
+
 export function setAgentDisabled(db: Database, agentId: string, disabled: boolean): boolean {
   return db.prepare('UPDATE agents SET disabled = ? WHERE id = ?')
     .run(disabled ? 1 : 0, agentId).changes > 0;

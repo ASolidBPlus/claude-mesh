@@ -85,7 +85,16 @@ function requireAdmin(
 }
 
 // Result of authenticating a request on an agent-or-admin route.
-type AuthResult = { mode: 'admin' } | { mode: 'agent'; agentId: string };
+// 'unauthenticated' exists so the dispatcher has an HONEST value for
+// auth:'handler' routes, where by design it checks no credential. It used to
+// write { mode: 'admin' } there — representing "nobody checked a credential"
+// with the MOST-privileged value in the union, which made admin the default
+// inheritance for the next handler-mode route. A type that cannot say
+// "unauthenticated" forces every dispatcher to lie; this one can.
+//
+// It is NEVER a grant. Every consumer must treat it as strictly less
+// privileged than 'agent': no scope, no ownership, no admin.
+export type AuthResult = { mode: 'admin' } | { mode: 'agent'; agentId: string } | { mode: 'unauthenticated' };
 
 // Resolve auth for a route that accepts EITHER the admin token OR an agent's
 // own bearer token. Admin is checked FIRST (exact, timing-safe) — if the token
@@ -155,9 +164,12 @@ interface AdminCtx {
   observerIndex: Map<string, WebSocket>;
   maxFileBytes: number;
   filesDir: string;
-  // Authenticated caller. 'admin' for admin-token routes; for 'agentOrAdmin'
-  // routes it is 'admin' or the specific agent. Handlers that don't scope by
-  // caller ignore it.
+  // Caller identity as established BY THE DISPATCHER. Two origins for 'admin':
+  // an admin-token route, or an 'agentOrAdmin' route whose caller presented the
+  // admin token. An 'agentOrAdmin' route may also yield the specific agent.
+  // 'handler' routes yield 'unauthenticated' — the dispatcher checked nothing,
+  // and the handler owns its own authentication. Handlers that don't scope by
+  // caller ignore this field.
   auth: AuthResult;
 }
 
@@ -657,6 +669,16 @@ function handleMessagesGet(ctx: AdminCtx): void {
   // (persisted as per-subscriber copies with to_agent = subscriber), and
   // request/response rows. Requesting another agent's scope is a hard 403;
   // admin is unconstrained (behaves exactly as before).
+  // 'unauthenticated' must never reach here: this route is not handler-mode,
+  // so the dispatcher has already refused. If it ever does, that is a routing
+  // bug, and the safe reading of it is NOT "unconstrained like admin" — refuse
+  // rather than fall through to the admin path below.
+  if (auth.mode === 'unauthenticated') {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'forbidden' }));
+    return;
+  }
+
   let effectiveAgent = agentParam;
   if (auth.mode === 'agent') {
     if (agentParam !== undefined && agentParam !== auth.agentId) {
@@ -731,9 +753,7 @@ async function handleFileById(ctx: AdminCtx): Promise<void> {
   // SAME 404 as a missing file — an agent cannot distinguish "no such file"
   // from "exists but not yours", so it can't enumerate/probe file_ids across
   // nodes (no existence oracle). from_agent/to_agent are already stored.
-  const authorized =
-    file !== null &&
-    (auth.mode === 'admin' || file.from_agent === auth.agentId || file.to_agent === auth.agentId);
+  const authorized = file !== null && fileAccessAuthorized(auth, file);
   if (!authorized) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'file not found' }));
@@ -1283,6 +1303,38 @@ function handleRegistrationKeyGet(ctx: AdminCtx): void {
     that only applies to the next reconnect — the actuator has to reach the
     socket, not just the row. Best-effort by nature: no socket is the normal
     case, and a close that fails must not fail the revocation. */
+/**
+ * Who may read a file's bytes (#57): admin unconditionally, an agent only if it
+ * is the file's sender or recipient.
+ *
+ * Exhaustive over AuthResult BY CONSTRUCTION — a switch with a `never` arm, so
+ * adding a fourth mode is a compile error here rather than a silent grant. It
+ * is written as a POSITIVE test per mode, never "not X ⇒ allow": that shape is
+ * why the dispatcher's old { mode: 'admin' } placeholder for handler-mode
+ * routes was one careless route away from becoming real admin access.
+ *
+ * Extracted so the refusal is directly testable at the layer the grant lives
+ * at, rather than only reachable through a route that happens to exist today.
+ */
+export function fileAccessAuthorized(
+  auth: AuthResult,
+  file: { from_agent: string; to_agent: string }
+): boolean {
+  switch (auth.mode) {
+    case 'admin':
+      return true;
+    case 'agent':
+      return file.from_agent === auth.agentId || file.to_agent === auth.agentId;
+    case 'unauthenticated':
+      // The dispatcher checked no credential. Never a grant.
+      return false;
+    default: {
+      const exhaustive: never = auth;
+      return exhaustive;
+    }
+  }
+}
+
 function closeAgentSocket(ctx: AdminCtx, agentId: string, reason: string): void {
   const ws = ctx.agentIndex.get(agentId);
   if (ws === undefined) return;
@@ -1518,7 +1570,10 @@ export function startHttpAdmin(
       if (matched && matched.auth === 'handler') {
         // No dispatcher-level credential BY DESIGN: this route's handler owns
         // its authentication and must refuse uniformly (see handleRegister).
-        auth = { mode: 'admin' };
+        // The ctx says 'unauthenticated' because that is the TRUTH here — the
+        // handler's own check is invisible to the dispatcher, so nothing it
+        // hands the handler may function as a grant.
+        auth = { mode: 'unauthenticated' };
       } else if (matched && matched.auth === 'agentOrAdmin') {
         const resolved = resolveAuth(req, res, db, adminToken);
         if (resolved === null) return; // 401 already written

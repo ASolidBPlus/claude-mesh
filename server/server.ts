@@ -2,7 +2,7 @@ import { openDb } from './db.ts';
 import { startWsServer, WsServerHandle } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
-import { startCleanup, CleanupHandle } from './cleanup.ts';
+import { startCleanup, resolveCleanupIntervalMs, CleanupHandle } from './cleanup.ts';
 import { startReminderScheduler, ReminderSchedulerHandle } from './reminder-scheduler.ts';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Database } from 'bun:sqlite';
@@ -54,16 +54,8 @@ export function loadConfig(): Config {
     adminPort = parsed;
   }
 
-  let cleanupIntervalMs = 60_000;
-  const cleanupStr = process.env.MESH_CLEANUP_INTERVAL_MS;
-  if (cleanupStr !== undefined) {
-    const parsed = parseInt(cleanupStr, 10);
-    if (isNaN(parsed) || parsed <= 0 || parsed > 3_600_000) {
-      process.stderr.write(`MESH_CLEANUP_INTERVAL_MS must be an integer between 1 and 3600000, got: ${cleanupStr}\n`);
-      process.exit(1);
-    }
-    cleanupIntervalMs = parsed;
-  }
+  // Single encoding lives in cleanup.ts alongside the timer it paces.
+  const cleanupIntervalMs = resolveCleanupIntervalMs(process.env.MESH_CLEANUP_INTERVAL_MS);
 
   let maxFileBytes = 10_485_760;
   const maxFileBytesStr = process.env.MESH_MAX_FILE_BYTES;
