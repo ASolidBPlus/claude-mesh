@@ -67,6 +67,70 @@ export function buildDeliverFrame(msg: {
   });
 }
 
+/** One message's worth of delivery state, as deliverOrQueue needs it. */
+export interface DeliverableMessage {
+  id: string;
+  from_agent: string;
+  to_agent: string;
+  payload: string;
+  content_type: string;
+  sent_at: number;
+  expires_at: number | null;
+  /** ttl_ms === 0: deliver live but persist nothing (and hence nothing to mark
+   *  delivered). Offline + ephemeral is dropped, not queued. */
+  ephemeral: boolean;
+  payloadBytes: number;
+}
+
+/**
+ * Deliver to a connected recipient, or queue for an offline one — the single
+ * implementation shared by routeDirect and the relay handler (F1b, §5.2).
+ *
+ * SYNCHRONOUS, and that is load-bearing rather than incidental: routeDirect's
+ * duplicate check and its insert must not be separated by an await, or two
+ * frames interleave, both pass the check, and the second insert throws. Every
+ * statement here is synchronous bun:sqlite or ws.send work.
+ */
+export function deliverOrQueue(
+  db: Database,
+  agentIndex: Map<string, WebSocket>,
+  msg: DeliverableMessage
+): void {
+  const recipientWs = agentIndex.get(msg.to_agent);
+  if (recipientWs !== undefined) {
+    if (!msg.ephemeral) {
+      insertMessage(db, {
+        id: msg.id, kind: 'direct', from_agent: msg.from_agent, to_agent: msg.to_agent,
+        payload: msg.payload, content_type: msg.content_type,
+        sent_at: msg.sent_at, expires_at: msg.expires_at,
+      });
+    }
+    recipientWs.send(buildDeliverFrame({
+      id: msg.id, kind: 'direct', from_agent: msg.from_agent, to_agent: msg.to_agent,
+      topic: null, correlation_id: null, payload: msg.payload,
+      content_type: msg.content_type, sent_at: msg.sent_at,
+    }));
+    if (!msg.ephemeral) markDelivered(db, msg.id);
+    incMsgStatus('direct', 'delivered');
+    incReceived(msg.to_agent);
+    incBytes('out', msg.payloadBytes);
+    return;
+  }
+
+  // Offline. ttl 0 is discarded rather than queued: an ephemeral message's
+  // whole point is that it is worthless later.
+  if (msg.ephemeral) {
+    incMsgStatus('direct', 'dropped');
+    return;
+  }
+  insertMessage(db, {
+    id: msg.id, kind: 'direct', from_agent: msg.from_agent, to_agent: msg.to_agent,
+    payload: msg.payload, content_type: msg.content_type,
+    sent_at: msg.sent_at, expires_at: msg.expires_at,
+  });
+  incMsgStatus('direct', 'queued');
+}
+
 export function routeDirect(
   db: Database,
   agentIndex: Map<string, WebSocket>,
@@ -139,62 +203,22 @@ export function routeDirect(
   const content_type = frame.content_type ?? 'text/plain';
   const sent_at = Date.now();
 
-  // 5. Recipient online
-  const recipientWs = agentIndex.get(frame.to);
-  if (recipientWs !== undefined) {
-    // ttl_ms=0 = EPHEMERAL: deliver live but do NOT persist a row (and hence
-    // nothing to markDelivered). Beat/heartbeat-class streams use this so they
-    // never accumulate as scrollback history. (Offline ttl-0 is already dropped
-    // below.) A stored row's only purpose is offline-queue + scrollback; an
-    // online ephemeral delivery needs neither.
-    const ephemeral = ttl === 0;
-    if (!ephemeral) {
-      insertMessage(db, {
-        id: frame.msg_id,
-        kind: 'direct',
-        from_agent,
-        to_agent: frame.to,
-        payload: frame.payload,
-        content_type,
-        sent_at,
-        expires_at,
-      });
-    }
-    const deliverFrame = buildDeliverFrame({
-      id: frame.msg_id,
-      kind: 'direct',
-      from_agent,
-      to_agent: frame.to,
-      topic: null,
-      correlation_id: null,
-      payload: frame.payload,
-      content_type,
-      sent_at,
-    });
-    recipientWs.send(deliverFrame);
-    if (!ephemeral) markDelivered(db, frame.msg_id);
-    incMsgStatus('direct', 'delivered');
-    incReceived(frame.to);
-    incBytes('out', payloadBytes);
-  } else {
-    // 6. Recipient offline
-    if (ttl === 0) {
-      // ttl_ms=0 and offline: discard
-      incMsgStatus('direct', 'dropped');
-      return { ok: true, msg_id: frame.msg_id };
-    }
-    insertMessage(db, {
-      id: frame.msg_id,
-      kind: 'direct',
-      from_agent,
-      to_agent: frame.to,
-      payload: frame.payload,
-      content_type,
-      sent_at,
-      expires_at,
-    });
-    incMsgStatus('direct', 'queued');
-  }
+  // 5/6. Deliver or queue. Extracted (F1b) so the relay handler reuses this
+  // EXACT path rather than a second copy of it — two implementations of
+  // "deliver if online, queue if not, honour ttl 0" would drift, and the drift
+  // would be invisible until a federated message behaved differently from a
+  // local one.
+  deliverOrQueue(db, agentIndex, {
+    id: frame.msg_id,
+    from_agent,
+    to_agent: frame.to,
+    payload: frame.payload,
+    content_type,
+    sent_at,
+    expires_at,
+    ephemeral: ttl === 0,
+    payloadBytes,
+  });
 
   emitTap(observerIndex, {
     type: 'tap', msg_id: frame.msg_id, kind: 'direct',

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { openDb, registerAgent, aclGrant, aclCheck, setOnline, insertFile, getAgentById, getFile, insertMessage, subscribe, getOrCreateTopic } from '../db.ts';
+import { openDb, registerAgent, upsertPeer, aclGrant, aclCheck, setOnline, insertFile, getAgentById, getFile, insertMessage, subscribe, getOrCreateTopic } from '../db.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
 import { hashToken } from '../auth.ts';
 import { Database } from 'bun:sqlite';
@@ -148,12 +148,18 @@ describe('http-admin', () => {
   // F0a §5.4 — ONE RULE AT THE CHOKEPOINT. Before this, the HTTP door 404'd a
   // remote endpoint while the MCP door accepted it: two doors, two rules, on
   // the exact pair #82 pinned for door parity.
-  it('POST /acl accepts a REMOTE endpoint that is not a local agent', async () => {
+  it('POST /acl accepts a REMOTE endpoint once a peering exists', async () => {
+    // F1b tightened F0a: a ':' endpoint now needs a peering too. Direction
+    // matters — inbound (remote -> local) is what a registered peer earns.
     registerAgent(db, { id: 'agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
+    upsertPeer(db, {
+      alias: 'othermesh', token_hash: 'b'.repeat(64), minted_by_key: 'k',
+      kinds: '["direct"]', rate_per_min: 600,
+    });
     const res = await fetch(`${base}/acl`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from_agent: 'agent-a', to_agent: 'othermesh:their-agent' }),
+      body: JSON.stringify({ from_agent: 'othermesh:their-agent', to_agent: 'agent-a' }),
     });
     expect(res.status).toBe(201);
   });
@@ -162,15 +168,19 @@ describe('http-admin', () => {
     // The gate that used to sit here left this door unable to revoke what the
     // MCP door could — grantable here, withdrawable only there.
     registerAgent(db, { id: 'agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
+    upsertPeer(db, {
+      alias: 'othermesh', token_hash: 'b'.repeat(64), minted_by_key: 'k',
+      kinds: '["direct"]', rate_per_min: 600,
+    });
     await fetch(`${base}/acl`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from_agent: 'agent-a', to_agent: 'othermesh:their-agent' }),
+      body: JSON.stringify({ from_agent: 'othermesh:their-agent', to_agent: 'agent-a' }),
     });
     const res = await fetch(`${base}/acl`, {
       method: 'DELETE',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from_agent: 'agent-a', to_agent: 'othermesh:their-agent' }),
+      body: JSON.stringify({ from_agent: 'othermesh:their-agent', to_agent: 'agent-a' }),
     });
     expect(res.status).toBe(200);
     expect((await res.json() as Record<string, unknown>).ok).toBe(true);
@@ -206,13 +216,41 @@ describe('http-admin', () => {
     expect(body.error).toBe('one of agent, granted_by, or granted_by_prefix is required');
   });
 
-  it('GET /acl — 404 if agent not in registry', async () => {
+  // F1b — DELIBERATE CONTRACT CHANGE; this test pinned the old one. The
+  // local-existence gate on GET /acl is gone (one rule at the chokepoint,
+  // F0a's third site). An unknown or REMOTE id now returns an empty list.
+  // No oracle: the route is admin-authenticated, so the caller can already
+  // enumerate agents.
+  it('GET /acl — empty list for an unknown id, not 404', async () => {
     const res = await fetch(`${base}/acl?agent=ghost`, {
       headers: { 'Authorization': `Bearer ${token}` },
     });
-    expect(res.status).toBe(404);
-    const body = await res.json() as Record<string, unknown>;
-    expect(body.error).toBe('agent not found');
+    expect(res.status).toBe(200);
+    const body = await res.json() as { inbound: unknown[]; outbound: unknown[] };
+    expect(body.inbound).toEqual([]);
+    expect(body.outbound).toEqual([]);
+  });
+
+  it('GET /acl — a REMOTE id lists its edges rather than 404ing', async () => {
+    // The reason the gate had to go: a remote id is never a local agent, so the
+    // gate made a peer's edges unlistable.
+    registerAgent(db, { id: 'agent-a', token_hash: 'a'.repeat(64), hostname: 'h' });
+    upsertPeer(db, {
+      alias: 'othermesh', token_hash: 'd'.repeat(64), minted_by_key: 'k',
+      kinds: '["direct"]', rate_per_min: 600,
+    });
+    aclGrant(db, 'othermesh:their-agent', 'agent-a', 'system');
+
+    const res = await fetch(`${base}/acl?agent=othermesh:their-agent`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      inbound: { from_agent: string }[]; outbound: { to_agent: string }[];
+    };
+    // The remote id is the GRANTER here, so the edge is on its outbound side.
+    expect(body.outbound.length).toBe(1);
+    expect(body.outbound[0]!.to_agent).toBe('agent-a');
   });
 
   // GET /agents

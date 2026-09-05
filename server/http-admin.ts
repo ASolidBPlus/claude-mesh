@@ -222,6 +222,15 @@ async function handleAclPost(ctx: AdminCtx): Promise<void> {
       res.end(JSON.stringify({ error: 'agent not found' }));
       return;
     }
+    // F1b (§5.4): the peering rule lives in aclGrant, so this door only MAPS
+    // its refusal. 409, not 404: the endpoint may well exist on the far mesh —
+    // what is missing is the peering, which is a conflict with our state rather
+    // than a claim about theirs.
+    if ((err as { code?: string }).code === 'NO_PEERING') {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'no peering' }));
+      return;
+    }
     throw err; // anything else is a real fault — let the dispatcher guard log it
   }
 
@@ -294,11 +303,11 @@ function handleAclGet(ctx: AdminCtx): void {
   // Agent-scoped (back-compat): {inbound, outbound}, optionally narrowed by
   // granted_by/prefix (JS filter — an agent's ACL set is small).
   if (agent) {
-    if (getAgentById(db, agent) === null) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'agent not found' }));
-      return;
-    }
+    // F1b: the local-existence gate that used to sit here is GONE — one rule
+    // at the chokepoint, and F0a's sweep missed this third site. Listing for an
+    // unknown or REMOTE id now returns an empty list rather than 404. No oracle
+    // is opened: this route is admin-authenticated, so the caller may already
+    // enumerate agents.
     let inbound = listInboundAcl(db, agent);
     let outbound = listOutboundAcl(db, agent);
     if (grantedBy !== null) {

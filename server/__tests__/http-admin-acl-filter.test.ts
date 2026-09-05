@@ -118,8 +118,18 @@ describe('GET /acl — granted_by filter (#38)', () => {
     expect((await get('?granted_by=x&granted_by_prefix=y')).status).toBe(400);
   });
 
-  it('unknown agent → 404 (unchanged)', async () => {
-    expect((await get('?agent=ghost')).status).toBe(404);
+  // F1b — DELIBERATE CONTRACT CHANGE; this pinned the old behaviour. GET /acl's
+  // local-existence gate is gone (one rule at the chokepoint), so an unknown id
+  // returns an empty listing rather than 404. The filter semantics under test
+  // here are unaffected.
+  it('unknown agent → empty listing, not 404', async () => {
+    const res = await fetch(`${base}/acl?agent=ghost&granted_by=admin`, {
+      headers: { Authorization: `Bearer ${ADMIN}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { inbound: unknown[]; outbound: unknown[] };
+    expect(body.inbound).toEqual([]);
+    expect(body.outbound).toEqual([]);
   });
 
   it('admin-only: no token → 401, agent token → 401 (not opened to agent tokens)', async () => {
