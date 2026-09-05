@@ -374,7 +374,11 @@ function handleListPresence(ctx: FrameCtx): void {
 // Frame type -> handler. Exact-string keys, mutually exclusive (no precedence),
 // so map order is behavior-irrelevant. A type absent from this map (or a
 // non-string type) falls through to NOT_IMPLEMENTED at the dispatch site.
-const POST_AUTH_HANDLERS: Record<string, FrameHandler> = {
+// Exported as a TEST SEAM, matching http-admin's ROUTES: the dispatcher's
+// crash guard (#94) can only be proven by making a handler throw, and a guard
+// that is never made to fail is not a guard. Production code must not mutate
+// this map.
+export const POST_AUTH_HANDLERS: Record<string, FrameHandler> = {
   ping: handlePing,
   send: handleSend,
   ack: handleAck,
@@ -578,7 +582,37 @@ export function startWsServer(
           const frameType = frame.type;
           const handler = typeof frameType === 'string' ? POST_AUTH_HANDLERS[frameType] : undefined;
           if (handler !== undefined) {
-            handler({ ws, state, db, frame, parsed, agentIndex, observerIndex, maxFileBytes, filesDir });
+            // #94 CLASS FIX, the same guard #68 gave the HTTP dispatcher. A
+            // handler throw here used to reach the process with no
+            // uncaughtException handler installed anywhere in server/ — so ANY
+            // unexpected throw on ANY frame killed the mesh and flapped every
+            // channel until a restart. A duplicate msg_id was merely the
+            // reachable instance; the defect is that one client's bad frame
+            // could stop the bus for everyone.
+            //
+            // The refusal is per-SOCKET, not per-process: the sender learns its
+            // frame failed, every other connection is untouched, and the
+            // process stays up. Logged because a caught crash that says nothing
+            // is a crash nobody fixes.
+            try {
+              handler({ ws, state, db, frame, parsed, agentIndex, observerIndex, maxFileBytes, filesDir });
+            } catch (err) {
+              console.error(JSON.stringify({
+                evt: 'ws.handler_threw',
+                frame_type: frameType,
+                agent: state.agentId,
+                error: (err as Error)?.message ?? String(err),
+                at: Date.now(),
+              }));
+              try {
+                ws.send(JSON.stringify({
+                  type: 'error',
+                  code: 'INTERNAL',
+                  message: 'internal error handling frame',
+                  ...(typeof frame.msg_id === 'string' ? { ref: frame.msg_id } : {}),
+                }));
+              } catch (_) { /* socket already gone; nothing further to do */ }
+            }
             return;
           }
 
