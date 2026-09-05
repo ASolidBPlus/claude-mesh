@@ -1,12 +1,19 @@
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import { unlinkSync } from 'fs';
-import { countExpiredUndeliveredSince, sweepRetention, sweepFileRetention, deleteExpiredFiles, deleteDeliveredOneShots } from './db.ts';
+import { countExpiredUndeliveredSince, sweepRetention, sweepFileRetention, deleteExpiredFiles, deleteDeliveredOneShots, sweepRelays } from './db.ts';
 import { incExpiredByKind } from './metrics.ts';
 
 export interface CleanupHandle {
   stop(): void;
 }
+
+/** How long a relayed remote msg_id is remembered for dedupe (F0b, §4). Seven
+    days: long enough that a peer reconnecting after an outage cannot replay,
+    short enough that the ledger stays bounded. A constant, not a knob —
+    shortening it silently widens a replay window, and a security bound must
+    never sit on a tunable. */
+export const RELAY_DEDUPE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function startCleanup(
   db: Database,
@@ -27,6 +34,13 @@ export function startCleanup(
   // counts rows whose TTL fell in [lastExpireSweepAt, now) exactly once.
   let lastExpireSweepAt = Date.now();
 
+  // WHICH TIMER A STEP BELONGS ON (repo rule, from #85's review): the
+  // all-or-nothing tick is acceptable for HOUSEKEEPING, where a skipped step is
+  // a delay that retries next tick. A step whose skipping would be a SECURITY
+  // EVENT needs its own timer. Every step below is the first kind, the relay
+  // sweep included — its rows only refuse a redelivered relay inside the dedupe
+  // window, so a skipped sweep costs disk, never correctness.
+  //
   // The main tick is ALL-OR-NOTHING per iteration: every step shares one try,
   // so a throw in step N skips N+1 onward and they retry together next tick.
   // That is tolerable because each step is idempotent and re-derives its own
@@ -80,6 +94,10 @@ export function startCleanup(
         }
         process.stdout.write(`[cleanup] retention swept ${sweptPaths.length} file(s)\n`);
       }
+
+      // Relay dedupe ledger (F0b). Housekeeping — see the rule above.
+      const sweptRelays = sweepRelays(db, RELAY_DEDUPE_MS);
+      if (sweptRelays > 0) process.stdout.write(`[cleanup] swept ${sweptRelays} relay ledger row(s)\n`);
 
       const deletedReminders = deleteDeliveredOneShots(db, Date.now() - 86_400_000);
       process.stdout.write(`[cleanup] cleaned ${deletedReminders} old delivered reminder(s)\n`);

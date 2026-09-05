@@ -36,6 +36,10 @@ import {
   listObservers,
 } from './db.ts';
 import { generateToken, hashToken, timingSafeEqual } from './auth.ts';
+import {
+  PEER_ALIAS_RE, RESERVED_ALIAS, insertPeerKey, listPeerKeys, getLivePeerKeyForAlias,
+  getPeerKeyBySecret, revokePeerKey, getPeerByAlias, upsertPeer, type PeerKey,
+} from './db.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
 import { renderMetrics } from './metrics.ts';
@@ -68,7 +72,16 @@ function requireAdmin(
 }
 
 // Result of authenticating a request on an agent-or-admin route.
-type AuthResult = { mode: 'admin' } | { mode: 'agent'; agentId: string };
+// 'unauthenticated' exists so the dispatcher has an HONEST value for
+// auth:'handler' routes, where by design it checks no credential. Representing
+// "nobody checked" as { mode: 'admin' } would make admin the default
+// inheritance for every future handler-authenticated route — and auth.mode ===
+// 'admin' is a GRANT on the file path. A type that cannot say "unauthenticated"
+// forces the dispatcher to lie.
+//
+// It is NEVER a grant. Every consumer must treat it as strictly less privileged
+// than 'agent': no scope, no ownership, no admin.
+export type AuthResult = { mode: 'admin' } | { mode: 'agent'; agentId: string } | { mode: 'unauthenticated' };
 
 // Resolve auth for a route that accepts EITHER the admin token OR an agent's
 // own bearer token. Admin is checked FIRST (exact, timing-safe) — if the token
@@ -147,7 +160,11 @@ interface Route {
   handler: AdminHandler;
   // 'admin' (default) requires the admin token; 'agentOrAdmin' also accepts an
   // agent's own bearer token (self-scoped in the handler).
-  auth?: 'admin' | 'agentOrAdmin';
+  //   'handler' — the dispatcher applies NO credential check; the HANDLER must
+  //   authenticate. Named for what the ROUTE's obligation is, not for what the
+  //   dispatcher does. One route in F0b: POST /peers/register, by peer key,
+  //   which is neither the admin token nor an agent token.
+  auth?: 'admin' | 'agentOrAdmin' | 'handler';
 }
 
 // Path matchers: `exact` for a literal path, `idMatch` to capture a single
@@ -233,10 +250,11 @@ async function handleAclDelete(ctx: AdminCtx): Promise<void> {
   // F0a: the rule for revoke is EDGE existence, not endpoint existence.
   //
   // These two gates used to 404 on an endpoint that was not a local agent —
-  // which since aclGrant accepts remote ids would make an edge to `remote:x`
-  // PERMANENTLY UNREVOKABLE over HTTP: the gate refuses before the DELETE runs,
-  // so the grant can be created and never withdrawn. A revoke you cannot
-  // perform is worse than one that reports nothing to do.
+  // which since aclGrant accepts remote ids would leave THIS door unable to
+  // revoke what the MCP door could: mesh_acl_deny has no such gate, so the edge
+  // was always withdrawable there. Each door was internally consistent; the
+  // defect was the gap between them, and a revoke one door cannot perform is
+  // worse than one that reports nothing to do.
   //
   // 404 now means what it should have meant here all along — no such edge.
   const removed = aclRevoke(db, from_agent, to_agent);
@@ -431,6 +449,49 @@ async function handleAgentPost(ctx: AdminCtx): Promise<void> {
     namespace = body.namespace as string | null;
   }
 
+  // F0b (§6) — id rules that only bind NEW agents. Existing ids are untouched:
+  // a validation change must not make a live agent unable to re-register, so
+  // legacy ':' ids are reported at boot instead (see server.ts) rather than
+  // being retroactively rejected here.
+  if (id.includes(':')) {
+    // ':' separates mesh from agent in a remote id. A local id containing one
+    // would be indistinguishable from a remote address.
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: "agent id must not contain ':'" }));
+    return;
+  }
+  if (id === RESERVED_ALIAS) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `agent id '${RESERVED_ALIAS}' is reserved` }));
+    return;
+  }
+  // Same collision as the mint-side check, from the other direction: whichever
+  // is created second is the one refused.
+  //
+  // TABLES READ, and why their union covers the state space: `peers` (a peer
+  // that has registered) and `peer_keys` (one that has been minted but not yet
+  // registered). A peer alias can only exist in those two states, so together
+  // they are total. The mint-side gate reads `agents` and `peer_keys`, which is
+  // the same argument from the other side.
+  //
+  // The gap this closes was NOT an unpinned gate — both gates were pinned. It
+  // was two pinned gates whose union missed a state, which mutation cannot
+  // find: every mutant of either gate died correctly while the hole stayed
+  // open. It was found by asking what tables each gate reads.
+  //
+  // BOTH tables are consulted, and the peer_keys half is the one that matters:
+  // a MINTED-but-not-yet-registered key lives only in peer_keys, so a gate that
+  // looked at `peers` alone let this sequence through —
+  //   mint key "x" -> register agent "x" (gate passes, peers is empty)
+  //     -> peer registers with its key -> upsertPeer("x") succeeds
+  // producing ONE id with TWO identities and no error at any step. Minting IS a
+  // creation, so under the rule above the agent is the one refused.
+  if (getPeerByAlias(db, id) !== null || getLivePeerKeyForAlias(db, id, Date.now()) !== null) {
+    res.writeHead(409, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'agent id collides with an existing peer alias' }));
+    return;
+  }
+
   const rawToken = generateToken();
   const token_hash = hashToken(rawToken);
   const agent = registerAgent(db, { id, token_hash, hostname, namespace });
@@ -576,6 +637,16 @@ function handleMessagesGet(ctx: AdminCtx): void {
   // (persisted as per-subscriber copies with to_agent = subscriber), and
   // request/response rows. Requesting another agent's scope is a hard 403;
   // admin is unconstrained (behaves exactly as before).
+  // 'unauthenticated' must never reach here — this route is not handler-mode,
+  // so the dispatcher already refused. If it ever does, that is a routing bug,
+  // and the safe reading is NOT "unconstrained like admin": refuse rather than
+  // fall through to the admin path below.
+  if (auth.mode === 'unauthenticated') {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'forbidden' }));
+    return;
+  }
+
   let effectiveAgent = agentParam;
   if (auth.mode === 'agent') {
     if (agentParam !== undefined && agentParam !== auth.agentId) {
@@ -650,9 +721,7 @@ async function handleFileById(ctx: AdminCtx): Promise<void> {
   // SAME 404 as a missing file — an agent cannot distinguish "no such file"
   // from "exists but not yours", so it can't enumerate/probe file_ids across
   // nodes (no existence oracle). from_agent/to_agent are already stored.
-  const authorized =
-    file !== null &&
-    (auth.mode === 'admin' || file.from_agent === auth.agentId || file.to_agent === auth.agentId);
+  const authorized = file !== null && fileAccessAuthorized(auth, file);
   if (!authorized) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'file not found' }));
@@ -1101,7 +1170,270 @@ function handleReminderDelete(ctx: AdminCtx): void {
 // 404 at the end of dispatch — there is intentionally no 405.
 /** Exported for tests ONLY: the dispatcher-guard test injects a throwing
     route to prove a handler exception cannot kill the process. */
+/**
+ * Who may read a file's bytes (#57): admin unconditionally, an agent only if it
+ * is the file's sender or recipient.
+ *
+ * Exhaustive over AuthResult BY CONSTRUCTION — a switch with a `never` arm, so
+ * adding a fourth mode is a compile error here rather than a silent grant.
+ * Written as a POSITIVE test per mode, never "not X ⇒ allow".
+ */
+export function fileAccessAuthorized(
+  auth: AuthResult,
+  file: { from_agent: string; to_agent: string }
+): boolean {
+  switch (auth.mode) {
+    case 'admin':
+      return true;
+    case 'agent':
+      return file.from_agent === auth.agentId || file.to_agent === auth.agentId;
+    case 'unauthenticated':
+      return false; // the dispatcher checked no credential. Never a grant.
+    default: {
+      const exhaustive: never = auth;
+      return exhaustive;
+    }
+  }
+}
+
+/**
+ * The dispatcher's whole auth decision, in one place, keyed on the route's
+ * declared mode. Returns null when it has already written a 401.
+ *
+ * Extracted so the 'handler' arm is TESTABLE. Left inline, a mutant restoring
+ * the old { mode: 'admin' } placeholder passes every test and every typecheck:
+ * the grant predicate is proven to refuse 'unauthenticated' while nothing
+ * proves the dispatcher ever produces it.
+ */
+export function resolveRouteAuth(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  db: Database,
+  adminToken: string,
+  mode: Route['auth'] | undefined
+): AuthResult | null {
+  if (mode === 'handler') {
+    // No dispatcher-level credential BY DESIGN: this route's handler owns its
+    // authentication and must refuse uniformly. The ctx says 'unauthenticated'
+    // because that is the TRUTH here — the handler's own check is invisible to
+    // the dispatcher, so nothing it hands the handler may act as a grant.
+    return { mode: 'unauthenticated' };
+  }
+  if (mode === 'agentOrAdmin') {
+    return resolveAuth(req, res, db, adminToken);
+  }
+  // 'admin' and the no-route case: unmatched paths still require the admin
+  // token before the 404, so an unauthenticated caller cannot probe which
+  // routes exist.
+  if (!requireAdmin(req, res, adminToken)) return null;
+  return { mode: 'admin' };
+}
+
+// ─── Peer keys and peer registration (F0b — §3, §4, §6) ─────────────────────
+
+/** Public shape of a peer key. NEVER includes key_hash: the mint response is
+    the only time the secret exists, and a listing that leaked the hash would
+    make every stored key offline-crackable from an admin-read alone. */
+function publicPeerKeyFields(db: Database, key: PeerKey) {
+  const peer = getPeerByAlias(db, key.alias);
+  return {
+    id: key.id,
+    alias: key.alias,
+    kinds: JSON.parse(key.kinds) as string[],
+    rate_per_min: key.rate_per_min,
+    expires_at: key.expires_at,
+    revoked_at: key.revoked_at,
+    note: key.note,
+    created_at: key.created_at,
+    // Per-alias live state, so an operator can see whether the key was used
+    // without joining two listings by hand.
+    registered: peer !== null,
+    peer_disabled: peer === null ? null : peer.disabled === 1,
+  };
+}
+
+async function handlePeerKeyPost(ctx: AdminCtx): Promise<void> {
+  const { req, res, db } = ctx;
+  const raw = await readBody(req);
+  let body: Record<string, unknown>;
+  try { body = JSON.parse(raw); } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid JSON' })); return;
+  }
+
+  const alias = body.alias;
+  if (typeof alias !== 'string' || !PEER_ALIAS_RE.test(alias)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'alias must match ^[a-z0-9][a-z0-9-]{0,62}$' })); return;
+  }
+  if (alias === RESERVED_ALIAS) {
+    // 'mesh' names THIS mesh in every remote id. A peer holding it would make
+    // its traffic indistinguishable from local traffic — refused at mint, the
+    // only point where refusing is cheap.
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `alias '${RESERVED_ALIAS}' is reserved` })); return;
+  }
+  if (getAgentById(db, alias) !== null) {
+    // A peer alias and a local agent id share one id space at the point of
+    // address resolution, so a collision makes routing ambiguous.
+    res.writeHead(409, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'alias collides with an existing local agent id' })); return;
+  }
+
+  const now = Date.now();
+  if (getLivePeerKeyForAlias(db, alias, now) !== null) {
+    // One live key per alias: two would mean two secrets can register the same
+    // peer, so revoking one would leave a door open that the operator believes
+    // they closed.
+    res.writeHead(409, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'a live key already exists for this alias' })); return;
+  }
+
+  let kinds: string[] = ['direct'];
+  if (body.kinds !== undefined) {
+    if (!Array.isArray(body.kinds) || !body.kinds.every(k => typeof k === 'string')) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'kinds must be an array of strings' })); return;
+    }
+    kinds = body.kinds as string[];
+  }
+
+  let rate_per_min = 600;
+  if (body.rate_per_min !== undefined) {
+    if (typeof body.rate_per_min !== 'number' || !Number.isInteger(body.rate_per_min) || body.rate_per_min <= 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'rate_per_min must be a positive integer' })); return;
+    }
+    rate_per_min = body.rate_per_min;
+  }
+
+  let expires_at: number | null = null;
+  if (body.expires_at !== undefined && body.expires_at !== null) {
+    if (typeof body.expires_at !== 'number' || !Number.isInteger(body.expires_at)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'expires_at must be an integer ms timestamp' })); return;
+    }
+    expires_at = body.expires_at;
+  }
+
+  const secret = generateToken();
+  const key = insertPeerKey(db, {
+    id: crypto.randomUUID(),
+    key_hash: hashToken(secret),
+    alias,
+    kinds: JSON.stringify(kinds),
+    rate_per_min,
+    expires_at,
+    note: typeof body.note === 'string' ? body.note : null,
+    created_at: now,
+  });
+
+  console.log(JSON.stringify({
+    evt: 'peer_key.minted', key_id: key.id, alias, kinds, rate_per_min, expires_at, at: now,
+  }));
+
+  res.writeHead(201, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    ...publicPeerKeyFields(db, key),
+    key: secret, // shown ONCE, never stored in the clear, never listed
+  }));
+}
+
+function handlePeerKeyGet(ctx: AdminCtx): void {
+  const { res, db } = ctx;
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ keys: listPeerKeys(db).map(k => publicPeerKeyFields(db, k)) }));
+}
+
+function handlePeerKeyDelete(ctx: AdminCtx): void {
+  const { res, db, params } = ctx;
+  const id = params.id as string;
+  if (!revokePeerKey(db, id)) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'no such live peer key' })); return;
+  }
+  console.log(JSON.stringify({ evt: 'peer_key.revoked', key_id: id, at: Date.now() }));
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ revoked: true, id }));
+}
+
+/** Every registration refusal returns THIS — one body, one status, no detail.
+    A peer presenting a wrong, revoked, expired, or nonexistent key learns only
+    that it was refused: distinguishing them would turn this endpoint into an
+    oracle for which keys exist. */
+function refusePeerRegistration(res: http.ServerResponse, reason: string, alias: string | null): void {
+  console.log(JSON.stringify({ evt: 'peer.register_refused', reason, alias, at: Date.now() }));
+  res.writeHead(403, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'registration refused' }));
+}
+
+async function handlePeerRegister(ctx: AdminCtx): Promise<void> {
+  const { req, res, db } = ctx;
+  // auth:'handler' — the dispatcher checked NOTHING. This handler is the only
+  // authentication on this route, and ctx.auth is 'unauthenticated' by
+  // construction so nothing it was handed can act as a grant.
+  const raw = await readBody(req);
+  let body: Record<string, unknown>;
+  try { body = JSON.parse(raw); } catch {
+    refusePeerRegistration(res, 'invalid_json', null); return;
+  }
+
+  const presented = body.key;
+  if (typeof presented !== 'string' || presented.length === 0) {
+    refusePeerRegistration(res, 'missing_key', null); return;
+  }
+
+  const key = getPeerKeyBySecret(db, presented);
+  if (key === null) { refusePeerRegistration(res, 'unknown_key', null); return; }
+  if (key.revoked_at !== null) { refusePeerRegistration(res, 'revoked_key', key.alias); return; }
+  if (key.expires_at !== null && key.expires_at <= Date.now()) {
+    refusePeerRegistration(res, 'expired_key', key.alias); return;
+  }
+
+  // Defence in depth, at the moment the collision becomes REAL rather than
+  // latent: the mint-side and agent-side gates should have made this
+  // impossible, but a key minted before those gates existed — or any future
+  // path that writes peer_keys without them — would otherwise create a second
+  // identity for an id that already names a local agent.
+  if (getAgentById(db, key.alias) !== null) {
+    console.error(JSON.stringify({
+      evt: 'peer.register_alias_collision', alias: key.alias, key_id: key.id, at: Date.now(),
+    }));
+    res.writeHead(409, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'alias collides with an existing local agent id' }));
+    return;
+  }
+
+  const token = generateToken();
+  const peer = upsertPeer(db, {
+    alias: key.alias,
+    token_hash: hashToken(token),
+    minted_by_key: key.id,
+    kinds: key.kinds,
+    rate_per_min: key.rate_per_min,
+  });
+
+  console.log(JSON.stringify({
+    evt: 'peer.registered', alias: peer.alias, key_id: key.id, at: Date.now(),
+  }));
+
+  res.writeHead(201, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    alias: peer.alias,
+    token, // shown ONCE
+    kinds: JSON.parse(peer.kinds) as string[],
+    rate_per_min: peer.rate_per_min,
+    protocol: 1,
+  }));
+}
+
 export const ROUTES: Route[] = [
+  { method: 'POST',   match: exact('/peer-keys'),                    handler: handlePeerKeyPost },
+  { method: 'GET',    match: exact('/peer-keys'),                    handler: handlePeerKeyGet },
+  { method: 'DELETE', match: idMatch(/^\/peer-keys\/([^/]+)$/),      handler: handlePeerKeyDelete },
+  // The ONLY handler-authenticated route: a peer presents a key, which is
+  // neither the admin token nor an agent token.
+  { method: 'POST',   match: exact('/peers/register'),               handler: handlePeerRegister, auth: 'handler' },
   { method: 'POST',   match: exact('/acl'),                          handler: handleAclPost },
   { method: 'DELETE', match: exact('/acl'),                          handler: handleAclDelete },
   { method: 'GET',    match: exact('/acl'),                          handler: handleAclGet },
@@ -1166,15 +1498,8 @@ export function startHttpAdmin(
         break;
       }
 
-      let auth: AuthResult;
-      if (matched && matched.auth === 'agentOrAdmin') {
-        const resolved = resolveAuth(req, res, db, adminToken);
-        if (resolved === null) return; // 401 already written
-        auth = resolved;
-      } else {
-        if (!requireAdmin(req, res, adminToken)) return;
-        auth = { mode: 'admin' };
-      }
+      const auth = resolveRouteAuth(req, res, db, adminToken, matched?.auth);
+      if (auth === null) return; // 401 already written
 
       if (matched) {
         // A handler throw here used to become an unhandled rejection (async

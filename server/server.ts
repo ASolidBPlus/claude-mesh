@@ -1,4 +1,4 @@
-import { openDb } from './db.ts';
+import { openDb, findPeerAliasCollisions } from './db.ts';
 import { startWsServer, WsServerHandle } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
@@ -136,6 +136,37 @@ async function main() {
     process.stderr.write(`Failed to open database: ${err}\n`);
     process.exit(1);
   }
+
+  // F0b (§6): report legacy agent ids containing ':' rather than rejecting
+  // them. ':' now separates mesh from agent in a remote id, so such an id is
+  // ambiguous — but a live agent that can no longer re-register is a worse
+  // outcome than an ambiguous one, and the operator is the only party who can
+  // decide to rename it. New ids are refused at POST /agents.
+  try {
+    const legacy = (db.prepare("SELECT id FROM agents WHERE id LIKE '%:%'").all() as { id: string }[]).map(r => r.id);
+    if (legacy.length > 0) {
+      console.warn(JSON.stringify({
+        evt: 'agents.legacy_colon_ids', count: legacy.length, ids: legacy,
+        msg: "agent ids containing ':' predate the remote-id grammar and are ambiguous; rename when convenient",
+        at: Date.now(),
+      }));
+    }
+  } catch { /* never block boot on a diagnostic */ }
+
+  // F0b (§6): report an id that names BOTH a local agent and a peer alias (or a
+  // live peer key). Same shape and reason as the legacy ':' report above —
+  // surfaced rather than silently tolerated, because the gates prevent NEW
+  // collisions and can do nothing about one already on disk.
+  try {
+    const collisions = findPeerAliasCollisions(db);
+    if (collisions.length > 0) {
+      console.warn(JSON.stringify({
+        evt: 'agents.peer_alias_collision', count: collisions.length, ids: collisions,
+        msg: 'these ids name both a local agent and a peer; routing cannot distinguish them',
+        at: Date.now(),
+      }));
+    }
+  } catch { /* never block boot on a diagnostic */ }
 
   // Single shared observerIndex: created ONCE here and passed to startWsServer
   // (populate/cleanup/fan-out), startHttpAdmin (live grant/revoke), AND

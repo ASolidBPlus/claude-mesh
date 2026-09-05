@@ -206,6 +206,57 @@ export function openDb(path: string): Database {
       online       INTEGER NOT NULL DEFAULT 0
     );
 
+    -- F0b (§3, §4): PEER MESHES. A peer is another claude-mesh, not an agent.
+    -- No FKs anywhere in these tables for the same reason acl lost its own: the
+    -- ids they carry are remote by construction.
+    CREATE TABLE IF NOT EXISTS peer_keys (
+      id            TEXT PRIMARY KEY,
+      key_hash      TEXT NOT NULL,
+      alias         TEXT NOT NULL,
+      -- Message kinds this peer may relay INBOUND. The border is per-peer and
+      -- each admin controls their own (§3): this column is that control.
+      kinds         TEXT NOT NULL DEFAULT '["direct"]',
+      rate_per_min  INTEGER NOT NULL DEFAULT 600,
+      expires_at    INTEGER,
+      revoked_at    INTEGER,
+      note          TEXT,
+      created_at    INTEGER NOT NULL
+    );
+
+    -- Same treatment as agents.token_hash (#45/#13) and for the same reason:
+    -- key_hash is the lookup key on every /peers/register call. NOT UNIQUE —
+    -- a unique index cannot be created over a pre-existing duplicate, and this
+    -- DDL runs on the LIVE database at boot, so it would turn a latent data
+    -- condition into a server that will not start. The invariant is enforced
+    -- at lookup instead: ambiguity authenticates NOBODY.
+    CREATE INDEX IF NOT EXISTS idx_peer_keys_key_hash ON peer_keys(key_hash);
+
+    -- D7: NO version column. A protocol version is a property of a live
+    -- connection, not of a stored row — persisting it would let a peers row
+    -- assert a version no current socket has agreed to.
+    CREATE TABLE IF NOT EXISTS peers (
+      alias         TEXT PRIMARY KEY,
+      token_hash    TEXT NOT NULL,
+      minted_by_key TEXT NOT NULL,
+      kinds         TEXT NOT NULL,
+      rate_per_min  INTEGER NOT NULL,
+      registered_at INTEGER NOT NULL,
+      last_seen     INTEGER,
+      disabled      INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_peers_token_hash ON peers(token_hash);
+
+    -- Relay dedupe ledger: a remote msg_id seen from a peer, so a redelivered
+    -- relay is refused rather than duplicated. Swept by the cleanup tick after
+    -- RELAY_DEDUPE_MS.
+    CREATE TABLE IF NOT EXISTS relays (
+      peer_alias    TEXT NOT NULL,
+      remote_msg_id TEXT NOT NULL,
+      seen_at       INTEGER NOT NULL,
+      PRIMARY KEY (peer_alias, remote_msg_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_relays_seen_at ON relays(seen_at);
+
     -- F0a (§4, §5.4): DELIBERATELY FK-LESS. An acl endpoint will soon be able
     -- to name a REMOTE id, which by definition has no agents(id) row — a
     -- foreign key would make the mesh unable to express the thing it exists to
@@ -599,9 +650,12 @@ export function aclGrant(
  * F0a: the count is now RETURNED rather than discarded, because the rule for
  * revoke is EDGE existence, not endpoint existence. The HTTP door used to
  * pre-check that both endpoints were local agents — which under F0 makes an
- * edge granted to a remote id unrevokable, since the gate refuses before the
- * DELETE ever runs. An endpoint check cannot express "this edge is not here",
- * and that is the only thing revoke actually needs to know.
+ * edge granted to a remote id unrevokable OVER HTTP, since the gate refuses
+ * before the DELETE ever runs (the MCP door has no such gate, so the edge was
+ * always withdrawable there — the defect was the gap between the doors).
+ *
+ * An endpoint check cannot express "this edge is not here", and that is the
+ * only thing revoke actually needs to know.
  */
 export function aclRevoke(db: Database, from_agent: string, to_agent: string): number {
   return db.prepare('DELETE FROM acl WHERE from_agent = ? AND to_agent = ?')
@@ -675,6 +729,179 @@ export function listAclPeers(db: Database, agentId: string): Set<string> {
   const peers = new Set<string>();
   for (const r of rows) if (r.peer !== agentId) peers.add(r.peer);
   return peers;
+}
+
+// ──────────────────────────────────────────────
+// 5.9 Peers (F0b — §3, §4, §6)
+// ──────────────────────────────────────────────
+
+export interface PeerKey {
+  id: string;
+  key_hash: string;
+  alias: string;
+  kinds: string;
+  rate_per_min: number;
+  expires_at: number | null;
+  revoked_at: number | null;
+  note: string | null;
+  created_at: number;
+}
+
+export interface Peer {
+  alias: string;
+  token_hash: string;
+  minted_by_key: string;
+  kinds: string;
+  rate_per_min: number;
+  registered_at: number;
+  last_seen: number | null;
+  disabled: number;
+}
+
+/** A peer alias must be usable as an id prefix, so the grammar is the same
+    shape as an agent id and is deliberately NOT a general string. */
+export const PEER_ALIAS_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+/** Reserved: 'mesh' names THIS mesh in every remote id, so a peer claiming it
+    would make its own traffic indistinguishable from local traffic. */
+export const RESERVED_ALIAS = 'mesh';
+
+export function insertPeerKey(
+  db: Database,
+  key: {
+    id: string;
+    key_hash: string;
+    alias: string;
+    kinds: string;
+    rate_per_min: number;
+    expires_at?: number | null;
+    note?: string | null;
+    created_at: number;
+  }
+): PeerKey {
+  db.prepare(`
+    INSERT INTO peer_keys (id, key_hash, alias, kinds, rate_per_min, expires_at, note, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(key.id, key.key_hash, key.alias, key.kinds, key.rate_per_min,
+         key.expires_at ?? null, key.note ?? null, key.created_at);
+  return db.prepare('SELECT * FROM peer_keys WHERE id = ?').get(key.id) as PeerKey;
+}
+
+export function getPeerKeyById(db: Database, id: string): PeerKey | null {
+  return db.prepare('SELECT * FROM peer_keys WHERE id = ?').get(id) as PeerKey | null;
+}
+
+export function listPeerKeys(db: Database): PeerKey[] {
+  return db.prepare('SELECT * FROM peer_keys ORDER BY created_at DESC').all() as PeerKey[];
+}
+
+/** A key is LIVE if it has not been revoked and has not expired. "A live key
+    already exists for this alias" is the 409 condition on mint. */
+export function getLivePeerKeyForAlias(db: Database, alias: string, now: number): PeerKey | null {
+  return db.prepare(
+    `SELECT * FROM peer_keys
+     WHERE alias = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)
+     ORDER BY created_at DESC LIMIT 1`
+  ).get(alias, now) as PeerKey | null;
+}
+
+/**
+ * Look a peer key up BY ITS SECRET, the same construction as #75's
+ * getAgentByToken and for the same three reasons:
+ *
+ *   - indexed on the hash, because this runs on every /peers/register call;
+ *   - AMBIGUITY AUTHENTICATES NOBODY — two rows sharing a hash is a data
+ *     condition no caller should be able to resolve in their favour, so it
+ *     fails closed and logs loudly rather than taking the first row;
+ *   - a final timing-safe compare, which is NOT redundant: SQLite's `=` honours
+ *     COLLATION, so a column declared NOCASE would return a row whose stored
+ *     hash differs from the computed one in case. That compare is the only
+ *     thing standing between a case-variant hash and an authenticated peer.
+ *     There is a test that builds exactly that world.
+ */
+export function getPeerKeyBySecret(db: Database, secret: string): PeerKey | null {
+  const hash = hashToken(secret);
+  const rows = db.prepare('SELECT * FROM peer_keys WHERE key_hash = ? LIMIT 2').all(hash) as PeerKey[];
+  if (rows.length === 0) return null;
+  if (rows.length > 1) {
+    console.error(JSON.stringify({
+      evt: 'peer_key.ambiguous_hash',
+      keys: rows.map(r => r.id),
+      msg: 'two or more peer keys share one hash; refusing to authenticate any of them',
+      at: Date.now(),
+    }));
+    return null;
+  }
+  const candidate = rows[0]!;
+  return timingSafeEqual(candidate.key_hash, hash) ? candidate : null;
+}
+
+/** Revocation is ONE transaction: a key marked dead while its peer row stays
+    enabled is precisely the half-applied state this exists to prevent, and it
+    is what two separate statements produce on a crash between them. */
+export function revokePeerKey(db: Database, id: string): boolean {
+  const tx = db.transaction(() => {
+    const changed = db.prepare('UPDATE peer_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL')
+      .run(Date.now(), id).changes;
+    if (changed === 0) return false;
+    db.prepare('UPDATE peers SET disabled = 1 WHERE minted_by_key = ?').run(id);
+    return true;
+  });
+  return tx() as boolean;
+}
+
+export function getPeerByAlias(db: Database, alias: string): Peer | null {
+  return db.prepare('SELECT * FROM peers WHERE alias = ?').get(alias) as Peer | null;
+}
+
+/**
+ * Ids that name BOTH a local agent and a peer (registered, or holding a live
+ * key). Backs the boot report — the gates prevent NEW collisions and can do
+ * nothing about one already on disk.
+ *
+ * Extracted so the query is testable. NOTE the limit: this pins WHAT the report
+ * finds, not that main() calls it. Same coverage as the legacy ':' report
+ * beside it, and stated rather than implied.
+ */
+export function findPeerAliasCollisions(db: Database): string[] {
+  return (db.prepare(
+    `SELECT a.id FROM agents a
+     WHERE a.id IN (SELECT alias FROM peers)
+        OR a.id IN (SELECT alias FROM peer_keys WHERE revoked_at IS NULL)`
+  ).all() as { id: string }[]).map(r => r.id);
+}
+
+export function listPeers(db: Database): Peer[] {
+  return db.prepare('SELECT * FROM peers ORDER BY alias').all() as Peer[];
+}
+
+/** Registration is an UPSERT: re-registering an existing peer ROTATES its token
+    rather than creating a second row, so a peer that reconnects with a fresh
+    key never ends up with two identities. Re-registration also clears
+    `disabled` — the key was checked live immediately above. */
+export function upsertPeer(
+  db: Database,
+  peer: { alias: string; token_hash: string; minted_by_key: string; kinds: string; rate_per_min: number }
+): Peer {
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO peers (alias, token_hash, minted_by_key, kinds, rate_per_min, registered_at, disabled)
+    VALUES (?, ?, ?, ?, ?, ?, 0)
+    ON CONFLICT(alias) DO UPDATE SET
+      token_hash = excluded.token_hash,
+      minted_by_key = excluded.minted_by_key,
+      kinds = excluded.kinds,
+      rate_per_min = excluded.rate_per_min,
+      registered_at = excluded.registered_at,
+      disabled = 0
+  `).run(peer.alias, peer.token_hash, peer.minted_by_key, peer.kinds, peer.rate_per_min, now);
+  return getPeerByAlias(db, peer.alias)!;
+}
+
+/** Sweep the relay dedupe ledger. Same delete-old-rows shape as sweepRetention;
+    nothing here is deliverable, so there is no still-in-flight exclusion. */
+export function sweepRelays(db: Database, dedupeMs: number): number {
+  return db.prepare('DELETE FROM relays WHERE seen_at < ?').run(Date.now() - dedupeMs).changes;
 }
 
 export function listInboundAcl(db: Database, id: string): AclRow[] {
