@@ -1255,6 +1255,7 @@ function publicPeerKeyFields(db: Database, key: PeerKey) {
     rate_per_min: key.rate_per_min,
     expires_at: key.expires_at,
     revoked_at: key.revoked_at,
+    rotates: key.rotates,
     note: key.note,
     created_at: key.created_at,
     // Per-alias live state, so an operator can see whether the key was used
@@ -1328,6 +1329,19 @@ async function handlePeerKeyPost(ctx: AdminCtx): Promise<void> {
     expires_at = body.expires_at;
   }
 
+  // #113: a ROTATION declares the key it replaces. Absent means rebind, which
+  // is the safe default — the alias's inbound edges are dropped at registration.
+  // Validated as a string only; whether it MATCHES the peer row's current key
+  // is decided at registration, where the row is the authority.
+  let rotates: string | null = null;
+  if (body.rotates !== undefined && body.rotates !== null) {
+    if (typeof body.rotates !== 'string' || body.rotates.length === 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'rotates must be a key id' })); return;
+    }
+    rotates = body.rotates;
+  }
+
   const secret = generateToken();
   const key = insertPeerKey(db, {
     id: crypto.randomUUID(),
@@ -1338,6 +1352,7 @@ async function handlePeerKeyPost(ctx: AdminCtx): Promise<void> {
     expires_at,
     note: typeof body.note === 'string' ? body.note : null,
     created_at: now,
+    rotates,
   });
 
   console.log(JSON.stringify({
@@ -1467,6 +1482,10 @@ async function handlePeerRegister(ctx: AdminCtx): Promise<void> {
     minted_by_key: key.id,
     kinds: key.kinds,
     rate_per_min: key.rate_per_min,
+    // #113: the lineage the operator declared when minting this key. upsertPeer
+    // decides whether it matches the row's current key; this handler carries it
+    // rather than interpreting it.
+    rotates: key.rotates,
   });
 
   // §6: re-registration ROTATED the token (upsertPeer), so any socket holding
