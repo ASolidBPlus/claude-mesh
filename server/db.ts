@@ -650,9 +650,12 @@ export function aclGrant(
  * F0a: the count is now RETURNED rather than discarded, because the rule for
  * revoke is EDGE existence, not endpoint existence. The HTTP door used to
  * pre-check that both endpoints were local agents — which under F0 makes an
- * edge granted to a remote id unrevokable, since the gate refuses before the
- * DELETE ever runs. An endpoint check cannot express "this edge is not here",
- * and that is the only thing revoke actually needs to know.
+ * edge granted to a remote id unrevokable OVER HTTP, since the gate refuses
+ * before the DELETE ever runs (the MCP door has no such gate, so the edge was
+ * always withdrawable there — the defect was the gap between the doors).
+ *
+ * An endpoint check cannot express "this edge is not here", and that is the
+ * only thing revoke actually needs to know.
  */
 export function aclRevoke(db: Database, from_agent: string, to_agent: string): number {
   return db.prepare('DELETE FROM acl WHERE from_agent = ? AND to_agent = ?')

@@ -250,10 +250,11 @@ async function handleAclDelete(ctx: AdminCtx): Promise<void> {
   // F0a: the rule for revoke is EDGE existence, not endpoint existence.
   //
   // These two gates used to 404 on an endpoint that was not a local agent —
-  // which since aclGrant accepts remote ids would make an edge to `remote:x`
-  // PERMANENTLY UNREVOKABLE over HTTP: the gate refuses before the DELETE runs,
-  // so the grant can be created and never withdrawn. A revoke you cannot
-  // perform is worse than one that reports nothing to do.
+  // which since aclGrant accepts remote ids would leave THIS door unable to
+  // revoke what the MCP door could: mesh_acl_deny has no such gate, so the edge
+  // was always withdrawable there. Each door was internally consistent; the
+  // defect was the gap between them, and a revoke one door cannot perform is
+  // worse than one that reports nothing to do.
   //
   // 404 now means what it should have meant here all along — no such edge.
   const removed = aclRevoke(db, from_agent, to_agent);

@@ -159,8 +159,8 @@ describe('http-admin', () => {
   });
 
   it('DELETE /acl can revoke an edge to a REMOTE endpoint', async () => {
-    // The gate that used to sit here made such an edge PERMANENTLY
-    // UNREVOKABLE over HTTP: grantable, never withdrawable.
+    // The gate that used to sit here left this door unable to revoke what the
+    // MCP door could — grantable here, withdrawable only there.
     registerAgent(db, { id: 'agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
     await fetch(`${base}/acl`, {
       method: 'POST',
@@ -178,8 +178,8 @@ describe('http-admin', () => {
 
   // F0a — DELIBERATE CONTRACT CHANGE, and this test pinned the old contract.
   // DELETE used to 200 on a nonexistent edge because its only 404 was an
-  // ENDPOINT check. That check had to go: it made an edge granted to a remote
-  // id permanently unrevokable. 404 now means what it should have meant here —
+  // ENDPOINT check. That check had to go: it left this door unable to revoke a
+  // remote edge that the MCP door could withdraw. 404 now means what it should have meant here —
   // no such edge.
   it('DELETE /acl — 404 when the edge does not exist', async () => {
     registerAgent(db, { id: 'agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
