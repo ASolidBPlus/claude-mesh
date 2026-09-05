@@ -441,6 +441,15 @@ export function startWsServer(
     // recipient set is computed up front and the registry is filtered in
     // memory; "live at fire time" is unchanged, since the single query runs at
     // fire time too. Previously an N-peer mesh cost N queries per event.
+    //
+    // ONE INTENDED BEHAVIOUR DELTA, stated because it hides inside a change
+    // advertised as pure performance. registry is keyed by SOCKET, so an agent
+    // holding a second live connection appears in it twice. Previously, if that
+    // agent also had a self-edge row in acl, aclRelated(A, A) was true and its
+    // own status frame went to its other socket. listAclPeers excludes self, so
+    // it no longer does. Intended — an agent does not need its own presence
+    // event — and the only reachable case requires both a second socket AND a
+    // self-edge, but it is a behaviour change and is pinned by a test.
     function broadcastStatus(agentId: string, online: boolean, lastSeen: number, excludeWs: WebSocket | null) {
       const statusMsg = JSON.stringify({ type: 'agent_status', agent_id: agentId, online, last_seen: lastSeen, last_alive: getAgentById(db, agentId)?.last_alive ?? null });
       const peers = listAclPeers(db, agentId);

@@ -165,6 +165,72 @@ describe('#11: the single query returns exactly the old per-peer answer', () => 
   });
 });
 
+describe('#11: the self-edge diagonal — the one intended behaviour delta', () => {
+  // registry is keyed by SOCKET, so an agent holding a second live connection
+  // appears in it twice. Before #11, an agent with a self-edge row in acl had
+  // aclRelated(A, A) === true, so its own status frame went to its other
+  // socket. listAclPeers excludes self, so it no longer does.
+  //
+  // Pinned rather than merely stated: replacing a pairwise predicate with set
+  // membership is exact only OFF the diagonal, and this is the diagonal.
+  it('an agent with a self-edge and two sockets does not receive its own status', async () => {
+    const db = openDb(':memory:');
+    const port = nextPort();
+    const filesDir = mkdtempSync(join(tmpdir(), 'mesh-11-self-'));
+    const handle: WsServerHandle = await startWsServer(port, db, 10_485_760, filesDir);
+    registerAgent(db, { id: 'twin', token_hash: hashToken('tok-twin'), hostname: 'h' });
+    aclGrant(db, 'twin', 'twin', 'system'); // the diagonal row
+
+    const first = await authConnect(port, 'twin', 'tok-twin');
+    const seen: unknown[] = [];
+    first.on('message', (d) => {
+      const m = JSON.parse(d.toString());
+      if (m.type === 'agent_status') seen.push(m);
+    });
+    await wait(50);
+
+    // Second socket for the SAME agent: its connect fires a presence broadcast
+    // with the new socket excluded, so the first socket is the only candidate.
+    const second = await authConnect(port, 'twin', 'tok-twin');
+    await wait(120);
+
+    expect(seen).toEqual([]);
+
+    try { first.close(); second.close(); } catch { /* ignore */ }
+    await handle.shutdown().catch(() => {});
+    db.close();
+  }, 20_000);
+
+  it('positive control: a DIFFERENT agent with an edge does receive it', async () => {
+    // Without this, the assertion above would pass just as well if presence
+    // broadcasting were broken entirely.
+    const db = openDb(':memory:');
+    const port = nextPort();
+    const filesDir = mkdtempSync(join(tmpdir(), 'mesh-11-ctl-'));
+    const handle: WsServerHandle = await startWsServer(port, db, 10_485_760, filesDir);
+    registerAgent(db, { id: 'watcher', token_hash: hashToken('tok-watcher'), hostname: 'h' });
+    registerAgent(db, { id: 'subject', token_hash: hashToken('tok-subject'), hostname: 'h' });
+    aclGrant(db, 'watcher', 'subject', 'system');
+
+    const w = await authConnect(port, 'watcher', 'tok-watcher');
+    const seen: { agent_id: string }[] = [];
+    w.on('message', (d) => {
+      const m = JSON.parse(d.toString());
+      if (m.type === 'agent_status') seen.push(m);
+    });
+    await wait(50);
+
+    const s2 = await authConnect(port, 'subject', 'tok-subject');
+    await wait(120);
+
+    expect(seen.map(m => m.agent_id)).toContain('subject');
+
+    try { w.close(); s2.close(); } catch { /* ignore */ }
+    await handle.shutdown().catch(() => {});
+    db.close();
+  }, 20_000);
+});
+
 describe('#11: the reverse index serves the queries it was added for', () => {
   // Asserted on the UNION and on listInboundAcl — NOT on aclRelated. The issue
   // claimed aclRelated's reversed OR arm was unindexed; it is not. That arm

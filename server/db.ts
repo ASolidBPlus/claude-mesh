@@ -488,8 +488,14 @@ export function aclRelated(db: Database, agentA: string, agentB: string): boolea
  * one per registered agent per call, so a presence change on an N-agent mesh
  * cost N queries to answer a question that is one query wide.
  *
- * Excludes self: an agent is not ACL-related to itself, and callers that want
- * to include the subject add it explicitly (list_presence does).
+ * SELF IS EXCLUDED. Call sites that need the subject add it back explicitly:
+ * handleListPresence does (its roster includes the caller), broadcastStatus
+ * deliberately does not (you do not need your own presence event).
+ *
+ * That exclusion is a real behaviour delta, not a tidy-up — see the note in
+ * ws-server's broadcastStatus. Replacing a pairwise predicate with set
+ * membership is exact only OFF the diagonal, and the diagonal is where a
+ * self-referential acl row lives.
  */
 export function listAclPeers(db: Database, agentId: string): Set<string> {
   const rows = db.prepare(
