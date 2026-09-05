@@ -54,15 +54,21 @@ for pkg in server client; do
     status=1
     continue
   fi
-  count=$(echo "$output" | grep -c "error TS" || true)
-
-  # Error IDENTITIES (file:line:code), sorted — the interim half of #80. The
-  # gate is still the COUNT; this exists so a DROP is legible. Recorded here
-  # rather than only compared, because "what vanished" cannot be reconstructed
-  # from two integers.
+  # ONE extraction feeds BOTH the count and the identities. They used to be two
+  # patterns over one population — anything matching `grep -c "error TS"` but
+  # not the identity regex made the number and the list disagree, and the
+  # NUMBER is the gate. A gate and its explanation must not be able to
+  # describe different worlds.
   identity_file=".github/typecheck-identities-${pkg}.txt"
-  current_ids=$(echo "$output" | grep -oE '^[^(]+\([0-9]+,[0-9]+\): error TS[0-9]+' \
-    | sed -E 's/\(([0-9]+),[0-9]+\): error (TS[0-9]+)/:\1:\2/' | sort)
+  current_ids=$(echo "$output" \
+    | grep -oE '^[^(]+\([0-9]+,[0-9]+\): error TS[0-9]+' \
+    | sed -E 's/\(([0-9]+),[0-9]+\): error (TS[0-9]+)/:\1:\2/' \
+    | LC_ALL=C sort)
+  # LC_ALL=C throughout: `comm` requires both inputs in the SAME collation, and
+  # the committed files were sorted in whoever's locale generated them while CI
+  # sorts in the runner's. On mismatch comm warns on stderr and STILL emits —
+  # wrong — output. C collation is the one locale that is the same everywhere.
+  count=$([ -z "$current_ids" ] && echo 0 || echo "$current_ids" | wc -l | tr -d ' ')
 
   if [ "$count" -gt "$baseline" ]; then
     echo "::error::${pkg}: typecheck errors went UP — ${baseline} → ${count}. New code must not add type errors."
@@ -87,7 +93,23 @@ for pkg in server client; do
     # readable, which is the part that could not wait.)
     echo "${pkg}: ${count} (baseline ${baseline}) — errors went DOWN"
     if [ -f "$identity_file" ]; then
-      vanished=$(comm -23 "$identity_file" <(echo "$current_ids") || true)
+      # comm's STATUS IS NOT SWALLOWED. If it cannot compare (collation
+      # mismatch, unsorted input), it warns and still prints a WRONG answer —
+      # and the wrong answer is usually the EMPTY one, which would skip the
+      # warning block below and leave a bare "errors went DOWN" on the exact
+      # run where 28 errors were suppressed. Could-not-compare is a THIRD
+      # STATE, not "nothing vanished" — the same discipline as never-ran.
+      comm_err=$(mktemp)
+      vanished=$(LC_ALL=C comm -23 "$identity_file" <(echo "$current_ids") 2>"$comm_err")
+      comm_status=$?
+      if [ "$comm_status" -ne 0 ] || [ -s "$comm_err" ]; then
+        echo "::error::${pkg}: CANNOT DETERMINE what vanished — comm failed to compare the identity baseline (collation or sort order). Treating this as unknown, NOT as 'nothing vanished'."
+        sed 's/^/    /' "$comm_err" | head -5
+        rm -f "$comm_err"
+        status=1
+        continue
+      fi
+      rm -f "$comm_err"
       if [ -n "$vanished" ]; then
         echo "  these stopped being reported — CONFIRM each is a real fix, not a file that stopped being checked:"
         echo "$vanished" | sed 's/^/    - /' | head -40
@@ -97,7 +119,12 @@ for pkg in server client; do
     else
       echo "  (no identity baseline recorded yet — ${identity_file} will be written the first time this is refreshed)"
     fi
-    echo "::notice::${pkg}: ${baseline} → ${count}. Do NOT lower the baseline until the disappeared list above is confirmed as real fixes; a suppressed or unchecked file looks identical to progress here."
+    # Naming the refresh command matters more than it looks: the identity file
+    # is not self-updating, so after the first legitimate fix-and-lower a stale
+    # baseline reports already-fixed errors as freshly vanished — and a warning
+    # list that is routinely wrong gets skimmed, then ignored. Both files move
+    # together or the next run lies.
+    echo "::notice::${pkg}: ${baseline} → ${count}. Do NOT lower the baseline until the disappeared list above is confirmed as real fixes; a suppressed or unchecked file looks identical to progress here. To accept: (cd ${pkg} && bunx tsc --noEmit 2>&1 | grep -oE '^[^(]+\\([0-9]+,[0-9]+\\): error TS[0-9]+' | sed -E 's/\\(([0-9]+),[0-9]+\\): error (TS[0-9]+)/:\\1:\\2/' | LC_ALL=C sort > ../${identity_file} && wc -l < ../${identity_file} > ../${baseline_file})"
   else
     echo "${pkg}: ${count} (baseline ${baseline}) ✅ held"
   fi
