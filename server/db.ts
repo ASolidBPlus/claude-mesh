@@ -95,6 +95,7 @@ export interface Observer {
   agent_id: string;
   granted_at: number;   // unix ms
   granted_by: string;   // admin-supplied label or "system"
+  cross_border: number; // F3: 1 = also sees frames crossing a border; 0 = local only
 }
 
 // ──────────────────────────────────────────────
@@ -393,9 +394,16 @@ export function openDb(path: string): Database {
       ON reminders(agent_id, status);
 
     CREATE TABLE IF NOT EXISTS observers (
-      agent_id   TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
-      granted_at INTEGER NOT NULL,
-      granted_by TEXT NOT NULL
+      agent_id     TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+      granted_at   INTEGER NOT NULL,
+      granted_by   TEXT NOT NULL,
+      -- F3: a SECOND grant, not a property of the first. An observer grant is
+      -- category-phrased ("observers see everything"), so its scope is settled
+      -- by what the system CONTAINS — federation widened it without anyone
+      -- editing the grant. cross_border=0 means the observer sees local traffic
+      -- only; frames crossing a border need this explicitly. Default 0, so an
+      -- existing grant does NOT silently acquire the wider scope.
+      cross_border INTEGER NOT NULL DEFAULT 0
     );
   `);
 
@@ -422,6 +430,13 @@ export function openDb(path: string): Database {
   // indistinguishable). ADDITIVE: existing rows get NULL and last_seen keeps its
   // exact current meaning for every consumer.
   try { db.exec('ALTER TABLE agents ADD COLUMN last_alive INTEGER'); } catch {}
+
+  // F3 migration: observer grants made before federation existed are LOCAL-ONLY.
+  // The default is 0 rather than 1 on purpose — an operator who granted "see
+  // everything" in a mesh with no borders did not consent to cross-border
+  // traffic, and a migration that widened them would be the same silent
+  // widening this column exists to stop.
+  try { db.exec('ALTER TABLE observers ADD COLUMN cross_border INTEGER NOT NULL DEFAULT 0'); } catch {}
 
   // F2a migration: why a queued message can never be delivered. Set together
   // with expires_at = now on a PERMANENT remote refusal, so the row stops being
@@ -1808,14 +1823,40 @@ export function deleteDeliveredOneShots(db: Database, olderThanMs: number): numb
 // 5.9 Observers
 // ──────────────────────────────────────────────
 
-export function grantObserver(db: Database, agent_id: string, granted_by: string): Observer {
+export function grantObserver(
+  db: Database,
+  agent_id: string,
+  granted_by: string,
+  cross_border = false,
+): Observer {
   const now = Date.now();
+  // A re-grant OVERWRITES cross_border with what this call asked for, rather
+  // than OR-ing it in: a grant is a statement of the intended scope, so a
+  // caller that omits the wider scope is asking for the narrower one. Silently
+  // keeping a previously-granted cross_border would make the scope a ratchet
+  // that no re-grant can tighten.
   db.prepare(`
-    INSERT INTO observers (agent_id, granted_at, granted_by)
-    VALUES (?, ?, ?)
-    ON CONFLICT(agent_id) DO UPDATE SET granted_at = excluded.granted_at, granted_by = excluded.granted_by
-  `).run(agent_id, now, granted_by);
+    INSERT INTO observers (agent_id, granted_at, granted_by, cross_border)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(agent_id) DO UPDATE SET
+      granted_at = excluded.granted_at,
+      granted_by = excluded.granted_by,
+      cross_border = excluded.cross_border
+  `).run(agent_id, now, granted_by, cross_border ? 1 : 0);
   return db.prepare('SELECT * FROM observers WHERE agent_id = ?').get(agent_id) as Observer;
+}
+
+/**
+ * The set of observers permitted to see frames that cross a border.
+ *
+ * TABLE READ: `observers` — total for this question, because the cross-border
+ * grant has exactly one home. It is deliberately NOT joined against `agents`
+ * or the live index: an id here that is not currently connected simply never
+ * matches during fan-out, and membership must not depend on connectivity.
+ */
+export function listCrossBorderObservers(db: Database): Set<string> {
+  const rows = db.prepare('SELECT agent_id FROM observers WHERE cross_border = 1').all() as { agent_id: string }[];
+  return new Set(rows.map(r => r.agent_id));
 }
 
 export function revokeObserver(db: Database, agent_id: string): boolean {

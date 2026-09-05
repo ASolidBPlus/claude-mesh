@@ -381,7 +381,16 @@ async function handleObserverPost(ctx: AdminCtx): Promise<void> {
     res.writeHead(404, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:'agent not found'})); return;
   }
   const granted_by = typeof body.granted_by === 'string' ? body.granted_by : 'system';
-  const row = grantObserver(db, agent_id, granted_by);
+  // F3: the wider scope must be asked for EXPLICITLY and with a boolean true.
+  // Not truthiness — `"false"`, `0`, `"no"` and a stray `{}` all mean "did not
+  // ask", and a grant that widens on a typo is the failure this scope exists to
+  // stop. An absent field is a narrow grant, which is also what a pre-F3 client
+  // sends, so old callers keep getting exactly what they got before.
+  if (body.cross_border !== undefined && typeof body.cross_border !== 'boolean') {
+    res.writeHead(400, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:'cross_border must be a boolean'})); return;
+  }
+  const cross_border = body.cross_border === true;
+  const row = grantObserver(db, agent_id, granted_by, cross_border);
   // Live-activate for a currently-connected socket (no reconnect needed).
   try { const ws = agentIndex.get(agent_id); if (ws !== undefined) observerIndex.set(agent_id, ws); } catch (_) { /* never 500 on live-index update */ }
   res.writeHead(201, {'Content-Type':'application/json'}); res.end(JSON.stringify(row));

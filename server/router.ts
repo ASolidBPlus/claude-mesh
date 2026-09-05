@@ -21,9 +21,10 @@ import {
   getFile,
   markFileDelivered,
   FileRecord,
+  listCrossBorderObservers,
 } from './db.ts';
 import { incMsgStatus, incSent, incReceived, incAclDenied, incError, incBytes, incFile, observePayloadBytes, incPeerRelay } from './metrics.ts';
-import { emitTap } from './tap.ts';
+import { emitTap, LOCAL_ONLY, type TapAudience } from './tap.ts';
 import { borderEvents } from './border.ts';
 
 // Wire-frame types live in the shared client package (single source of truth).
@@ -211,6 +212,23 @@ export interface RelayFrameIn {
  * an enumeration oracle for our local agents. RATE_LIMITED is deliberately
  * distinguishable because it is the one refusal the peer can act on.
  */
+const NO_OBSERVERS: ReadonlySet<string> = new Set();
+
+/**
+ * The audience for a frame that crosses a border (F3).
+ *
+ * The `observerIndex.size === 0` short-circuit is why this is a helper and not
+ * an inline call: with no observers connected there is nobody the query could
+ * inform, so the common case pays nothing on the relay path. The query is only
+ * reached when an observer is actually connected.
+ */
+function crossBorderAudience(db: Database, observerIndex: Map<string, WebSocket>): TapAudience {
+  return {
+    crossBorder: true,
+    scoped: observerIndex.size === 0 ? NO_OBSERVERS : listCrossBorderObservers(db),
+  };
+}
+
 export function routeRelay(
   db: Database,
   agentIndex: Map<string, WebSocket>,
@@ -305,11 +323,12 @@ export function routeRelay(
     payloadBytes,
   });
 
+  // CROSS-BORDER (inbound): `from` is a remote id stamped with the peer alias.
   emitTap(observerIndex, {
     type: 'tap', msg_id: localId, kind: 'direct',
     from: stampedFrom, to, topic: null, correlation_id: null,
     sent_at: now, size: payloadBytes, payload,
-  });
+  }, crossBorderAudience(db, observerIndex));
 
   incPeerRelay(alias, 'in', 'delivered');
   return { ok: true };
@@ -436,11 +455,12 @@ export function routeDirect(
       });
       incMsgStatus('direct', 'queued');
 
+      // CROSS-BORDER (outbound): `to` is a remote id (alias:agent).
       emitTap(observerIndex, {
         type: 'tap', msg_id: frame.msg_id, kind: 'direct',
         from: from_agent, to: frame.to, topic: null, correlation_id: null,
         sent_at: sentAtRemote, size: payloadBytes, payload: frame.payload,
-      });
+      }, crossBorderAudience(db, observerIndex));
 
       // ACK THE LOCAL SENDER NOW (D8): acceptance means "queued for the border",
       // not "delivered to the far mesh". The forwarder reports the real outcome
@@ -537,7 +557,7 @@ export function routeDirect(
     type: 'tap', msg_id: frame.msg_id, kind: 'direct',
     from: from_agent, to: frame.to, topic: null, correlation_id: null,
     sent_at, size: payloadBytes, payload: frame.payload,
-  });
+  }, LOCAL_ONLY);
 
   return { ok: true, msg_id: frame.msg_id };
 }
@@ -666,7 +686,7 @@ export function routePublish(
     type: 'tap', msg_id: frame.msg_id, kind: 'topic',
     from: from_agent, to: null, topic: frame.topic, correlation_id: null,
     sent_at, size: payloadBytes, payload: frame.payload,
-  });
+  }, LOCAL_ONLY);
 
   return { ok: true, msg_id: frame.msg_id };
 }
@@ -817,7 +837,7 @@ export function routeFile(
     from: from_agent, to: frame.to, topic: null, correlation_id: null,
     sent_at, size: size_bytes, payload: null,
     file_id, filename: frame.filename, content_type,
-  });
+  }, LOCAL_ONLY);
 
   return { ok: true, msg_id: frame.msg_id, fileId: file_id };
 }
