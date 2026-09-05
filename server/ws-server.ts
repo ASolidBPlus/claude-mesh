@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as net from 'net';
-import { getAgentById, setOnline, touchAgent, touchAlive, getPendingMessages, markAcked, aclRelated, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
+import { getAgentById, setOnline, clearAllOnline, touchAgent, touchAlive, getPendingMessages, markAcked, aclRelated, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
 import { validateToken } from './auth.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
@@ -405,6 +405,18 @@ export function startWsServer(
   observerIndex: Map<string, WebSocket> = new Map(),   // NEW — defaulted
 ): Promise<WsServerHandle> {
   return new Promise((resolve, reject) => {
+    // #87: reconcile the durable `online` flag with reality BEFORE binding the
+    // listener. Nothing can be connected yet — agentIndex is created empty a
+    // few lines below and no socket has been accepted — so this is exact, not
+    // an approximation. Any agent that survived the restart re-asserts online
+    // on its reconnect, which the client does automatically.
+    const staleOnline = clearAllOnline(db);
+    if (staleOnline > 0) {
+      console.log(JSON.stringify({
+        evt: 'presence.stale_online_cleared', count: staleOnline, at: Date.now(),
+      }));
+    }
+
     // Create an HTTP server explicitly so we can track and destroy its sockets
     const httpServer = http.createServer();
     const wss = new WebSocketServer({ server: httpServer });
