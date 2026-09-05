@@ -133,6 +133,28 @@ describe('F1a: peer authentication', () => {
     }
   }, 20_000);
 
+  // #119 item 1: the control above pins that the own-input refusal is DISTINCT —
+  // a statement about its current VALUE. What makes that branch safe is that it
+  // is a pure function of what the caller SENT (it reads no server state), so
+  // pin the PROPERTY: the same malformed frame gets identical bytes whether the
+  // id it names exists (local-a, registered by setup) or not. An edit that made
+  // the branch state-dependent would keep it distinct — and the control above
+  // green — while reopening the agent-id oracle #117 closed; it reds here.
+  it('the OWN-INPUT refusal is input-only: identical for an existing and a non-existing id', async () => {
+    const { db, handle, port } = await setup();
+    const existing = await open(port, { type: 'auth', agent_id: 'local-a' });          // token missing
+    const nonexistent = await open(port, { type: 'auth', agent_id: 'no-such-agent' }); // token missing
+    try {
+      const frames = [existing, nonexistent].map(s => JSON.stringify(s.frames.find(f => f.type === 'error')));
+      expect(frames[0]).toContain('missing agent_id or token');
+      expect(new Set(frames).size).toBe(1);
+    } finally {
+      try { existing.ws.close(); nonexistent.ws.close(); } catch { /* ignore */ }
+      await handle.shutdown().catch(() => {});
+      db.close();
+    }
+  }, 20_000);
+
   // C9 SET TEST — the agent door. Every reachable cause of the one question
   // "may this caller in?", side by side. A door can pass every per-guard test
   // and still violate C9 the moment one branch gains a message; only the set
