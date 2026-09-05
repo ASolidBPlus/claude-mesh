@@ -5,7 +5,7 @@ import { startWsServer, WsServerHandle, PEER_PROTOCOL_VERSION } from '../ws-serv
 import { startCleanup } from '../cleanup.ts';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
-import { mkdtempSync } from 'fs';
+import { mkdtempSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -154,6 +154,18 @@ describe('F1a: peer authentication', () => {
       db.close();
     }
   }, 20_000);
+
+  // C9 obligation (i), re-derived not re-run: every set test above is a
+  // hand-written enumeration of the causes its author listed, so re-running
+  // them cannot see the reachable set GROW. A new AUTH_FAILED emit site is a
+  // new `if` block in production code with no test file in the diff. Pin the
+  // count: adding a refusal cause at this door without adding it to the set
+  // tests fails HERE. Update the literal only together with the set tests.
+  it('the auth door emits AUTH_FAILED from exactly 4 sites (literal pin; grow the set tests first)', () => {
+    const src = readFileSync(join(import.meta.dir, '..', 'ws-server.ts'), 'utf8');
+    const emits = src.match(/code: 'AUTH_FAILED'/g) ?? [];
+    expect(emits.length).toBe(4);
+  });
 
   // C9 SET TEST — the agent door. Every reachable cause of the one question
   // "may this caller in?", side by side. A door can pass every per-guard test
