@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { openDb, registerAgent, getAgentByToken } from '../db.ts';
+import { openDb, registerAgent, getAgentByToken, deleteAgent } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { mkdtempSync } from 'fs';
 import { join } from 'path';
@@ -64,12 +64,28 @@ function preFederationDb(path: string): void {
     CREATE TABLE observers (
       agent_id TEXT PRIMARY KEY, granted_at INTEGER NOT NULL, granted_by TEXT NOT NULL
     );
+    -- The acl shape as it was BEFORE F0a: with the foreign keys, which is what
+    -- every database on disk still has.
+    CREATE TABLE acl (
+      from_agent   TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      to_agent     TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      granted_at   INTEGER NOT NULL,
+      granted_by   TEXT NOT NULL,
+      PRIMARY KEY (from_agent, to_agent)
+    );
+    CREATE INDEX idx_acl_reverse ON acl(to_agent, from_agent);
   `);
   db.prepare(
     'INSERT INTO agents (id, token_hash, hostname, registered_at, last_seen) VALUES (?,?,?,?,?)',
   ).run('prod-agent', hashToken('prod-token'), 'prod-host', 1, 1);
   db.prepare('INSERT INTO observers (agent_id, granted_at, granted_by) VALUES (?,?,?)')
     .run('prod-agent', 1, 'admin');
+  db.prepare('INSERT INTO agents (id, token_hash, hostname, registered_at, last_seen) VALUES (?,?,?,?,?)')
+    .run('peer-agent', hashToken('peer-token'), 'peer-host', 1, 1);
+  db.prepare('INSERT INTO acl (from_agent, to_agent, granted_at, granted_by) VALUES (?,?,?,?)')
+    .run('prod-agent', 'peer-agent', 11, 'admin');
+  db.prepare('INSERT INTO acl (from_agent, to_agent, granted_at, granted_by) VALUES (?,?,?,?)')
+    .run('peer-agent', 'prod-agent', 22, 'system');
   db.close();
 }
 
@@ -127,6 +143,79 @@ describe('migration chain — openDb over databases that predate the current sch
     preFederationDb(path);
     openDb(path).close();
     const db = openDb(path); // must not throw on the second pass
+    expect(getAgentByToken(db, 'prod-token')?.id).toBe('prod-agent');
+    db.close();
+  });
+
+  // ── F0a: the acl FK-less rebuild ────────────────────────────────────────
+
+  const aclRows = (db: Database) =>
+    db.prepare('SELECT from_agent, to_agent, granted_at, granted_by FROM acl ORDER BY from_agent').all();
+
+  it('★ F0a: an upgraded acl table loses its foreign keys and keeps every row', () => {
+    const path = tmpDb('aclfk');
+    preFederationDb(path);
+
+    const before = (() => { const d = new Database(path); const r = aclRows(d); d.close(); return r; })();
+    expect(before.length).toBe(2);
+
+    const db = openDb(path);
+    // The point of the rebuild: no foreign keys left, so an acl endpoint can
+    // name something that is not a local agent row.
+    expect((db.prepare('PRAGMA foreign_key_list(acl)').all() as unknown[]).length).toBe(0);
+    // EDGE FOR EDGE, including granted_at/granted_by — a rebuild that kept the
+    // pairs but reset the provenance would pass a count-only assertion.
+    expect(aclRows(db)).toEqual(before);
+    db.close();
+  });
+
+  it('★ F0a: the rebuild restores secondary indexes — idx_acl_reverse survives', () => {
+    // The table is dropped, so its indexes go with it. #11's reverse index is
+    // a performance guarantee that would vanish silently: nothing fails, the
+    // query just scans again. Captured DDL is replayed after the rename.
+    const path = tmpDb('aclidx');
+    preFederationDb(path);
+    const db = openDb(path);
+
+    const idx = (db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='acl'").all() as { name: string }[])
+      .map(r => r.name);
+    expect(idx).toContain('idx_acl_reverse');
+
+    const plan = (db.prepare(
+      'EXPLAIN QUERY PLAN SELECT * FROM acl WHERE to_agent = ?'
+    ).all('x') as { detail: string }[]).map(r => r.detail).join(' | ');
+    expect(plan).toContain('idx_acl_reverse');
+    db.close();
+  });
+
+  it('★ F0a: a second openDb does NOT rebuild — the probe makes it idempotent', () => {
+    const path = tmpDb('aclidem');
+    preFederationDb(path);
+    openDb(path).close();
+
+    const db = openDb(path);
+    expect((db.prepare('PRAGMA foreign_key_list(acl)').all() as unknown[]).length).toBe(0);
+    expect(aclRows(db).length).toBe(2);
+    // A rebuild that ran again would still LOOK correct here, so assert the
+    // thing that distinguishes them: the rebuild recreates the table, which
+    // resets its rootpage. Same rootpage across the second boot = untouched.
+    const root = (n: string) => (db.prepare("SELECT rootpage FROM sqlite_master WHERE type='table' AND name=?").get(n) as { rootpage: number }).rootpage;
+    const first = root('acl');
+    openDb(path).close();
+    expect(root('acl')).toBe(first);
+    db.close();
+  });
+
+  it('★ F0a: deleteAgent still clears the agent\'s acl rows without the cascade', () => {
+    const path = tmpDb('acldel');
+    preFederationDb(path);
+    const db = openDb(path);
+
+    expect(aclRows(db).length).toBe(2);
+    deleteAgent(db, 'peer-agent');
+    // Both directions gone: the cascade covered from_agent AND to_agent, and
+    // the explicit delete must not quietly cover only one.
+    expect(aclRows(db).length).toBe(0);
     expect(getAgentByToken(db, 'prod-token')?.id).toBe('prod-agent');
     db.close();
   });

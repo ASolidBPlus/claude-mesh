@@ -193,7 +193,22 @@ async function handleAclPost(ctx: AdminCtx): Promise<void> {
   }
 
   const granted_by = typeof body.granted_by === 'string' ? body.granted_by : 'system';
-  const row = aclGrant(db, from_agent, to_agent, granted_by);
+  // F0a: aclGrant now enforces local-endpoint existence itself (the guarantee
+  // the acl foreign key used to give). The 404s above still run first and are
+  // unchanged, so this maps the same failure to the SAME response rather than
+  // introducing a second shape for one condition — a caller cannot tell which
+  // layer refused, which is the point.
+  let row;
+  try {
+    row = aclGrant(db, from_agent, to_agent, granted_by);
+  } catch (err) {
+    if ((err as { code?: string }).code === 'AGENT_NOT_FOUND') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'agent not found' }));
+      return;
+    }
+    throw err; // anything else is a real fault — let the dispatcher guard log it
+  }
 
   res.writeHead(201, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(row));

@@ -292,7 +292,25 @@ function handleMeshAclAllow(ctx: ToolCtx): ToolResult {
   };
   // Checked BEFORE the write, so a refusal cannot leave a half-applied grant.
   if (!adminTokenOk(admin_token, adminToken)) return unauthorizedResult();
-  const row = aclGrant(db, agent_id, as_agent, as_agent);
+  // F0a — DELIBERATE SHAPE CHANGE, the one in this PR. aclGrant now throws
+  // AGENT_NOT_FOUND for a bare endpoint that is not a local agent. Previously
+  // this tool had no such case: the acl foreign key raised a raw SQLite error
+  // that escaped as an MCP -32603 internal error, i.e. a caller naming a
+  // typo'd agent was told the server broke. It is now a normal tool error the
+  // caller can act on. Stated rather than slipped in: any consumer matching on
+  // -32603 for this case sees a different result.
+  let row;
+  try {
+    row = aclGrant(db, agent_id, as_agent, as_agent);
+  } catch (err) {
+    if ((err as { code?: string }).code === 'AGENT_NOT_FOUND') {
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ error: 'AGENT_NOT_FOUND' }) }],
+        isError: true,
+      };
+    }
+    throw err;
+  }
   return { content: [{ type: 'text' as const, text: JSON.stringify(row) }], isError: false };
 }
 
