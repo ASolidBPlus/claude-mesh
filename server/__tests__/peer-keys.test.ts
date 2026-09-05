@@ -441,6 +441,83 @@ describe('F0b: one id cannot name two identities', () => {
   });
 });
 
+describe('F1a: revocation and re-registration close the live socket', () => {
+  // The ACTION half. The cleanup sweep is the STATE half and runs regardless —
+  // neither replaces the other: an action can be missed by a crash, and a 15 s
+  // window is not a substitute for closing it now.
+  let db: Database;
+  let handle: HttpAdminHandle;
+  let base: string;
+  let peerIndex: Map<string, { sent: string[]; closed: boolean }>;
+
+  beforeEach(async () => {
+    db = openDb(':memory:');
+    peerIndex = new Map();
+    handle = await startHttpAdmin(
+      0, db, ADMIN, 10_485_760, mkdtempSync(join(tmpdir(), 'mesh-f1a-r-')),
+      new Map(), new Map(), peerIndex as never,
+    );
+    base = `http://localhost:${(handle.server.address() as net.AddressInfo).port}`;
+  });
+  afterEach(async () => {
+    await handle.shutdown().catch(() => {});
+    db.close();
+  });
+
+  function fakeSocket(alias: string) {
+    const rec = { sent: [] as string[], closed: false };
+    (peerIndex as Map<string, unknown>).set(alias, {
+      send(d: string) { rec.sent.push(d); },
+      close() { rec.closed = true; },
+    });
+    return rec;
+  }
+
+  const post = (path: string, body: unknown) =>
+    fetch(`${base}${path}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${ADMIN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  it('revoking a key closes that peer\'s socket immediately', async () => {
+    const minted = await (await post('/peer-keys', { alias: 'othermesh' })).json() as { id: string; key: string };
+    await post('/peers/register', { key: minted.key });
+    const sock = fakeSocket('othermesh');
+
+    await fetch(`${base}/peer-keys/${minted.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${ADMIN}` } });
+
+    expect(sock.closed).toBe(true);
+    // Same refusal text as a bad token: revocation is not an oracle.
+    expect(sock.sent.some(m => JSON.parse(m).message === 'invalid token')).toBe(true);
+  });
+
+  it('re-registration closes the socket holding the ROTATED-AWAY token', async () => {
+    const minted = await (await post('/peer-keys', { alias: 'othermesh' })).json() as { key: string };
+    await post('/peers/register', { key: minted.key });
+    const sock = fakeSocket('othermesh');
+
+    await post('/peers/register', { key: minted.key }); // rotates token_hash
+
+    // That socket authenticated with a credential that no longer exists.
+    expect(sock.closed).toBe(true);
+  });
+
+  it('positive control: an UNRELATED peer\'s socket is untouched', async () => {
+    const a = await (await post('/peer-keys', { alias: 'mesh-a' })).json() as { id: string; key: string };
+    const b = await (await post('/peer-keys', { alias: 'mesh-b' })).json() as { key: string };
+    await post('/peers/register', { key: a.key });
+    await post('/peers/register', { key: b.key });
+    const sockA = fakeSocket('mesh-a');
+    const sockB = fakeSocket('mesh-b');
+
+    await fetch(`${base}/peer-keys/${a.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${ADMIN}` } });
+
+    expect(sockA.closed).toBe(true);
+    expect(sockB.closed).toBe(false);
+  });
+});
+
 describe('F0b: inert with zero peers', () => {
   it('a mesh that never mints a key has no peers, and agent registration is unchanged', async () => {
     const db = openDb(':memory:');

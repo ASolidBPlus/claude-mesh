@@ -871,6 +871,21 @@ export function findPeerAliasCollisions(db: Database): string[] {
   ).all() as { id: string }[]).map(r => r.id);
 }
 
+/** Stamp a peer's proof-of-life. F1a: a peer's `ping` stamps this and nothing
+    else — `peers` has no `online` column, and after #87 a durable liveness
+    CLAIM is exactly what must not be invented. `peerIndex` is the online
+    truth, and it lives in memory where a restart clears it. */
+export function touchPeer(db: Database, alias: string): void {
+  db.prepare('UPDATE peers SET last_seen = ? WHERE alias = ?').run(Date.now(), alias);
+}
+
+/** Aliases of every peer whose row is disabled — for the sweep that closes a
+    revoked peer's socket. Cheap: the revoked set is expected to be near-empty. */
+export function listDisabledPeerAliases(db: Database): string[] {
+  return (db.prepare('SELECT alias FROM peers WHERE disabled = 1').all() as { alias: string }[])
+    .map(r => r.alias);
+}
+
 export function listPeers(db: Database): Peer[] {
   return db.prepare('SELECT * FROM peers ORDER BY alias').all() as Peer[];
 }

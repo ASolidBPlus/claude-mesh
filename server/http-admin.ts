@@ -38,7 +38,7 @@ import {
 import { generateToken, hashToken, timingSafeEqual } from './auth.ts';
 import {
   PEER_ALIAS_RE, RESERVED_ALIAS, insertPeerKey, listPeerKeys, getLivePeerKeyForAlias,
-  getPeerKeyBySecret, revokePeerKey, getPeerByAlias, upsertPeer, type PeerKey,
+  getPeerKeyBySecret, revokePeerKey, getPeerByAlias, upsertPeer, getPeerKeyById, type PeerKey,
 } from './db.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
@@ -144,6 +144,9 @@ interface AdminCtx {
   params: Record<string, string>;
   agentIndex: Map<string, WebSocket>;
   observerIndex: Map<string, WebSocket>;
+  /** F1a: alias -> peer socket. Present so revocation and re-registration can
+   *  close a live peer connection immediately. */
+  peerIndex: Map<string, WebSocket>;
   maxFileBytes: number;
   filesDir: string;
   // Authenticated caller. 'admin' for admin-token routes; for 'agentOrAdmin'
@@ -1345,6 +1348,20 @@ function handlePeerKeyGet(ctx: AdminCtx): void {
   res.end(JSON.stringify({ keys: listPeerKeys(db).map(k => publicPeerKeyFields(db, k)) }));
 }
 
+/**
+ * Close a peer's live socket, if it has one. F1a: the ACTION half of
+ * revocation — the cleanup sweep is the STATE half and runs regardless, so a
+ * missed close here costs at most PEER_SWEEP_INTERVAL_MS rather than leaving a
+ * revoked peer connected indefinitely. Best-effort by design; a socket that
+ * cannot be closed is exactly what the sweep exists for.
+ */
+function closePeerSocket(ctx: AdminCtx, alias: string, code: string, message: string): void {
+  const sock = ctx.peerIndex.get(alias);
+  if (sock === undefined) return;
+  try { sock.send(JSON.stringify({ type: 'error', code, message })); } catch { /* ignore */ }
+  try { sock.close(1008, message); } catch { /* ignore */ }
+}
+
 function handlePeerKeyDelete(ctx: AdminCtx): void {
   const { res, db, params } = ctx;
   const id = params.id as string;
@@ -1352,6 +1369,12 @@ function handlePeerKeyDelete(ctx: AdminCtx): void {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'no such live peer key' })); return;
   }
+  // F1a: close the live socket NOW. revokePeerKey already set disabled=1 in its
+  // transaction, so the sweep would close it within 15 s regardless — this is
+  // the fast path, not the guarantee.
+  const revokedKey = getPeerKeyById(db, id);
+  if (revokedKey !== null) closePeerSocket(ctx, revokedKey.alias, 'AUTH_FAILED', 'invalid token');
+
   console.log(JSON.stringify({ evt: 'peer_key.revoked', key_id: id, at: Date.now() }));
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ revoked: true, id }));
@@ -1413,6 +1436,12 @@ async function handlePeerRegister(ctx: AdminCtx): Promise<void> {
     rate_per_min: key.rate_per_min,
   });
 
+  // §6: re-registration ROTATED the token (upsertPeer), so any socket holding
+  // the old one is authenticated with a credential that no longer exists.
+  // Closing it makes the rotation effective immediately rather than whenever
+  // that socket happens to drop.
+  closePeerSocket(ctx, peer.alias, 'AUTH_FAILED', 'invalid token');
+
   console.log(JSON.stringify({
     evt: 'peer.registered', alias: peer.alias, key_id: key.id, at: Date.now(),
   }));
@@ -1464,6 +1493,10 @@ export function startHttpAdmin(
   filesDir: string = '/data/files',
   agentIndex: Map<string, WebSocket> = new Map(),
   observerIndex: Map<string, WebSocket> = new Map(),   // NEW — defaulted
+  // F1a: alias -> peer socket, so revocation can close the connection NOW
+  // rather than waiting for the sweep. Defaulted, so every existing caller and
+  // test is unchanged.
+  peerIndex: Map<string, WebSocket> = new Map(),
 ): Promise<HttpAdminHandle> {
   return new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
@@ -1508,7 +1541,7 @@ export function startHttpAdmin(
         // request fails loudly instead of the whole mesh dying quietly: log,
         // 500 if the head isn't out yet, sever the socket if it is.
         try {
-          await matched.handler({ req, res, db, url, params, agentIndex, observerIndex, maxFileBytes, filesDir, auth });
+          await matched.handler({ req, res, db, url, params, agentIndex, observerIndex, peerIndex, maxFileBytes, filesDir, auth });
         } catch (err) {
           console.error(`[http-admin] handler crashed: ${method} ${pathname}:`, err);
           if (!res.headersSent) {
