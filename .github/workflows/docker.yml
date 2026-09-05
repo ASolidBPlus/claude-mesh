@@ -40,6 +40,27 @@ jobs:
           bun install --frozen-lockfile
           bun test
 
+  # #18 — tsc was unusable as a gate (every .ts import was TS5097). The config
+  # fix makes its output meaningful; this job makes it BIND. A ratchet rather
+  # than a blocking zero-error gate, because 155 real errors remain and a
+  # permanently-red job teaches people to ignore CI — see the script header for
+  # what a count-based ratchet does and does not catch.
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install (server)
+        working-directory: server
+        run: bun install --frozen-lockfile
+      - name: Install (client SDK)
+        working-directory: client
+        run: bun install --frozen-lockfile
+      - name: Typecheck ratchet
+        run: ./.github/scripts/typecheck-ratchet.sh
+
   docker:
     needs: test
     runs-on: ubuntu-latest
