@@ -17,6 +17,9 @@ const EXPECTED_TOOLS = [
   'mesh_acl_deny',
 ];
 
+/** The admin token this suite's MCP server is configured with (#8). */
+const ADMIN_TOKEN = 'test-admin-secret';
+
 const REQUIRED_FIELDS: Record<string, string[]> = {
   mesh_send: ['to', 'message', 'as_agent'],
   mesh_broadcast: ['topic', 'message', 'as_agent'],
@@ -24,8 +27,10 @@ const REQUIRED_FIELDS: Record<string, string[]> = {
   mesh_unsubscribe: ['topic', 'as_agent'],
   mesh_discover: [],
   mesh_status: ['as_agent'],
-  mesh_acl_allow: ['agent_id', 'as_agent'],
-  mesh_acl_deny: ['agent_id', 'as_agent'],
+  // #8: writing an ACL edge is an admin operation on the HTTP plane, so the
+  // stdio tools require the same credential — admin_token is REQUIRED here.
+  mesh_acl_allow: ['agent_id', 'as_agent', 'admin_token'],
+  mesh_acl_deny: ['agent_id', 'as_agent', 'admin_token'],
 };
 
 describe('startMcpServer', () => {
@@ -35,7 +40,7 @@ describe('startMcpServer', () => {
 
   beforeEach(async () => {
     db = openDb(':memory:');
-    handle = await startMcpServer(db);
+    handle = await startMcpServer(db, new Map(), new Map(), ADMIN_TOKEN);
 
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await handle.server.connect(serverTransport);
@@ -327,7 +332,7 @@ describe('startMcpServer', () => {
     registerAgent(db, { id: 'acl-agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
     registerAgent(db, { id: 'acl-agent-b', token_hash: 'b'.repeat(64), hostname: 'host2' });
     // as_agent='acl-agent-b' allows agent_id='acl-agent-a' to send to acl-agent-b
-    const result = await client.callTool({ name: 'mesh_acl_allow', arguments: { agent_id: 'acl-agent-a', as_agent: 'acl-agent-b' } });
+    const result = await client.callTool({ name: 'mesh_acl_allow', arguments: { agent_id: 'acl-agent-a', as_agent: 'acl-agent-b', admin_token: ADMIN_TOKEN } });
     expect(result.isError).toBe(false);
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
     const parsed = JSON.parse(text);
@@ -339,7 +344,7 @@ describe('startMcpServer', () => {
     registerAgent(db, { id: 'deny-agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
     registerAgent(db, { id: 'deny-agent-b', token_hash: 'b'.repeat(64), hostname: 'host2' });
     aclGrant(db, 'deny-agent-a', 'deny-agent-b', 'system');
-    const result = await client.callTool({ name: 'mesh_acl_deny', arguments: { agent_id: 'deny-agent-a', as_agent: 'deny-agent-b' } });
+    const result = await client.callTool({ name: 'mesh_acl_deny', arguments: { agent_id: 'deny-agent-a', as_agent: 'deny-agent-b', admin_token: ADMIN_TOKEN } });
     expect(result.isError).toBe(false);
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
     const parsed = JSON.parse(text);

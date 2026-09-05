@@ -183,7 +183,10 @@ async function main() {
     process.exit(0);
   }
 
-  const mcpHandle = await startMcpServer(db, agentIndex, observerIndex);
+  // adminToken passed so the ACL tools can gate on it (#8) — without it the
+  // stdio plane would keep writing ACL edges with no credential while the
+  // equivalent HTTP routes require one.
+  const mcpHandle = await startMcpServer(db, agentIndex, observerIndex, config.adminToken);
   const transport = new StdioServerTransport();
   await mcpHandle.server.connect(transport);
 
