@@ -1,11 +1,11 @@
 import { describe, it, expect } from 'bun:test';
-import { openDb, registerAgent, upsertPeer, getPeerByAlias } from '../db.ts';
+import { openDb, registerAgent, upsertPeer, getPeerByAlias, getAgentById } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { startWsServer, WsServerHandle, PEER_PROTOCOL_VERSION } from '../ws-server.ts';
 import { startCleanup } from '../cleanup.ts';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
-import { mkdtempSync } from 'fs';
+import { mkdtempSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -132,6 +132,52 @@ describe('F1a: peer authentication', () => {
       db.close();
     }
   }, 20_000);
+
+  // #119 item 1: the control above pins that the own-input refusal is DISTINCT —
+  // a statement about its current VALUE. What makes that branch safe is that it
+  // is a pure function of what the caller SENT (it reads no server state), so
+  // pin the PROPERTY: the same malformed frame gets identical bytes whether the
+  // id it names exists (local-a, registered by setup) or not. An edit that made
+  // the branch state-dependent would keep it distinct — and the control above
+  // green — while reopening the agent-id oracle #117 closed; it reds here.
+  it('the OWN-INPUT refusal is input-only: identical for an existing and a non-existing id', async () => {
+    const { db, handle, port } = await setup();
+    // Naming a precondition is not asserting it: the guarantee below rests on
+    // local-a EXISTING. Assert it here, so an edit to setup() reds this test
+    // instead of turning it into two identical nonexistent cases.
+    const EXISTING = 'local-a'; // one name for the assertion AND the probe, so they cannot drift apart
+    expect(getAgentById(db, EXISTING)).not.toBeNull();
+    const existing = await open(port, { type: 'auth', agent_id: EXISTING });          // token missing
+    const nonexistent = await open(port, { type: 'auth', agent_id: 'no-such-agent' }); // token missing
+    try {
+      const frames = [existing, nonexistent].map(s => JSON.stringify(s.frames.find(f => f.type === 'error')));
+      expect(frames[0]).toContain('missing agent_id or token');
+      expect(new Set(frames).size).toBe(1);
+    } finally {
+      try { existing.ws.close(); nonexistent.ws.close(); } catch { /* ignore */ }
+      await handle.shutdown().catch(() => {});
+      db.close();
+    }
+  }, 20_000);
+
+  // C9 obligation (i), re-derived not re-run: every set test above is a
+  // hand-written enumeration of the causes its author listed, so re-running
+  // them cannot see the reachable set GROW. A new AUTH_FAILED emit site is a
+  // new `if` block in production code with no test file in the diff. Pin the
+  // count: adding a refusal cause at this door without adding it to the set
+  // tests fails HERE. Update the literal only together with the set tests.
+  it('the auth door emits AUTH_FAILED from exactly 4 sites (literal pin; grow the set tests first)', () => {
+    const src = readFileSync(join(import.meta.dir, '..', 'ws-server.ts'), 'utf8');
+    // Quote-agnostic on purpose: nothing in this repo enforces quote style, and
+    // a pin defeated by a spelling variant is the class of defect it exists to catch.
+    // RESIDUAL, stated so the character class is not read as the closed form:
+    // this counts SOURCE TEXT. An emit written as a template literal, through an
+    // alias (`const AUTH_FAILED = 'AUTH_FAILED'`) or any computed code is invisible
+    // to it, and every set test stays green. The closed form counts the PARSED
+    // value — the AST, or the set of codes the door emits at runtime (#119 item 3).
+    const emits = src.match(/code:\s*['"]AUTH_FAILED['"]/g) ?? [];
+    expect(emits.length).toBe(4);
+  });
 
   // C9 SET TEST — the agent door. Every reachable cause of the one question
   // "may this caller in?", side by side. A door can pass every per-guard test
