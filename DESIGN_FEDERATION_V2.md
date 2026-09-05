@@ -1,137 +1,164 @@
-# DESIGN v2: Mesh-to-Mesh Federation
+# DESIGN v2.1: Mesh-to-Mesh Federation
 
-**Status: PLAN — nothing here is implemented.** Plan-only PR; implementation starts only on the owner's explicit approval, then as separate PRs (§10). **Supersedes `DESIGN_FEDERATION.md`** (single-bus multi-tenant, merged 2026-09-05 as cad4c9b/414d3df), which the owner scrapped the same day: *"Federated means multiple tenants… why else would we do this if it's all on one bus?"*
+**Status: PLAN — nothing here is implemented.** Plan-only PR; implementation starts only on the owner's explicit approval, then as separate PRs (§11). **Supersedes `DESIGN_FEDERATION.md`** (single-bus multi-tenant, scrapped by the owner the day it merged: *"why else would we do this if it's all on one bus?"*). v2.1 is the respin after a NO-GO from the plan evaluator: every mechanism below was checked against main `74771ee`, and every point a builder would otherwise have had to decide is decided here (§14 ledger).
 
-**The shape, in one paragraph, because the previous doc's approval never said it plainly:** every organisation runs **its own claude-mesh instance with its own admin token**. Meshes **peer with each other directly and pairwise** — no hub, no shared bus, no shared registry. A mesh joins a peering by **presenting a key the other mesh's admin minted**; after that, agents on one mesh can address and message agents on the peer mesh. **Each admin controls what crosses their own border and which message types** — the sending side decides what may leave, the receiving side decides what may enter, and neither trusts the other's check. Your mesh stays yours; theirs stays theirs.
-
-Author: mesh-planner, 2026-09-05. Grounded in the code at main `74771ee` (functions cited by name; line numbers drift). Inputs folded: the consumer census (mesh-chat's four ACL writers), the runtime's requirements, and what #84 taught about which pieces transfer.
+**The shape, in one paragraph:** every organisation runs **its own claude-mesh instance with its own admin token**. Meshes **peer directly and pairwise** — no hub, no shared bus, no shared registry. A mesh joins a peering by **presenting a key the other mesh's admin minted**; after that, agents on one mesh address agents on the other as `<alias>:<agent>`. **Each admin controls what crosses their own border and which message types** — the sender decides what may leave, the receiver decides what may enter, and neither trusts the other's check. Your mesh stays yours.
 
 ---
 
-## 1. The trust join — read this section first
+## 1. The trust join — read first
 
-The hard question moved. On one bus it was *"which namespace may write to which."* Between buses it is: **what does mesh A accept from mesh B, and on whose authority?** The well-known failure mode is each side assuming the other validated, so nobody owns the join. This design names an owner for every check.
+Between buses the hard question is: **what does mesh A accept from mesh B, and on whose authority?** The known failure is each side assuming the other validated. Every check below has one owner, runs on the side that suffers if it is wrong, and fails closed. Nothing is delegated across the border except the one thing that must be (row 7), which is stated.
 
-| Check | Owner | Consults | On failure |
-|---|---|---|---|
-| May this mesh (B) connect to my border at all? | **Receiver A** | A's `peers` row for B (minted by A's admin, presented by B) — token, not-disabled, not-expired | socket closed with `AUTH_FAILED`; identical to a bad agent token (no oracle) |
-| May this local agent send to a remote id at all? | **Sender B** | B's outbound peering for the alias (B holds a token minted by A) + B's outbound ACL edge `local → A:agent` | `AGENT_NOT_FOUND` — identical to a nonexistent local id (anti-enumeration) |
-| May this remote sender reach this local agent? | **Receiver A** | A's inbound ACL edge `B:sender → local` | relay refused with `ACL_DENIED` **to the peer** (the peer is a trusted-enough party to be told), nothing to the remote agent |
-| Is this message type allowed across this border? | **Both**, independently | the direction's peering row `kinds` | refused on whichever side finds it; v1 = `direct` only |
-| Is this a one-hop message? | **Receiver A** | relay `from` and `to` must be bare local ids (no `:`) | refused; no transit |
-| May anyone grant an ACL edge naming a remote id? | **The bus holding the edge** | the peering in that direction must exist | `aclGrant` refuses — whoever writes it (see §5) |
+| # | Check | Owner | Consults | On failure |
+|---|---|---|---|---|
+| 1 | May mesh B connect to my border? | Receiver A | A's `peers` row for the alias: token, not disabled, protocol compatible | socket closed `AUTH_FAILED`, byte-identical to a bad agent token |
+| 2 | May local agent X send to `alias:y`? | Sender B | `outbound_peers` row enabled + outbound ACL edge `X → alias:y` + kind ∈ outbound kinds | `AGENT_NOT_FOUND`, byte-identical to a nonexistent local id |
+| 3 | May `alias:x` reach local agent Y? | Receiver A | inbound ACL edge `alias:x → Y`, kind ∈ inbound kinds, Y exists | one uniform `RELAY_REFUSED` to the peer — the peer learns a relay was refused, never *why* (no existence or ACL oracle to a peer either) |
+| 4 | Is this one hop? | Receiver A | relay `from` and `to` are bare (no `:`) | `RELAY_REFUSED` |
+| 5 | Is the peer within its rate? | Receiver A | token bucket per alias, counted on **every** relay frame incl. refused ones, checked first after row 1 | `RATE_LIMITED` (the peer is told — it needs to back off) |
+| 6 | Has this relay been seen before? | Receiver A | `relays(alias, remote_msg_id)` | duplicate → re-`ack`, deliver nothing (idempotent) |
+| 7 | Is `from` really agent X on mesh B? | **Sender B** (the authenticated agent socket's own id) | — | **Receiver A trusts B's admin for every name under `alias:` — this is the single cross-border delegation, and it is a delegation to an admin, not to an agent** |
+| 8 | May anyone write an ACL edge naming `alias:z`? | The bus holding the edge | the peering in the implied direction exists | `aclGrant` refuses, whoever writes it (§5.4) |
 
-Rules that follow: **every check runs on the side that would suffer if it were wrong; no check is delegated across the border; all checks fail closed.** A peer is authenticated (we know which mesh is talking) but never *trusted* beyond what our own ACL says.
+**1.1 Where an agent id flows today, and what a remote id does there.** A remote id is a third inhabitant of a `TEXT` column; no type forces the audit (#84's `{mode:'unauthenticated'}` did and found a second fall-through), so the plan enumerates:
+
+| Consumer | With `alias:x` | Owner |
+|---|---|---|
+| `getAgentById` in `routeDirect` | not reached for a real remote: the `:` branch (§5.3) runs first; it FALLS THROUGH to this lookup only when the prefix is not an enabled outbound alias — which preserves any legacy local id containing `:` and keeps `AGENT_NOT_FOUND` uniform | sender |
+| `getAgentById` on the relay path | never called with a remote id (row 4 runs first) | receiver |
+| A local reply to `from = alias:x` | an ordinary outbound send → row 2 (named because it is where this will be forgotten) | sender |
+| `aclCheck` / `aclGrant` | after the F0 `acl` rebuild (no FKs), remote ids are ordinary endpoints; the gate is at write time | the holding bus |
+| `broadcastStatus` / `list_presence` | never render or target a remote id: peer sockets have `agentId: null` and are skipped by every `state.agentId !== null` guard by construction; no presence crosses a border | receiver |
+| `GET /messages` node-scoping | a local agent's own history legitimately contains remote `from`/`to` rows | — |
+| File ownership predicates | unreachable: peer sockets cannot send file frames; files never cross | receiver |
+| Metrics | labels per **peer alias** and direction, never per remote agent (#12) | both |
+| MCP `mesh_send` / `mesh_broadcast` | `as_agent` containing `:` is refused (a local plane must not forge a remote sender); a remote `to` flows into `routeDirect`'s branch | sender |
+| MCP `mesh_discover` / `mesh_status` | local roster only, unchanged | — |
+| Observer tap | local observers see relayed inbound rows and outbound remote-addressed rows as stored (stated policy) | each bus, its own half |
+| Reminders / topics / subscriptions | self-only / local-only; a peer socket cannot `remind`, `subscribe`, `publish`; FKs on those tables stay | receiver |
+| Logs / error strings | may contain remote ids (not secrets); never `outbound_peers.token` (C7) | — |
 
 ---
 
 ## 2. Constraints
 
-- **C1 — One admin per mesh, never shared.** Each mesh keeps its own `MESH_ADMIN_TOKEN`. Peers never hold each other's admin token; a peering key grants registration only.
-- **C2 — Naming must not grant.** Addressing a peer alias or remote agent grants nothing until this mesh's admin has (a) registered the peering in that direction and (b) written the ACL edge. Unknown peers/agents are refused, never created.
-- **C3 — Pure-bus rule.** Cross-bus routing is bus work; analytics stay outside.
-- **C4 — Compose over the existing per-pair ACL.** Remote ids are ordinary endpoints in the existing `acl` table; the peering is an outer gate over them, never a replacement.
-- **C5 — Zero behaviour change until a peer key is minted.** Every phase is inert on a mesh with no `peers` rows. Existing suite green with zero modified tests.
-- **C6 — Directional independence.** A→B and B→A are separate registrations, separate connections, separate ACL, separately revocable. "Peered" is never a single fact; every API and status names the direction (this is the decision the builder asked to be explicit — see D2 for why the alternative was rejected).
+- **C1** One admin per mesh; peers never hold each other's admin token; a peer key grants registration only.
+- **C2** Naming must not grant: addressing an alias or remote agent grants nothing until this mesh's admin registered the peering in that direction and wrote the edge. Unknown = refused, never created.
+- **C3** Pure-bus: cross-bus routing is bus work; analytics stay outside.
+- **C4** Remote ids compose over the existing per-pair `acl` as ordinary endpoints — **which requires removing the `acl` table's foreign keys to `agents` (§4, F0)**; the peering is an outer gate at write time, never a replacement for the pair edge.
+- **C5** Zero behaviour change until a peer key is minted; existing suite green with zero modified tests; **legacy agent ids containing `:` keep working** (§5.3 fall-through) and are logged at boot.
+- **C6** Directional independence: A→B and B→A are separate registrations, sockets, ACL, and revocations. "Peered" is never a single fact; every API names the direction.
+- **C7** The DB will hold exactly one class of live credential: `outbound_peers.token` (the sender must present it; everything else is hashed). It is never returned by any read API, never logged, never a metric label; the F2 migration is flagged in its PR as **changing the DB's sensitivity class** so backups/exports/dumps are told, not surprised.
+- **C8** A peer must not be able to crash the receiver: **#94 (frame-dispatcher guard + `DUPLICATE_MSG_ID`) is a prerequisite of F1.**
 
 ---
 
 ## 3. Concepts
 
-- **Peer alias.** The name **this** mesh uses for a remote mesh (`po-red`). Local to the assigning mesh — A may call a mesh `po-red` while that mesh calls A `hq`. No global namespace, so no uniqueness authority is needed (the previous design's reservation logic dies with it). Grammar: `^[a-z0-9][a-z0-9-]{0,62}$`; `mesh` reserved (system sender).
-- **Remote id.** `<peer-alias>:<agent>`. The `:` is the structural discriminator: **local agent ids may never contain `:`** (validated at `POST /agents` and `/register`), so any consumer can tell remote from local by syntax, not lookup.
-- **Peer key.** Minted by the *receiving* mesh's admin for a named alias; shown once; SHA-256 stored; expiry; revocable. Presented once by the remote mesh's admin to register; never used again (the registration returns a peer token).
-- **Peering (directional).** On the receiver: a `peers` row (alias, token hash, kinds, rate cap, disabled). On the sender: an `outbound_peers` row (alias, the receiver's URL, the token the receiver issued). One socket per outbound peering, opened by the **sender**, authenticated as the peer.
-- **Relay.** The only frame a peer connection may send: carries the original local sender id and the local target id on the receiver. The receiver stamps `from = <alias>:<sender>` and then treats it as an ordinary direct message.
+- **Peer alias** — the name *this* mesh gives a remote mesh. Local to the assigning mesh; no global namespace. Grammar `^[a-z0-9][a-z0-9-]{0,62}$`; `mesh` reserved; an alias may not equal any existing local agent id, and `POST /agents` refuses an id equal to an existing alias (the `setOnline`/registry collision the evaluator found).
+- **Remote id** — `<alias>:<agent>`. Local ids minted from F0 on may not contain `:`; legacy ones are tolerated (C5).
+- **Peer key** — minted by the receiver's admin for an alias; shown once; hashed; expiry; revocable; at most one live (non-revoked) key per alias (`409` otherwise).
+- **Peering (directional)** — receiver side: a `peers` row; sender side: an `outbound_peers` row holding the receiver's URL, the token the receiver issued, and **`assigned_alias`** — the name the receiver gave us, which the forwarder presents at auth.
+- **Relay** — the only message frame a peer socket may send; carries the sender's local agent id and the receiver-local target.
 
 ---
 
-## 4. Data model (each mesh, additive)
+## 4. Data model (each mesh; additive except the `acl` rebuild)
 
 ```sql
-CREATE TABLE peer_keys (          -- minted by THIS mesh's admin for a remote mesh to present
-  id TEXT PRIMARY KEY, key_hash TEXT NOT NULL, alias TEXT NOT NULL,
-  kinds TEXT NOT NULL DEFAULT '["direct"]', rate_per_min INTEGER NOT NULL DEFAULT 600,
-  expires_at INTEGER, revoked_at INTEGER, note TEXT, created_at INTEGER NOT NULL
-);
-CREATE TABLE peers (              -- inbound peerings: remote meshes allowed to connect to THIS border
-  alias TEXT PRIMARY KEY, token_hash TEXT NOT NULL, key_id TEXT NOT NULL,
-  kinds TEXT NOT NULL, rate_per_min INTEGER NOT NULL, disabled INTEGER NOT NULL DEFAULT 0,
-  registered_at INTEGER NOT NULL, last_alive INTEGER, remote_version INTEGER NOT NULL
-);
-CREATE TABLE outbound_peers (     -- outbound peerings: remote meshes THIS mesh may send into
-  alias TEXT PRIMARY KEY, url TEXT NOT NULL, token TEXT NOT NULL,   -- the receiver-issued token (a secret; this row is the sender's credential)
-  kinds TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, last_alive INTEGER
-);
--- messages: no schema change. to_agent / from_agent are TEXT with no FK, so remote ids store as-is.
+-- F0: rebuild acl WITHOUT the REFERENCES agents(id) ON DELETE CASCADE constraints (SQLite cannot drop an FK in place):
+--   PRAGMA foreign_keys=OFF; CREATE TABLE acl_new(... no FKs ...); INSERT ... SELECT; DROP acl; ALTER TABLE acl_new RENAME TO acl; recreate idx_acl_reverse; PRAGMA foreign_keys=ON.
+--   deleteAgent() then deletes the agent's acl rows EXPLICITLY (it relied on the cascade). Covered by the #90 migration-chain test with rows present.
+CREATE TABLE peer_keys (id TEXT PRIMARY KEY, key_hash TEXT NOT NULL, alias TEXT NOT NULL, kinds TEXT NOT NULL DEFAULT '["direct"]',
+  rate_per_min INTEGER NOT NULL DEFAULT 600, expires_at INTEGER, revoked_at INTEGER, note TEXT, created_at INTEGER NOT NULL);
+CREATE TABLE peers (alias TEXT PRIMARY KEY, token_hash TEXT NOT NULL, key_id TEXT NOT NULL, kinds TEXT NOT NULL, rate_per_min INTEGER NOT NULL,
+  disabled INTEGER NOT NULL DEFAULT 0, registered_at INTEGER NOT NULL, last_alive INTEGER);           -- protocol version lives in the handshake only (D7)
+CREATE TABLE outbound_peers (alias TEXT PRIMARY KEY, url TEXT NOT NULL, token TEXT NOT NULL /* C7 */, assigned_alias TEXT NOT NULL,
+  kinds TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, last_alive INTEGER);
+CREATE TABLE relays (alias TEXT NOT NULL, remote_msg_id TEXT NOT NULL, local_msg_id TEXT NOT NULL, seen_at INTEGER NOT NULL, PRIMARY KEY(alias, remote_msg_id));  -- dedupe; swept after 7 days
+ALTER TABLE messages ADD COLUMN failed_code TEXT;   -- set when the remote refused; row keeps history
 ```
-Key secrets: `generateToken`/`hashToken` (auth.ts), exactly as agent tokens. `peers`/`peer_keys` are the receiver's state; `outbound_peers` is the sender's. A mesh that is both (the normal case) has all three.
 
 ---
 
 ## 5. Enforcement and wire
 
-**5.1 Border listener (receiver side)** — the existing WS server. A peer authenticates with `{type:'auth', agent_id: '<alias>', token, protocol: 1}` — the one addition to the auth frame is the **protocol version**, and the receiver refuses a mismatch loudly (`PROTOCOL_MISMATCH`, logged with both versions) before anything else; `auth_ok` echoes the receiver's version. Peering compatibility is therefore "both sides on a protocol-compatible release", checked at the handshake, not discovered mid-relay. The server resolves the token and the server resolves the token against `peers` *before* `agents` (peers are few; a hash-indexed lookup like #75's, fail-closed on ambiguity, final timing-safe compare — the #75 pattern, duplicated not shared). A peer socket is marked as such in the registry; **a peer connection may send only `relay` frames** — `send`/`publish`/`file_send`/`subscribe`/reminders from a peer socket are refused (`NOT_ALLOWED`), and `relay` from a non-peer socket is refused identically. A `disabled` peer fails auth like a bad token; an already-connected peer that becomes disabled is closed by a sweep on its own fixed timer (the #84 state-backstop rule: a security step never rides the housekeeping tick).
+**5.1 Border listener (receiver).** In the WS auth handler, after the frame's `agent_id`/`token` are validated as strings and **before** `getAgentById`: look up `peers` by `alias = agent_id` and compare the token hash with the timing-safe compare (the WS style: id-keyed then compare — not #75's token-hash scan). If a `peers` row matches: (a) if `disabled` → `AUTH_FAILED` (identical to a bad token); (b) **then** check `protocol` — absent or unsupported → `PROTOCOL_MISMATCH`, logged with both versions, socket closed; (c) `ConnState` gets `agentId: null, peerAlias: alias` — so `setOnline`, `agentIndex.set`, the pending-queue count, `drainQueue`/`drainFileQueue`, `broadcastStatus`, the observer registration, and the close-path counterparts are all skipped by the existing `state.agentId !== null` guards (enumerated in the F1 brief); (d) the socket is put in a new `peerIndex: Map<alias, WebSocket>` exposed on `WsServerHandle`; (e) `auth_ok` for a peer is `{type:'auth_ok', peer: alias, protocol: 1}` (no queue fields). If no `peers` row matches, auth proceeds exactly as today; the `protocol` field is ignored for agents (C5). Peer-socket frame allowlist: **`relay` and `ping`** (the SDK's heartbeat must be answered or the forwarder tears down every 60 s); `ping` from a peer stamps `peers.last_alive`; everything else → `NOT_ALLOWED`; `relay` from an agent socket → `NOT_ALLOWED`. A peer that becomes disabled is closed immediately by revocation **and** by a sweep on its own fixed timer (`PEER_SWEEP_INTERVAL_MS = 15_000`, a constant, own `setInterval` + own `try`, walking `peerIndex` — the #84 pattern at peer granularity).
 
-**5.2 Relay frame** — `{type:'relay', v:1, msg_id, from:'<bare local id on sender>', to:'<bare local id on receiver>', kind:'direct', payload, content_type, ttl_ms?}`. Receiver checks, in order, each fail-closed: peer not disabled → `v` supported → `from` and `to` contain no `:` (one hop) → `kind ∈ peers.kinds` → rate cap → `to` exists locally (`getAgentById`) → **inbound ACL** `aclCheck('<alias>:'+from, to)`. On success it becomes an ordinary direct message with `from_agent = '<alias>:<from>'` and is delivered/queued with today's semantics (queue, TTL, drain, retention untouched). The peer receives an `ack` or an `error` per relay; the receiver never contacts the remote *agent*.
+**5.2 Relay frame.** `{type:'relay', msg_id, from, to, kind:'direct', payload, content_type?, ttl_ms?}` — `msg_id` is the **sender's local row id** (unique on the sender). Receiver, in order, each fail-closed: peer not disabled (auth already guaranteed; re-checked cheaply) → **rate bucket** (per alias, `rate_per_min` sustained, burst = the same number, in memory, counts every relay) → `from`/`to` bare (row 4) → `kind ∈ peers.kinds` → dedupe: if `(alias, msg_id) ∈ relays` → re-`ack`, stop → `to` exists → inbound `aclCheck(alias+':'+from, to)` → **mint a local row id**, insert `relays(alias, msg_id, local_id)`, then deliver/queue as an ordinary direct message with `from_agent = alias:from` (today's queue, TTL, drain, retention — unchanged) → `ack {ref: msg_id}`. Refusals: `RATE_LIMITED` (told), everything from row 3/4 → uniform `RELAY_REFUSED {ref: msg_id}`. Any handler throw is caught by #94's dispatcher guard.
 
-**5.3 Outbound (sender side)** — in `routeDirect`, before the existing recipient lookup: if `frame.to` contains `:`, split at the first `:` → alias must have an enabled `outbound_peers` row (else `AGENT_NOT_FOUND`, identical to a nonexistent local id — anti-enumeration and C2) → `kind ∈ outbound kinds` → **outbound ACL** `aclCheck(sender, frame.to)` (the edge names the remote id) → capability of the sender as today. Then the message is stored with `to_agent = frame.to` (remote) and handed to the **border forwarder**: one `MeshClient`-based connection per outbound peering (the SDK already gives reconnect, re-auth, heartbeat, half-open detection — #67), which sends a `relay` and marks the row delivered on the peer's `ack`; on `error` the row is marked failed and the error is surfaced to the local sender as an `error` frame (`REMOTE_REFUSED`, no detail beyond the code — the remote's reason is the remote's business). While the peering socket is down, rows queue exactly like messages to an offline local agent (same TTL, same cleanup, same silent-expiry caveat as fleet "#99" — a known gap, not widened here).
+**5.3 Outbound (sender).** In `routeDirect`, before the existing recipient lookup: if `frame.to` contains `:`, split at the FIRST `:`; if the prefix is an **enabled `outbound_peers` alias** → remote path; else → fall through to the local lookup unchanged (legacy ids with `:` keep working; an unknown alias yields the same `AGENT_NOT_FOUND` as an unknown local id). Remote path: the remainder must itself be bare (a second `:` → `AGENT_NOT_FOUND`, never a wasted relay) → `kind ∈ outbound kinds` → outbound `aclCheck(from_agent, frame.to)` → insert the row with `to_agent = frame.to`, `expires_at` from `ttl_ms` exactly as today → **ack the local sender now** (D8: ack means "accepted and queued for the border", the same meaning an ack has today for an offline local recipient) → notify the forwarder. `from_agent` must be bare: `routeDirect` refuses any `from_agent` containing `:` from non-relay callers, and the MCP tools refuse `as_agent` containing `:` (H1).
 
-**5.4 The ACL chokepoint for remote ids** — `aclGrant` (the only `INSERT INTO acl`, reached from `POST /acl` and the MCP tool) refuses any edge where either endpoint contains `:` unless the alias has a peering **in the direction the edge implies**: `local → alias:x` requires an enabled `outbound_peers` row; `alias:x → local` requires a non-disabled `peers` row. Whoever writes it — reconciler, consent flow, mirror, admin — this is the one enforcement point (the consumer census: four mesh-chat writers, one of which multiplies edges). Tenancy is never read from a client-supplied field.
+**Border forwarder** (new module `server/border.ts`, in-process): one instance per enabled `outbound_peers` row, started at boot and on `POST /outbound-peers`, stopped on `DELETE`/disable. Uses `PeerClient` (§7) with `agent_id = assigned_alias`, `protocol: 1`. Drain: `SELECT … FROM messages WHERE to_agent LIKE ? ESCAPE '\' AND delivered_at IS NULL AND failed_code IS NULL AND (expires_at IS NULL OR expires_at >= now)` with the alias LIKE-escaped, ordered by `sent_at`, excluding an in-memory **in-flight set** of row ids awaiting ack. Sends one `relay` per row with `msg_id = row.id`. On `ack {ref}` → `markDelivered(ref)`, remove from in-flight. On `error {ref, code}` → set `failed_code = code`, remove from in-flight, and if the originating agent is connected (`agentIndex.get(from_agent)`) send it `{type:'error', code:'REMOTE_REFUSED', ref: row.id}` — best effort, stated (D8). On disconnect → clear in-flight (unacked rows are re-sent after reconnect; the receiver's dedupe makes that safe). Drain triggers: connect/reconnect, every insert for that alias (an in-process emitter from `routeDirect`), and a 30 s backstop tick. No local ack is ever deferred; no `ACK_TIMEOUT` is introduced on the agent side.
 
-**5.5 Replies and addressing.** A local agent receiving `from: 'po-red:helpdesk'` replies to that string; §5.3 routes it. Agents see remote ids exactly as the FQ form; local ids stay bare (the previous design's egress-normalization machinery is not needed: there is no shared prefix to strip). Presence, topics, files, reminders do **not** cross borders in v1 (§9).
+**5.4 The ACL chokepoint for remote ids.** `aclGrant` (the only `INSERT INTO acl`; callers `POST /acl` and MCP `mesh_acl_allow`) refuses any edge where an endpoint contains `:` **and is not an existing local agent id** (legacy rule) unless the alias has a peering in the implied direction — `local → alias:x` needs an enabled `outbound_peers` row, `alias:x → local` needs a non-disabled `peers` row — read via new `db.ts` helpers (`hasOutboundPeer`, `hasInboundPeer`; `db.ts` never imports `http-admin`). `handleAclPost`, `handleAclDelete`, `handleAclGet?agent=` currently 404 on `getAgentById` for each endpoint; each gains a "remote id ⇒ skip existence check, apply the peering rule" branch so revoke and list work for remote ids too.
 
-**5.6 Revocation.** Receiver: `DELETE /peer-keys/:id` → `peers.disabled=1` in the same transaction; socket closed immediately AND by the sweep (action + state). Sender: `DELETE /outbound-peers/:alias` → forwarder stopped, queued rows to that alias expire normally. Neither side needs the other's cooperation to cut its direction.
+**5.5 Addressing.** Agents see remote ids as the FQ string and reply to it (row 2). Local ids stay bare. No normalization layer exists or is needed.
 
----
-
-## 6. Admin API (each mesh, admin port, admin token unless stated)
-
-- `POST /peer-keys {alias, kinds?, rate_per_min?, expires_at?, note?}` → `{id, key (shown once), …}`; `GET /peer-keys` (no hashes); `DELETE /peer-keys/:id` (revoke + disable the peer).
-- `POST /peers/register` — **authenticated by a peer key**, `auth: 'handler'` with `{mode:'unauthenticated'}` at the dispatcher (the #84 pattern, retargeted). Body `{remote_version}`. Returns `{alias, token (shown once)}`. Uniform 403 on any failure; structured server log with the discriminator. Idempotent per key (re-register = token rotation).
-- `GET /peers` — inbound peerings, state per row (`disabled`, `last_alive`, connected?).
-- `POST /outbound-peers {alias, url, token, kinds?}` / `DELETE /outbound-peers/:alias` / `GET /outbound-peers` — the sender-side credential store; `token` is the secret the receiver returned and is never returned by GET.
-- `POST /acl` unchanged in shape; gains the §5.4 refusal.
-
-A peering setup, end to end, is therefore: A's admin mints a key for alias `B` → hands it out of band → B's admin `POST A/peers/register` with it → B's admin `POST B/outbound-peers {alias:'A', url:A, token}` → both admins write ACL edges on their own side. Reverse direction: the same four steps with roles swapped.
+**5.6 Revocation.** Receiver: `DELETE /peer-keys/:id` → `peers.disabled = 1` in the same transaction; socket closed immediately via `peerIndex` and by the sweep. Sender: `DELETE /outbound-peers/:alias` → forwarder stopped **and, in the same transaction, every undelivered row to `alias:*` gets `expires_at = now`** — those rows are undeliverable by construction from that instant, and this is the only moment anyone knows it; without this, an untTL'd row (`expires_at IS NULL`, an ordinary case) would be preserved forever by `sweepRetention`'s still-deliverable exclusion, a state that predicate cannot express ("pending, and the only path is gone"). A peering socket that is merely DOWN is different and untouched: the peering may return, so its rows keep today's offline semantics.
 
 ---
 
-## 7. What transfers from #84 (held) and what does not
+## 6. Admin API (each mesh; admin port; admin token unless stated)
 
-Transfers: key mint-once/show-once, SHA-256 storage, expiry, single-transaction revoke ("a secret that authorises a registration" — holder-agnostic); `auth:'handler'` + `resolveRouteAuth` + `{mode:'unauthenticated'}` (exactly the peer-registration case); the migration-chain test (already carved out as #90); the #75 lookup pattern. Does not transfer: `max_agents` (peer limits are kinds + rate, not population); per-agent `disabled` and `closeAgentSocket` (peers get their own link state and their own sweep — right idea, right granularity now); tenant names/reservation (no shared registry to be reserved in; only the grammar and the `:` exclusion survive).
+- `POST /peer-keys {alias, kinds?, rate_per_min?, expires_at?, note?}` → `{id, key(once), alias, kinds, rate_per_min, expires_at}`; refuses an alias equal to a local agent id or `mesh`, an alias with a live key (`409`), bad grammar. `GET /peer-keys` (no hashes, live-peer state per alias). `DELETE /peer-keys/:id` (§5.6).
+- `POST /peers/register` — authenticated by a peer key via `auth: 'handler'` + `{mode:'unauthenticated'}` (the #84 mechanism, cherry-picked in F0 — D9). Body `{}`. Returns `{alias, token(once), kinds, rate_per_min, protocol: 1}`. Uniform `403` body on any failure; one structured server log line with the discriminator. Presenting the key again = token rotation **and** the existing peer socket for that alias is closed (no silent takeover).
+- `GET /peers` — inbound peerings: alias, kinds, rate, disabled, last_alive, `connected` (from `peerIndex`).
+- `POST /outbound-peers {alias, url, token, assigned_alias, kinds?}` (url must be `ws://` or `wss://`; loopback allowed) / `DELETE /outbound-peers/:alias` / `GET /outbound-peers` (alias, url, assigned_alias, enabled, last_alive — **never** token, C7). Enable/disable via `PATCH /outbound-peers/:alias {enabled}`; the forwarder starts/stops on these calls (event, not poll).
+- `POST /acl` unchanged in shape; §5.4 applies.
 
-## 8. Worked example — PowerOUT (illustrative; the capability is general)
+A peering, end to end: A's admin mints a key for alias `B` → out of band → B's admin `POST A/peers/register` → gets `{alias:'B', token}` → B's admin `POST B/outbound-peers {alias:'A', url:A, token, assigned_alias:'B'}` → both admins write their own edges. Reverse: same steps, roles swapped.
 
-Each student org = its own mesh (the published image, one container). The orchestrator lives on the host mesh. Inter-org play = pairwise peerings the game backend sets up via each org mesh's admin API as the scenario dictates (org-red mints a key for org-blue and vice versa; each writes edges only for the personas that should be reachable). Backend → orchestrator = org mesh → host mesh registration, host-side inbound edge `org-red:backend → orchestrator`, nothing else from that org can reach the fleet. Round teardown = revoke the peer keys; each org's mesh is otherwise untouched.
+---
 
-**Runtime-side note (mesh-agent builder):** this shape fits the arena *better* than tenants did — `arena/run.sh` already boots one local claude-mesh per arena instance, so org-per-scenario becomes "N mesh instances on distinct ports, peered as the scenario dictates", with no in-bus gating. Three things the previous design cost dissolve (tenant id grammar and egress normalization; an intra-tenant grant capability — a per-org mesh admin is scoped by construction; slug/namespace alignment). What remains theirs: cross-org NPC *initiation* still needs a runtime-side peer-alias mechanism binding an authored name to a runtime `<alias>:<agent>` address — same shape as before, different target.
+## 7. SDK changes (F0, `@claude-mesh/client`, minor version bump)
 
-## 9. Non-goals (v1)
+- `AuthFrame.protocol?: number` — sent only by `PeerClient`; agents unchanged.
+- `PeerClient extends MeshClient`: exposes `relay(frame)` (over the private `rawSend`/`sendWithAck` path, keyed by the relay `msg_id`), treats `PROTOCOL_MISMATCH` as fatal (no reconnect — today only first-auth `AUTH_FAILED` is fatal), keeps heartbeat/half-open detection/reconnect exactly as today. `ack`/`error` with `ref` are already parsed. The runtime's SDK pin is unaffected (agent auth is byte-identical).
 
-Transit/multi-hop; topics, files, presence, reminders across borders; a global directory of meshes; a negotiated bidirectional link (D2); public-internet exposure of the border (peers reach each other over a network the operators trust — LAN or a tunnel; public exposure is #74's territory, parked as written); analytics.
+## 8. What transfers from #84 (held, not merged) — D9
 
-## 10. Phasing (each PR inert without a peer key; each through the review lane; owner approves this doc first)
+F0 **cherry-picks** from `feat/registration-keys`: key mint-once/show-once, SHA-256 storage, expiry, single-transaction revoke; `auth:'handler'`, `resolveRouteAuth`, `{mode:'unauthenticated'}` and the exhaustive predicate; the collation-test pattern (duplicated per table, not shared). Not transferred: `max_agents`, agent `disabled`, `closeAgentSocket`, tenant names/reservation. #84 is then closed with a comment pointing here.
+
+## 9. Worked example — PowerOUT (illustrative)
+
+Each student org = its own mesh (one container of the tagged image). Orchestrator on the host mesh. Inter-org play = pairwise peerings the game backend sets up through each org mesh's admin API (org-red mints a key for `org-blue`, and vice versa; each writes edges only for the personas that should be reachable). Backend → orchestrator = org mesh → host mesh registration, host-side edge `org-red:backend → orchestrator`. Teardown = revoke keys.
+
+**Runtime note (mesh-agent builder):** this fits the arena better than tenants did — `arena/run.sh` already boots one local mesh per instance, so org-per-scenario becomes N meshes on distinct ports, peered as the scenario dictates. Cross-org NPC initiation is **authorable**: an alias is stable author-chosen vocabulary (`rival-helpdesk:sam` can sit in persona text), and spin-up binds each alias to whichever mesh plays that role via an alias→mesh table; prompts stay byte-identical across runs and orgs.
+
+## 10. Non-goals (v1)
+
+Transit/multi-hop; topics, files, presence, reminders across borders; a global mesh directory; a negotiated bidirectional link (D2); a single socket carrying both directions (D3); public-internet exposure of the border — peers reach each other over a network the operators trust (LAN/tunnel); public exposure is #74's territory, parked as written; sender-side caps on what may queue toward a down peering (rows accumulate until TTL — stated).
+
+## 11. Phasing (each PR inert without a peer key; each through the review lane; owner approves this doc first)
 
 | Phase | Content | Depends |
 |---|---|---|
-| F0 | Retarget #84's salvageable core: `peer_keys` + `peers` tables, `POST /peer-keys` (+list/revoke), `POST /peers/register` (handler-auth), local-id `:` exclusion. No wire change | #90 merged |
-| F1 | Inbound border: peer auth on the WS server, `relay` frame + §5.2 checks, §5.4 `aclGrant` refusal, peer-disabled sweep, per-peer metrics | F0 |
-| F2 | Outbound border: `outbound_peers` API, `routeDirect` remote branch + outbound ACL, border forwarder on the SDK, ack/error surfacing, queue drain per peering | F1 |
-| F3 | Docs (README §federation) and the **release artifact**: peer orgs run a semver-tagged ghcr image cut from a git tag (never `:main`/`:latest`), with the protocol version stated in the tag's release notes; this mesh plans to move from "restart = git checkout" to running the same tagged image once mesh-to-mesh lands, so the #73 deploy contract becomes the peer contract rather than a second one (operator position, spawner-v2). Then the coordinated spawner-mesh redeploy (operator-scheduled) | F2 |
+| F0 | `acl` FK-removal rebuild + explicit ACL cleanup in `deleteAgent` (+ migration-chain cases with rows); `peer_keys`/`peers`/`relays` tables; `POST/GET/DELETE /peer-keys`; `POST /peers/register` (cherry-picked handler-auth); local-id `:` exclusion + alias/agent-id collision rules; boot log of legacy `:` ids; SDK: `protocol` field + `PeerClient`. No wire behaviour change | #90, #94 merged |
+| F1 | Inbound border: peer auth (§5.1), `peerIndex`, allowlist, `relay` handling (§5.2) with rate bucket + dedupe + local row ids, §5.4 `aclGrant` gate + handler branches, MCP `as_agent` refusal, peer sweep, per-peer metrics (`mesh_peer_relays_total{alias,direction,outcome}`, `mesh_peer_up{alias}`) | F0 |
+| F2 | Outbound border: `outbound_peers` API + `messages.failed_code`, `routeDirect` branch + fall-through, forwarder (`server/border.ts`), `REMOTE_REFUSED` surfacing, revocation-time row expiry, sensitivity-class flag in the PR | F1 |
+| F3 | README §federation; release artifact: peer orgs run a **semver-tagged ghcr image cut from a git tag** (never `:main`/`:latest`) with the protocol version in the release notes; this mesh moves to the same tagged image so #73's deploy contract becomes the peer contract; then the coordinated spawner-mesh redeploy (operator-scheduled) | F2 |
 
-## 11. Decisions and open questions
+## 12. Decisions (D) and owner questions (Q)
 
-- **D1** Remote id = `<alias>:<agent>`; local ids may not contain `:`. Aliases are per-mesh.
-- **D2** Peering is **two independent directional registrations**, not one negotiated link. Rejected alternative: a negotiated bidirectional link is simpler to display but requires both admins to agree state atomically across two databases nobody jointly owns — the asymmetric case (A accepts B while B has revoked A) is *legitimate*, so the model must represent it; the cost is that every status names its direction, which the API does.
-- **D3** The sender opens the socket; the receiver authenticates it with a key it minted. One socket per direction (a single socket carrying both directions is a later optimisation, not v1).
-- **D4** v1 crosses the border with `direct` only; kinds are a per-peering allowlist for later widening.
-- **D5** Remote refusals reach the local sender as a code only (`REMOTE_REFUSED`), never the remote's reason.
-- **Q1 (owner):** v1 = direct messages only across a border — confirm, or name a second kind needed on day one.
-- **Q2 (owner):** v1 assumes peers reach each other over a trusted network (LAN/tunnel); public-internet peering waits on #74 — confirm.
+- **D1** Remote id `<alias>:<agent>`; new local ids may not contain `:`; legacy ones tolerated and logged.
+- **D2** Two independent directional registrations, not a negotiated link (asymmetric states are legitimate; every status names its direction).
+- **D3** Sender opens the socket; receiver authenticates with its own minted key; one socket per direction.
+- **D4** `direct` only across borders in v1; kinds is a per-peering allowlist.
+- **D5** Remote refusals reach the local sender as `REMOTE_REFUSED` (code only), best effort to a live socket, always recorded in `failed_code`.
+- **D6** Receiver mints local row ids; dedupes on `(alias, remote_msg_id)`; peers get uniform `RELAY_REFUSED` for anything but rate limiting.
+- **D7** Protocol version is checked at the WS handshake only, after the token resolves to a peer; absent = mismatch for peers, ignored for agents; `peers` stores no version.
+- **D8** Local ack = accepted-and-queued (today's meaning); nothing defers it.
+- **D9** F0 cherry-picks #84's mechanisms; #84 itself closes.
+- **Q1 (owner):** direct-only across borders for v1 — confirm.
+- **Q2 (owner):** peers reach each other over a trusted network (LAN/tunnel) for v1; public exposure stays with #74 — confirm.
 
-## 12. Success criteria (runnable, per phase)
+## 13. Success criteria (runnable, per phase; every phase also: existing suite green, zero modified tests)
 
-F0: `bun test server/__tests__/peer-keys.test.ts` — mint/list(no hashes)/register/rotate/revoke; revoked/expired/unknown → byte-identical 403; alias grammar; local id with `:` refused at `POST /agents`; existing suite unmodified.
-F1: `peer-border.test.ts` — peer auth succeeds/disabled fails identically to bad token; `send` from a peer socket → `NOT_ALLOWED`; `relay` from an agent socket → `NOT_ALLOWED`; relay with `:` in from/to → refused (one hop); kind not in kinds → refused; rate cap → refused; no inbound edge → `ACL_DENIED` to the peer, nothing delivered; with edge → delivered with `from = alias:sender`, queued if offline, drains on reconnect; `aclGrant` naming `alias:x` with no peering → refused, with peering → written, from both HTTP and MCP; disabled peer's socket closed by the sweep driven through the real timer entry point.
-F2: `peer-outbound.test.ts` — two real servers in one process; `to = alias:agent` with no outbound peering → `AGENT_NOT_FOUND` identical to unknown local; with peering but no outbound edge → `AGENT_NOT_FOUND`; with both → relayed, acked, marked delivered; remote refusal → local `REMOTE_REFUSED`; peering socket down → row queues and delivers on reconnect; reply from the remote agent arrives with the FQ `from`. And the C5 criterion at every phase: the entire existing suite green with zero modified tests.
+F0: migration-chain test from pre-federation snapshots WITH acl rows: rebuild keeps every edge, `deleteAgent` still removes its edges; key mint/list(no hashes)/register/rotate(closes old peer socket)/revoke; second live key for an alias → 409; alias equal to a local id → 400, `POST /agents` with an id equal to an alias → 400; revoked/expired/unknown key → byte-identical 403; boot logs legacy `:` ids; `PeerClient` sends `protocol`, `MeshClient` doesn't.
+F1: peer auth OK / disabled identical to bad token / wrong-or-missing protocol → `PROTOCOL_MISMATCH`; `auth_ok` shape; `send` from a peer socket and `relay` from an agent socket → `NOT_ALLOWED`; `ping` from a peer → `pong` + `last_alive`; rate bucket refuses the (N+1)th relay in a minute incl. refused ones; `:` in from/to → `RELAY_REFUSED`; kind not allowed → `RELAY_REFUSED`; unknown `to` and no-edge → the SAME `RELAY_REFUSED` bytes; with edge → delivered with `from = alias:x`, queued if offline, drains on reconnect; same relay twice → one delivery, two acks; `aclGrant` naming `alias:x` w/o peering → refused, with → written, via HTTP and MCP; MCP `as_agent` with `:` → refused; sweep closes a disabled peer's socket, driven through the real timer entry point; a throwing relay handler → one `INTERNAL` frame, process alive (#94).
+F2: two real servers in one process; `to = alias:x` with no outbound peering → `AGENT_NOT_FOUND` identical to unknown local; legacy local id with `:` still delivers; with peering, no edge → `AGENT_NOT_FOUND`; with both → relayed, acked, `delivered_at` set only on the peer's ack; peering down → row queues, delivers on reconnect, no duplicate at the remote (dedupe); remote refusal → `failed_code` set + `REMOTE_REFUSED` to the live sender; `DELETE /outbound-peers` → queued untTL'd rows expire in the same transaction; `GET /outbound-peers` never contains the token; reply from the remote agent arrives with the FQ `from`.
+
+## 14. Ledger — every Generator decision the evaluator listed, resolved
+1 peer auth id-keyed+compare, `assigned_alias` stored (§3/§5.1) · 2 protocol check after peer resolution; absent=mismatch for peers; `auth_ok` shape (§5.1, D7) · 3 `ConnState{agentId:null, peerAlias}` + enumerated skipped paths (§5.1) · 4 `peerIndex` on `WsServerHandle` (§5.1) · 5 `PEER_SWEEP_INTERVAL_MS=15_000` constant (§5.1) · 6 allowlist `relay`+`ping`, `last_alive` (§5.1) · 7 `acl` rebuild, `deleteAgent` cleanup, handler branches (§4, §5.4) · 8 `hasInboundPeer`/`hasOutboundPeer` in db.ts (§5.4) · 9 local row ids, `relays` dedupe, ack `ref` (§5.2, D6) · 10 forwarder module, query, in-flight, ack-marks-delivered, triggers (§5.3) · 11 ack semantics + `REMOTE_REFUSED` path (§5.3, D5, D8) · 12 rate bucket first, in-memory, counts refused (§5.2) · 13 alias collision/409/re-register-closes-socket (§3, §6) · 14 register body/response (§6) · 15 URL validation, event-driven forwarder start/stop (§6) · 16 second `:` refused locally (§5.3) · 17 tap policy (§1.1) · 18 metric names (§11 F1) · 19 MCP `as_agent` refusal (§5.3) · 20 SDK changes named (§7) · 21 #84 cherry-pick (D9) · 22 legacy `:` ids: fall-through + boot log (§5.3, C5).
