@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { openDb, registerAgent, getAgentByToken, deleteAgent } from '../db.ts';
+import { openDb, registerAgent, getAgentByToken, deleteAgent, rebuildAclFkLess } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { mkdtempSync } from 'fs';
 import { join } from 'path';
@@ -167,6 +167,29 @@ describe('migration chain — openDb over databases that predate the current sch
     // pairs but reset the provenance would pass a count-only assertion.
     expect(aclRows(db)).toEqual(before);
     db.close();
+  });
+
+  it('★ F0a: the rebuild REFUSES to run inside a transaction', () => {
+    // The precondition is that PRAGMA foreign_keys = OFF is a silent no-op
+    // inside a transaction. Documented, it is the weakest form there is: a
+    // future tidy-up wrapping the migration section in db.transaction() would
+    // make the pragma no-op, run the DROP/RENAME under FK enforcement, and
+    // produce a server that will not start on every boot. So it throws.
+    const path = tmpDb('acltx');
+    preFederationDb(path);
+    const db = new Database(path);
+    expect(() => db.transaction(() => rebuildAclFkLess(db))()).toThrow(/outside a transaction/);
+    // And the table is untouched — a guard that threw halfway would be worse
+    // than none.
+    expect((db.prepare('PRAGMA foreign_key_list(acl)').all() as unknown[]).length).toBeGreaterThan(0);
+    db.close();
+
+    // Positive control: the SAME call outside a transaction succeeds, so the
+    // throw above is the precondition and not the function being broken.
+    const ok = new Database(path);
+    expect(() => rebuildAclFkLess(ok)).not.toThrow();
+    expect((ok.prepare('PRAGMA foreign_key_list(acl)').all() as unknown[]).length).toBe(0);
+    ok.close();
   });
 
   it('★ F0a: the rebuild restores secondary indexes — idx_acl_reverse survives', () => {

@@ -97,6 +97,70 @@ export interface Observer {
 // 5.1 Database initialization
 // ──────────────────────────────────────────────
 
+/**
+ * F0a (§4): rebuild an UPGRADED acl table to the FK-less shape.
+ *
+ * CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so
+ * databases created before this change keep their REFERENCES clauses and would
+ * reject the first remote endpoint written to them.
+ *
+ * Extracted from openDb so the precondition below is REACHABLE FROM A TEST.
+ * Documented preconditions are the weakest form there is — see the guard.
+ */
+export function rebuildAclFkLess(db: Database): void {
+  // MUST run outside any transaction: `PRAGMA foreign_keys = OFF` is a silent
+  // NO-OP inside one. Measured, not assumed —
+  //   outside, after ON:        { foreign_keys: 1 }
+  //     inside txn, after OFF:  { foreign_keys: 1 }   <-- ignored, no error
+  //   outside, after OFF:       { foreign_keys: 0 }
+  //
+  // This THROWS rather than merely saying so in a comment. A future tidy-up
+  // that wrapped the migration section in a transaction would otherwise make
+  // the pragma no-op silently, and the DROP/RENAME below would then run under
+  // FK enforcement — producing a server that will not start, on every boot,
+  // which is the exact failure this file's migration tests exist to prevent.
+  // Eliminating the precondition beats documenting it.
+  if (db.inTransaction) {
+    throw new Error('acl rebuild must run outside a transaction: PRAGMA foreign_keys is ignored inside one');
+  }
+
+  try {
+    const fks = db.prepare('PRAGMA foreign_key_list(acl)').all() as unknown[];
+    if (fks.length === 0) return; // already FK-less: a second boot is a no-op
+
+    // Secondary indexes are dropped along with the table, so capture their DDL
+    // first and re-execute it after the rename — this is what preserves
+    // idx_acl_reverse (#11). The PK's autoindex has a NULL sql and is recreated
+    // by the CREATE TABLE itself, so it is filtered out rather than replayed.
+    const indexDdl = (db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='acl' AND sql IS NOT NULL"
+    ).all() as { sql: string }[]).map((r) => r.sql);
+
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec(`
+      CREATE TABLE acl_new (
+        from_agent   TEXT NOT NULL,
+        to_agent     TEXT NOT NULL,
+        granted_at   INTEGER NOT NULL,
+        granted_by   TEXT NOT NULL,
+        PRIMARY KEY (from_agent, to_agent)
+      );
+    `);
+    db.exec('INSERT INTO acl_new SELECT from_agent, to_agent, granted_at, granted_by FROM acl');
+    db.exec('DROP TABLE acl');
+    db.exec('ALTER TABLE acl_new RENAME TO acl');
+    for (const ddl of indexDdl) db.exec(ddl);
+    db.exec('PRAGMA foreign_keys = ON');
+
+    console.log(JSON.stringify({ evt: 'db.acl_rebuilt_fkless', indexes_restored: indexDdl.length, at: Date.now() }));
+  } catch (err) {
+    // Loud, and fatal to the boot: an acl table left half-rebuilt is worse than
+    // one never touched, and this runs before the server accepts anything.
+    process.stderr.write(`FATAL: acl FK-less rebuild failed: ${err}\n`);
+    throw err;
+  }
+}
+
 export function openDb(path: string): Database {
   const db = new Database(path);
 
@@ -274,58 +338,7 @@ export function openDb(path: string): Database {
     }
   } catch {}
 
-  // F0a (§4): rebuild an UPGRADED acl table to the FK-less shape above.
-  // CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so
-  // databases created before this change keep their REFERENCES clauses and
-  // would reject the first remote endpoint written to them.
-  //
-  // MUST run outside any db.transaction(): `PRAGMA foreign_keys = OFF` is a
-  // silent NO-OP inside one. Measured, not assumed —
-  //   outside, after ON:        { foreign_keys: 1 }
-  //     inside txn, after OFF:  { foreign_keys: 1 }   <-- ignored
-  //   outside, after OFF:       { foreign_keys: 0 }
-  // The pragma does not error; it is simply disregarded, so a transactional
-  // version of this rebuild would appear to work and silently fail its purpose.
-  //
-  // Probe-driven so it is idempotent: a table already FK-less has an empty
-  // foreign_key_list and is left untouched, which is what makes a second boot
-  // a no-op rather than a repeated rebuild.
-  try {
-    const fks = db.prepare('PRAGMA foreign_key_list(acl)').all() as unknown[];
-    if (fks.length > 0) {
-      // Secondary indexes are dropped along with the table, so capture their
-      // DDL first and re-execute it after the rename — this is what preserves
-      // idx_acl_reverse (#11). The PK's autoindex has a NULL sql and is
-      // recreated by the CREATE TABLE itself, so it is filtered out rather
-      // than replayed.
-      const indexDdl = (db.prepare(
-        "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='acl' AND sql IS NOT NULL"
-      ).all() as { sql: string }[]).map((r) => r.sql);
-
-      db.exec('PRAGMA foreign_keys = OFF');
-      db.exec(`
-        CREATE TABLE acl_new (
-          from_agent   TEXT NOT NULL,
-          to_agent     TEXT NOT NULL,
-          granted_at   INTEGER NOT NULL,
-          granted_by   TEXT NOT NULL,
-          PRIMARY KEY (from_agent, to_agent)
-        );
-      `);
-      db.exec('INSERT INTO acl_new SELECT from_agent, to_agent, granted_at, granted_by FROM acl');
-      db.exec('DROP TABLE acl');
-      db.exec('ALTER TABLE acl_new RENAME TO acl');
-      for (const ddl of indexDdl) db.exec(ddl);
-      db.exec('PRAGMA foreign_keys = ON');
-
-      console.log(JSON.stringify({ evt: 'db.acl_rebuilt_fkless', indexes_restored: indexDdl.length, at: Date.now() }));
-    }
-  } catch (err) {
-    // Loud, and fatal to the boot: an acl table left half-rebuilt is worse than
-    // one never touched, and this runs before the server accepts anything.
-    process.stderr.write(`FATAL: acl FK-less rebuild failed: ${err}\n`);
-    throw err;
-  }
+  rebuildAclFkLess(db);
 
   return db;
 }
