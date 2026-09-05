@@ -164,9 +164,35 @@ describe('F2a: routeDirect remote branch', () => {
     expect((results[0] as { error_code: string }).error_code).toBe('AGENT_NOT_FOUND');
   });
 
+  // #123: the C9 SET TEST for a caller with NO EDGE. Before the fix,
+  // KIND_NOT_ALLOWED was emitted BEFORE the ACL check, so an agent holding no
+  // edge could enumerate which outbound peerings exist by sending a wrong-kind
+  // message — and the error even named the alias. There is no other route to
+  // that topology from inside the mesh.
+  it('an EDGELESS caller cannot tell wrong-kind from no-peering from no-edge', () => {
+    peering('far', '["file"]');          // exists, but 'direct' is not permitted
+    // deliberately NO aclGrant for the sender
+
+    const results = [
+      send('far:them', 'k1'),            // peering exists, kind not permitted
+      send('ghost:them', 'k2'),          // no peering at all
+      send('far:other', 'k3'),           // peering exists, no edge
+    ];
+    // error_message echoes the caller's own `to`, which it supplied — not a
+    // disclosure. The CODE is what must not vary.
+    const shapes = new Set(results.map(r => JSON.stringify({ ...r, error_message: '' })));
+    expect(shapes.size).toBe(1);
+    expect((results[0] as { error_code: string }).error_code).toBe('AGENT_NOT_FOUND');
+  });
+
   it('KIND_NOT_ALLOWED stays DISTINCT — own configuration, crosses no border', () => {
-    // The deliberate exception to the set above: this reveals only what THIS
-    // mesh's admin configured for its own outbound side.
+    // The deliberate exception, and the justification is REACHABILITY (#123):
+    // only a caller that ALREADY HOLDS AN EDGE to this peering can reach this
+    // refusal, and such a caller already knows the peering exists. The
+    // exemption is about who can reach the message, never about what it says.
+    //
+    // This is also the positive control for the set test above — without it,
+    // "all three identical" is satisfied by never emitting KIND_NOT_ALLOWED.
     peering('far', '["file"]');
     aclGrant(db, 'sender', 'far:them', 'admin');
 
