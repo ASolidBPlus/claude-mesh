@@ -6,6 +6,7 @@ import {
   registerAgent,
   aclGrant,
   getOrCreateTopic,
+  getTopicSubscribers,
   subscribe,
   getAgentSubscriptions,
   getPendingMessages,
@@ -288,11 +289,52 @@ describe('routeUnsubscribe', () => {
     db = openDb(':memory:');
   });
 
-  it('TOPIC_NOT_FOUND when topic does not exist', () => {
-    registerAgent(db, { id: 'agent-sub', token_hash: 's'.repeat(64), hostname: 'h1' });
-    const result = routeUnsubscribe(db, 'agent-sub', { type: 'unsubscribe', topic: 'ghost-topic' });
-    expect(result.ok).toBe(false);
-    expect(result.error_code).toBe('TOPIC_NOT_FOUND');
+  // #129. This test previously asserted TOPIC_NOT_FOUND — it PINNED the
+  // enumeration oracle as intended behaviour, which is why the oracle survived
+  // every review of this file. Inverted deliberately: the absence of that
+  // refusal is now the property under test.
+  it('#129 SET: both reachable answers to "may I unsubscribe from X" are byte-identical', () => {
+    registerAgent(db, { id: 'prober', token_hash: 's'.repeat(64), hostname: 'h1' });
+    registerAgent(db, { id: 'owner', token_hash: 'o'.repeat(64), hostname: 'h1' });
+    getOrCreateTopic(db, 'real-topic', 'owner');   // exists; prober not subscribed
+
+    // The two states a prober can distinguish between, if anything leaks.
+    const exists    = routeUnsubscribe(db, 'prober', { type: 'unsubscribe', topic: 'real-topic' });
+    const absent    = routeUnsubscribe(db, 'prober', { type: 'unsubscribe', topic: 'ghost-topic' });
+
+    // Byte-identical, not merely both-truthy: a `message` added to one branch
+    // is exactly how this class comes back, and only comparing the serialized
+    // answers side by side catches it.
+    expect(JSON.stringify(exists)).toBe(JSON.stringify(absent));
+    expect(exists.ok).toBe(true);
+    expect(absent.ok).toBe(true);
+    expect(exists.error_code).toBeUndefined();
+  });
+
+  // PER-GUARD. The property above is an ABSENCE, so it must be shown that the
+  // assertion can fail: a mutant reinstating the existence check has to produce
+  // a different byte. Without this the test passes just as well against a
+  // routeUnsubscribe that returns a constant.
+  it('#129 CONTROL: reinstating an existence check WOULD produce a different byte', () => {
+    registerAgent(db, { id: 'prober', token_hash: 's'.repeat(64), hostname: 'h1' });
+    getOrCreateTopic(db, 'real-topic', 'prober');
+
+    const real = routeUnsubscribe(db, 'prober', { type: 'unsubscribe', topic: 'real-topic' });
+    // What the deleted branch returned, reconstructed verbatim.
+    const oracle = { ok: false, error_code: 'TOPIC_NOT_FOUND', error_message: 'topic ghost-topic does not exist' };
+    expect(JSON.stringify(real)).not.toBe(JSON.stringify(oracle));
+  });
+
+  // The refusal protected no state, so removing it must not have changed any:
+  // an unsubscribe by a non-subscriber leaves the real subscriber alone.
+  it('#129 the always-ok answer does not disturb another agent\'s subscription', () => {
+    registerAgent(db, { id: 'prober', token_hash: 's'.repeat(64), hostname: 'h1' });
+    registerAgent(db, { id: 'victim', token_hash: 'v'.repeat(64), hostname: 'h1' });
+    getOrCreateTopic(db, 'shared', 'victim');
+    subscribe(db, 'victim', 'shared');
+
+    routeUnsubscribe(db, 'prober', { type: 'unsubscribe', topic: 'shared' });
+    expect(getTopicSubscribers(db, 'shared')).toEqual(['victim']);
   });
 
   it('unsubscribe removes subscription', () => {

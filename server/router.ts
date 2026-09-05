@@ -706,10 +706,28 @@ export function routeUnsubscribe(
   agent_id: string,
   frame: UnsubscribeFrame
 ): RouterResult {
-  const existing = db.prepare('SELECT 1 FROM topics WHERE name = ?').get(frame.topic);
-  if (existing === null) {
-    return { ok: false, error_code: 'TOPIC_NOT_FOUND', error_message: `topic ${frame.topic} does not exist` };
-  }
+  // #129: NO TOPIC-EXISTENCE CHECK. Unsubscribe is idempotent and always
+  // succeeds — including for a topic that does not exist, and for one the
+  // caller was never subscribed to.
+  //
+  // The deleted check was an ENUMERATION ORACLE, and one that C9's own
+  // detection method could not see. `listTopics` is admin-only (http-admin.ts),
+  // `routeSubscribe` and `routePublish` both getOrCreateTopic and so never
+  // refuse on absence: this was the ONLY topic-existence refusal an agent
+  // socket could reach. The system withholds the topic list from agents, which
+  // makes existence confidential, so a per-guess `TOPIC_NOT_FOUND` vs `ok`
+  // handed any authenticated agent the whole namespace, one probe at a time,
+  // with no subscription and no trace.
+  //
+  // Note the SHAPE, because it is why a uniform-refusal review missed it: the
+  // discriminator was a refusal versus a SUCCESS. Driving every reachable
+  // refusal cause at this door and asserting identical bytes passes while the
+  // oracle stays wide open, since the leaking outcome was never a refusal.
+  //
+  // Deleting the check loses nothing real: dbUnsubscribe is already an
+  // unconditional DELETE scoped by agent_id, so the refusal never protected
+  // any state — it only reported. Idempotent unsubscribe is also the honest
+  // contract for a caller retrying after a lost ack.
   dbUnsubscribe(db, agent_id, frame.topic);
   return { ok: true };
 }
