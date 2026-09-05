@@ -80,6 +80,10 @@ export interface AuthFrame {
   type: 'auth';
   agent_id: string;
   token: string;
+  /** F0c (§7): protocol version, sent only by a peer connection. Absent on an
+   *  ordinary agent auth frame, which must stay byte-identical to today's —
+   *  an added field would change what every existing client sends. */
+  protocol?: number;
 }
 
 // ──────────────────────────────────────────────

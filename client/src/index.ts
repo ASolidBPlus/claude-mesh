@@ -1,4 +1,6 @@
 export { MeshClient } from './client.ts';
+export { PeerClient } from './peer-client.ts';
+export type { RelayFrame } from './peer-client.ts';
 export type {
   MeshClientConfig,
   MeshClientEvent,

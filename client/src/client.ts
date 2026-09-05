@@ -490,7 +490,11 @@ export class MeshClient {
     return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
   }
 
-  private rawSend(frame: object): void {
+  /** F0c (§7): protected, not private, so a subclass can send frames the base
+   *  class knows nothing about (a peer relay). Widened deliberately — the
+   *  alternative is a subclass reaching into private state, which is the same
+   *  coupling with none of the visibility. */
+  protected rawSend(frame: object): void {
     if (!this.isOpen()) {
       throw new Error('not connected');
     }
@@ -530,7 +534,10 @@ export class MeshClient {
     return settler;
   }
 
-  private sendWithAck(ref: string, frame: object): Promise<void> {
+  /** F0c (§7): protected for the same reason as rawSend — PeerClient.relay()
+   *  needs the ack/timeout machinery, and reimplementing it in the subclass
+   *  would be a second place for ACK_TIMEOUT semantics to drift. */
+  protected sendWithAck(ref: string, frame: object): Promise<void> {
     if (!this.isOpen()) {
       return Promise.reject(new Error('not connected'));
     }
@@ -681,6 +688,7 @@ export class MeshClient {
         type: 'auth',
         agent_id: config.agentId,
         token: config.agentToken, // RAW token; server hashes it
+        ...this.authExtras(),
       };
       try {
         ws.send(JSON.stringify(authFrame));
@@ -880,13 +888,38 @@ export class MeshClient {
     );
   }
 
+  /** F0c (§7): extra fields merged into the auth frame. Default {} so an
+   *  ordinary MeshClient's auth frame is byte-identical to today's — pinned by
+   *  a test, because a silently widened auth frame would change what every
+   *  existing agent sends to every existing server. */
+  protected authExtras(): Record<string, unknown> {
+    return {};
+  }
+
+  /** F0c (§7): which error frames stop the client for good. Default is today's
+   *  behaviour exactly — a pre-first-auth AUTH_FAILED, or a PROTOCOL_MISMATCH
+   *  at any time. An AUTH_FAILED AFTER a successful first auth stays
+   *  reconnectable for an agent: it is usually a restarted server, and giving
+   *  up would be worse than retrying. A peer overrides this, because for a peer
+   *  the same frame means the far side revoked it. */
+  protected isFatalError(frame: ErrorFrame): boolean {
+    return (frame.code === 'AUTH_FAILED' && !this.firstAuthDone)
+      || frame.code === 'PROTOCOL_MISMATCH';
+  }
+
   private onError(frame: ErrorFrame): void {
     const ref = frame.ref;
 
-    // Pre-auth fatal auth failure → reject the in-flight connect() and stop.
-    if (frame.code === 'AUTH_FAILED' && !this.firstAuthDone) {
+    // Fatal-error branch. WHICH errors are fatal is a subclass decision
+    // (isFatalError); the HANDLING is not, so there is one branch rather than
+    // two implementations that could drift.
+    if (this.isFatalError(frame)) {
       this.shouldReconnect = false;
       this.clearConnectTimeout();
+      // F0c: emit before closing. A fatal error that only rejects the in-flight
+      // connect() is invisible to a caller that already connected once — which
+      // is exactly the post-first-auth case a peer must stop on.
+      this.emit('error', this.makeError(frame));
       this.settleConnect(false, this.makeError(frame));
       if (this.ws !== null) {
         try {

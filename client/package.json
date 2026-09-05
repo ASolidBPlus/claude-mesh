@@ -1,6 +1,6 @@
 {
   "name": "@claude-mesh/client",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "type": "module",
   "main": "./src/index.ts",
   "module": "./src/index.ts",
@@ -15,7 +15,9 @@
       "import": "./src/protocol.ts"
     }
   },
-  "files": ["src"],
+  "files": [
+    "src"
+  ],
   "scripts": {
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit"
