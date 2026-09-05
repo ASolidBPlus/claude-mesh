@@ -217,6 +217,11 @@ export function openDb(path: string): Database {
       -- each admin controls their own (§3): this column is that control.
       kinds         TEXT NOT NULL DEFAULT '["direct"]',
       rate_per_min  INTEGER NOT NULL DEFAULT 600,
+      -- D10: expires_at bounds the window in which this key may be used to
+      -- REGISTER; it does not bound the resulting peering (the peer holds its
+      -- own token, is never re-checked against the key, and is ended by
+      -- revokePeerKey — why minted_by_key exists). There is no time-bounded
+      -- peering; if you want one, this field is not it (#114).
       expires_at    INTEGER,
       revoked_at    INTEGER,
       note          TEXT,
@@ -392,6 +397,12 @@ export function openDb(path: string): Database {
   // indistinguishable). ADDITIVE: existing rows get NULL and last_seen keeps its
   // exact current meaning for every consumer.
   try { db.exec('ALTER TABLE agents ADD COLUMN last_alive INTEGER'); } catch {}
+
+  // #113 migration: DECLARED LINEAGE on a peer key. A rotation NAMES the key
+  // it replaces; a rebind names nothing. Additive, existing rows get NULL —
+  // which is the safe default by construction (no declared lineage means
+  // rebind means the alias's inbound edges are dropped).
+  try { db.exec('ALTER TABLE peer_keys ADD COLUMN rotates TEXT'); } catch {}
 
   // #11 migration: reverse ACL index. The acl PK is (from_agent, to_agent), so
   // every from_agent-leading lookup is already served — INCLUDING both arms of
@@ -792,6 +803,9 @@ export interface PeerKey {
   revoked_at: number | null;
   note: string | null;
   created_at: number;
+  /** #113: the key_id this key REPLACES, when the operator declared a rotation.
+   *  NULL means no lineage was declared — treated as a rebind. */
+  rotates: string | null;
 }
 
 export interface Peer {
@@ -824,13 +838,14 @@ export function insertPeerKey(
     expires_at?: number | null;
     note?: string | null;
     created_at: number;
+    rotates?: string | null;
   }
 ): PeerKey {
   db.prepare(`
-    INSERT INTO peer_keys (id, key_hash, alias, kinds, rate_per_min, expires_at, note, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO peer_keys (id, key_hash, alias, kinds, rate_per_min, expires_at, note, created_at, rotates)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(key.id, key.key_hash, key.alias, key.kinds, key.rate_per_min,
-         key.expires_at ?? null, key.note ?? null, key.created_at);
+         key.expires_at ?? null, key.note ?? null, key.created_at, key.rotates ?? null);
   return db.prepare('SELECT * FROM peer_keys WHERE id = ?').get(key.id) as PeerKey;
 }
 
@@ -991,6 +1006,43 @@ export function hasOutboundPeer(_db: Database, _alias: string): boolean {
   return false;
 }
 
+/**
+ * AN ALIAS'S EDGES END WITH THE PEERING THAT CREATED THEM.
+ *
+ * Revocation used to park grants rather than revoke them: revokePeerKey
+ * disables the `peers` row and never touches `acl`, a new key may be minted for
+ * the same alias once the old is revoked, and registration's upsertPeer sets
+ * `disabled = 0` — so every surviving `alias:*` edge came back to life for
+ * WHOEVER NOW HOLDS THE NAME. Reproduced end to end:
+ *
+ *   mesh ONE edge honoured:       true
+ *   after revoke, peer disabled:  true
+ *     edge still in acl:          true
+ *   after re-register, disabled:  false
+ *     MESH TWO inherits it:       true
+ *
+ * Not an escalation — every step is an admin action — but it is operator
+ * SURPRISE of the worst kind: the operator revoked a peering and believes the
+ * grants went with it. This codebase already argues that principle for keys at
+ * http-admin.ts:1297 ("revoking one would leave a door open the operator
+ * believes they closed"); edges are the same argument one level out.
+ *
+ * DIRECTION IS EXPLICIT, never inferred: 'inbound' edges are the ones the alias
+ * GRANTS FROM (`from_agent` prefixed `alias:`), 'outbound' the ones it is
+ * granted TO. A helper that guessed from context would eventually guess wrong
+ * in the direction that leaves a door open.
+ *
+ * Returns the number of edges removed, so callers can log what a revocation
+ * actually destroyed rather than asserting it destroyed something.
+ */
+export function deletePeeringEdges(db: Database, alias: string, direction: 'inbound' | 'outbound'): number {
+  const column = direction === 'inbound' ? 'from_agent' : 'to_agent';
+  // Prefix range, not LIKE: `alias:` .. `alias;` is index-servable and cannot
+  // be confused by a '%' or '_' inside an alias. (';' is ':' + 1.)
+  return db.prepare(`DELETE FROM acl WHERE ${column} >= ? AND ${column} < ?`)
+    .run(`${alias}:`, `${alias};`).changes;
+}
+
 export function listPeers(db: Database): Peer[] {
   return db.prepare('SELECT * FROM peers ORDER BY alias').all() as Peer[];
 }
@@ -1001,9 +1053,47 @@ export function listPeers(db: Database): Peer[] {
     `disabled` — the key was checked live immediately above. */
 export function upsertPeer(
   db: Database,
-  peer: { alias: string; token_hash: string; minted_by_key: string; kinds: string; rate_per_min: number }
+  peer: {
+    alias: string; token_hash: string; minted_by_key: string;
+    kinds: string; rate_per_min: number;
+    /** #113: the key_id this registration's key declares it replaces. */
+    rotates?: string | null;
+  }
 ): Peer {
   const now = Date.now();
+  // AN ALIAS'S EDGES END WITH THE PEERING THAT CREATED THEM (#113).
+  //
+  // The decision is DECLARED LINEAGE, not an inferred one. The obvious signal —
+  // "the row was disabled, so this is a rebind" — CANNOT WORK, verified at the
+  // tree:
+  //   - minting refuses while a live key exists (http-admin, 409), so a
+  //     receiver-side ROTATION must also go revoke -> mint -> register. At the
+  //     DB layer that is BYTE-IDENTICAL to a rebind.
+  //   - key EXPIRY never disables the row (only revokePeerKey does), so
+  //     expired -> mint -> register re-arms an ENABLED row and any
+  //     disabled-based hook never fires at all.
+  // Two operations, one state transition: the intent lives with the operator
+  // and is simply not present in the data.
+  //
+  // So the operator declares it. A rotation key NAMES the key it replaces, and
+  // edges survive only if that lineage matches the row's CURRENT key.
+  //
+  // THE FAIL DIRECTION IS SAFE BY CONSTRUCTION: absent lineage, or lineage
+  // naming some other key, means rebind means drop. The cost of forgetting to
+  // say "rotation" is a re-grant; the cost of the opposite default is a live
+  // edge pointing at whoever now holds the name.
+  const existing = getPeerByAlias(db, peer.alias);
+  if (existing !== null) {
+    const declared = peer.rotates ?? null;
+    const isRotation = declared !== null && declared === existing.minted_by_key;
+    if (!isRotation) {
+      const removed = deletePeeringEdges(db, peer.alias, 'inbound');
+      console.log(JSON.stringify({
+        evt: 'peer.edges_ended_with_peering', alias: peer.alias, removed,
+        declared_rotates: declared, previous_key: existing.minted_by_key, at: now,
+      }));
+    }
+  }
   db.prepare(`
     INSERT INTO peers (alias, token_hash, minted_by_key, kinds, rate_per_min, registered_at, disabled)
     VALUES (?, ?, ?, ?, ?, ?, 0)
