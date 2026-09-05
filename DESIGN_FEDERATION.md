@@ -95,6 +95,11 @@ concurrency (#41's consumer) without a second isolation mechanism:
 - **Capabilities.** A per-key (inherited per-agent) allowlist of bus operations:
   `send:direct`, `send:file`, `publish`, `subscribe`. Home-tenant agents
   (`minted_by_key IS NULL`) are unrestricted, as today.
+- **Terminology guard** *(consumer-review amendment)*: in this design,
+  `agents.namespace` means **tenant** — and "tenant" is the word to use in every
+  builder brief. mesh-chat's codebase already uses "namespace" for something else
+  (the `granted_by` *prefix* convention, `mesh-chat:group:*`); briefs that say
+  "namespace" near mesh-chat or its reconciler will get the wrong field filtered.
 
 ---
 
@@ -398,6 +403,31 @@ same in-memory id→namespace lookup the router's tenant gate needs anyway (one 
 maintained at register/patch time, shared by both consumers — not a per-emit DB
 query).
 
+**The home tenant is scopable too** *(consumer-review amendment)*: `namespace` may be
+the reserved word `home`, scoping a tap to home-tenant traffic (`ns = NULL` endpoints)
+under the same D3 rule. Without this, `NULL` = global is the *only* way to observe the
+fleet — meaning the fleet god view necessarily sees every tenant's intra-org traffic.
+With it, the operator chooses per grant: `home`-scoped for fleet observability,
+global (`NULL`) only where cross-tenant visibility is actually wanted.
+
+**And "reserved" must be enforced, not asserted** *(lane finding)*: §3/§5.1 already
+refuse `home` at `POST /agents` and key minting, but a reserved word is only reserved
+if **one validator** refuses it at **every** namespace-writing surface. Rule: a
+single tenant-name validator — rejecting `home`, `mesh`, and any future reserved
+scope word, with the reason stated at the validator — applied at `POST /agents`,
+`PATCH /agents/:id` (the previously-unguarded surface: an admin PATCH could have
+minted a tenant literally named `home`, making every `home`-scoped observer grant
+ambiguous between fleet scope and that tenant's traffic), and
+`POST /registration-keys`.
+
+**Disclosure owed to third-party tenants** — stated here because it is a property of
+the design, not a bug: a **global tap exists** and the host operator can hold one, so
+the operator *can* observe all bus traffic, including a tenant's intra-org messages;
+and **topic names are globally visible** (any consumer that lists topics — e.g. a
+channel directory — shows every tenant's topic names; content is gated, names are
+not; never encode secrets in a topic name). Any real external org must be told both
+at onboarding.
+
 Grant surface: `POST /observers` gains an optional `namespace` field. Admin-only, as
 today (`server/http-admin.ts` observer routes).
 
@@ -496,6 +526,89 @@ layer do the isolation. One primitive, two consumers.
 | 2 | `federation_links` API + the admit rule at the four sites + presence + capabilities (§6). Inert while no non-NULL-namespace agent has ever been minted | 1 |
 | 3 | Scoped observers (§7) | 1 |
 | 4 | README §federation + deploy-contract cross-ref (#71); worked example | 2,3 |
+
+**Tenant-grant refusal** *(consumer-review amendment, upgraded from an obligation to
+a bus-side refusal after lane review — this class of hazard would silently defeat
+C4)*: consumers that hold the admin token and write ACL edges in bulk can
+auto-satisfy the "per-pair ACL on top" layer for a whole tenant the moment a link
+exists. The known instance: mesh-chat's ACL reconciler expands orchestrator-role
+groups against the entire `GET /agents` roster and grants bidirectional user↔agent
+edges — tenant-minted agents would be auto-granted to every orchestrator-tier user.
+
+The first version of this gate read "no link until *every* bulk `granted_by` writer
+filters to the home tenant" — a universal quantifier over an unenumerated set,
+spanning repositories the link-creator cannot read, held by a person, with no
+mechanism. It could only ever be believed released, not proven released. The
+consumer-side census that killed it: mesh-chat alone writes ACL from **four** places
+(group reconciler, manual admin grants, visibility consent, and a webhook mirror
+that *copies an owner's reach to a second node under a different stamp* —
+multiplying any cross-tenant edge it sees), three with no tenant filter — and they
+are not all the same kind of decision, which no per-writer filter or per-request
+flag can express.
+
+**The bus owns the ACL table, so the rule is a refusal requiring BOTH conditions**
+(lands in Phase 2, with the links API): **the shared grant path (`aclGrant` —
+reached from both `POST /acl` and the MCP grant tool) refuses any edge where
+`ns(from) ≠ ns(to)` unless (a) a `federation_links` row already exists for that
+direction AND (b) the request carries an explicit `tenant_grant: true` marker.**
+The two conditions are independent and each closes the other's gap — this section
+went through both single-condition designs and each failed:
+
+- *Marker only* (first draft): a flag is exactly the kind of thing an automation
+  copies — it can be asserted into being by any writer, with or without operator
+  intent.
+- *Link only* (second draft): once the operator links two tenants, unfiltered
+  automation fills in every pair across the link — mesh-chat's census (below) has
+  three writers that would do so on day one, and the rule would have *defined* that
+  auto-grant as "the deliberate decision". The refusal would have been active
+  exactly when the hazard isn't (pre-link, when no tenant traffic is possible
+  anyway) and inactive exactly when it is. Damage was bounded by the link's `kinds`
+  at the admission points — but `kinds` bounds *what*, C4's pair layer bounds
+  *which pairs*, and only one would have survived.
+
+Under AND: a copied flag buys nothing without an operator link; automation that
+doesn't know about tenants passes no marker, so it creates nothing even after the
+link lands — a consent flow or webhook mirror physically cannot create a
+cross-tenant edge, for two reasons, the second of which holds at the only time it
+ever mattered. "Two decisions" (C4) is now literally two artifacts: the operator's
+link, and a grant request that says what it is doing. Norm for any consumer that
+ever sends the marker (the bus cannot enforce this; stating it is what makes it
+reviewable): `tenant_grant: true` is sent only behind an explicit operator
+confirmation for that specific pair — never by default, never by policy expansion.
+A marker-sender that automates the marker has reintroduced the hole by hand. Same-tenant edges are
+unaffected: intra-tenant granting stays exactly as today, which is what C5
+requires. The release condition collapses from "all writers everywhere comply" to
+"the refusal is deployed" — verifiable from this repo alone, and the fleet operator
+can key its link-creation gate on that one landing. The tenancy test reads the
+bus's own `agents` row (authoritative — never a client-supplied field, so no
+absent-field-read-as-null fail-open), and **fails closed**: an endpoint whose
+tenant cannot be resolved is refused, not defaulted to `home`.
+
+Two facts the implementer of this refusal must see together *(lane finding — they
+lived in sections written for different reasons)*: the link lookup **maps `NULL →
+'home'`** before asking "does a link exist for this direction" (`agents.namespace`
+uses `NULL` for home; `federation_links.from_ns/to_ns` are `TEXT NOT NULL` using the
+literal `home`), and that mapping is unambiguous **only because the reserved-word
+validator (§7) refuses `home` as a mintable tenant name**. If a tenant could be
+named `home`, a `('home' → X)` link row would be ambiguous between the home tenant
+and that tenant, and the refusal would consult a link the operator never created for
+the pair in front of it. **The validator is therefore a correctness precondition of
+this refusal, not an observability tidiness item** — Phase 2 must not ship the
+refusal without it.
+
+Kept with the rest of the dialectic because it will recur somewhere unrelated to
+tenants: the link-only draft failed not because links are weak, but because **the
+control's active window was the complement of the threat window** — it refused
+pre-link, when no tenant traffic was possible, and stood down post-link, the only
+time the hazard existed. That is the transferable form.
+
+The terminology guard (§3) is part of the same finding, not a tidiness item: the
+obligation version required every writer to filter by a field whose name means
+something *else* in the very codebase holding the known instance — compliance was
+fragile by construction; the refusal is immune to the vocabulary. mesh-chat's
+reconciler filter (Dinfra/mesh-chat #77, in flight — merge SHA + deploy confirmation
+to follow from chat-planner) remains worth shipping as defense-in-depth and hygiene,
+but **it is no longer the gate**.
 
 Builder briefs will be functionality-framed per fleet convention, cite this doc + ticket
 numbers, and go through the normal review lane; I do not implement.
