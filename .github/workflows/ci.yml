@@ -1,10 +1,16 @@
-name: Docker
+name: CI
 
-# Build the server image, and publish it to GitHub Container Registry
-# (ghcr.io/<owner>/claude-mesh) on pushes to main and on version tags.
-# Pull requests build the image but do NOT push — that validates the
-# Dockerfile without publishing.
+# The repository's single CI workflow, and the ONLY place the test suite and
+# the typecheck ratchet run — on pull requests and on every push to main.
+# Jobs:
+#   test      — bun test, server and client
+#   typecheck — the error-count ratchet (.github/scripts/typecheck-ratchet.sh);
+#               fails when the count goes UP, lists what disappeared when it goes down
+#   docker    — build the server image; publish to GitHub Container Registry
+#               (ghcr.io/<owner>/claude-mesh) on pushes to main and on version tags.
+#               Pull requests build but do NOT push — validates the Dockerfile.
 #
+# "docker ✅" alone does NOT mean the tests ran — check the test/typecheck jobs.
 # No secrets to configure: GHCR auth uses the built-in GITHUB_TOKEN.
 # Note: production (spawner-mesh) currently git-pulls the source rather than
 # pulling this image, so the published image is for external `docker run`
