@@ -212,6 +212,42 @@ export function openDb(path: string): Database {
     CREATE INDEX IF NOT EXISTS idx_reminders_agent
       ON reminders(agent_id, status);
 
+    -- §4 (Phase 1): a registration key mints agents into ONE tenant. The raw
+    -- secret is shown once at mint and stored only as a hash, exactly like an
+    -- agent token — id is the loggable public handle ("regk_" + 8 hex), so
+    -- provenance can be traced without the secret appearing anywhere.
+    CREATE TABLE IF NOT EXISTS registration_keys (
+      id           TEXT PRIMARY KEY,
+      key_hash     TEXT NOT NULL,
+      namespace    TEXT NOT NULL,
+      capabilities TEXT NOT NULL DEFAULT '["send:direct"]',
+      -- Cap on LIVE (enabled) minted agents, not lifetime (§4 F2): disabling an
+      -- agent frees a slot, which is what makes a key reusable after cleanup.
+      max_agents   INTEGER NOT NULL DEFAULT 16,
+      expires_at   INTEGER,
+      revoked_at   INTEGER,
+      note         TEXT,
+      created_at   INTEGER NOT NULL
+    );
+
+    -- Same treatment as agents.token_hash (#45/#13): key_hash is the lookup key
+    -- on every /register call. NOT UNIQUE for the same reason — a unique index
+    -- cannot be created over a pre-existing duplicate and this DDL runs on the
+    -- live database; ambiguity is refused at lookup instead.
+    CREATE INDEX IF NOT EXISTS idx_registration_keys_key_hash
+      ON registration_keys(key_hash);
+
+    -- §4: table only in Phase 1. No API and no enforcement until Phase 2 —
+    -- created here so the migration is one step rather than two.
+    CREATE TABLE IF NOT EXISTS federation_links (
+      from_ns    TEXT NOT NULL,
+      to_ns      TEXT NOT NULL,
+      kinds      TEXT NOT NULL DEFAULT '["direct"]',
+      granted_at INTEGER NOT NULL,
+      granted_by TEXT NOT NULL,
+      PRIMARY KEY (from_ns, to_ns)
+    );
+
     CREATE TABLE IF NOT EXISTS observers (
       agent_id   TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
       granted_at INTEGER NOT NULL,
@@ -242,6 +278,21 @@ export function openDb(path: string): Database {
   // indistinguishable). ADDITIVE: existing rows get NULL and last_seen keeps its
   // exact current meaning for every consumer.
   try { db.exec('ALTER TABLE agents ADD COLUMN last_alive INTEGER'); } catch {}
+
+  // §4 (Phase 1) migrations — additive, inert until Phase 2 enforces tenants.
+  // `minted_by_key` NULL = home/admin-minted, which is every existing row.
+  try { db.exec('ALTER TABLE agents ADD COLUMN minted_by_key TEXT'); } catch {}
+  // `disabled` is enforced at BOTH auth sites in this phase (WS auth and HTTP
+  // resolveAuth) — it is the revocation cascade's actuator, not a label.
+  try { db.exec('ALTER TABLE agents ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0'); } catch {}
+  // §7: NULL = global observer, i.e. exactly today's behaviour for every
+  // existing grant. Scoped observers are Phase 3; the column lands here so the
+  // migration is one step.
+  try { db.exec('ALTER TABLE observers ADD COLUMN namespace TEXT'); } catch {}
+  // AFTER the ALTER above, not in the DDL block: the column does not exist
+  // until the migration runs, and an index over a missing column fails the
+  // whole openDb() — which on this component is a server that will not start.
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_agents_minted_by_key ON agents(minted_by_key)'); } catch {}
 
   // Sprint 12 migration: drop the deprecated `data` column (base64 blob in
   // SQLite) if it still exists from pre-Sprint-12 databases. It was declared
