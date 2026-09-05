@@ -6,6 +6,7 @@ import {
   getAgentById,
   aclCheck,
   insertMessage,
+  getMessage,
   markDelivered,
   getPendingMessages,
   getOrCreateTopic,
@@ -91,6 +92,29 @@ export function routeDirect(
     incError('ACL_DENIED');
     incAclDenied(from_agent);
     return { ok: false, error_code: 'ACL_DENIED', error_message: `${from_agent} is not permitted to send to ${frame.to}` };
+  }
+
+  // 3b. Duplicate msg_id (#94). frame.msg_id becomes messages.id, the PRIMARY
+  // KEY, so a repeat raises UNIQUE constraint failed — which, before the
+  // dispatcher guard, escaped as an uncaught exception and killed the process.
+  // An honest SDK retry after a lost ack is enough to do it.
+  //
+  // Refused BEFORE any side effect, which is the whole point of doing it here
+  // rather than catching the constraint at the insert: by insert time the
+  // recipient has already been handed the frame on the online path, so a
+  // catch-based fix would deliver the message twice and THEN report an error.
+  //
+  // Checked against the stored row, so ttl_ms=0 is unaffected: an ephemeral
+  // send persists nothing, has no id to collide with, and stays repeatable.
+  // Reusing an id that DOES identify a stored message is refused, since that
+  // is precisely the ambiguity the primary key exists to prevent.
+  if (getMessage(db, frame.msg_id) !== null) {
+    incError('DUPLICATE_MSG_ID');
+    return {
+      ok: false,
+      error_code: 'DUPLICATE_MSG_ID',
+      error_message: `msg_id already used: ${frame.msg_id}`,
+    };
   }
 
   // accepted+routed

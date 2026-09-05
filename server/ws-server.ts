@@ -60,7 +60,11 @@ interface FrameCtx {
   filesDir: string;
 }
 
-type FrameHandler = (ctx: FrameCtx) => void;
+// Handlers are synchronous TODAY. The return type admits a promise anyway so
+// the dispatcher's guard is COLOUR-BLIND (#94): a guard whose coverage depends
+// on handlers staying sync is one `async` keyword away from being disabled,
+// with no line of the guard itself changing.
+type FrameHandler = (ctx: FrameCtx) => void | Promise<void>;
 
 function handlePing(ctx: FrameCtx): void {
   const { ws, state, db, frame } = ctx;
@@ -374,7 +378,11 @@ function handleListPresence(ctx: FrameCtx): void {
 // Frame type -> handler. Exact-string keys, mutually exclusive (no precedence),
 // so map order is behavior-irrelevant. A type absent from this map (or a
 // non-string type) falls through to NOT_IMPLEMENTED at the dispatch site.
-const POST_AUTH_HANDLERS: Record<string, FrameHandler> = {
+// Exported as a TEST SEAM, matching http-admin's ROUTES: the dispatcher's
+// crash guard (#94) can only be proven by making a handler throw, and a guard
+// that is never made to fail is not a guard. Production code must not mutate
+// this map.
+export const POST_AUTH_HANDLERS: Record<string, FrameHandler> = {
   ping: handlePing,
   send: handleSend,
   ack: handleAck,
@@ -578,7 +586,53 @@ export function startWsServer(
           const frameType = frame.type;
           const handler = typeof frameType === 'string' ? POST_AUTH_HANDLERS[frameType] : undefined;
           if (handler !== undefined) {
-            handler({ ws, state, db, frame, parsed, agentIndex, observerIndex, maxFileBytes, filesDir });
+            // #94 CLASS FIX, the same guard #68 gave the HTTP dispatcher. A
+            // handler throw here used to reach the process with no
+            // uncaughtException handler installed anywhere in server/ — so ANY
+            // unexpected throw on ANY frame killed the mesh and flapped every
+            // channel until a restart. A duplicate msg_id was merely the
+            // reachable instance; the defect is that one client's bad frame
+            // could stop the bus for everyone.
+            //
+            // The refusal is per-SOCKET, not per-process: the sender learns its
+            // frame failed, every other connection is untouched, and the
+            // process stays up. Logged because a caught crash that says nothing
+            // is a crash nobody fixes.
+            // COLOUR-BLIND by construction: a synchronous throw and a rejected
+            // promise are the same event to this dispatcher. Today every
+            // handler is sync and the try/catch alone would do — but the ws
+            // 'message' listener does not await, so the moment any handler
+            // becomes async its rejection becomes an unhandled rejection and
+            // kills the process again, with no line of THIS code changing.
+            // The HTTP plane already paid for exactly that (#68).
+            const report = (err: unknown) => {
+              console.error(JSON.stringify({
+                evt: 'ws.handler_threw',
+                frame_type: frameType,
+                agent: state.agentId,
+                error: (err as Error)?.message ?? String(err),
+                at: Date.now(),
+              }));
+              try {
+                ws.send(JSON.stringify({
+                  type: 'error',
+                  code: 'INTERNAL',
+                  message: 'internal error handling frame',
+                  ...(typeof frame.msg_id === 'string' ? { ref: frame.msg_id } : {}),
+                }));
+              } catch (_) { /* socket already gone; nothing further to do */ }
+            };
+            try {
+              const maybe = handler({ ws, state, db, frame, parsed, agentIndex, observerIndex, maxFileBytes, filesDir });
+              // Thenable check rather than `instanceof Promise`: a handler may
+              // return a promise from another realm or a non-native thenable,
+              // and this guard must not care which.
+              if (maybe !== undefined && maybe !== null && typeof (maybe as PromiseLike<void>).then === 'function') {
+                (maybe as PromiseLike<void>).then(undefined, report);
+              }
+            } catch (err) {
+              report(err);
+            }
             return;
           }
 
