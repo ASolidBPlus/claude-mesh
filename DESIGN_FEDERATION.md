@@ -380,8 +380,9 @@ numbers, and go through the normal review lane; I do not implement.
   internet")*: remote tenants are in scope ⇒ the `wss://` TLS-terminating ingress
   (§8-P2) is a **hard prerequisite before the first real tenant connects**. Ops-level
   work (reverse proxy in front of the WS port), not bus code; joins Phase 0.
-- **Q2 (product, for the owner):** default capability set for a new key — proposal is
-  `["send:direct"]` (everything else opt-in per key). Confirm or broaden.
+- **D6** *(was Q2 — answered by the owner 2026-09-05: "yes, direct messages only")*:
+  new keys default to `["send:direct"]`; file sending, publish, and subscribe are
+  opt-in per key at mint time (or via an admin `PATCH` later).
 
 ## 13. Success criteria (runnable once implemented; per-phase)
 
