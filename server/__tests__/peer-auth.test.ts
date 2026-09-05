@@ -170,6 +170,11 @@ describe('F1a: peer authentication', () => {
     const src = readFileSync(join(import.meta.dir, '..', 'ws-server.ts'), 'utf8');
     // Quote-agnostic on purpose: nothing in this repo enforces quote style, and
     // a pin defeated by a spelling variant is the class of defect it exists to catch.
+    // RESIDUAL, stated so the character class is not read as the closed form:
+    // this counts SOURCE TEXT. An emit written as a template literal, through an
+    // alias (`const AUTH_FAILED = 'AUTH_FAILED'`) or any computed code is invisible
+    // to it, and every set test stays green. The closed form counts the PARSED
+    // value — the AST, or the set of codes the door emits at runtime (#119 item 3).
     const emits = src.match(/code:\s*['"]AUTH_FAILED['"]/g) ?? [];
     expect(emits.length).toBe(4);
   });
