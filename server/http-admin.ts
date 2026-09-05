@@ -3,6 +3,10 @@ import * as http from 'http';
 import * as net from 'net';
 import { WebSocket } from 'ws';
 import {
+  newRegistrationKeyId,
+  insertRegistrationKey,
+  listRegistrationKeys,
+  countLiveMintedAgents,
   getAgentById,
   getAgentByToken,
   aclGrant,
@@ -36,6 +40,11 @@ import {
   listObservers,
 } from './db.ts';
 import { generateToken, hashToken, timingSafeEqual } from './auth.ts';
+import {
+  checkTenantName,
+  checkCapabilities,
+  DEFAULT_CAPABILITIES,
+} from './tenant-names.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
 import { renderMetrics } from './metrics.ts';
@@ -1084,7 +1093,110 @@ function handleReminderDelete(ctx: AdminCtx): void {
 // 404 at the end of dispatch — there is intentionally no 405.
 /** Exported for tests ONLY: the dispatcher-guard test injects a throwing
     route to prove a handler exception cannot kill the process. */
+// ─── Registration keys (§5.1) — admin only ──────────────────────────────────
+
+/** The public projection. The hash NEVER appears here — a list endpoint that
+    leaks hashes turns an audit surface into an offline-cracking corpus, and
+    the raw secret exists in exactly one response ever (the 201 below). */
+function publicKeyFields(db: Database, k: ReturnType<typeof listRegistrationKeys>[number]) {
+  return {
+    id: k.id,
+    namespace: k.namespace,
+    capabilities: JSON.parse(k.capabilities) as string[],
+    max_agents: k.max_agents,
+    expires_at: k.expires_at,
+    revoked_at: k.revoked_at,
+    note: k.note,
+    created_at: k.created_at,
+    // The operator's actual question when reading this list: how much of the
+    // cap is spent. LIVE count (enabled only), matching what the cap enforces.
+    live_agents: countLiveMintedAgents(db, k.id),
+  };
+}
+
+async function handleRegistrationKeyPost(ctx: AdminCtx): Promise<void> {
+  const { req, res, db } = ctx;
+  const raw = await readBody(req);
+  let body: Record<string, unknown>;
+  try { body = JSON.parse(raw); }
+  catch { res.writeHead(400, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:'invalid JSON'})); return; }
+
+  // ONE validator, this surface being one of its three call sites (§7
+  // amendment). `home` and `mesh` are refused here because a tenant of either
+  // name makes Phase 2's scope resolution ambiguous — the refusal must be at
+  // mint time, since a name that was never mintable needs no runtime check.
+  const nsCheck = checkTenantName(body.namespace);
+  if (!nsCheck.ok) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid namespace', message: nsCheck.reason }));
+    return;
+  }
+  const namespace = body.namespace as string;
+
+  const capabilities = body.capabilities === undefined ? [...DEFAULT_CAPABILITIES] : body.capabilities;
+  const capCheck = checkCapabilities(capabilities);
+  if (!capCheck.ok) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid capabilities', message: capCheck.reason }));
+    return;
+  }
+
+  let max_agents = 16;
+  if (body.max_agents !== undefined) {
+    if (typeof body.max_agents !== 'number' || !Number.isInteger(body.max_agents) || body.max_agents < 1) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid max_agents', message: 'max_agents must be a positive integer' }));
+      return;
+    }
+    max_agents = body.max_agents;
+  }
+
+  let expires_at: number | null = null;
+  if (body.expires_at !== undefined && body.expires_at !== null) {
+    if (typeof body.expires_at !== 'number' || !Number.isFinite(body.expires_at)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid expires_at', message: 'expires_at must be an epoch-ms number' }));
+      return;
+    }
+    expires_at = body.expires_at;
+  }
+
+  const note = typeof body.note === 'string' ? body.note : null;
+
+  // Same custody as an agent token: generate, hash, store the hash, return the
+  // raw ONCE. Nothing else in the system can reproduce it afterwards.
+  const secret = generateToken();
+  const key = insertRegistrationKey(db, {
+    id: newRegistrationKeyId(),
+    key_hash: hashToken(secret),
+    namespace,
+    capabilities: JSON.stringify(capabilities),
+    max_agents,
+    expires_at,
+    note,
+  });
+
+  console.log(JSON.stringify({
+    evt: 'registration_key.minted', key_id: key.id, tenant: namespace,
+    capabilities, max_agents, expires_at, at: Date.now(),
+  }));
+
+  res.writeHead(201, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    ...publicKeyFields(db, key),
+    key: secret, // shown once, never stored, never listed
+  }));
+}
+
+function handleRegistrationKeyGet(ctx: AdminCtx): void {
+  const { res, db } = ctx;
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(listRegistrationKeys(db).map((k) => publicKeyFields(db, k))));
+}
+
 export const ROUTES: Route[] = [
+  { method: 'POST',   match: exact('/registration-keys'),            handler: handleRegistrationKeyPost },
+  { method: 'GET',    match: exact('/registration-keys'),            handler: handleRegistrationKeyGet },
   { method: 'POST',   match: exact('/acl'),                          handler: handleAclPost },
   { method: 'DELETE', match: exact('/acl'),                          handler: handleAclDelete },
   { method: 'GET',    match: exact('/acl'),                          handler: handleAclGet },

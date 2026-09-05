@@ -949,3 +949,97 @@ function timingSafeEqual(a: string, b: string): boolean {
   }
   return result === 0;
 }
+
+// ─── Registration keys (§4/§5.1, Phase 1) ───────────────────────────────────
+
+export interface RegistrationKey {
+  id: string;
+  key_hash: string;
+  namespace: string;
+  capabilities: string;
+  max_agents: number;
+  expires_at: number | null;
+  revoked_at: number | null;
+  note: string | null;
+  created_at: number;
+}
+
+/** Public id: loggable, never secret. "regk_" + 8 hex, like the "ghs_"/"regk_"
+    convention that makes a credential's TYPE visible in a log line. */
+export function newRegistrationKeyId(): string {
+  return `regk_${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`;
+}
+
+export function insertRegistrationKey(
+  db: Database,
+  key: {
+    id: string;
+    key_hash: string;
+    namespace: string;
+    capabilities: string;
+    max_agents: number;
+    expires_at: number | null;
+    note: string | null;
+  },
+): RegistrationKey {
+  db.prepare(`
+    INSERT INTO registration_keys
+      (id, key_hash, namespace, capabilities, max_agents, expires_at, revoked_at, note, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+  `).run(
+    key.id, key.key_hash, key.namespace, key.capabilities,
+    key.max_agents, key.expires_at, key.note, Date.now(),
+  );
+  return getRegistrationKeyById(db, key.id) as RegistrationKey;
+}
+
+export function getRegistrationKeyById(db: Database, id: string): RegistrationKey | null {
+  return db.prepare('SELECT * FROM registration_keys WHERE id = ?').get(id) as RegistrationKey | null;
+}
+
+/**
+ * Look a key up by its RAW secret — the /register auth path.
+ *
+ * Same construction as getAgentByToken (#45/#13), for the same reasons and
+ * with the same three properties, which are load-bearing here too:
+ *   - INDEXED on key_hash, because /register is an unauthenticated front door
+ *     and a scan per attempt is a free amplification primitive;
+ *   - AMBIGUITY FAILS CLOSED: two rows sharing a hash cannot say which tenant
+ *     a caller belongs to, so it authenticates NOBODY rather than picking one
+ *     and minting into the wrong tenant;
+ *   - the final timing-safe compare is NOT redundant. SQLite's `=` honours the
+ *     column collation, so a single COLLATE NOCASE on key_hash would return a
+ *     row whose hash differs from the probe's in case. Pinned by a test that
+ *     builds exactly that column (see registration-keys.test.ts) — the
+ *     obligation carried from #75.
+ */
+export function getRegistrationKeyBySecret(db: Database, secret: string): RegistrationKey | null {
+  const hash = hashToken(secret);
+  const rows = db
+    .prepare('SELECT * FROM registration_keys WHERE key_hash = ? LIMIT 2')
+    .all(hash) as RegistrationKey[];
+  if (rows.length === 0) return null;
+  if (rows.length > 1) {
+    console.error(
+      `[db] AMBIGUOUS registration key_hash — ${rows.length}+ keys share one hash (${rows
+        .map((r) => r.id)
+        .join(', ')}); refusing to authenticate any of them`,
+    );
+    return null;
+  }
+  const candidate = rows[0]!;
+  return timingSafeEqual(candidate.key_hash, hash) ? candidate : null;
+}
+
+export function listRegistrationKeys(db: Database): RegistrationKey[] {
+  return db.prepare('SELECT * FROM registration_keys ORDER BY created_at DESC').all() as RegistrationKey[];
+}
+
+/** LIVE population for a key: enabled agents only (§4 F2 — disabling frees a
+    slot, so the cap is on concurrent agents, not lifetime mints). */
+export function countLiveMintedAgents(db: Database, keyId: string): number {
+  const row = db
+    .prepare('SELECT COUNT(*) AS n FROM agents WHERE minted_by_key = ? AND disabled = 0')
+    .get(keyId) as { n: number };
+  return row.n;
+}

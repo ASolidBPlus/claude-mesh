@@ -113,3 +113,43 @@ export function checkHomeAgentId(id: unknown): NameCheck {
 export function fqId(tenant: string, shortName: string): string {
   return `${tenant}:${shortName}`;
 }
+
+/** The capability vocabulary a registration key may grant (§3). Closed set:
+    an unknown capability is refused at mint rather than stored and ignored,
+    because a key whose capabilities silently don't mean anything is exactly
+    the "configured but inert" shape this design keeps refusing elsewhere. */
+export const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set([
+  'send:direct',
+  'send:file',
+  'publish',
+  'subscribe',
+]);
+
+/** D6: new keys default to direct messages only; everything else is opt-in
+    per key at mint time. */
+export const DEFAULT_CAPABILITIES: readonly string[] = ['send:direct'];
+
+/**
+ * Validate a capability list. Refuses non-arrays, non-strings, unknown verbs
+ * and duplicates — the last because a duplicate is a sign the caller believes
+ * something about ordering or multiplicity that this field does not have.
+ */
+export function checkCapabilities(caps: unknown): NameCheck {
+  if (!Array.isArray(caps)) return { ok: false, reason: 'capabilities must be an array of strings' };
+  if (caps.length === 0) {
+    return { ok: false, reason: 'capabilities must not be empty — omit the field to take the default' };
+  }
+  const seen = new Set<string>();
+  for (const c of caps) {
+    if (typeof c !== 'string') return { ok: false, reason: 'capabilities must be an array of strings' };
+    if (!KNOWN_CAPABILITIES.has(c)) {
+      return {
+        ok: false,
+        reason: `unknown capability '${c}' — known: ${[...KNOWN_CAPABILITIES].join(', ')}`,
+      };
+    }
+    if (seen.has(c)) return { ok: false, reason: `duplicate capability '${c}'` };
+    seen.add(c);
+  }
+  return { ok: true };
+}
