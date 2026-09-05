@@ -880,6 +880,25 @@ describe('Referential integrity (FK enforcement)', () => {
     expect(aclRelated(db, 'real-agent', 'ghost')).toBe(false);
   });
 
+  // THE F0a POINT. The foreign key was removed so an acl endpoint can name a
+  // REMOTE id, which has no agents(id) row and never will. If the local-
+  // existence check applied to it, the FK would have been traded for a check
+  // that rejects exactly the same thing — the whole change would be inert.
+  //
+  // Added because the mutant that deletes the ':' carve-out SURVIVED the rest
+  // of this suite: every other test here would pass with remote ids broken.
+  it('aclGrant accepts a REMOTE endpoint that is not a local agent', () => {
+    const db = freshDb();
+    makeAgent(db, 'local-one');
+    expect(() => aclGrant(db, 'local-one', 'othermesh:their-agent', 'system')).not.toThrow();
+    expect(aclRelated(db, 'local-one', 'othermesh:their-agent')).toBe(true);
+    // And in the from position, which is a different argument to the check.
+    expect(() => aclGrant(db, 'othermesh:their-agent', 'local-one', 'system')).not.toThrow();
+    // Negative control on the same test: a BARE unknown id is still refused,
+    // so this is not passing because the check stopped working entirely.
+    expect(() => aclGrant(db, 'local-one', 'no-such-agent', 'system')).toThrow();
+  });
+
   it('aclGrant still accepts two existing agents — the positive control', () => {
     const db = freshDb();
     makeAgent(db, 'a'); makeAgent(db, 'b');
