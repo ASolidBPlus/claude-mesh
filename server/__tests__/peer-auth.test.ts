@@ -73,20 +73,46 @@ describe('F1a: peer authentication', () => {
     }
   }, 20_000);
 
-  it('a DISABLED peer is refused with the byte-identical bad-token error', async () => {
-    // A revoked peer must not be able to tell "my key was revoked" from "my
-    // token is wrong" — otherwise the refusal is an oracle for key state.
+  // The oracle test. It compares the three outcomes a PROBER CAN REACH against
+  // each other — the previous version compared a disabled peer against an
+  // AGENT with a wrong token, which is byte-identity against the wrong
+  // subject: it passed while a revoked peer could still distinguish itself.
+  it('all three peer-reachable refusals are byte-identical', async () => {
     const { db, handle, port } = await setup();
-    const good = await open(port, { type: 'auth', agent_id: 'local-a', token: 'wrong-token' });
-    db.prepare('UPDATE peers SET disabled = 1 WHERE alias = ?').run('othermesh');
-    const s = await open(port, { type: 'auth', agent_id: 'othermesh', token: 'peer-tok', protocol: 1 });
+    upsertPeer(db, {
+      alias: 'deadmesh', token_hash: hashToken('peer-tok'),
+      minted_by_key: 'k1', kinds: '["direct"]', rate_per_min: 600,
+    });
+    db.prepare('UPDATE peers SET disabled = 1 WHERE alias = ?').run('deadmesh');
+
+    const nonexistent = await open(port, { type: 'auth', agent_id: 'nosuchmesh', token: 'peer-tok', protocol: 1 });
+    const wrongToken  = await open(port, { type: 'auth', agent_id: 'othermesh', token: 'WRONG', protocol: 1 });
+    const disabled    = await open(port, { type: 'auth', agent_id: 'deadmesh', token: 'peer-tok', protocol: 1 });
     try {
-      const badTokenErr = good.frames.find(f => f.type === 'error');
-      const disabledErr = s.frames.find(f => f.type === 'error');
-      expect(JSON.stringify(disabledErr)).toBe(JSON.stringify(badTokenErr));
-      expect(handle.peerIndex.get('othermesh')).toBeUndefined();
+      const errs = [nonexistent, wrongToken, disabled].map(s => JSON.stringify(s.frames.find(f => f.type === 'error')));
+      // A distinct DISABLED message is a revocation oracle; making all three
+      // 'invalid token' would instead be an alias-existence oracle. Identical
+      // is the only shape that leaks on neither axis.
+      expect(new Set(errs).size).toBe(1);
+      expect(JSON.parse(errs[0]!)).toEqual({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' });
+      expect(handle.peerIndex.get('deadmesh')).toBeUndefined();
     } finally {
-      try { s.ws.close(); good.ws.close(); } catch { /* ignore */ }
+      for (const s of [nonexistent, wrongToken, disabled]) { try { s.ws.close(); } catch { /* ignore */ } }
+      await handle.shutdown().catch(() => {});
+      db.close();
+    }
+  }, 20_000);
+
+  it('positive control: an AGENT with a wrong token still says "invalid token"', async () => {
+    // Agents keep their existing contract — the unified refusal is the PEER
+    // path's, not a global flattening. Without this, the test above is
+    // satisfied by making every refusal in the server identical.
+    const { db, handle, port } = await setup();
+    const s = await open(port, { type: 'auth', agent_id: 'local-a', token: 'WRONG' });
+    try {
+      expect(s.frames.find(f => f.type === 'error')?.message).toBe('invalid token');
+    } finally {
+      try { s.ws.close(); } catch { /* ignore */ }
       await handle.shutdown().catch(() => {});
       db.close();
     }

@@ -569,13 +569,32 @@ export function startWsServer(
             // coincide — so the alias-keyed lookup IS the credential lookup,
             // and there is no id for which both or neither could match.
             const peerRow = getPeerByAlias(db, agentId);
-            if (peerRow !== null && validateToken(token, peerRow.token_hash)) {
-              // (a) disabled first, and with the EXACT message of the
-              // invalid-token path: a revoked peer must not be able to tell
-              // "my key was revoked" from "my token is wrong".
-              if (peerRow.disabled === 1) {
+            if (peerRow !== null) {
+              // ONE refusal for every peer-reachable failure, and it is
+              // `unknown agent` — what a stranger already sees.
+              //
+              // Measured before choosing it. The three outcomes a prober can
+              // reach are: nonexistent alias, real alias + wrong token, and
+              // disabled alias + right token. Any message that differs between
+              // them is an oracle:
+              //   - a distinct DISABLED message tells a revoked peer that its
+              //     key was revoked rather than mistyped (this was the bug —
+              //     `invalid token` vs `unknown agent`, reproduced);
+              //   - making all three `invalid token` would instead separate a
+              //     real-alias-wrong-token from a nonexistent alias, trading a
+              //     revocation oracle for an ALIAS-EXISTENCE one.
+              // `unknown agent` is the only choice that adds no signal on
+              // either axis, because it is already the answer to "who?".
+              //
+              // Handled INSIDE this branch rather than falling through to the
+              // agent path. The fall-through produced the right string only
+              // because #98's collision gates make an alias-shaped agent id
+              // impossible — correct by a distant invariant is not the same as
+              // correct, and this is a refusal path where that distinction is
+              // the whole point.
+              if (peerRow.disabled === 1 || !validateToken(token, peerRow.token_hash)) {
                 try {
-                  ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'invalid token' }));
+                  ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
                 } catch (_) { /* ignore */ }
                 ws.close(1008, 'auth failed');
                 return;
