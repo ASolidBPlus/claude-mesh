@@ -5,7 +5,11 @@ plan-only PR; implementation starts only on his explicit approval, and then as s
 PRs (see §11 Phasing).
 
 Author: mesh-planner, 2026-09-05. Grounded in a full code read at HEAD `1f0d793`; every
-file:line below was verified against that commit.
+file:line below was verified against that commit. Reviewed by the mesh-agent builder
+(F1-F3, folded) and by an independent plan evaluator against the code on disk
+(**GO-with-amendments**; all ten amendments folded — the notable ones: the admin-port
+exposure model for remote tenants (§8-P2b), the topic-ownership rule (§6), admission-
+time-only enforcement semantics (§6), and re-registration state purge (§5.2)).
 
 ---
 
@@ -134,12 +138,23 @@ raw value returned once in the creation response.
 
 **Federated agent ids are namespace-prefixed at the bus level, tenant-relative in
 use** *(amended after runtime review — F1)*: an agent minted by a key for namespace
-`ns` has fully-qualified (FQ) id `ns:<name>` (server-enforced at registration;
-`<name>` follows the existing bare-id grammar). This prevents an external tenant from
-claiming fleet-meaningful names (`deploy-helper`, …) — id squatting is refused at mint
-time, and a colon-prefixed id is immediately legible in logs and provenance. Existing
-home ids contain no `:`; `POST /agents` (admin) additionally refuses new ids containing
-`:` unless they match the agent's declared namespace.
+`ns` has fully-qualified (FQ) id `ns:<name>`, server-enforced at registration. **The
+bus has no id grammar today** (`POST /agents` accepts any non-empty string,
+`server/http-admin.ts:392-396`), so this plan defines one for the paths it adds: bare
+names and namespaces both match `^[a-z0-9][a-z0-9-]{0,62}$` (lowercase alphanumeric +
+hyphen, ≤ 63 chars — the mesh-agent runtime's grammar, minus the colon we add between
+them). Enforced at `POST /register` and `POST /registration-keys`; `POST /agents`
+(admin) keeps its permissive grammar for home agents but refuses ids containing `:`
+and the reserved bare names `mesh` and `home` (an admin-minted agent literally named
+`mesh` would collide with the system sender, §6). This prevents an external tenant
+from claiming fleet-meaningful names (`deploy-helper`, …) — id squatting is refused at
+mint time, and a colon-prefixed id is immediately legible in logs and provenance.
+
+**Namespace is frozen for minted agents**: `PATCH /agents/:id` refuses `namespace`
+changes when `minted_by_key IS NOT NULL` — a minted agent's tenant is its key's tenant
+forever (else the `ns:` prefix ↔ `namespace` column correspondence that short-name
+resolution depends on desyncs, and a PATCH could silently promote a foreign agent into
+the home tenant).
 
 **Short-name resolution (tenant-relative addressing).** The tenant prefix must never
 leak into agent-visible text: the mesh-agent runtime validates ids against
@@ -149,12 +164,17 @@ runtime depends on. So:
 
 - A sender in tenant `ns` addressing bare `dana` resolves server-side to `ns:dana` —
   and ONLY that. On miss: `AGENT_NOT_FOUND`. Bare names never resolve cross-tenant and
-  never fall through to home (C2: no ambiguity, no squat leverage).
+  never fall through to home (C2: no ambiguity, no squat leverage). **NULL branch,
+  explicit:** for a home-tenant sender (`ns = NULL`) resolution is the identity
+  function — the presented id is looked up literally, exactly today's behaviour.
+  Resolution executes wherever a sender-supplied target id enters the server:
+  `routeDirect`'s `frame.to`, `routeFile`'s target, `handleFilePost`'s `to_agent`,
+  and the MCP `mesh_send`/`mesh_broadcast` paths (which flow into the same router
+  functions).
 - Cross-tenant sends use the FQ form (`other-ns:name`, or the bare home id for linked
   home targets) and still pass the full admit rule (§6).
-- Same-tenant deliveries present **short** names in the deliver frame (shared prefix
-  stripped from `from`/`to`); cross-tenant deliveries present FQ names. Home-tenant
-  agents (NULL) see today's behaviour byte-for-byte.
+- Same-tenant deliveries present **short** names; cross-tenant deliveries present FQ
+  names. Home-tenant agents (NULL) see today's behaviour byte-for-byte.
 - The FQ form is canonical everywhere operator-facing: DB rows, admin API, observer
   tap, logs, metrics.
 
@@ -168,10 +188,20 @@ Concretely:
   per agent; the hash-indexed lookup from §5.5 makes this the natural primary key)
   and verifies the presented `agent_id` matches the resolved agent's short or FQ form.
   `auth_ok` echoes the short form.
-- Every agent-facing emission is tenant-relative: deliver frames both directions,
-  presence events, acks/errors that echo ids, and reminder deliveries. One
-  normalization point server-side (strip-own-ns on egress to a tenant socket), not
-  per-surface special cases.
+- Every agent-facing emission is tenant-relative. One normalization point server-side
+  (strip-own-ns on egress to a tenant socket), not per-surface special cases — and
+  "every" is enumerated so no surface is missed *(evaluator amendment)*: `deliver`
+  frames from ALL producers (live `routeDirect`, **`drainQueue` replays of stored FQ
+  rows** — `server/router.ts:181` — `routePublish`, and the reminder scheduler's
+  frames, `server/reminder-scheduler.ts:58`), all three `file_deliver` builders
+  (`server/router.ts:421-434, 469-482`, `server/http-admin.ts:773-785`),
+  `agent_status` (`server/ws-server.ts:418`) and `presence_list`
+  (`server/ws-server.ts:366`) frames, error/ack strings that interpolate ids
+  (`server/router.ts:86, 93, 363, 370` — today they'd leak the raw FQ id into
+  agent-visible text), and `GET /messages` rows served to an agent-scoped token
+  (`server/http-admin.ts:577-587` — an agent reading its own scrollback must not see
+  its prefix). The egress-normalization function is applied at frame/response build
+  time for whichever agent the bytes are going to.
 - Cross-tenant peers are the single exception: they arrive FQ (`other-ns:name`) by
   design — a distinct grammar is *correct* there, since they are a different kind of
   correspondent and per-tenant runtimes may need to widen their id validation only if
@@ -186,10 +216,12 @@ sides of the comparison live in the same short grammar.
 
 ## 5. API surface (admin port, same auth conventions as today)
 
-### 5.1 `POST /registration-keys` — admin only
-Body: `{ namespace, capabilities?, max_agents?, expires_at?, note? }`.
+### 5.1 `POST /registration-keys` / `GET /registration-keys` — admin only
+Create: body `{ namespace, capabilities?, max_agents?, expires_at?, note? }`.
 Refuses `namespace: "home"` (C2) and malformed capability strings.
 201 → `{ id, key: "<raw shown once>", namespace, capabilities, max_agents, expires_at }`.
+List (audit surface — operators must be able to enumerate keys after creation): returns
+every key's public fields + live-minted count, **never** hashes or raw secrets.
 
 ### 5.2 `POST /register` — **authenticates with a registration key**, not admin
 `Authorization: Bearer <raw key>`. Body: `{ id, hostname }` (`id` is the bare name;
@@ -207,6 +239,17 @@ that key already minted rotates the agent's token (old token invalidated) and cl
 `disabled`. This is the scenario-reset path — spin-down/spin-up cycles on the same ids
 cost nothing and never exhaust the key; only *distinct live* identities count against
 `max_agents`. An id minted by a *different* key is `403` (no cross-key capture).
+
+**Re-registration purges conversation state, keeps topology** *(evaluator amendment —
+without this, a re-minted identity inherits its predecessor's mailbox)*: in the same
+transaction as the token rotation, the server deletes the agent's **undelivered queued
+messages and files, its pending reminders, and its topic subscriptions**. Queued
+reminders never expire (`expires_at = null`, `server/reminder-scheduler.ts:44`), so
+without the purge a "fresh" scenario incarnation would drain its predecessor's backlog
+on first connect — cross-run information leakage. **ACL edges are kept**: they are
+admin-granted tenant topology, not conversation state, and purging them would make
+every reset an admin ceremony again (R6). If a fresh-ACL reset is wanted, that is key
+revocation + a new key — the terminal path.
 
 **The key holder never chooses its namespace or capabilities — they come from the key
 (C1).** Failures are uniform 403s (no oracle distinguishing "revoked" from "expired"
@@ -268,9 +311,31 @@ admit(A → B, kind):
   admit ⇔ tenant_gate AND capability AND pair_acl
 ```
 
-Applied at the four existing admit sites found in the code read — these are the only
-places a delivery decision is made today, and the tenant gate composes at exactly the
-same call sites:
+**Enforcement is admission-time only** *(evaluator amendment — stated explicitly so
+nobody assumes otherwise)*: `drainQueue` (`server/router.ts:174-188`) and
+`drainFileQueue` (:454-488) replay already-admitted rows with no re-check, and that
+stays true. A message admitted while a link/ACL existed still delivers after the
+link/ACL is removed, on the recipient's next connect. This matches today's ACL
+semantics exactly (a revoke does not claw back queued mail) and is the cheap, honest
+rule. The compensations are: `disabled` blocks connection (so a disabled agent drains
+nothing), and re-registration purges the queue (§5.2). If claw-back semantics are ever
+wanted, that is a separate design, not an implicit property.
+
+**Unlinked cross-tenant targets are indistinguishable from nonexistent ones**
+*(evaluator amendment — closes an enumeration oracle)*: the existence check runs before
+the ACL check today (`server/router.ts:84-87` then :90-94), so a naive "prepend the
+tenant gate" would let a prober in tenant A distinguish `AGENT_NOT_FOUND` (id free)
+from `TENANT_DENIED` (id exists in tenant B) and enumerate another org's roster.
+Rule: when the tenant gate fails **and no link exists** between the tenants, the
+response is `AGENT_NOT_FOUND` — identical to a nonexistent target. `TENANT_DENIED`
+is returned only when a link exists but the *kind* is not in `link.kinds` (the
+requester already legitimately knows of the peer tenant; the error is then a useful
+diagnostic, not an oracle).
+
+Applied at the four existing **admission points** found in the code read — the only
+places a message is *admitted* today (delivery replays are covered by the
+admission-time rule above), and the tenant gate composes at exactly the same call
+sites:
 
 | Site | Today | Change |
 |---|---|---|
@@ -279,18 +344,36 @@ same call sites:
 | WS file send | `server/router.ts:367-371` | same composition; `send:file` capability |
 | HTTP file upload | `server/http-admin.ts:725-729` | same composition |
 
+In the topic row, "same composition per subscriber" means: the **publisher's**
+`publish` capability is checked once at `routePublish` entry; per subscriber, the
+composition is tenant gate + the existing per-subscriber `aclCheck` (the subscriber's
+own capabilities are not consulted at delivery — capabilities restrict what an agent
+*does*, not what it may *receive*).
+
 Plus two adjacent surfaces the code read showed carry cross-agent information:
 
-- **Presence**: presence events fan out to `aclRelated` peers (`server/db.ts:393-398`).
-  The tenant gate applies to presence delivery too — an org must not observe another
-  org's agents flapping (R2's spirit; an admin-created stray cross-tenant ACL edge
-  without a link must not leak presence).
-- **Subscribe**: `routeSubscribe` (`server/router.ts:303`) checks the `subscribe`
-  capability. Topic *names* remain global (pure-bus; a name is not a secret); content
-  is protected by the per-subscriber gate above.
+- **Presence — both surfaces** *(evaluator amendment)*: presence reaches agents on two
+  paths, and both get the tenant gate: the `broadcastStatus` fan-out to `aclRelated`
+  peers (`server/ws-server.ts:417-425`, helper `server/db.ts:393-398`) **and** the
+  on-demand `list_presence` roster (`server/ws-server.ts:356-372`), which builds from
+  the same `aclRelated` over all agents and would otherwise leak through a stray
+  admin-created cross-tenant ACL edge exactly the way the broadcast would. An org must
+  not observe another org's agents flapping — on either path.
+- **Subscribe / topic creation** *(evaluator amendment — closes a cross-tenant DoS)*:
+  `routeSubscribe` checks the `subscribe` capability. But both `routeSubscribe` and
+  `routePublish` call `getOrCreateTopic` (`server/router.ts:209, 308`) — subscribe
+  today implicitly **creates** topics, and `topics.created_by` ownership means
+  `deleteAgent` cascades the topic and every subscription to it away
+  (`server/db.ts:357-360, 150-155`). A federated agent that first-subscribes to a
+  not-yet-created home topic would own it, and its teardown would destroy home
+  subscriptions. Rule: **for capability-scoped agents (`minted_by_key IS NOT NULL`),
+  `getOrCreateTopic` becomes get-or-refuse** (`TOPIC_NOT_FOUND`) — federated agents
+  never create or own topics; topic creation stays a home/admin act. Topic *names*
+  remain global (pure-bus; a name is not a secret); content is protected by the
+  per-subscriber gate above.
 
 Message `kind` needs no new vocabulary: producers hard-code `direct`/`topic`/`file`
-(`server/router.ts:119,153,248,281`; files via the `files` table) and `insertMessage`
+(`server/router.ts:120,154,248,281`; files via the `files` table) and `insertMessage`
 accepts what producers write (`server/db.ts:428-455`). The capability check happens at
 the producer entry points above, so no central kind validator is required — though
 adding one at `insertMessage` would be harmless hardening.
@@ -304,14 +387,16 @@ ACL) is currently all-or-nothing — which would force per-tenant tooling (e.g. 
 scenario scorer) to hold what amounts to a global-visibility credential.
 
 Additive change: `observers.namespace TEXT` — `NULL` keeps today's global behaviour;
-a non-NULL value delivers only events where **both** endpoints (or the single endpoint,
-for presence/registration events) are in that namespace. Cross-tenant traffic (link
-traffic) is visible to the **global** tap only — neither tenant's scoped tap sees the
-other side's… actually both endpoints' namespaces differ, so link traffic appears in
-neither scoped tap; if a tenant tap should see its own agents' cross-tenant traffic,
-that is a one-line policy choice (`from ∈ ns OR to ∈ ns`) — **recommended**, since a
-tenant watching its own agents is the point. Decision recorded in §12 as D3 with the
-recommended default.
+a non-NULL value delivers a tapped frame iff `ns(from) ∈ ns OR ns(to) ∈ ns` — a
+scoped tap sees all of its own tenant's traffic, **including its agents' cross-tenant
+(link) traffic in both directions** (D3: a tenant watching its own agents is the
+point). Facts of the tap today, so the mechanism is specified against what exists:
+the tap emits only `direct|topic|file` message frames (`server/tap.ts:13`) — there
+are no presence or registration tap events, and this plan adds none — and `emitTap`
+receives ids only, no namespaces (`server/tap.ts:32`). The namespace test uses the
+same in-memory id→namespace lookup the router's tenant gate needs anyway (one map,
+maintained at register/patch time, shared by both consumers — not a per-emit DB
+query).
 
 Grant surface: `POST /observers` gains an optional `namespace` field. Admin-only, as
 today (`server/http-admin.ts` observer routes).
@@ -330,12 +415,24 @@ today (`server/http-admin.ts` observer routes).
   not ship while that plane is wider than the new front door. **Phase 0 includes the
   decision on #8** (minimum: drop the two ACL tools or gate them on `MESH_ADMIN_TOKEN`;
   `as_agent` impersonation for *sends* is a separate, explicit operator-plane choice).
+  The decision must also cover `mesh_discover`/`mesh_status`, which return the full
+  roster — acceptable only while the stdio plane is operator-only.
 - **P2 — Transport (#21).** The bus is plaintext `ws://`/`http` (`server/ws-server.ts:401`,
   `server/http-admin.ts:1120`). Registration keys and agent tokens are bearer secrets.
-  If a federated project's nodes connect from **outside the Docker host**, a
-  TLS-terminating ingress (`wss://` reverse proxy — ops-level, no in-bus TLS work) is a
-  hard prerequisite for the first remote tenant. If they run on the same host/network,
-  it isn't. **This is open question Q1 (§12).**
+  Remote tenants are in scope (D5), so a TLS-terminating ingress (`wss://` reverse
+  proxy — ops-level, no in-bus TLS work) is a hard prerequisite before the first real
+  tenant connects.
+- **P2b — Admin-port exposure model** *(evaluator amendment — this was a hole)*.
+  Federated tenants need more than the WS port: `POST /register` lives on the admin
+  port, and file delivery hands agents a `fetch_url` of `/files/<id>` on the admin
+  port (fetched with the agent token — `client/src/client.ts:419-433`), as does
+  node-scoped `GET /messages`. But the admin port also serves **unauthenticated
+  `/metrics`** (`server/http-admin.ts:1121-1132`) exposing every agent id, per-agent
+  traffic counters, and ACL-denied counts — the full fleet topology, no credential
+  (#9). Rule: the ingress in front of the admin port for tenants is a **route
+  allowlist** — exactly `/register`, `/files/:id`, `/messages` — and everything else
+  (`/metrics`, all admin routes) is not routed. This is ingress configuration, not bus
+  code, but it is part of the D5 prerequisite and the Phase-4 docs must state it.
 - **P3 — Deploy model.** Merge-to-main goes live on the next spawner-mesh restart (#71),
   and a mesh restart flaps every fleet agent's channel. All phases below are inert-until-
   used (C5) precisely so merging is safe and the *restart* is the only scheduling
@@ -423,21 +520,33 @@ numbers, and go through the normal review lane; I do not implement.
 ## 13. Success criteria (runnable once implemented; per-phase)
 
 Phase 1: `bun test server/__tests__/registration-keys.test.ts` — mint/register/limits/
-revoke-cascade paths; plus: register with revoked key → 403; 17th *live* mint on max 16
-→ 403, but disable one then mint → succeeds (live-count, not lifetime — F2);
-re-register an id minted by the same key → new token, old token dead, `disabled`
-cleared; re-register an id minted by a different key → 403; registering bare name
-`mesh` → 403 (reserved); disabled agent WS auth → `AUTH_FAILED`.
+revoke-cascade paths; plus: register with revoked key → 403; register with **expired**
+key → 403; 17th *live* mint on max 16 → 403, but disable one then mint → succeeds
+(live-count, not lifetime — F2); re-register an id minted by the same key → new token,
+old token dead, `disabled` cleared, **and predecessor state purged**: queued
+messages/files gone, pending reminders gone, subscriptions gone, ACL edges kept
+(§5.2); re-register an id minted by a different key → 403; registering bare name
+`mesh` → 403 (reserved); id/namespace outside the grammar → 400; `PATCH` namespace on
+a minted agent → 403 (frozen); disabled agent WS auth → `AUTH_FAILED` **and** disabled
+agent `GET /messages` with its token → 401.
 
 Phase 2: `bun test server/__tests__/tenant-gate.test.ts` — cross-tenant direct without
 link → `TENANT_DENIED`; with link but no ACL → `ACL_DENIED`; with both → delivered;
 same-tenant unaffected; home↔home (NULL) completely unchanged against the existing
 suite (`bun test` green with zero modified existing tests — the regression criterion
-for C5); topic publish crosses tenants only via link (R4); capability-stripped agent
-`publish` → `CAPABILITY_DENIED`; presence does not cross unlinked tenants; bare-name
-send within a tenant resolves and delivers with short names in the frame, bare-name
-send to another tenant's agent → `AGENT_NOT_FOUND` even when a link + ACL exist (F1);
-a reminder set by a federated agent fires and is delivered to it with no link to home
+for C5); **cross-tenant send with no link → `AGENT_NOT_FOUND` whether or not the
+target exists** (the anti-enumeration rule; `TENANT_DENIED` only for kind-not-in-link);
+topic publish crosses tenants only via link (R4); capability-stripped agent `publish`
+→ `CAPABILITY_DENIED`; **file sends gated at both sites** — WS `routeFile` and HTTP
+upload each: cross-tenant without link refused, sender without `send:file` →
+`CAPABILITY_DENIED`; federated agent subscribe to a nonexistent topic →
+`TOPIC_NOT_FOUND` (never creates — the ownership/DoS rule); presence does not cross
+unlinked tenants **on either surface** (`broadcastStatus` fan-out AND the
+`list_presence` roster); a message queued while a link existed still delivers after
+link removal on next connect (admission-time semantics, explicit); bare-name send
+within a tenant resolves and delivers with short names in the frame, bare-name send to
+another tenant's agent → `AGENT_NOT_FOUND` even when a link + ACL exist (F1); a
+reminder set by a federated agent fires and is delivered to it with no link to home
 (F3 — the system-sender exemption regression test).
 
 Phase 3: scoped observer receives own-tenant + own-agents' link traffic, and nothing
