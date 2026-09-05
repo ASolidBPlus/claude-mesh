@@ -440,7 +440,17 @@ export function startWsServer(
 
     // Create an HTTP server explicitly so we can track and destroy its sockets
     const httpServer = http.createServer();
-    const wss = new WebSocketServer({ server: httpServer });
+    // (c) Drop oversize frames at the CONNECTION level, before JSON.parse.
+    //
+    // The 1 MiB payload check in the router runs AFTER parsing, so a 100 MiB
+    // frame was already fully buffered and parsed before anything refused it —
+    // the cost is paid before the guard speaks. maxPayload makes the ws library
+    // fail the frame and close, so a hostile size never reaches the parser.
+    //
+    // Headroom above the payload cap because the frame carries envelope too
+    // (type, ids, content_type); the ROUTER's 1 MiB check is still the payload
+    // authority and is unchanged.
+    const wss = new WebSocketServer({ server: httpServer, maxPayload: 1_100_000 });
     const connections = new Set<WebSocket>();
     const sockets = new Set<net.Socket>();
     // Connection registry: ws -> state

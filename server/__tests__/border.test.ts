@@ -4,9 +4,10 @@ import {
   drainOutbound, expireStaleOutbound, markMessageFailed, countPendingMessages,
   listOutboundPeers, getMessage,
 } from '../db.ts';
-import { routeDirect } from '../router.ts';
+import { routeDirect, routeRelay, MAX_TTL_MS } from '../router.ts';
 import { RELAY_DEDUPE_MS } from '../cleanup.ts';
 import { startBorder, forwarders, borderEvents } from '../border.ts';
+import { validateOutboundPeerUrl } from '../http-admin.ts';
 import { renderMetrics, setPeerUpSource } from '../metrics.ts';
 import { Database } from 'bun:sqlite';
 import type { WebSocket } from 'ws';
@@ -14,7 +15,7 @@ import { readFileSync, readdirSync, statSync, mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { startWsServer } from '../ws-server.ts';
-import { upsertPeer, aclCheck } from '../db.ts';
+import { upsertPeer, aclCheck, getPeerByAlias } from '../db.ts';
 import { hashToken } from '../auth.ts';
 
 // F2b — the OUTBOUND border. Tests here cover the parts that do not need a
@@ -35,9 +36,20 @@ afterEach(() => {
   db.close();
 });
 
+function sourceFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const name of readdirSync(dir)) {
+    if (name === 'node_modules' || name === '__tests__') continue;
+    const full = join(dir, name);
+    if (statSync(full).isDirectory()) out.push(...sourceFiles(full));
+    else if (name.endsWith('.ts')) out.push(full);
+  }
+  return out;
+}
+
 function peering(alias: string, rate = 600): void {
   insertOutboundPeer(db, {
-    alias, url: `ws://${alias}.example:7300`, token: 'SECRET-TOKEN-VALUE',
+    alias, url: `ws://127.0.0.1:7300`, token: 'SECRET-TOKEN-VALUE',
     assigned_alias: 'us', kinds: '["direct"]', rate_per_min: rate, created_at: Date.now(),
   });
 }
@@ -194,17 +206,6 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
   //
   // A mutant re-introducing a literal at any reader is what this exists to
   // prevent.
-  function sourceFiles(dir: string): string[] {
-    const out: string[] = [];
-    for (const name of readdirSync(dir)) {
-      if (name === 'node_modules' || name === '__tests__') continue;
-      const full = join(dir, name);
-      if (statSync(full).isDirectory()) out.push(...sourceFiles(full));
-      else if (name.endsWith('.ts')) out.push(full);
-    }
-    return out;
-  }
-
   it('exactly one definition, and no bare `protocol: <number>` literal anywhere', () => {
     const root = join(import.meta.dir, '..', '..');
     const files = [...sourceFiles(join(root, 'server')), ...sourceFiles(join(root, 'client', 'src'))];
@@ -360,5 +361,93 @@ describe('F2b: end to end over two servers', () => {
     expect(getOutboundPeer(db, 'far')?.enabled).toBe(0);
     expect(countPendingMessages(db)).toBe(0);      // rows expired by endOutboundPeering
     expect(aclCheck(db, 'sender', 'far:bob')).toBe(false);   // outbound edges gone
+  }, 20_000);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Hardening items (a)-(g)
+// ════════════════════════════════════════════════════════════════════════════
+
+describe('F2b (b): ttl is clamped on BOTH branches and negatives are refused', () => {
+  it('sender side: an enormous ttl is clamped to MAX_TTL_MS, a negative is refused', () => {
+    peering('far');
+    aclGrant(db, 'sender', 'far:them', 'admin');
+
+    routeDirect(db, new Map(), 'sender', {
+      type: 'send', msg_id: 'huge', to: 'far:them', payload: 'p',
+      content_type: 'text/plain', ttl_ms: 999_999_999_999,
+    } as never);
+    const row = getMessage(db, 'huge')!;
+    // Clamped, not honoured: past the dedupe window the forwarder expires the
+    // row anyway, so a longer ttl promises storage the system will not keep.
+    expect(row.expires_at! - row.sent_at).toBeLessThanOrEqual(MAX_TTL_MS);
+
+    const neg = routeDirect(db, new Map(), 'sender', {
+      type: 'send', msg_id: 'neg', to: 'far:them', payload: 'p',
+      content_type: 'text/plain', ttl_ms: -5,
+    } as never);
+    // REFUSED, not clamped to 0 — 0 already means ephemeral here, so mapping a
+    // malformed value onto it would turn a bad frame into a different valid
+    // request.
+    expect(neg.ok).toBe(false);
+    expect(getMessage(db, 'neg')).toBeNull();
+  });
+
+  it('receiver side: a peer relay with a negative ttl is RELAY_REFUSED', () => {
+    registerAgent(db, { id: 'local-x', token_hash: 'c'.repeat(64), hostname: 'h' });
+    upsertPeer(db, {
+      alias: 'inbound', token_hash: hashToken('t'), minted_by_key: 'k',
+      kinds: '["direct"]', rate_per_min: 600,
+    });
+    aclGrant(db, 'inbound:them', 'local-x', 'admin');
+
+    const r = routeRelay(db, new Map(), getPeerByAlias(db, 'inbound')!, {
+      type: 'relay', msg_id: 'r-neg', kind: 'direct',
+      from: 'them', to: 'local-x', payload: 'p', ttl_ms: -1,
+    });
+    expect(r.ok).toBe(false);
+  });
+});
+
+describe('F2b (d)+(g): ONE url predicate, ws:// only for loopback', () => {
+  it('accepts wss anywhere and ws only on loopback', () => {
+    expect(validateOutboundPeerUrl('wss://far.example:7300').ok).toBe(true);
+    expect(validateOutboundPeerUrl('ws://127.0.0.1:7300').ok).toBe(true);
+    expect(validateOutboundPeerUrl('ws://localhost:7300').ok).toBe(true);
+    // Plaintext to a remote host would put outbound_peers.token — a live
+    // credential — on the wire on every reconnect.
+    expect(validateOutboundPeerUrl('ws://far.example:7300').ok).toBe(false);
+    expect(validateOutboundPeerUrl('http://far.example').ok).toBe(false);
+    expect(validateOutboundPeerUrl('not a url').ok).toBe(false);
+  });
+
+  it('certificate verification is never disabled — source scan', () => {
+    // The usual way this rule dies is one { rejectUnauthorized: false } added
+    // to make a staging box work. A source scan is the only thing that catches
+    // an option nobody's test exercises.
+    const root = join(import.meta.dir, '..', '..');
+    const files = [...sourceFiles(join(root, 'client', 'src')), join(root, 'server', 'border.ts')];
+    for (const f of files) {
+      expect(readFileSync(f, 'utf8')).not.toContain('rejectUnauthorized');
+    }
+  });
+});
+
+describe('F2b (c): oversize frames are dropped before the parser', () => {
+  it('the WS server sets maxPayload below the router payload cap + envelope', async () => {
+    // The router's 1 MiB check runs AFTER JSON.parse, so without this the cost
+    // of a hostile frame is paid before anything refuses it.
+    const port = 23900 + Math.floor(Date.now() % 90);
+    const d = openDb(':memory:');
+    const h = await startWsServer(port, d, 10_485_760, mkdtempSync(join(tmpdir(), 'mesh-mp-')));
+    try {
+      expect((h.wss as unknown as { options: { maxPayload: number } }).options.maxPayload)
+        .toBeLessThan(2 * 1024 * 1024);
+      expect((h.wss as unknown as { options: { maxPayload: number } }).options.maxPayload)
+        .toBeGreaterThan(1_048_576);
+    } finally {
+      await h.shutdown().catch(() => {});
+      d.close();
+    }
   }, 20_000);
 });

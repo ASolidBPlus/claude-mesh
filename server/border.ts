@@ -128,8 +128,19 @@ export class Forwarder {
     // less observable of the two. A revoked peering is NOT a down peering — it
     // will not recover — so its queued rows are undeliverable from this instant
     // and would otherwise sit pending forever.
+    // (e) TRUST BOUNDARY OF THIS DECISION, stated because it is a
+    // disable-on-a-frame:
+    //   - over wss:// with verified certificates (the only non-loopback form
+    //     POST/PATCH accept), the frame is genuinely the remote's;
+    //   - over loopback ws://, an on-path injector could send AUTH_FAILED and
+    //     disable the peering.
+    // The bound is ACCEPTED: an attacker already on loopback has better
+    // options, and the failure is RECOVERABLE by PATCH {enabled:true} — a
+    // denial of service, not a compromise. The frame is logged verbatim so an
+    // operator can see what disabled it rather than inferring.
     console.error(JSON.stringify({
-      evt: 'outbound_peering.revoked_by_receiver', alias: this.row.alias, at: Date.now(),
+      evt: 'outbound_peering.revoked_by_receiver', alias: this.row.alias,
+      frame: err, at: Date.now(),
     }));
     endOutboundPeering(this.db, this.row.alias, 'revoked_by_receiver');
     this.stop();
@@ -184,6 +195,12 @@ export class Forwarder {
         // delivered_at is set ONLY on the peer's ack — never on send.
         markDelivered(this.db, row.id);
         incPeerRelay(this.row.alias, 'outbound', 'delivered');
+        // (a) THE BACKOFF RESETS HERE AND NOWHERE ELSE — on a relay ACK, never
+        // on connect. A far side that accepts the TCP/WS connection and then
+        // drops or refuses everything would otherwise reset the backoff on
+        // every reconnect, defeating it entirely: the forwarder would hammer a
+        // peering that is up in the only sense that costs us nothing to check.
+        // Progress means a message was accepted, not that a socket opened.
         this.backoff = BACKOFF_MIN_MS;
         this.drain();
       },

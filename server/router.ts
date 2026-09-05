@@ -142,6 +142,21 @@ export function deliverOrQueue(
 /** Per-alias sliding-minute counter. In memory: a rate limit is about the
  *  CURRENT connection's behaviour, and persisting it would let a restart
  *  either forgive a flood or punish a peer for one it has already stopped. */
+/**
+ * F2b (b): the largest ttl a caller may ask for, either direction.
+ *
+ * Set to the relay dedupe window (7 days) rather than something larger,
+ * because beyond it the row is unsendable anyway: the receiver has forgotten
+ * the remote msg_id, so the forwarder expires such rows rather than
+ * re-delivering them. A ttl past that point promises storage the system will
+ * not honour, which is worse than refusing it.
+ *
+ * NEGATIVE ttls are REFUSED, not clamped to 0: 0 already means something
+ * specific here (ephemeral — deliver live or drop), so silently mapping -5
+ * onto it would turn a malformed frame into a different valid request.
+ */
+export const MAX_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
 const relayBuckets = new Map<string, { windowStart: number; count: number }>();
 
 /** Exported for tests only — a bucket that survives between cases would make
@@ -272,7 +287,11 @@ export function routeRelay(
   db.prepare('INSERT INTO relays (peer_alias, remote_msg_id, seen_at) VALUES (?, ?, ?)')
     .run(alias, msg_id, now);
 
-  const ttl = typeof frame.ttl_ms === 'number' ? frame.ttl_ms : 300_000;
+  // (b) A peer's ttl is untrusted input. Negative is malformed; enormous
+  // promises storage past the dedupe window, which is never honoured.
+  const rawTtl = typeof frame.ttl_ms === 'number' ? frame.ttl_ms : 300_000;
+  if (!Number.isFinite(rawTtl) || rawTtl < 0) return refuse('bad_ttl');
+  const ttl = Math.min(rawTtl, MAX_TTL_MS);
   const content_type = typeof frame.content_type === 'string' ? frame.content_type : 'text/plain';
   deliverOrQueue(db, agentIndex, {
     id: localId,
@@ -385,7 +404,15 @@ export function routeDirect(
       incBytes('in', payloadBytes);
       observePayloadBytes(payloadBytes);
 
-      const ttlRemote = frame.ttl_ms === undefined ? 300_000 : frame.ttl_ms;
+      // (b) Same clamp on the sending side. A local agent asking for a
+      // year-long ttl to a remote id would otherwise queue a row the forwarder
+      // expires at 7 days anyway — a promise the system does not keep.
+      const rawTtlRemote = frame.ttl_ms === undefined ? 300_000 : frame.ttl_ms;
+      if (!Number.isFinite(rawTtlRemote) || rawTtlRemote < 0) {
+        incError('AGENT_NOT_FOUND');
+        return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
+      }
+      const ttlRemote = Math.min(rawTtlRemote, MAX_TTL_MS);
       const sentAtRemote = Date.now();
 
       // ttl_ms = 0 keeps its LOCAL meaning: deliver live or drop, never queue.

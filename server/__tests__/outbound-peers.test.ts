@@ -119,7 +119,7 @@ describe('F2a: routeDirect remote branch', () => {
 
   function peering(alias: string, kinds = '["direct"]'): void {
     insertOutboundPeer(db, {
-      alias, url: 'ws://far.example:7300', token: 'SECRET-TOKEN-VALUE',
+      alias, url: 'ws://127.0.0.1:7300', token: 'SECRET-TOKEN-VALUE',
       assigned_alias: 'us', kinds, rate_per_min: 600, created_at: Date.now(),
     });
   }
@@ -261,7 +261,7 @@ describe('F2a: outbound peering gates aclGrant at both doors', () => {
     expect(() => aclGrant(db, 'sender', 'far:them', 'admin')).toThrow(/outbound peering/);
 
     insertOutboundPeer(db, {
-      alias: 'far', url: 'ws://x:1', token: 'T', assigned_alias: 'us',
+      alias: 'far', url: 'ws://127.0.0.1:7302', token: 'T', assigned_alias: 'us',
       kinds: '["direct"]', rate_per_min: 600, created_at: Date.now(),
     });
     expect(() => aclGrant(db, 'sender', 'far:them', 'admin')).not.toThrow();
@@ -273,7 +273,7 @@ describe('F2a: outbound peering gates aclGrant at both doors', () => {
     const db = openDb(':memory:');
     registerAgent(db, { id: 'sender', token_hash: 'a'.repeat(64), hostname: 'h' });
     insertOutboundPeer(db, {
-      alias: 'far', url: 'ws://x:1', token: 'T', assigned_alias: 'us',
+      alias: 'far', url: 'ws://127.0.0.1:7302', token: 'T', assigned_alias: 'us',
       kinds: '["direct"]', rate_per_min: 600, created_at: Date.now(),
     });
     db.prepare('UPDATE outbound_peers SET enabled = 0').run();
@@ -295,7 +295,7 @@ describe('F2a: endOutboundPeering — one transaction, three effects', () => {
     db = openDb(':memory:');
     registerAgent(db, { id: 'sender', token_hash: 'a'.repeat(64), hostname: 'h' });
     insertOutboundPeer(db, {
-      alias: 'far', url: 'ws://x:1', token: 'T', assigned_alias: 'us',
+      alias: 'far', url: 'ws://127.0.0.1:7302', token: 'T', assigned_alias: 'us',
       kinds: '["direct"]', rate_per_min: 600, created_at: Date.now(),
     });
     aclGrant(db, 'sender', 'far:them', 'admin');
@@ -328,7 +328,7 @@ describe('F2a: endOutboundPeering — one transaction, three effects', () => {
 
   it('a BYSTANDER peering keeps its rows and edges', () => {
     insertOutboundPeer(db, {
-      alias: 'other', url: 'ws://y:1', token: 'T2', assigned_alias: 'us',
+      alias: 'other', url: 'ws://127.0.0.1:7303', token: 'T2', assigned_alias: 'us',
       kinds: '["direct"]', rate_per_min: 600, created_at: Date.now(),
     });
     aclGrant(db, 'sender', 'other:them', 'admin');
@@ -376,7 +376,7 @@ describe('F2a: POST /outbound-peers and the forwarder-factory refusal', () => {
       body: JSON.stringify(body),
     });
 
-  const VALID = { alias: 'far', url: 'ws://far.example:7300', token: 'SECRET-TOKEN-VALUE', assigned_alias: 'us' };
+  const VALID = { alias: 'far', url: 'ws://127.0.0.1:7300', token: 'SECRET-TOKEN-VALUE', assigned_alias: 'us' };
 
   it('refuses 503 with NO row written when no forwarder factory is registered', async () => {
     // THE JOIN IN TIME. Between F2a and F2b merging, a peering created here
@@ -474,7 +474,7 @@ describe('F2a: DELETE ends a peering, PATCH pauses one', () => {
     await fetch(`${base}/outbound-peers`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${ADMIN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ alias: 'far', url: 'ws://far:1', token: 'T', assigned_alias: 'us' }),
+      body: JSON.stringify({ alias: 'far', url: 'ws://127.0.0.1:7301', token: 'T', assigned_alias: 'us' }),
     });
     aclGrant(db, 'sender', 'far:them', 'admin');
     routeDirect(db, new Map(), 'sender', {
