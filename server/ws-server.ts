@@ -640,6 +640,15 @@ export function startWsServer(
               // for — a peer reconnecting because its old socket died, where
               // the dead socket's close event can arrive AFTER the new one has
               // authenticated and indexed.
+              //
+              // #105: NO BEHAVIOURAL TEST DISTINGUISHES THE TWO ORDERS.
+              // Measured — inverted order WITH the guard is 646/0, identical to
+              // what ships. THIS COMMENT IS THE CONTROL. The verification
+              // procedure is the 2x2 mutation, order x guard: only the cell
+              // with close-then-index AND no guard misbehaves, so neither
+              // single mutant catches a regression here. A refactor that
+              // restores close-then-index silently RE-INERTS the guard, with
+              // every test still green.
               const existing = peerIndex.get(agentId);
               peerIndex.set(agentId, ws);
               if (existing !== undefined && existing !== ws) {

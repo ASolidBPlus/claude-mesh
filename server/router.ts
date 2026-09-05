@@ -227,6 +227,13 @@ export function routeRelay(
 
   // ── Peer state, then rate, then border, then dedupe. Order matters: the rate
   // bucket counts BEFORE the cheaper checks so a peer cannot probe for free.
+  // A relay arriving on a still-open socket of a DISABLED peer — the window
+  // before the sweep closes it, or before a revoke-close lands. The refusal is
+  // the SAME RELAY_REFUSED bytes as every other: not a distinct code (that
+  // would tell a revoked peer it was revoked, #104's lesson at the relay
+  // layer), and not a close from here — closing is the sweep's and the
+  // revoke path's job, and doing it in two places means two things that can
+  // disagree about when a socket dies.
   if (peer.disabled === 1) return refuse('peer_disabled');
 
   const now = Date.now();

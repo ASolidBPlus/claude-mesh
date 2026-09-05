@@ -204,12 +204,23 @@ describe('F1b: the rate bucket', () => {
 describe('F1b: a disabled peer relays nothing', () => {
   beforeEach(() => resetRelayBuckets());
 
-  it('refuses even with a valid edge and a live socket', () => {
+  it('refuses with the SAME bytes as a no-edge refusal, and does not close', () => {
+    // The window before the sweep closes the socket, or before a revoke-close
+    // lands. Compared against another PEER-REACHABLE refusal (#104's lesson:
+    // an equality test needs its subjects justified — comparing against an
+    // agent-path refusal would prove nothing about what a peer can observe).
     const db = setup();
-    db.prepare('UPDATE peers SET disabled = 1 WHERE alias = ?').run('othermesh');
     const sock = fakeSocket();
-    const r = routeRelay(db, new Map([['local-a', sock]]), getPeerByAlias(db, 'othermesh')!, relayFrame());
-    expect(r.ok).toBe(false);
+    const live = getPeerByAlias(db, 'othermesh')!;
+    const noEdge = routeRelay(db, new Map([['local-a', sock]]), live, relayFrame({ to: 'local-b' }));
+
+    db.prepare('UPDATE peers SET disabled = 1 WHERE alias = ?').run('othermesh');
+    const disabled = routeRelay(db, new Map([['local-a', sock]]), getPeerByAlias(db, 'othermesh')!, relayFrame());
+
+    expect(disabled.ok).toBe(false);
+    expect(JSON.stringify(disabled)).toBe(JSON.stringify({ ...noEdge, ref: 'remote-1' }));
+    // Nothing delivered, and the relay path does not close the socket —
+    // closing belongs to the sweep and the revoke path.
     expect(sock.sent.length).toBe(0);
     db.close();
   });
