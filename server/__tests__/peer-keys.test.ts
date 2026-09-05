@@ -69,6 +69,17 @@ describe('F0b: peer keys', () => {
     expect(raw).toContain('othermesh');
   });
 
+  it('the MINT response carries the secret but not the stored hash', async () => {
+    // Shape hygiene rather than a security boundary — stated plainly: the
+    // caller already holds the secret, so it could compute the hash itself.
+    // Asserted anyway because the mint response is the one place a stored-hash
+    // field would look natural, and a mutant adding it survived the listing
+    // test above (which is correctly scoped to the LISTING and cannot see it).
+    const raw = await (await post('/peer-keys', { alias: 'shapecheck' })).text();
+    expect(raw).not.toContain('key_hash');
+    expect(raw).toContain('"key"');
+  });
+
   it('refuses a bad alias grammar, the reserved alias, and a live duplicate', async () => {
     expect((await post('/peer-keys', { alias: 'Bad Alias' })).status).toBe(400);
     expect((await post('/peer-keys', { alias: '-leading' })).status).toBe(400);
