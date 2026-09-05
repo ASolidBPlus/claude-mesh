@@ -685,9 +685,21 @@ export function startWsServer(
               return;
             }
 
+            // FOLDED PER C9 (#116). This said `invalid token` while an unknown
+            // id six lines above says `unknown agent` — two answers to ONE
+            // question ("may this caller in?"), which let an UNAUTHENTICATED
+            // network caller enumerate agent ids by reading the difference.
+            //
+            // #104 folded the PEER path for exactly this and the agent path was
+            // never folded, because the comparison that finds it is refusals
+            // side by side, and #104 only put the PEER refusals side by side.
+            //
+            // The frame's own-input refusal above ('missing agent_id or token')
+            // stays distinct: it answers a different question — what the caller
+            // SENT — and reveals nothing about what exists here.
             if (!validateToken(token, agent.token_hash)) {
               try {
-                ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'invalid token' }));
+                ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
               } catch (_) { /* ignore */ }
               ws.close(1008, 'auth failed');
               return;

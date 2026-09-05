@@ -103,16 +103,73 @@ describe('F1a: peer authentication', () => {
     }
   }, 20_000);
 
-  it('positive control: an AGENT with a wrong token still says "invalid token"', async () => {
-    // Agents keep their existing contract — the unified refusal is the PEER
-    // path's, not a global flattening. Without this, the test above is
-    // satisfied by making every refusal in the server identical.
+  // REPLACED IN #116, and the replacement is the point.
+  //
+  // This control used to assert an AGENT with a wrong token still said
+  // 'invalid token' — correct for its stated purpose (proving the #104 peer
+  // fold was not a global flattening) and, by asserting it, it PINNED the agent
+  // door's distinguishable refusals as intended behaviour. They were the same
+  // enumeration oracle, on the door reachable without any credential at all.
+  //
+  // A scope-bounding control says "I changed X and not Y". That is right as
+  // discipline and becomes "Y is correct" the moment nobody revisits Y. The
+  // comparand has to be something that SHOULD stay distinct — here the
+  // own-input refusal, which answers what the caller SENT rather than what
+  // exists.
+  it('positive control: the OWN-INPUT refusal stays distinct', async () => {
     const { db, handle, port } = await setup();
-    const s = await open(port, { type: 'auth', agent_id: 'local-a', token: 'WRONG' });
+    const malformed = await open(port, { type: 'auth', agent_id: 123, token: 'x' });
+    const unknown = await open(port, { type: 'auth', agent_id: 'nobody', token: 'x' });
     try {
-      expect(s.frames.find(f => f.type === 'error')?.message).toBe('invalid token');
+      const m1 = malformed.frames.find(f => f.type === 'error')?.message;
+      const m2 = unknown.frames.find(f => f.type === 'error')?.message;
+      expect(m1).toBe('missing agent_id or token');
+      // Distinct BY DESIGN: it reveals only what the caller sent.
+      expect(m1).not.toBe(m2);
     } finally {
-      try { s.ws.close(); } catch { /* ignore */ }
+      try { malformed.ws.close(); unknown.ws.close(); } catch { /* ignore */ }
+      await handle.shutdown().catch(() => {});
+      db.close();
+    }
+  }, 20_000);
+
+  // C9 SET TEST — the agent door. Every reachable cause of the one question
+  // "may this caller in?", side by side. A door can pass every per-guard test
+  // and still violate C9 the moment one branch gains a message; only the set
+  // sees it, and the set is how #116 was found in the first place.
+  it('agent door: unknown id and wrong token are byte-identical', async () => {
+    const { db, handle, port } = await setup();
+    const unknownId = await open(port, { type: 'auth', agent_id: 'no-such-agent', token: 'whatever' });
+    const wrongToken = await open(port, { type: 'auth', agent_id: 'local-a', token: 'WRONG' });
+    try {
+      const errs = [unknownId, wrongToken].map(s => JSON.stringify(s.frames.find(f => f.type === 'error')));
+      expect(new Set(errs).size).toBe(1);
+      expect(JSON.parse(errs[0]!)).toEqual({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' });
+    } finally {
+      try { unknownId.ws.close(); wrongToken.ws.close(); } catch { /* ignore */ }
+      await handle.shutdown().catch(() => {});
+      db.close();
+    }
+  }, 20_000);
+
+  // CROSS-DOOR set test: peer-side and agent-side refusals are ONE frame.
+  // Without this, the two doors can each be internally uniform and still differ —
+  // and the difference tells an unauthenticated caller whether a name is an
+  // agent or an alias, which is the same enumeration by another route.
+  it('peer-side and agent-side refusals are the same frame', async () => {
+    const { db, handle, port } = await setup();
+    db.prepare('UPDATE peers SET disabled = 1 WHERE alias = ?').run('othermesh');
+    const sessions = await Promise.all([
+      open(port, { type: 'auth', agent_id: 'no-such-agent', token: 'x' }),          // unknown agent id
+      open(port, { type: 'auth', agent_id: 'local-a', token: 'WRONG' }),            // bad agent token
+      open(port, { type: 'auth', agent_id: 'nosuchmesh', token: 'x', protocol: 1 }),// unknown alias
+      open(port, { type: 'auth', agent_id: 'othermesh', token: 'peer-tok', protocol: 1 }), // disabled peer
+    ]);
+    try {
+      const errs = sessions.map(s => JSON.stringify(s.frames.find(f => f.type === 'error')));
+      expect(new Set(errs).size).toBe(1);
+    } finally {
+      for (const s of sessions) { try { s.ws.close(); } catch { /* ignore */ } }
       await handle.shutdown().catch(() => {});
       db.close();
     }

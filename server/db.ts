@@ -1082,6 +1082,19 @@ export function upsertPeer(
   // naming some other key, means rebind means drop. The cost of forgetting to
   // say "rotation" is a re-grant; the cost of the opposite default is a live
   // edge pointing at whoever now holds the name.
+  //
+  // THE LIMIT OF DECLARED LINEAGE, stated so nobody reads it as more than it
+  // is: `rotates` verifies that this key SUCCEEDS a specific prior key (checked
+  // against the row's minted_by_key). It does NOT verify that the same
+  // COUNTERPARTY holds it. An admin who mints with `rotates` and hands the
+  // secret to a different mesh transfers the edges — truthfully declared, and
+  // wrong.
+  //
+  // The declarer is the ADMIN AT MINT TIME, not the peer at registration, and
+  // that is the security-critical property: the peer presenting the key cannot
+  // choose whether its arrival counts as a rotation. Failure therefore requires
+  // an ACTIVE INCORRECT DECLARATION by the trust root, never an omission —
+  // absent means rebind means drop.
   const existing = getPeerByAlias(db, peer.alias);
   if (existing !== null) {
     const declared = peer.rotates ?? null;
