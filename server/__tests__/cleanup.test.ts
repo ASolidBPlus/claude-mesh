@@ -95,6 +95,10 @@ describe('cleanup', () => {
     db.close();
   });
 
+  // NOTE (#39): this file is UNDELIVERED, which is now load-bearing — the
+  // delivery TTL only reaps undelivered files. Comment added, assertions
+  // untouched: the test passed before and after the split, so it never pinned
+  // the defect.
   it('cleanup tick calls deleteExpiredFiles — expired file is removed from DB and disk', async () => {
     const db = openDb(':memory:');
     const agentIndex = new Map<string, WebSocket>();

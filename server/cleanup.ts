@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import { unlinkSync } from 'fs';
-import { countExpiredUndeliveredSince, sweepRetention, deleteExpiredFiles, deleteDeliveredOneShots } from './db.ts';
+import { countExpiredUndeliveredSince, sweepRetention, sweepFileRetention, deleteExpiredFiles, deleteDeliveredOneShots } from './db.ts';
 import { incExpiredByKind } from './metrics.ts';
 
 export interface CleanupHandle {
@@ -46,11 +46,32 @@ export function startCleanup(
         process.stdout.write(`[cleanup] retention swept ${removed} message(s)\n`);
       }
 
+      // UNDELIVERED + expired only (#39): a delivered file's bytes are history
+      // now, removed by the retention sweep below rather than by delivery TTL.
       const expiredPaths = deleteExpiredFiles(db);
+      // Unlink AFTER the row delete, never before: a crash between the two
+      // would otherwise leave rows pointing at missing bytes, which reads as
+      // corruption rather than cleanup. An unlink failure is logged, never
+      // fatal — a leaked byte-blob is recoverable, a dead cleanup loop is not.
       for (const p of expiredPaths) {
-        try { unlinkSync(p); } catch {}
+        try { unlinkSync(p); } catch (err) {
+          console.warn(`[cleanup] file bytes not unlinked (row already removed): ${p}: ${(err as Error).message}`);
+        }
       }
       process.stdout.write(`[cleanup] expired ${expiredPaths.length} file(s)\n`);
+
+      // Files retention sweep (#39): the twin of the messages sweep above, and
+      // the ONLY path that removes a delivered file. Same still-deliverable
+      // exclusion, same delete-then-unlink order.
+      if (resolvedRetentionMs !== null) {
+        const sweptPaths = sweepFileRetention(db, resolvedRetentionMs);
+        for (const p of sweptPaths) {
+          try { unlinkSync(p); } catch (err) {
+            console.warn(`[cleanup] file bytes not unlinked (row already removed): ${p}: ${(err as Error).message}`);
+          }
+        }
+        process.stdout.write(`[cleanup] retention swept ${sweptPaths.length} file(s)\n`);
+      }
 
       const deletedReminders = deleteDeliveredOneShots(db, Date.now() - 86_400_000);
       process.stdout.write(`[cleanup] cleaned ${deletedReminders} old delivered reminder(s)\n`);
