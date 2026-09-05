@@ -351,3 +351,35 @@ describe('startMcpServer', () => {
     expect(parsed.ok).toBe(true);
   });
 });
+
+
+describe('F1b: MCP send/broadcast require an existing LOCAL sender', () => {
+  // Until now only mesh_status checked as_agent, so a stdio caller could send
+  // as ANY string — including `othermesh:someone`, forging a federated sender
+  // on a bus where alias:x is about to MEAN something.
+  it('refuses a remote-looking or unknown as_agent, and still accepts a real one', async () => {
+    const db = openDb(':memory:');
+    registerAgent(db, { id: 'real-agent', token_hash: 'a'.repeat(64), hostname: 'h' });
+    registerAgent(db, { id: 'target', token_hash: 'b'.repeat(64), hostname: 'h' });
+    aclGrant(db, 'real-agent', 'target', 'system');
+    const h = await startMcpServer(db, new Map(), new Map(), 'admin-secret');
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    const c = new Client({ name: 't', version: '1' }, { capabilities: {} });
+    await h.server.connect(st);
+    await c.connect(ct);
+    try {
+      for (const forged of ['othermesh:someone', 'no-such-agent']) {
+        const r = await c.callTool({ name: 'mesh_send', arguments: { to: 'target', message: 'x', as_agent: forged } });
+        expect(r.isError).toBe(true);
+        expect(JSON.parse((r.content as { text: string }[])[0]!.text).error).toBe('AGENT_NOT_FOUND');
+      }
+      // Positive control: a real local sender still works, so the check is not
+      // a wall.
+      const ok = await c.callTool({ name: 'mesh_send', arguments: { to: 'target', message: 'x', as_agent: 'real-agent' } });
+      expect(ok.isError).toBe(false);
+    } finally {
+      await h.shutdown?.().catch?.(() => {});
+      db.close();
+    }
+  });
+});

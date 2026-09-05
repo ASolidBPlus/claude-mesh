@@ -148,6 +148,22 @@ describe('http-admin', () => {
   // F0a §5.4 — ONE RULE AT THE CHOKEPOINT. Before this, the HTTP door 404'd a
   // remote endpoint while the MCP door accepted it: two doors, two rules, on
   // the exact pair #82 pinned for door parity.
+  // F1b: the peering rule lives in aclGrant; this door only MAPS it. Paired
+  // with the MCP door's equivalent so ONE mutation in the chokepoint reds both
+  // — the structural pattern F0a established for door parity.
+  it('POST /acl refuses a remote endpoint with NO peering — 409 no peering', async () => {
+    registerAgent(db, { id: 'agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
+    const res = await fetch(`${base}/acl`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_agent: 'nopeer:someone', to_agent: 'agent-a' }),
+    });
+    // 409, not 404: the endpoint may well exist on the far mesh — what is
+    // missing is the peering, which is a conflict with OUR state.
+    expect(res.status).toBe(409);
+    expect((await res.json() as Record<string, unknown>).error).toBe('no peering');
+  });
+
   it('POST /acl accepts a REMOTE endpoint once a peering exists', async () => {
     // F1b tightened F0a: a ':' endpoint now needs a peering too. Direction
     // matters — inbound (remote -> local) is what a registered peer earns.

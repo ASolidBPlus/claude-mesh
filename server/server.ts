@@ -1,4 +1,5 @@
 import { openDb, findPeerAliasCollisions } from './db.ts';
+import { setPeerUpSource } from './metrics.ts';
 import { startWsServer, WsServerHandle } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
@@ -184,6 +185,11 @@ async function main() {
   }
 
   const { agentIndex, peerIndex } = wsHandle;
+
+  // F1b: mesh_peer_up reads the LIVE index rather than a stored column —
+  // `peers` has no `online` field, and after #87 a durable liveness claim that
+  // outlives the process is exactly what must not exist.
+  setPeerUpSource(() => peerIndex.keys());
 
   const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, observerIndex, peerIndex);
 

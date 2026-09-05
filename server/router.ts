@@ -5,6 +5,7 @@ import { join } from 'path';
 import {
   getAgentById,
   aclCheck,
+  type Peer,
   insertMessage,
   getMessage,
   markDelivered,
@@ -19,7 +20,7 @@ import {
   markFileDelivered,
   FileRecord,
 } from './db.ts';
-import { incMsgStatus, incSent, incReceived, incAclDenied, incError, incBytes, incFile, observePayloadBytes } from './metrics.ts';
+import { incMsgStatus, incSent, incReceived, incAclDenied, incError, incBytes, incFile, observePayloadBytes, incPeerRelay } from './metrics.ts';
 import { emitTap } from './tap.ts';
 
 // Wire-frame types live in the shared client package (single source of truth).
@@ -129,6 +130,160 @@ export function deliverOrQueue(
     sent_at: msg.sent_at, expires_at: msg.expires_at,
   });
   incMsgStatus('direct', 'queued');
+}
+
+// ──────────────────────────────────────────────
+// 5.9 Inbound relay (F1b — §5.2)
+// ──────────────────────────────────────────────
+
+/** Per-alias sliding-minute counter. In memory: a rate limit is about the
+ *  CURRENT connection's behaviour, and persisting it would let a restart
+ *  either forgive a flood or punish a peer for one it has already stopped. */
+const relayBuckets = new Map<string, { windowStart: number; count: number }>();
+
+/** Exported for tests only — a bucket that survives between cases would make
+ *  the rate test depend on execution order. */
+export function resetRelayBuckets(): void {
+  relayBuckets.clear();
+}
+
+/** Returns true if this relay is WITHIN the peer's rate. Counts EVERY relay,
+ *  including ones about to be refused: otherwise a peer can probe the mesh for
+ *  free by sending frames it knows will fail. */
+function withinRate(alias: string, limitPerMin: number, now: number): boolean {
+  const b = relayBuckets.get(alias);
+  if (b === undefined || now - b.windowStart >= 60_000) {
+    relayBuckets.set(alias, { windowStart: now, count: 1 });
+    return true;
+  }
+  b.count += 1;
+  return b.count <= limitPerMin;
+}
+
+export interface RelayFrameIn {
+  type: 'relay';
+  msg_id?: unknown;
+  kind?: unknown;
+  from?: unknown;
+  to?: unknown;
+  payload?: unknown;
+  content_type?: unknown;
+  ttl_ms?: unknown;
+}
+
+/**
+ * Handle one `relay` frame from an authenticated PEER socket.
+ *
+ * FULLY SYNCHRONOUS — zero awaits anywhere. Every step is synchronous
+ * bun:sqlite or ws.send work, and that is a stated invariant rather than an
+ * accident: the dedupe check and the `relays` insert must not be separated by
+ * an await, or two frames interleave, both pass, and the second insert throws.
+ * The ONLY position an await could ever be added is AFTER the ack has been
+ * sent, and nothing here needs one.
+ *
+ * Does NOT call routeDirect: that path is for a LOCAL sender and applies rules
+ * (duplicate msg_id against messages.id, local ACL from a bare id) that mean
+ * something different here. It shares deliverOrQueue, which is the part that
+ * must not diverge.
+ *
+ * REFUSALS ARE UNIFORM. Everything except the rate limit answers
+ * RELAY_REFUSED: a peer learns that its frame was refused and nothing about
+ * WHY — not whether the recipient exists, not whether an edge exists, not
+ * whether the kind is permitted. Distinguishing them would make this endpoint
+ * an enumeration oracle for our local agents. RATE_LIMITED is deliberately
+ * distinguishable because it is the one refusal the peer can act on.
+ */
+export function routeRelay(
+  db: Database,
+  agentIndex: Map<string, WebSocket>,
+  peer: Peer,
+  frame: RelayFrameIn,
+  observerIndex: Map<string, WebSocket> = new Map()
+): { ok: true } | { ok: false; code: 'RELAY_REFUSED' | 'RATE_LIMITED'; ref?: string } {
+  const alias = peer.alias;
+  const ref = typeof frame.msg_id === 'string' && frame.msg_id.length > 0 ? frame.msg_id : undefined;
+  const refuse = (reason: string) => {
+    incPeerRelay(alias, 'in', 'refused');
+    console.log(JSON.stringify({ evt: 'peer.relay_refused', alias, reason, at: Date.now() }));
+    return { ok: false as const, code: 'RELAY_REFUSED' as const, ...(ref !== undefined ? { ref } : {}) };
+  };
+
+  // ── Validation. Shape first, so a malformed frame never reaches a lookup.
+  const { msg_id, from, to, payload, kind } = frame;
+  if (typeof msg_id !== 'string' || msg_id.length === 0) return refuse('bad_msg_id');
+  if (typeof from !== 'string' || from.length === 0) return refuse('bad_from');
+  if (typeof to !== 'string' || to.length === 0) return refuse('bad_to');
+  if (typeof payload !== 'string') return refuse('bad_payload');
+  if (kind !== 'direct') return refuse('bad_kind');
+
+  // ONE HOP. `from`/`to` must be bare — a ':' would mean this peer is relaying
+  // on behalf of a THIRD mesh, which is transitive federation nobody agreed to:
+  // our admin's border decision covers this peer, not that peer's peers.
+  if (Buffer.byteLength(from, 'utf8') > 256 || from.includes(':')) return refuse('from_not_one_hop');
+  if (Buffer.byteLength(to, 'utf8') > 256 || to.includes(':')) return refuse('to_not_one_hop');
+
+  const payloadBytes = Buffer.byteLength(payload, 'utf8');
+  if (payloadBytes > 1_048_576) return refuse('too_large');
+
+  // ── Peer state, then rate, then border, then dedupe. Order matters: the rate
+  // bucket counts BEFORE the cheaper checks so a peer cannot probe for free.
+  if (peer.disabled === 1) return refuse('peer_disabled');
+
+  const now = Date.now();
+  if (!withinRate(alias, peer.rate_per_min, now)) {
+    incPeerRelay(alias, 'in', 'rate_limited');
+    return { ok: false, code: 'RATE_LIMITED', ...(ref !== undefined ? { ref } : {}) };
+  }
+
+  // The border its admin set, read from `peers` (copied there at registration)
+  // and never from peer_keys — the key may have been re-minted since.
+  let allowedKinds: string[];
+  try { allowedKinds = JSON.parse(peer.kinds) as string[]; } catch { return refuse('bad_kinds_column'); }
+  if (!Array.isArray(allowedKinds) || !allowedKinds.includes(kind)) return refuse('kind_not_permitted');
+
+  // ── Dedupe on the REMOTE id, within RELAY_DEDUPE_MS. A repeat inside the
+  // window is re-ACKed and delivered NOTHING: the peer's retry after a lost ack
+  // must be safe. After the window the row is swept and the same id is a NEW
+  // message BY DESIGN — a dedupe ledger that grew forever is the alternative.
+  const seen = db.prepare('SELECT 1 FROM relays WHERE peer_alias = ? AND remote_msg_id = ?').get(alias, msg_id);
+  if (seen !== null) {
+    incPeerRelay(alias, 'in', 'duplicate');
+    return { ok: true };
+  }
+
+  // ── Recipient and the inbound edge. Both answer the same RELAY_REFUSED.
+  if (getAgentById(db, to) === null) return refuse('to_unknown');
+  const stampedFrom = `${alias}:${from}`;
+  if (!aclCheck(db, stampedFrom, to)) return refuse('no_edge');
+
+  // ── Accept. A LOCAL id for messages.id: the remote id is the peer's
+  // namespace and could collide with one of ours, so it lives only in `relays`.
+  const localId = crypto.randomUUID();
+  db.prepare('INSERT INTO relays (peer_alias, remote_msg_id, seen_at) VALUES (?, ?, ?)')
+    .run(alias, msg_id, now);
+
+  const ttl = typeof frame.ttl_ms === 'number' ? frame.ttl_ms : 300_000;
+  const content_type = typeof frame.content_type === 'string' ? frame.content_type : 'text/plain';
+  deliverOrQueue(db, agentIndex, {
+    id: localId,
+    from_agent: stampedFrom,
+    to_agent: to,
+    payload,
+    content_type,
+    sent_at: now,
+    expires_at: ttl === 0 ? null : now + ttl,
+    ephemeral: ttl === 0,
+    payloadBytes,
+  });
+
+  emitTap(observerIndex, {
+    type: 'tap', msg_id: localId, kind: 'direct',
+    from: stampedFrom, to, topic: null, correlation_id: null,
+    sent_at: now, size: payloadBytes, payload,
+  });
+
+  incPeerRelay(alias, 'in', 'delivered');
+  return { ok: true };
 }
 
 export function routeDirect(

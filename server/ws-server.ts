@@ -7,7 +7,7 @@ import { validateToken } from './auth.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
 import {
-  routeDirect, drainQueue, SendFrame,
+  routeDirect, routeRelay, drainQueue, SendFrame,
   routePublish, routeSubscribe, routeUnsubscribe,
   routeFile, drainFileQueue, FileSendFrame,
   PublishFrame, SubscribeFrame, UnsubscribeFrame,
@@ -777,8 +777,35 @@ export function startWsServer(
               } catch (_) { /* ignore */ }
               return;
             }
-            // `relay` itself lands in F1b; until then it is not implemented,
-            // and says so rather than being silently accepted.
+            // F1b: the relay itself. Handled here rather than through
+            // POST_AUTH_HANDLERS because those receive an agent ctx and this
+            // needs the peer row — routing it through the agent map would mean
+            // reconstructing peer identity from a structure that does not hold
+            // it.
+            const peerRow = getPeerByAlias(db, state.peerAlias);
+            if (peerRow === null) {
+              // The row vanished under a live socket (deleted between auth and
+              // now). Fail closed; the sweep will close the socket.
+              try {
+                ws.send(JSON.stringify({ type: 'error', code: 'RELAY_REFUSED', message: 'relay refused' }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+            const relayResult = routeRelay(db, agentIndex, peerRow, frame as never, observerIndex);
+            try {
+              if (relayResult.ok) {
+                ws.send(JSON.stringify({
+                  type: 'ack', ok: true,
+                  ...(typeof frame.msg_id === 'string' ? { ref: frame.msg_id } : {}),
+                }));
+              } else {
+                ws.send(JSON.stringify({
+                  type: 'error', code: relayResult.code, message: 'relay refused',
+                  ...(relayResult.ref !== undefined ? { ref: relayResult.ref } : {}),
+                }));
+              }
+            } catch (_) { /* ignore */ }
+            return;
           } else if (frameType === 'relay') {
             try {
               ws.send(JSON.stringify({

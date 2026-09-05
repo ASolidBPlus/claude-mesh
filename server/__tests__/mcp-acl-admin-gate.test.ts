@@ -76,6 +76,15 @@ describe('#8 — mesh_acl_allow / mesh_acl_deny require the admin token', () => 
   });
 
   // F0a — the revoke rule is EDGE existence at BOTH doors.
+  // F1b: the other half of the door-parity pair. One mutation in aclGrant's
+  // peering rule must red this AND the HTTP door's equivalent.
+  it('mesh_acl_allow reports NO_PEERING for a remote endpoint with no peering', async () => {
+    const r = await call('mesh_acl_allow', { agent_id: 'nopeer:someone', as_agent: 'A', admin_token: ADMIN });
+    expect(r.isError).toBe(true);
+    expect(JSON.parse((r.content as { text: string }[])[0]!.text).error).toBe('NO_PEERING');
+    expect(aclCheck(db, 'nopeer:someone', 'A')).toBe(false);
+  });
+
   it('mesh_acl_deny reports EDGE_NOT_FOUND when there was nothing to revoke', async () => {
     // Previously this returned ok:true whether or not anything was withdrawn,
     // so an operator revoking a typo'd edge was told it worked. Deliberate
