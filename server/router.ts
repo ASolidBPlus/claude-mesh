@@ -5,6 +5,8 @@ import { join } from 'path';
 import {
   getAgentById,
   aclCheck,
+  hasOutboundPeer,
+  getOutboundPeer,
   type Peer,
   insertMessage,
   getMessage,
@@ -22,6 +24,7 @@ import {
 } from './db.ts';
 import { incMsgStatus, incSent, incReceived, incAclDenied, incError, incBytes, incFile, observePayloadBytes, incPeerRelay } from './metrics.ts';
 import { emitTap } from './tap.ts';
+import { borderEvents } from './border.ts';
 
 // Wire-frame types live in the shared client package (single source of truth).
 // Import them for local type annotations AND re-export so existing importers of
@@ -305,6 +308,110 @@ export function routeDirect(
   if (payloadBytes > 1_048_576) {
     incError('MESSAGE_TOO_LARGE');
     return { ok: false, error_code: 'MESSAGE_TOO_LARGE', error_message: 'payload exceeds 1 MB limit' };
+  }
+
+  // 1b. REMOTE BRANCH (F2a, §5.3) — before the local recipient lookup.
+  //
+  // C9 note, per door: every refusal below answers ONE question — "may this
+  // message go to that remote?" — and every one of them is AGENT_NOT_FOUND with
+  // the same bytes as an unknown LOCAL id. A local sender must not be able to
+  // tell "that mesh is not peered", "that address is malformed", "no edge" or
+  // "no such local agent" apart; distinguishing them would let any agent map
+  // this mesh's peerings and ACL from the outside.
+  //
+  // KIND_NOT_ALLOWED is the deliberate exception and stays distinct: it reveals
+  // only THIS mesh's own outbound configuration, which the sender's own admin
+  // set, and crosses no border. Answering it uniformly would cost a real
+  // diagnostic to protect nothing.
+  //
+  // TABLES READ: outbound_peers (via hasOutboundPeer) and agents (the local
+  // lookup below). The union is total for "where does this address point?"
+  // because an id either names a live outbound peering or it does not, and if
+  // it does not it can only be a local id — legacy colon ids included, which is
+  // why the fall-through is UNCHANGED rather than an error.
+  const colon = frame.to.indexOf(':');
+  if (colon > 0) {
+    const alias = frame.to.slice(0, colon);
+    if (hasOutboundPeer(db, alias)) {
+      const remainder = frame.to.slice(colon + 1);
+
+      // One hop. A second ':' would address a mesh THROUGH a mesh — transitive
+      // federation our admin never agreed to. Refused here rather than wasting
+      // a relay the far side would refuse anyway.
+      if (remainder.length === 0 || remainder.includes(':')) {
+        incError('AGENT_NOT_FOUND');
+        return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
+      }
+
+      // The sender's own outbound configuration — see the C9 note above.
+      const peering = getOutboundPeer(db, alias)!;
+      let outboundKinds: string[];
+      try { outboundKinds = JSON.parse(peering.kinds) as string[]; } catch { outboundKinds = []; }
+      if (!outboundKinds.includes('direct')) {
+        incError('KIND_NOT_ALLOWED');
+        return { ok: false, error_code: 'KIND_NOT_ALLOWED', error_message: `kind not permitted to ${alias}` };
+      }
+
+      if (!aclCheck(db, from_agent, frame.to)) {
+        incError('AGENT_NOT_FOUND');
+        return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
+      }
+
+      // #94's duplicate check in the SAME position as the local path: above the
+      // metrics, which are the first side effect (#96 pins that ordering).
+      if (getMessage(db, frame.msg_id) !== null) {
+        incError('DUPLICATE_MSG_ID');
+        return { ok: false, error_code: 'DUPLICATE_MSG_ID', error_message: `msg_id already used: ${frame.msg_id}` };
+      }
+
+      incSent(from_agent);
+      incBytes('in', payloadBytes);
+      observePayloadBytes(payloadBytes);
+
+      const ttlRemote = frame.ttl_ms === undefined ? 300_000 : frame.ttl_ms;
+      const sentAtRemote = Date.now();
+
+      // ttl_ms = 0 keeps its LOCAL meaning: deliver live or drop, never queue.
+      // "Online" for a remote id means the peering's socket is connected, which
+      // only the forwarder knows — so F2a drops it rather than storing a row no
+      // ttl-0 sender expects to exist. F2b relays it live when connected.
+      if (ttlRemote === 0) {
+        incMsgStatus('direct', 'dropped');
+        return { ok: true, msg_id: frame.msg_id };
+      }
+
+      insertMessage(db, {
+        id: frame.msg_id,
+        kind: 'direct',
+        from_agent,
+        to_agent: frame.to,          // the FQ remote id; the forwarder ranges on it
+        payload: frame.payload,
+        content_type: frame.content_type ?? 'text/plain',
+        sent_at: sentAtRemote,
+        expires_at: sentAtRemote + ttlRemote,
+      });
+      incMsgStatus('direct', 'queued');
+
+      emitTap(observerIndex, {
+        type: 'tap', msg_id: frame.msg_id, kind: 'direct',
+        from: from_agent, to: frame.to, topic: null, correlation_id: null,
+        sent_at: sentAtRemote, size: payloadBytes, payload: frame.payload,
+      });
+
+      // ACK THE LOCAL SENDER NOW (D8): acceptance means "queued for the border",
+      // not "delivered to the far mesh". The forwarder reports the real outcome
+      // later via delivered_at, or failed_code + REMOTE_REFUSED.
+      //
+      // The emit is AFTER the synchronous section and is never awaited — an
+      // await between the duplicate check and the insert lets two frames
+      // interleave, both pass, and the second insert throw.
+      borderEvents.emit('enqueued', alias);
+
+      return { ok: true, msg_id: frame.msg_id };
+    }
+    // Not a live outbound peering: fall through to the local lookup UNCHANGED.
+    // A legacy colon id is a local agent (#113/§5.4) and must keep working, and
+    // an unknown alias gets the same AGENT_NOT_FOUND as any unknown local id.
   }
 
   // 2. Recipient exists check
