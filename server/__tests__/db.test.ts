@@ -13,6 +13,7 @@ import {
   deleteAgent,
   aclGrant,
   aclRelated,
+  upsertPeer,
   aclRevoke,
   aclCheck,
   listInboundAcl,
@@ -888,12 +889,21 @@ describe('Referential integrity (FK enforcement)', () => {
   // Added because the mutant that deletes the ':' carve-out SURVIVED the rest
   // of this suite: every other test here would pass with remote ids broken.
   it('aclGrant accepts a REMOTE endpoint that is not a local agent', () => {
+    // F1b: a remote endpoint now also needs a PEERING. F0a accepted any ':' id
+    // with no further check; this test pinned that looser behaviour, so it is
+    // updated rather than deleted — the property it exists for (a remote id is
+    // not subjected to a local-existence test) is unchanged.
     const db = freshDb();
     makeAgent(db, 'local-one');
-    expect(() => aclGrant(db, 'local-one', 'othermesh:their-agent', 'system')).not.toThrow();
-    expect(aclRelated(db, 'local-one', 'othermesh:their-agent')).toBe(true);
-    // And in the from position, which is a different argument to the check.
+    upsertPeer(db, {
+      alias: 'othermesh', token_hash: 'a'.repeat(64), minted_by_key: 'k',
+      kinds: '["direct"]', rate_per_min: 600,
+    });
+    // INBOUND only: remote -> local is allowed once the peer is registered.
     expect(() => aclGrant(db, 'othermesh:their-agent', 'local-one', 'system')).not.toThrow();
+    expect(aclRelated(db, 'othermesh:their-agent', 'local-one')).toBe(true);
+    // OUTBOUND is refused until F2's outbound_peers exists.
+    expect(() => aclGrant(db, 'local-one', 'othermesh:their-agent', 'system')).toThrow(/outbound peering/);
     // Negative control on the same test: a BARE unknown id is still refused,
     // so this is not passing because the check stopped working entirely.
     expect(() => aclGrant(db, 'local-one', 'no-such-agent', 'system')).toThrow();

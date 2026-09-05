@@ -625,6 +625,52 @@ function assertLocalEndpointExists(db: Database, endpoint: string): void {
   throw err;
 }
 
+/**
+ * F1b (§5.4) — the PEERING rule, in the chokepoint so no handler branches on it.
+ *
+ * An endpoint is REMOTE iff it contains ':' AND is not an existing local
+ * agent. The second clause is not belt-and-braces — it is the whole
+ * difference between a rule that works and one that breaks live agents.
+ *
+ * Grammar alone is true for ids created from F0b onward (POST /agents refuses
+ * ':') and FALSE for the population F0b deliberately preserved: legacy colon
+ * ids are REPORTED at boot and never rejected, precisely because they exist.
+ * Treating ':' as decisive made aclGrant refuse NO_PEERING for two ordinary
+ * local agents — reproduced:
+ *   local-a -> legacy:node   NO_PEERING (no outbound peering for legacy)
+ *   legacy:node -> local-a   NO_PEERING (no inbound peering for legacy)
+ *
+ * BOUNDED TO GRANT. aclCheck is a SELECT and aclRevoke a bare DELETE, neither
+ * consulting this rule, so existing legacy edges kept working and remained
+ * revocable throughout — the defect was creation only.
+ *
+ * TABLES READ: `peers` only (via hasInboundPeer). That is total for the inbound
+ * direction because a peer can relay to us only if it has registered, and
+ * registration is the only thing that writes `peers`. The outbound direction
+ * reads nothing yet — `outbound_peers` is F2's — so it refuses, which is the
+ * honest answer rather than a permissive default.
+ */
+function assertPeeringAllowed(db: Database, from_agent: string, to_agent: string): void {
+  const fail = (msg: string): never => {
+    const err = new Error(msg) as Error & { code?: string };
+    err.code = 'NO_PEERING';
+    throw err;
+  };
+  // The lookup is what distinguishes a remote id from a legacy local one.
+  const isRemote = (endpoint: string) => endpoint.includes(':') && getAgentById(db, endpoint) === null;
+  const fromRemote = isRemote(from_agent);
+  const toRemote = isRemote(to_agent);
+
+  if (fromRemote) {
+    const alias = from_agent.slice(0, from_agent.indexOf(':'));
+    if (!hasInboundPeer(db, alias)) fail(`no inbound peering for ${alias}`);
+  }
+  if (toRemote) {
+    const alias = to_agent.slice(0, to_agent.indexOf(':'));
+    if (!hasOutboundPeer(db, alias)) fail(`no outbound peering for ${alias}`);
+  }
+}
+
 export function aclGrant(
   db: Database,
   from_agent: string,
@@ -633,6 +679,7 @@ export function aclGrant(
 ): AclRow {
   assertLocalEndpointExists(db, from_agent);
   assertLocalEndpointExists(db, to_agent);
+  assertPeeringAllowed(db, from_agent, to_agent);
   const now = Date.now();
   db.prepare(`
     INSERT INTO acl (from_agent, to_agent, granted_at, granted_by)
@@ -884,6 +931,28 @@ export function touchPeer(db: Database, alias: string): void {
 export function listDisabledPeerAliases(db: Database): string[] {
   return (db.prepare('SELECT alias FROM peers WHERE disabled = 1').all() as { alias: string }[])
     .map(r => r.alias);
+}
+
+/**
+ * F1b (§5.4): may `alias` relay INBOUND to us? True iff a non-disabled peers
+ * row exists. This is the peering half of the acl rule for `alias:x -> local`.
+ */
+export function hasInboundPeer(db: Database, alias: string): boolean {
+  const row = db.prepare('SELECT 1 FROM peers WHERE alias = ? AND disabled = 0').get(alias);
+  return row !== null;
+}
+
+/**
+ * F1b (§5.4): may we relay OUTBOUND to `alias`? Always false today — the
+ * `outbound_peers` table is F2's, and until it exists there is no such thing as
+ * an outbound peering to check.
+ *
+ * Written NOW, returning false, rather than inlining `false` at the call site:
+ * F2 fills this in instead of re-plumbing the rule through aclGrant, and the
+ * refusal reads as "no outbound peering" rather than as a hardcoded no.
+ */
+export function hasOutboundPeer(_db: Database, _alias: string): boolean {
+  return false;
 }
 
 export function listPeers(db: Database): Peer[] {

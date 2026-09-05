@@ -39,6 +39,9 @@ const payloadBytes    = newHistogram([64, 256, 1024, 4096, 16384, 65536, 262144,
 function bump(m: LabeledCounter, key: string, by = 1): void { m.set(key, (m.get(key) ?? 0) + by); }
 function s(v: unknown): string { return typeof v === 'string' ? v : String(v); }
 
+// F1b: alias \0 direction \0 outcome -> count.
+const peerRelays = new Map<string, number>();
+
 export function escapeLabelValue(v: string): string {
   return v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
 }
@@ -46,6 +49,18 @@ export function escapeLabelValue(v: string): string {
 // ──────────────────────────────────────────────
 // Public functions (ALL wrapped try/catch, never throw)
 // ──────────────────────────────────────────────
+
+/**
+ * F1b (§1.1, #12): peer relay counters.
+ *
+ * LABELLED PER PEER ALIAS, never per remote agent. A remote mesh chooses its
+ * own agent ids, so a per-agent label lets a peer mint unbounded label values
+ * in our metrics store — cardinality we do not control. The alias is OURS: we
+ * issued it, and there is exactly one per peering.
+ */
+export function incPeerRelay(alias: string, direction: string, outcome: string): void {
+  try { bump(peerRelays, `${s(alias)}\0${s(direction)}\0${s(outcome)}`); } catch (_) { /* metrics must never affect delivery */ }
+}
 
 export function incReminderFired(): void {
   try { remindersFired += 1; } catch (_) { /* metrics must never affect delivery */ }
@@ -101,6 +116,14 @@ function renderHistogram(name: string, help: string, h: Histogram, lines: string
   lines.push(`${name}_bucket{le="+Inf"} ${cumulative}`); // == h.count
   lines.push(`${name}_sum ${h.sum}`);
   lines.push(`${name}_count ${h.count}`);
+}
+
+/** Supplies the live peer aliases for mesh_peer_up. Set once at boot by
+ *  server.ts from the WS handle's peerIndex; defaults to none so every existing
+ *  caller of renderMetrics (and every test) is unchanged. */
+let peerUpAliases: () => Iterable<string> = () => [];
+export function setPeerUpSource(fn: () => Iterable<string>): void {
+  peerUpAliases = fn;
 }
 
 export function renderMetrics(db: Database): string {
@@ -197,6 +220,24 @@ export function renderMetrics(db: Database): string {
 
   // Histograms
   renderHistogram('mesh_message_payload_bytes', 'Accepted message payload sizes in bytes.', payloadBytes, lines);
+
+  // mesh_peer_relays_total {alias,direction,outcome}
+  lines.push('# HELP mesh_peer_relays_total Relayed messages by peer alias, direction and outcome.');
+  lines.push('# TYPE mesh_peer_relays_total counter');
+  for (const [key, v] of peerRelays) {
+    const [alias, direction, outcome] = key.split('\0');
+    lines.push(`mesh_peer_relays_total{alias="${escapeLabelValue(alias ?? '')}",direction="${escapeLabelValue(direction ?? '')}",outcome="${escapeLabelValue(outcome ?? '')}"} ${v}`);
+  }
+
+  // mesh_peer_up {alias} — 1 iff a socket is currently held for that alias.
+  // Read from the LIVE index, not from a stored column: peers has no `online`
+  // field and after #87 a durable liveness claim that outlives the process is
+  // exactly what must not be invented.
+  lines.push('# HELP mesh_peer_up Whether a peer mesh currently holds an authenticated socket.');
+  lines.push('# TYPE mesh_peer_up gauge');
+  for (const alias of peerUpAliases()) {
+    lines.push(`mesh_peer_up{alias="${escapeLabelValue(alias)}"} 1`);
+  }
 
   return lines.join('\n') + '\n';
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { openDb, registerAgent, aclCheck, aclGrant } from '../db.ts';
+import { openDb, registerAgent, upsertPeer, aclCheck, aclGrant } from '../db.ts';
 import { startMcpServer, McpServerHandle } from '../mcp-server.ts';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -76,6 +76,15 @@ describe('#8 — mesh_acl_allow / mesh_acl_deny require the admin token', () => 
   });
 
   // F0a — the revoke rule is EDGE existence at BOTH doors.
+  // F1b: the other half of the door-parity pair. One mutation in aclGrant's
+  // peering rule must red this AND the HTTP door's equivalent.
+  it('mesh_acl_allow reports NO_PEERING for a remote endpoint with no peering', async () => {
+    const r = await call('mesh_acl_allow', { agent_id: 'nopeer:someone', as_agent: 'A', admin_token: ADMIN });
+    expect(r.isError).toBe(true);
+    expect(JSON.parse((r.content as { text: string }[])[0]!.text).error).toBe('NO_PEERING');
+    expect(aclCheck(db, 'nopeer:someone', 'A')).toBe(false);
+  });
+
   it('mesh_acl_deny reports EDGE_NOT_FOUND when there was nothing to revoke', async () => {
     // Previously this returned ok:true whether or not anything was withdrawn,
     // so an operator revoking a typo'd edge was told it worked. Deliberate
@@ -88,10 +97,15 @@ describe('#8 — mesh_acl_allow / mesh_acl_deny require the admin token', () => 
   it('mesh_acl_deny revokes an edge to a REMOTE endpoint', async () => {
     // The door-parity case: HTTP could not do this before F0a, MCP could.
     // Now both can, by the same rule.
-    aclGrant(db, 'A', 'othermesh:their-agent', 'system');
-    const r = await call('mesh_acl_deny', { agent_id: 'A', as_agent: 'othermesh:their-agent', admin_token: ADMIN });
+    // F1b: inbound direction, and the peering must exist first.
+    upsertPeer(db, {
+      alias: 'othermesh', token_hash: 'c'.repeat(64), minted_by_key: 'k',
+      kinds: '["direct"]', rate_per_min: 600,
+    });
+    aclGrant(db, 'othermesh:their-agent', 'A', 'system');
+    const r = await call('mesh_acl_deny', { agent_id: 'othermesh:their-agent', as_agent: 'A', admin_token: ADMIN });
     expect(r.isError).toBe(false);
-    expect(aclCheck(db, 'A', 'othermesh:their-agent')).toBe(false);
+    expect(aclCheck(db, 'othermesh:their-agent', 'A')).toBe(false);
   });
 
   it('an EMPTY admin_token is not a token, even against an empty configured one', async () => {

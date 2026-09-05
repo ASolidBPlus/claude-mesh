@@ -268,11 +268,35 @@ function handleMeshDiscover(ctx: ToolCtx): ToolResult {
   };
 }
 
+/**
+ * F1b (§5.2): `as_agent` must name an EXISTING LOCAL agent.
+ *
+ * Until now only mesh_status checked this, so a stdio caller could send as any
+ * string — including `othermesh:someone`, forging a federated sender on a bus
+ * where `alias:x` is about to MEAN something. Closing it here rather than in
+ * the router keeps the router's contract (it takes a from_agent and trusts it)
+ * and puts the check at the door that accepts untrusted input.
+ *
+ * TABLE READ: `agents`. Total for this question because a local agent exists
+ * iff it has an agents row, and a remote id can never have one (POST /agents
+ * refuses ':' since F0b).
+ */
+function requireLocalSender(db: Database, as_agent: unknown): ToolResult | null {
+  if (typeof as_agent === 'string' && getAgentById(db, as_agent) !== null) return null;
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify({ error: 'AGENT_NOT_FOUND' }) }],
+    isError: true,
+  };
+}
+
 function handleMeshSend(ctx: ToolCtx): ToolResult {
   const { args, db, agentIndex, observerIndex } = ctx;
   const { to, message, ttl_seconds, as_agent } = args as {
     to: string; message: string; ttl_seconds?: number; as_agent: string;
   };
+  const senderRefusal = requireLocalSender(db, as_agent);
+  if (senderRefusal !== null) return senderRefusal;
+
   const msgId = crypto.randomUUID();
   const ttl_ms = ttl_seconds !== undefined ? ttl_seconds * 1000 : 300_000;
   const result = routeDirect(db, agentIndex, as_agent, {
@@ -309,6 +333,15 @@ function handleMeshAclAllow(ctx: ToolCtx): ToolResult {
         isError: true,
       };
     }
+    // F1b (§5.4): same rule as the HTTP door, mapped for this one. The rule
+    // itself lives in aclGrant; both doors only translate its refusal, which is
+    // why ONE mutation there reds both doors' tests.
+    if ((err as { code?: string }).code === 'NO_PEERING') {
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ error: 'NO_PEERING' }) }],
+        isError: true,
+      };
+    }
     throw err;
   }
   return { content: [{ type: 'text' as const, text: JSON.stringify(row) }], isError: false };
@@ -319,6 +352,9 @@ function handleMeshBroadcast(ctx: ToolCtx): ToolResult {
   const { topic, message, ttl_seconds, as_agent } = args as {
     topic: string; message: string; ttl_seconds?: number; as_agent: string;
   };
+  const senderRefusal = requireLocalSender(db, as_agent);
+  if (senderRefusal !== null) return senderRefusal;
+
   const msgId = crypto.randomUUID();
   const ttl_ms = ttl_seconds !== undefined ? ttl_seconds * 1000 : 300_000;
   const result = routePublish(db, agentIndex, as_agent, {
