@@ -758,12 +758,50 @@ export function markFileDelivered(db: Database, id: string): void {
   db.prepare('UPDATE files SET delivered_at = ? WHERE id = ?').run(Date.now(), id);
 }
 
+/**
+ * #39 — the files twin of #34, fixed for messages in #40.
+ *
+ * This deleted on `expires_at < now` with NO delivered_at condition, so a
+ * DELIVERED file's row and bytes vanished ~5 minutes after acceptance:
+ * delivery TTL was destroying history, exactly as it had for messages.
+ *
+ * The split, mirroring #40: `expires_at` governs DELIVERABILITY of undelivered
+ * files only. Delivered files persist and are removed by the retention sweep
+ * (sweepFileRetention) if a window is configured — never by the delivery TTL.
+ *
+ * ORDER IS LOAD-BEARING and was already right here: DELETE ... RETURNING, then
+ * the caller unlinks. Verified before changing anything rather than "fixed" on
+ * suspicion — unlinking first would leave rows pointing at missing bytes on a
+ * crash between the two, which reads as corruption rather than as cleanup.
+ */
 export function deleteExpiredFiles(db: Database): string[] {
   const rows = db.prepare(`
     DELETE FROM files
-    WHERE expires_at IS NOT NULL AND expires_at < ?
+    WHERE delivered_at IS NULL
+      AND expires_at IS NOT NULL AND expires_at < ?
     RETURNING file_path
   `).all(Date.now()) as { file_path: string }[];
+  return rows.map(r => r.file_path);
+}
+
+/**
+ * Retention sweep for files (#39), the same shape as sweepRetention for
+ * messages — including its still-deliverable exclusion, so retention never
+ * destroys durable pending mail: an undelivered, not-yet-expired file survives
+ * regardless of age.
+ *
+ * Returns the paths of removed rows so the caller can unlink AFTER the delete,
+ * for the same reason as above.
+ */
+export function sweepFileRetention(db: Database, retentionMs: number): string[] {
+  const now = Date.now();
+  const cutoff = now - retentionMs;
+  const rows = db.prepare(
+    `DELETE FROM files
+     WHERE sent_at < ?
+       AND NOT (delivered_at IS NULL AND (expires_at IS NULL OR expires_at >= ?))
+     RETURNING file_path`
+  ).all(cutoff, now) as { file_path: string }[];
   return rows.map(r => r.file_path);
 }
 
