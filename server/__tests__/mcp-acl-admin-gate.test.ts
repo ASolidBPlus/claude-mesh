@@ -101,6 +101,22 @@ describe('#8 — mesh_acl_allow / mesh_acl_deny require the admin token', () => 
     db2.close();
   });
 
+  it('★ an ABSENT admin_token REFUSES — it does not crash the tool plane', async () => {
+    // The contract, pinned. `admin_token?: unknown` means an absent argument
+    // arrives as `undefined`, and timingSafeEqual would throw on it — which
+    // the reviewer's mutant produced as `MCP -32603`. No write happens either
+    // way (the throw precedes aclGrant, so it was never a bypass), but a tool
+    // that CRASHES where its siblings return a typed error is a worse
+    // contract: the shape of a refusal must not depend on which field was
+    // missing. So this asserts the typed refusal specifically, not merely
+    // "isError".
+    const r = await call('mesh_acl_deny', { agent_id: 'A', as_agent: 'B' });
+    expect(r.isError).toBe(true);
+    const body = parse(r);
+    expect(body.error).toBe('UNAUTHORIZED');
+    expect(body.message).toContain('admin_token');
+  });
+
   it('the read-only tools are unchanged — mesh_discover still needs no token', async () => {
     // Scope check: #8's fix is the two WRITE tools. discover/status returning
     // the roster is a separate, stated exposure (still operator-plane only).

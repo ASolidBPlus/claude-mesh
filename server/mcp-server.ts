@@ -189,13 +189,32 @@ interface ToolCtx {
  *   doors disagree, the stricter one is the parity worth having.
  */
 function adminTokenOk(provided: unknown, configured: string): boolean {
-  // These two length checks are MUTUALLY REDUNDANT — either alone closes the
-  // '' === '' hole, which is why a mutation that deletes one survives. They
-  // are both kept deliberately: the pair states the intent from both sides
-  // (an unconfigured server grants nothing; an empty argument is not a
-  // credential), and the redundancy is only safe to remove BOTH at once,
-  // which is exactly the edit nobody should make. Noted here so a future
-  // reader deleting "the dead one" knows the other is load-bearing.
+  // NOT mutually redundant — an earlier version of this comment said they were,
+  // and the reviewer disproved it by reading the mutant's OUTPUT rather than
+  // its count. Measured, both directions:
+  //
+  //   delete the `configured` check → every test still passes (redundant HERE)
+  //   delete the `provided` check   → 3 tests fail, and the failure is
+  //                                   `MCP -32603: undefined is not an object
+  //                                   (evaluating 'a.length')` — timingSafeEqual
+  //                                   crashing on `undefined`
+  //
+  // The asymmetry is `admin_token?: unknown`: an ABSENT argument arrives as
+  // `undefined`, and ONLY the `provided` check covers that. So: redundant FOR
+  // THE EMPTY-STRING CASE ONLY; for an ABSENT token the `provided` check is
+  // the SOLE cover. Do not delete it as a duplicate of the line above it.
+  //
+  // CONTRACT (already true, now pinned by test): an absent admin_token RETURNS
+  // unauthorizedResult() like every other refusal on this plane — it does not
+  // throw. The crash above exists only in the mutant; no ACL row is written
+  // either way, since the throw would precede aclGrant, so it was never a
+  // bypass. But a tool that crashes where its siblings return a typed error is
+  // a worse contract, and the shape of a refusal must not depend on which
+  // field was missing.
+  //
+  // The throw itself lives in timingSafeEqual, which assumes two strings; the
+  // `provided` check is what keeps that assumption true at this call site.
+  // Hardening the shared helper is a separate question, not smuggled in here.
   if (typeof configured !== 'string' || configured.length === 0) return false;
   if (typeof provided !== 'string' || provided.length === 0) return false;
   return timingSafeEqual(provided, configured);
