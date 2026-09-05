@@ -170,4 +170,65 @@ describe('#94: the dispatcher guard is the class fix', () => {
       db.close();
     }
   }, 20_000);
+
+  // THE property test. Every handler is synchronous today, so the sync case
+  // above passes with a plain try/catch — and would keep passing while the
+  // guard silently covered nothing the day a handler gained an `async`
+  // keyword. The ws 'message' listener does not await, so a rejection becomes
+  // an unhandled rejection and kills the process, with no line of the guard
+  // changing. Federation F1 adds awaitable work to the relay path, so this is
+  // a scheduled event, not a hypothetical. The HTTP plane already paid for it
+  // once (#68).
+  it('a handler returning a REJECTED PROMISE is caught identically', async () => {
+    const { db, handle, port } = await setup();
+    const a = await authConnect(port, 'A', 'ta');
+    POST_AUTH_HANDLERS['__test_reject'] = () => Promise.reject(new Error('deliberate async explosion'));
+    try {
+      const before = a.frames.length;
+      a.ws.send(JSON.stringify({ type: '__test_reject', msg_id: 'boom-2' }));
+      await wait(200);
+
+      const errs = a.frames.slice(before).filter(f => f.type === 'error');
+      expect(errs.length).toBe(1);
+      expect(errs[0].code).toBe('INTERNAL');
+      expect(errs[0].ref).toBe('boom-2');
+      expect(a.ws.readyState).toBe(WebSocket.OPEN);
+
+      a.ws.send(JSON.stringify({ type: 'send', to: 'B', payload: 'alive', msg_id: 'after-reject' }));
+      await wait(150);
+      expect(a.frames.some(f => f.type === 'ack' && f.ref === 'after-reject' && f.ok === true)).toBe(true);
+    } finally {
+      delete POST_AUTH_HANDLERS['__test_reject'];
+      try { a.ws.close(); } catch { /* ignore */ }
+      await handle.shutdown().catch(() => {});
+      db.close();
+    }
+  }, 20_000);
+
+  it('an async handler that RESOLVES is undisturbed — the guard is not a filter', () => {
+    // Positive control: the thenable branch must pass success through
+    // untouched, or "no error frame" above would be satisfied by a guard that
+    // swallows everything.
+    return (async () => {
+      const { db, handle, port } = await setup();
+      const a = await authConnect(port, 'A', 'ta');
+      let ran = false;
+      POST_AUTH_HANDLERS['__test_ok'] = async (ctx) => {
+        ran = true;
+        ctx.ws.send(JSON.stringify({ type: 'ack', ref: 'ok-1', ok: true }));
+      };
+      try {
+        a.ws.send(JSON.stringify({ type: '__test_ok', msg_id: 'ok-1' }));
+        await wait(200);
+        expect(ran).toBe(true);
+        expect(a.frames.some(f => f.type === 'ack' && f.ref === 'ok-1' && f.ok === true)).toBe(true);
+        expect(a.frames.some(f => f.type === 'error')).toBe(false);
+      } finally {
+        delete POST_AUTH_HANDLERS['__test_ok'];
+        try { a.ws.close(); } catch { /* ignore */ }
+        await handle.shutdown().catch(() => {});
+        db.close();
+      }
+    })();
+  }, 20_000);
 });

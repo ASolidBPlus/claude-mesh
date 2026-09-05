@@ -60,7 +60,11 @@ interface FrameCtx {
   filesDir: string;
 }
 
-type FrameHandler = (ctx: FrameCtx) => void;
+// Handlers are synchronous TODAY. The return type admits a promise anyway so
+// the dispatcher's guard is COLOUR-BLIND (#94): a guard whose coverage depends
+// on handlers staying sync is one `async` keyword away from being disabled,
+// with no line of the guard itself changing.
+type FrameHandler = (ctx: FrameCtx) => void | Promise<void>;
 
 function handlePing(ctx: FrameCtx): void {
   const { ws, state, db, frame } = ctx;
@@ -594,9 +598,14 @@ export function startWsServer(
             // frame failed, every other connection is untouched, and the
             // process stays up. Logged because a caught crash that says nothing
             // is a crash nobody fixes.
-            try {
-              handler({ ws, state, db, frame, parsed, agentIndex, observerIndex, maxFileBytes, filesDir });
-            } catch (err) {
+            // COLOUR-BLIND by construction: a synchronous throw and a rejected
+            // promise are the same event to this dispatcher. Today every
+            // handler is sync and the try/catch alone would do — but the ws
+            // 'message' listener does not await, so the moment any handler
+            // becomes async its rejection becomes an unhandled rejection and
+            // kills the process again, with no line of THIS code changing.
+            // The HTTP plane already paid for exactly that (#68).
+            const report = (err: unknown) => {
               console.error(JSON.stringify({
                 evt: 'ws.handler_threw',
                 frame_type: frameType,
@@ -612,6 +621,17 @@ export function startWsServer(
                   ...(typeof frame.msg_id === 'string' ? { ref: frame.msg_id } : {}),
                 }));
               } catch (_) { /* socket already gone; nothing further to do */ }
+            };
+            try {
+              const maybe = handler({ ws, state, db, frame, parsed, agentIndex, observerIndex, maxFileBytes, filesDir });
+              // Thenable check rather than `instanceof Promise`: a handler may
+              // return a promise from another realm or a non-native thenable,
+              // and this guard must not care which.
+              if (maybe !== undefined && maybe !== null && typeof (maybe as PromiseLike<void>).then === 'function') {
+                (maybe as PromiseLike<void>).then(undefined, report);
+              }
+            } catch (err) {
+              report(err);
             }
             return;
           }
