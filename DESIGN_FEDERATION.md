@@ -1,5 +1,7 @@
 # DESIGN: Federated Access
 
+> ⚠️ **SUPERSEDED 2026-09-05** by `DESIGN_FEDERATION_V2.md` (mesh-to-mesh). The single-bus multi-tenant shape below was scrapped by the owner the day it merged; kept for the enforcement ideas that carried forward.
+
 Status: **PLAN — nothing here is implemented.** Per the owner's instruction this is a
 plan-only PR; implementation starts only on his explicit approval, and then as separate
 PRs (see §11 Phasing).
