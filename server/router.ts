@@ -319,10 +319,14 @@ export function routeDirect(
   // "no such local agent" apart; distinguishing them would let any agent map
   // this mesh's peerings and ACL from the outside.
   //
-  // KIND_NOT_ALLOWED is the deliberate exception and stays distinct: it reveals
-  // only THIS mesh's own outbound configuration, which the sender's own admin
-  // set, and crosses no border. Answering it uniformly would cost a real
-  // diagnostic to protect nothing.
+  // KIND_NOT_ALLOWED is the deliberate exception, and the justification is
+  // REACHABILITY, not content (#123): it is emitted only AFTER the ACL check,
+  // so only a caller that already holds an edge to this peering can ever see
+  // it — and such a caller already knows the peering exists. Before the ACL
+  // check the same message was an enumeration oracle for the topology.
+  //
+  // The lesson is that an exemption from uniformity is a property of WHO CAN
+  // REACH the refusal, never of what the refusal says.
   //
   // TABLES READ: outbound_peers (via hasOutboundPeer) and agents (the local
   // lookup below). The union is total for "where does this address point?"
@@ -343,18 +347,31 @@ export function routeDirect(
         return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
       }
 
-      // The sender's own outbound configuration — see the C9 note above.
+      // ACL FIRST, THEN KIND — the order is the security property (#123).
+      //
+      // Reversed, KIND_NOT_ALLOWED is emitted before anyone checks whether the
+      // caller may address this peering at all, so an agent with NO edge learns
+      // that the peering EXISTS by sending a wrong-kind message. There is no
+      // other route to that topology from inside. Reproduced:
+      //   peering EXISTS -> KIND_NOT_ALLOWED (and it named the alias)
+      //   peering ABSENT -> AGENT_NOT_FOUND
+      //
+      // Behind the ACL check, the exemption is justified by REACHABILITY rather
+      // than by content: a caller holding an edge to alias:x already knows that
+      // peering exists, so telling it about a kind reveals nothing it could not
+      // already determine. A caller without one sees the uniform
+      // AGENT_NOT_FOUND for no-peering, no-edge and wrong-kind alike.
+      if (!aclCheck(db, from_agent, frame.to)) {
+        incError('AGENT_NOT_FOUND');
+        return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
+      }
+
       const peering = getOutboundPeer(db, alias)!;
       let outboundKinds: string[];
       try { outboundKinds = JSON.parse(peering.kinds) as string[]; } catch { outboundKinds = []; }
       if (!outboundKinds.includes('direct')) {
         incError('KIND_NOT_ALLOWED');
         return { ok: false, error_code: 'KIND_NOT_ALLOWED', error_message: `kind not permitted to ${alias}` };
-      }
-
-      if (!aclCheck(db, from_agent, frame.to)) {
-        incError('AGENT_NOT_FOUND');
-        return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
       }
 
       // #94's duplicate check in the SAME position as the local path: above the
