@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { openDb, registerAgent, upsertPeer, getPeerByAlias } from '../db.ts';
+import { openDb, registerAgent, upsertPeer, getPeerByAlias, getAgentById } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { startWsServer, WsServerHandle, PEER_PROTOCOL_VERSION } from '../ws-server.ts';
 import { startCleanup } from '../cleanup.ts';
@@ -142,6 +142,10 @@ describe('F1a: peer authentication', () => {
   // green — while reopening the agent-id oracle #117 closed; it reds here.
   it('the OWN-INPUT refusal is input-only: identical for an existing and a non-existing id', async () => {
     const { db, handle, port } = await setup();
+    // Naming a precondition is not asserting it: the guarantee below rests on
+    // local-a EXISTING. Assert it here, so an edit to setup() reds this test
+    // instead of turning it into two identical nonexistent cases.
+    expect(getAgentById(db, 'local-a')).not.toBeNull();
     const existing = await open(port, { type: 'auth', agent_id: 'local-a' });          // token missing
     const nonexistent = await open(port, { type: 'auth', agent_id: 'no-such-agent' }); // token missing
     try {
