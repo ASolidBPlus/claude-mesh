@@ -145,8 +145,9 @@ describe('F1a: peer authentication', () => {
     // Naming a precondition is not asserting it: the guarantee below rests on
     // local-a EXISTING. Assert it here, so an edit to setup() reds this test
     // instead of turning it into two identical nonexistent cases.
-    expect(getAgentById(db, 'local-a')).not.toBeNull();
-    const existing = await open(port, { type: 'auth', agent_id: 'local-a' });          // token missing
+    const EXISTING = 'local-a'; // one name for the assertion AND the probe, so they cannot drift apart
+    expect(getAgentById(db, EXISTING)).not.toBeNull();
+    const existing = await open(port, { type: 'auth', agent_id: EXISTING });          // token missing
     const nonexistent = await open(port, { type: 'auth', agent_id: 'no-such-agent' }); // token missing
     try {
       const frames = [existing, nonexistent].map(s => JSON.stringify(s.frames.find(f => f.type === 'error')));
@@ -167,7 +168,9 @@ describe('F1a: peer authentication', () => {
   // tests fails HERE. Update the literal only together with the set tests.
   it('the auth door emits AUTH_FAILED from exactly 4 sites (literal pin; grow the set tests first)', () => {
     const src = readFileSync(join(import.meta.dir, '..', 'ws-server.ts'), 'utf8');
-    const emits = src.match(/code: 'AUTH_FAILED'/g) ?? [];
+    // Quote-agnostic on purpose: nothing in this repo enforces quote style, and
+    // a pin defeated by a spelling variant is the class of defect it exists to catch.
+    const emits = src.match(/code:\s*['"]AUTH_FAILED['"]/g) ?? [];
     expect(emits.length).toBe(4);
   });
 
