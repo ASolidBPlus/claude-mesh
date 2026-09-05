@@ -356,6 +356,28 @@ export function touchAlive(db: Database, id: string): void {
   db.prepare('UPDATE agents SET last_alive = ? WHERE id = ?').run(Date.now(), id);
 }
 
+/**
+ * #87 — clear every agent's `online` flag. Returns the number of rows changed.
+ *
+ * `online` is a claim about a LIVE SOCKET, but it lives in a durable table, so
+ * it outlives the process that could vouch for it. Only the connect and
+ * disconnect handlers ever wrote it, and a disconnect handler cannot run for a
+ * socket that died with the server — so after a restart every agent that was
+ * connected and does not reconnect reads as online FOREVER. Reproduced
+ * directly: set online, close the db, reopen it, and the flag is still 1.
+ *
+ * That is worse than staleness: it is confidently wrong output. A roster that
+ * says "offline" about a live agent is a lag; one that says "online" about an
+ * agent that has been gone for a week is a lie the reader cannot detect.
+ *
+ * Called once at WS-server startup, BEFORE the listener accepts — at that
+ * instant no socket exists, so "nobody is online" is not a guess, it is the
+ * only true statement about the world. Reconnects re-assert it immediately.
+ */
+export function clearAllOnline(db: Database): number {
+  return db.prepare('UPDATE agents SET online = 0 WHERE online = 1').run().changes;
+}
+
 export function setOnline(db: Database, id: string, online: boolean): void {
   db.prepare('UPDATE agents SET online = ?, last_seen = ? WHERE id = ?')
     .run(online ? 1 : 0, Date.now(), id);
