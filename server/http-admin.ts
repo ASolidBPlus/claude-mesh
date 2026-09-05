@@ -1254,7 +1254,7 @@ async function handlePeerKeyPost(ctx: AdminCtx): Promise<void> {
     res.end(JSON.stringify({ error: `alias '${RESERVED_ALIAS}' is reserved` })); return;
   }
   if (getAgentById(db, alias) !== null) {
-    // A peer alias and a local agent id share one namespace at the point of
+    // A peer alias and a local agent id share one id space at the point of
     // address resolution, so a collision makes routing ambiguous.
     res.writeHead(409, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'alias collides with an existing local agent id' })); return;
