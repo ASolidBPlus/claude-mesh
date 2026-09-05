@@ -358,6 +358,21 @@ NPCs) run on the mesh-agent runtime.
 | Per-org scoring/monitoring | Scoped observer per org namespace (R5) — no admin credential in game infrastructure |
 | Round teardown | One `DELETE /registration-keys/:id` per org (R6) |
 
+Two runtime-side notes on the inter-org row (from the mesh-agent builder's review, so
+a phase plan doesn't assume more than exists):
+
+- Cross-org persona contact means those personas **do** see FQ peer ids
+  (`po-blue:helpdesk`) — the §4 cross-tenant exception applies to them. This is fine
+  for the runtime (inbound `from` is unconstrained and per-peer history keeps the
+  cached prompt prefix tenant-agnostic), but it is a fact of the wire, not hidden.
+- Cross-tenant contact is **reactive-only** for authored personas as things stand: a
+  persona can reply to an FQ peer (it copies the id from the inbound tag) but cannot
+  *initiate* contact, because tenants are minted at runtime and authored persona text
+  cannot contain a not-yet-existing FQ id. NPC-initiated cross-org contact needs a
+  runtime-side mechanism (e.g. scenario-level peer aliases bound at spin-up — mesh-agent
+  lane, planned alongside org-concurrency), and must not be assumed working in any
+  PowerOUT phasing.
+
 This mapping is also, deliberately, the shape the mesh-agent runtime's org/scenario
 concurrency needs (#41's consumer): mint a namespace per scenario org and let this
 layer do the isolation. One primitive, two consumers.
