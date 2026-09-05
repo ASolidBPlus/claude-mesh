@@ -1393,6 +1393,20 @@ function handlePeerKeyDelete(ctx: AdminCtx): void {
     A peer presenting a wrong, revoked, expired, or nonexistent key learns only
     that it was refused: distinguishing them would turn this endpoint into an
     oracle for which keys exist. */
+/** Why a presented key was not live, FOR THE LOG LINE ONLY. Reads the columns
+ *  directly and deliberately: it feeds a diagnostic string and never a branch,
+ *  so it cannot become a second authority on liveness. The 403 body is uniform
+ *  regardless (§6) — this changes what the OPERATOR sees, never the peer. */
+function describeDeadKey(db: Database, secret: string): string {
+  const row = db.prepare('SELECT revoked_at, expires_at FROM peer_keys WHERE key_hash = ? LIMIT 2')
+    .all(hashToken(secret)) as { revoked_at: number | null; expires_at: number | null }[];
+  if (row.length !== 1) return 'unknown_key';
+  const k = row[0]!;
+  if (k.revoked_at !== null) return 'revoked_key';
+  if (k.expires_at !== null && k.expires_at <= Date.now()) return 'expired_key';
+  return 'unknown_key';
+}
+
 function refusePeerRegistration(res: http.ServerResponse, reason: string, alias: string | null): void {
   console.log(JSON.stringify({ evt: 'peer.register_refused', reason, alias, at: Date.now() }));
   res.writeHead(403, { 'Content-Type': 'application/json' });
@@ -1416,11 +1430,21 @@ async function handlePeerRegister(ctx: AdminCtx): Promise<void> {
   }
 
   const key = getPeerKeyBySecret(db, presented);
-  if (key === null) { refusePeerRegistration(res, 'unknown_key', null); return; }
-  if (key.revoked_at !== null) { refusePeerRegistration(res, 'revoked_key', key.alias); return; }
-  if (key.expires_at !== null && key.expires_at <= Date.now()) {
-    refusePeerRegistration(res, 'expired_key', key.alias); return;
+  if (key === null) {
+    // DIAGNOSTIC ONLY — never a branch. The refusal has already been decided
+    // above; this reads the columns solely to say WHY in the log, so an
+    // operator can tell a revoked key from an expired one from a wrong one.
+    // It must not become a condition: a second reader of these columns is how
+    // the third authority appeared in the first place.
+    refusePeerRegistration(res, describeDeadKey(db, presented), null);
+    return;
   }
+  // No liveness branch here. getPeerKeyBySecret returns null for a key that is
+  // not live, by the SAME definition the mint gate and the boot report use — so
+  // this handler has no opinion of its own to drift from theirs. It used to
+  // read revoked_at and expires_at itself and agree by coincidence, which is
+  // the property #103 exists to remove, on the highest-stakes consumer: this is
+  // the call that decides whether a peer obtains a live token.
 
   // Defence in depth, at the moment the collision becomes REAL rather than
   // latent: the mint-side and agent-side gates should have made this
