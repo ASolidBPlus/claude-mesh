@@ -27,6 +27,14 @@ export function startCleanup(
   // counts rows whose TTL fell in [lastExpireSweepAt, now) exactly once.
   let lastExpireSweepAt = Date.now();
 
+  // The main tick is ALL-OR-NOTHING per iteration: every step shares one try,
+  // so a throw in step N skips N+1 onward and they retry together next tick.
+  // That is tolerable because each step is idempotent and re-derives its own
+  // window, but it means ORDER CARRIES A DEPENDENCY — anything added here
+  // inherits "may be skipped whenever an earlier step throws". A step that
+  // must run regardless needs its own try, not a new line at the bottom.
+  // (Pre-existing behaviour; stated because #39 added a step and the next
+  // person will add another.)
   const timer = setInterval(() => {
     try {
       const now = Date.now();
