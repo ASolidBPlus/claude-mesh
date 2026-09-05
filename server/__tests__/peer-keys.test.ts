@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import {
   openDb, registerAgent, getPeerByAlias, getPeerKeyBySecret, insertPeerKey,
-  listPeers, revokePeerKey, upsertPeer, findPeerAliasCollisions,
+  listPeers, revokePeerKey, upsertPeer, findPeerAliasCollisions, getLivePeerKeyForAlias,
 } from '../db.ts';
 import { hashToken, generateToken } from '../auth.ts';
 import { startHttpAdmin, HttpAdminHandle, resolveRouteAuth, fileAccessAuthorized, type AuthResult } from '../http-admin.ts';
@@ -89,6 +89,19 @@ describe('F0b: peer keys', () => {
     // One live key per alias: two would mean two secrets register the same
     // peer, so revoking one leaves a door the operator believes they closed.
     expect((await post('/peer-keys', { alias: 'dupe' })).status).toBe(409);
+  });
+
+  it('an EXPIRED key does not block a new mint for the same alias (#103)', async () => {
+    // The GATE side of the shared live-key definition. Paired with the report
+    // test so that dropping expiry from the shared fragment reds BOTH — which
+    // is what demonstrates they really share it rather than happening to agree.
+    insertPeerKey(db, {
+      id: 'old-expired', key_hash: hashToken('oldsecret'), alias: 'recycled',
+      kinds: '["direct"]', rate_per_min: 600,
+      expires_at: Date.now() - 1000, created_at: Date.now() - 5000,
+    });
+    // An expired key is not live, so the alias is free again.
+    expect((await post('/peer-keys', { alias: 'recycled' })).status).toBe(201);
   });
 
   it('refuses an alias that collides with an existing local agent id', async () => {
@@ -418,6 +431,26 @@ describe('F0b: one id cannot name two identities', () => {
     registerAgent(db, { id: 'innocent', token_hash: 'e'.repeat(64), hostname: 'h' });
 
     expect(findPeerAliasCollisions(db)).toEqual(['both-things']);
+  });
+
+  it('an EXPIRED but unrevoked key is NOT reported (#103)', () => {
+    // The two definitions had drifted: the gate required not-revoked AND
+    // not-expired; the report required only not-revoked. So a key the gate
+    // would refuse to honour was named as a live collision.
+    //
+    // Over-reporting is the direction a detection query dies in — an operator
+    // who learns the report cries wolf stops reading it, and then it is worth
+    // nothing on the day it is right.
+    insertPeerKey(db, {
+      id: 'seed-exp', key_hash: hashToken('sx'), alias: 'expired-name',
+      kinds: '["direct"]', rate_per_min: 600,
+      expires_at: Date.now() - 1000, created_at: Date.now() - 5000,
+    });
+    registerAgent(db, { id: 'expired-name', token_hash: 'g'.repeat(64), hostname: 'h' });
+
+    // The gate agrees it is not live — the two must give the same answer.
+    expect(getLivePeerKeyForAlias(db, 'expired-name', Date.now())).toBeNull();
+    expect(findPeerAliasCollisions(db)).toEqual([]);
   });
 
   it('a REVOKED key is not reported as a collision', () => {

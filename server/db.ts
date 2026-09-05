@@ -844,10 +844,31 @@ export function listPeerKeys(db: Database): PeerKey[] {
 
 /** A key is LIVE if it has not been revoked and has not expired. "A live key
     already exists for this alias" is the 409 condition on mint. */
+/**
+ * ONE definition of a LIVE peer key, as a SQL fragment shared by every query
+ * that asks the question (#103).
+ *
+ * It was two: the mint gate required not-revoked AND not-expired, while the
+ * boot report required only not-revoked. So an expired-but-unrevoked key was
+ * invisible to the gate (correct — it cannot register) and named by the report
+ * as a collision (wrong). Reproduced before fixing:
+ *   gate sees a live key?  false
+ *   boot report names it?  [ "expired-alias" ]
+ *
+ * Over-reporting is the direction a detection query dies in: an operator who
+ * learns the collision report cries wolf stops reading it, and then it is
+ * worth nothing on the day it is right. Sharing the fragment means the two
+ * cannot drift again — a third caller inherits the definition rather than
+ * restating it.
+ *
+ * `?` binds the comparison time. Callers pass `now`.
+ */
+const LIVE_PEER_KEY_SQL = 'revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)';
+
 export function getLivePeerKeyForAlias(db: Database, alias: string, now: number): PeerKey | null {
   return db.prepare(
     `SELECT * FROM peer_keys
-     WHERE alias = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)
+     WHERE alias = ? AND ${LIVE_PEER_KEY_SQL}
      ORDER BY created_at DESC LIMIT 1`
   ).get(alias, now) as PeerKey | null;
 }
@@ -911,11 +932,13 @@ export function getPeerByAlias(db: Database, alias: string): Peer | null {
  * beside it, and stated rather than implied.
  */
 export function findPeerAliasCollisions(db: Database): string[] {
+  // Uses the SAME live-key definition as the gate (#103), so the report can
+  // only ever name a collision the gate would actually have refused.
   return (db.prepare(
     `SELECT a.id FROM agents a
      WHERE a.id IN (SELECT alias FROM peers)
-        OR a.id IN (SELECT alias FROM peer_keys WHERE revoked_at IS NULL)`
-  ).all() as { id: string }[]).map(r => r.id);
+        OR a.id IN (SELECT alias FROM peer_keys WHERE ${LIVE_PEER_KEY_SQL})`
+  ).all(Date.now()) as { id: string }[]).map(r => r.id);
 }
 
 /** Stamp a peer's proof-of-life. F1a: a peer's `ping` stamps this and nothing
