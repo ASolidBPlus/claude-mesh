@@ -53,9 +53,12 @@ plain forward on the internal network. Gating is the bus's in-band auth: the fir
 frame must be a valid agent-token auth or the socket is closed (5-second pre-auth
 timeout already exists, `server/ws-server.ts:446-453`). No human SSO on this hostname
 — it is key-gated m2m by construction. **Open hardening option for the owner:**
-per-tenant mTLS client certificates on top. Recommendation: not for v1 — it doubles
-tenant onboarding complexity for marginal gain over token auth + rate limits, and
-nothing in this design precludes adding it later.
+per-tenant mTLS client certificates on top. Recommendation (operator concurs; not
+pre-clearance — the reviewer may still push back, and their position wins unless the
+owner overrules): not for v1 — it doubles tenant onboarding complexity for marginal
+gain over token auth + rate limits. The triggers that make it worth revisiting:
+tenant count grows past a handful, or the first credential incident. Nothing in this
+design precludes adding it then.
 
 **R-d — Rate limits and a kill switch.**
 - Proxy level (pre-auth): per-IP connection-rate and request-rate caps on both
