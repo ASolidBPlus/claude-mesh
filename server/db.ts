@@ -887,9 +887,20 @@ export function getLivePeerKeyForAlias(db: Database, alias: string, now: number)
  *     thing standing between a case-variant hash and an authenticated peer.
  *     There is a test that builds exactly that world.
  */
-export function getPeerKeyBySecret(db: Database, secret: string): PeerKey | null {
+export function getPeerKeyBySecret(db: Database, secret: string, now: number = Date.now()): PeerKey | null {
   const hash = hashToken(secret);
-  const rows = db.prepare('SELECT * FROM peer_keys WHERE key_hash = ? LIMIT 2').all(hash) as PeerKey[];
+  // Liveness is COMPUTED BY THE SHARED FRAGMENT, not re-derived in TypeScript
+  // (#103, extended): registration was a THIRD authority on "live" — it read
+  // revoked_at and expires_at itself and agreed with the gate by coincidence.
+  // It is now the same sentence, evaluated by SQLite.
+  //
+  // Selected as a column rather than moved into the WHERE deliberately: the
+  // AMBIGUITY check must still see EVERY row sharing this hash, live or not.
+  // Two keys with one hash is an alarming data condition whichever of them is
+  // revoked, and filtering first would hide half of it.
+  const rows = db.prepare(
+    `SELECT *, (${LIVE_PEER_KEY_SQL}) AS is_live FROM peer_keys WHERE key_hash = ? LIMIT 2`
+  ).all(now, hash) as (PeerKey & { is_live: number })[];
   if (rows.length === 0) return null;
   if (rows.length > 1) {
     console.error(JSON.stringify({
@@ -901,7 +912,9 @@ export function getPeerKeyBySecret(db: Database, secret: string): PeerKey | null
     return null;
   }
   const candidate = rows[0]!;
-  return timingSafeEqual(candidate.key_hash, hash) ? candidate : null;
+  if (!timingSafeEqual(candidate.key_hash, hash)) return null;
+  // The single liveness decision, from the single definition.
+  return candidate.is_live ? candidate : null;
 }
 
 /** Revocation is ONE transaction: a key marked dead while its peer row stays

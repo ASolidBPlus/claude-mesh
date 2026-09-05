@@ -197,6 +197,33 @@ describe('F0b: POST /peers/register', () => {
     expect(new Set(bodies).size).toBe(1);
   });
 
+  it('an EXPIRED key cannot register — the THIRD consumer of the live definition', () => {
+    // #107: registration used to decide liveness itself, in TypeScript, on the
+    // fetched row — agreeing with the gate and the report by coincidence. It is
+    // the highest-stakes consumer: this call decides whether a peer obtains a
+    // live token. It now asks the same shared fragment.
+    //
+    // Asserted at the db layer as well as through the door, so the SEMANTIC
+    // mutant (drop expiry, keep the bound `now`) reds this consumer distinctly
+    // rather than only via the wire-level byte-identity test.
+    const expiredSecret = 'expired-secret-value';
+    insertPeerKey(db, {
+      id: 'k-exp', key_hash: hashToken(expiredSecret), alias: 'expiredmesh2',
+      kinds: '["direct"]', rate_per_min: 600,
+      expires_at: Date.now() - 1000, created_at: Date.now() - 5000,
+    });
+    expect(getPeerKeyBySecret(db, expiredSecret)).toBeNull();
+
+    // Positive control: a live key with the same shape still resolves.
+    const liveSecret = 'live-secret-value';
+    insertPeerKey(db, {
+      id: 'k-live', key_hash: hashToken(liveSecret), alias: 'livemesh2',
+      kinds: '["direct"]', rate_per_min: 600,
+      expires_at: Date.now() + 60_000, created_at: Date.now(),
+    });
+    expect(getPeerKeyBySecret(db, liveSecret)?.id).toBe('k-live');
+  });
+
   it('re-registration ROTATES the token rather than creating a second peer', async () => {
     const { key } = await mint('othermesh');
     const first = await (await register({ key })).json() as { token: string };
