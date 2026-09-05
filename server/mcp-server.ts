@@ -9,6 +9,7 @@ import {
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import { listAgents, aclGrant, aclRevoke, getAgentSubscriptions, getAgentById, getPendingMessages } from './db.ts';
+import { timingSafeEqual } from './auth.ts';
 
 const SERVER_START_MS = Date.now();
 import { routeDirect, routePublish, routeSubscribe, routeUnsubscribe } from './router.ts';
@@ -105,8 +106,13 @@ const TOOLS = [
       properties: {
         agent_id: { type: 'string' },
         as_agent: { type: 'string', description: 'Agent ID whose ACL is being modified' },
+        admin_token: {
+          type: 'string',
+          description:
+            'MESH_ADMIN_TOKEN. Required: writing an ACL edge is an admin operation on the HTTP plane (#8), and this tool must not be the cheaper door to the same write.',
+        },
       },
-      required: ['agent_id', 'as_agent'],
+      required: ['agent_id', 'as_agent', 'admin_token'],
     },
   },
   {
@@ -117,8 +123,13 @@ const TOOLS = [
       properties: {
         agent_id: { type: 'string' },
         as_agent: { type: 'string', description: 'Agent ID whose ACL is being modified' },
+        admin_token: {
+          type: 'string',
+          description:
+            'MESH_ADMIN_TOKEN. Required: writing an ACL edge is an admin operation on the HTTP plane (#8), and this tool must not be the cheaper door to the same write.',
+        },
       },
-      required: ['agent_id', 'as_agent'],
+      required: ['agent_id', 'as_agent', 'admin_token'],
     },
   },
 ];
@@ -151,6 +162,59 @@ interface ToolCtx {
   db: Database;
   agentIndex: Map<string, WebSocket>;
   observerIndex: Map<string, WebSocket>;
+  /** The configured MESH_ADMIN_TOKEN, for the ACL tools' admin gate (#8). */
+  adminToken: string;
+}
+
+/**
+ * The stdio MCP plane's admin gate (#8).
+ *
+ * The two ACL tools wrote `acl` rows with no credential at all, while the
+ * equivalent HTTP routes (`POST /acl`, `DELETE /acl`) require the admin token.
+ * Same write, two doors, one of them unlocked — and DESIGN_FEDERATION P1 will
+ * not ship a narrower front door while a wider one stands beside it.
+ *
+ * Two properties this must hold, both of which have bitten this codebase:
+ *
+ *   FAIL CLOSED ON AN UNCONFIGURED SECRET. If the server somehow runs with an
+ *   empty admin token, an empty `admin_token` argument must NOT match it.
+ *   `'' === ''` is the accident that turns a missing secret into a universal
+ *   key. (server.ts:27-31 exits at boot when MESH_ADMIN_TOKEN is empty, so
+ *   this is defence in depth — but the check here must not DEPEND on that
+ *   guard being upstream, because a test harness or a future embedder can
+ *   construct the server directly.)
+ *
+ *   TIMING-SAFE COMPARE, matching resolveAuth (http-admin.ts:87) rather than
+ *   requireAdmin's plain `===` (http-admin.ts:61). Where the two existing
+ *   doors disagree, the stricter one is the parity worth having.
+ */
+function adminTokenOk(provided: unknown, configured: string): boolean {
+  // These two length checks are MUTUALLY REDUNDANT — either alone closes the
+  // '' === '' hole, which is why a mutation that deletes one survives. They
+  // are both kept deliberately: the pair states the intent from both sides
+  // (an unconfigured server grants nothing; an empty argument is not a
+  // credential), and the redundancy is only safe to remove BOTH at once,
+  // which is exactly the edit nobody should make. Noted here so a future
+  // reader deleting "the dead one" knows the other is load-bearing.
+  if (typeof configured !== 'string' || configured.length === 0) return false;
+  if (typeof provided !== 'string' || provided.length === 0) return false;
+  return timingSafeEqual(provided, configured);
+}
+
+/** The refusal, shaped like every other tool error on this plane. */
+function unauthorizedResult(): ToolResult {
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({
+          error: 'UNAUTHORIZED',
+          message: 'admin_token is required and must match MESH_ADMIN_TOKEN — no ACL edge was written',
+        }),
+      },
+    ],
+    isError: true,
+  };
 }
 
 type ToolHandler = (ctx: ToolCtx) => Promise<ToolResult> | ToolResult;
@@ -203,8 +267,12 @@ function handleMeshSend(ctx: ToolCtx): ToolResult {
 }
 
 function handleMeshAclAllow(ctx: ToolCtx): ToolResult {
-  const { args, db } = ctx;
-  const { agent_id, as_agent } = args as { agent_id: string; as_agent: string };
+  const { args, db, adminToken } = ctx;
+  const { agent_id, as_agent, admin_token } = args as {
+    agent_id: string; as_agent: string; admin_token?: unknown;
+  };
+  // Checked BEFORE the write, so a refusal cannot leave a half-applied grant.
+  if (!adminTokenOk(admin_token, adminToken)) return unauthorizedResult();
   const row = aclGrant(db, agent_id, as_agent, as_agent);
   return { content: [{ type: 'text' as const, text: JSON.stringify(row) }], isError: false };
 }
@@ -265,8 +333,11 @@ function handleMeshUnsubscribe(ctx: ToolCtx): ToolResult {
 }
 
 function handleMeshAclDeny(ctx: ToolCtx): ToolResult {
-  const { args, db } = ctx;
-  const { agent_id, as_agent } = args as { agent_id: string; as_agent: string };
+  const { args, db, adminToken } = ctx;
+  const { agent_id, as_agent, admin_token } = args as {
+    agent_id: string; as_agent: string; admin_token?: unknown;
+  };
+  if (!adminTokenOk(admin_token, adminToken)) return unauthorizedResult();
   aclRevoke(db, agent_id, as_agent);
   return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true }) }], isError: false };
 }
@@ -320,7 +391,12 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
 export async function startMcpServer(
   db: Database,
   agentIndex: Map<string, WebSocket> = new Map(),
-  observerIndex: Map<string, WebSocket> = new Map()
+  observerIndex: Map<string, WebSocket> = new Map(),
+  /** MESH_ADMIN_TOKEN, for the ACL tools' admin gate (#8). Defaults to '' —
+      which `adminTokenOk` treats as "no admin operations are possible",
+      NOT as "an empty token matches". An embedder that forgets to pass it
+      loses the two ACL tools; it does not silently open them. */
+  adminToken = ''
 ): Promise<McpServerHandle> {
   const server = new Server(
     { name: 'mesh', version: '0.1.0' },
@@ -351,7 +427,7 @@ export async function startMcpServer(
     // as the prior if-chain did.
     const handler = TOOL_HANDLERS[toolName];
     if (handler !== undefined) {
-      return handler({ args, db, agentIndex, observerIndex });
+      return handler({ args, db, agentIndex, observerIndex, adminToken });
     }
 
     return NOT_IMPLEMENTED_RESPONSE;
