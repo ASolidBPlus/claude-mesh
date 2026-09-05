@@ -472,6 +472,20 @@ export function aclCheck(db: Database, from_agent: string, to_agent: string): bo
   return row !== null;
 }
 
+/**
+ * DELIBERATELY RETAINED as the test oracle for listAclPeers
+ * (presence-acl-queries.test.ts). DO NOT REMOVE AS UNUSED.
+ *
+ * Since #11 this has ZERO production callers — presence was the last one. A
+ * dead-code sweep would delete it, the differential test that compares the
+ * UNION against this pairwise predicate would go with it, and the UNION would
+ * lose its only independent cross-check WITHOUT ANYTHING GOING RED.
+ *
+ * That compounds with the schema-contingency note on listAclPeers: if this is
+ * tidied away first, both the oracle and the cross-check are gone before the
+ * day that note was written for. Its value is precisely that it computes the
+ * same answer a different way.
+ */
 export function aclRelated(db: Database, agentA: string, agentB: string): boolean {
   const row = db.prepare(
     'SELECT 1 FROM acl WHERE (from_agent = ? AND to_agent = ?) OR (from_agent = ? AND to_agent = ?)'
