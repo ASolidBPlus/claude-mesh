@@ -137,6 +137,22 @@ async function main() {
     process.exit(1);
   }
 
+  // F0b (§6): report legacy agent ids containing ':' rather than rejecting
+  // them. ':' now separates mesh from agent in a remote id, so such an id is
+  // ambiguous — but a live agent that can no longer re-register is a worse
+  // outcome than an ambiguous one, and the operator is the only party who can
+  // decide to rename it. New ids are refused at POST /agents.
+  try {
+    const legacy = (db.prepare("SELECT id FROM agents WHERE id LIKE '%:%'").all() as { id: string }[]).map(r => r.id);
+    if (legacy.length > 0) {
+      console.warn(JSON.stringify({
+        evt: 'agents.legacy_colon_ids', count: legacy.length, ids: legacy,
+        msg: "agent ids containing ':' predate the remote-id grammar and are ambiguous; rename when convenient",
+        at: Date.now(),
+      }));
+    }
+  } catch { /* never block boot on a diagnostic */ }
+
   // Single shared observerIndex: created ONCE here and passed to startWsServer
   // (populate/cleanup/fan-out), startHttpAdmin (live grant/revoke), AND
   // startMcpServer (so MCP-originated traffic is tapped too). The SAME Map
