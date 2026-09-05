@@ -146,10 +146,18 @@ describe('F0c: PeerClient', () => {
       const connectionsAfterFirst = mesh.authFrames.length;
 
       mesh.sendError('AUTH_FAILED');
-      await wait(400);
+      // The socket MUST be closed too, or "did not reconnect" holds trivially:
+      // a client with a live socket has no reason to reconnect whatever it
+      // thinks of the error. Without this the assertion below is vacuous —
+      // verified, because the mutant that made PeerClient treat AUTH_FAILED as
+      // non-fatal passed this test until the close was added.
+      mesh.sockets[mesh.sockets.length - 1]?.close();
+      await wait(1500);
 
       expect(errors.some(e => e.code === 'AUTH_FAILED')).toBe(true);
-      // Did not come back: no further auth frame arrived.
+      // Did not come back: no further auth frame arrived, even though the
+      // socket died — which for a non-fatal error would have triggered a
+      // reconnect within the 500 ms base backoff.
       expect(mesh.authFrames.length).toBe(connectionsAfterFirst);
     } finally {
       try { peer.close(); } catch { /* ignore */ }
@@ -167,7 +175,8 @@ describe('F0c: PeerClient', () => {
       await wait(50);
       const before = mesh.authFrames.length;
       mesh.sendError('PROTOCOL_MISMATCH');
-      await wait(400);
+      mesh.sockets[mesh.sockets.length - 1]?.close(); // see the note above
+      await wait(1500);
       expect(errors.some(e => e.code === 'PROTOCOL_MISMATCH')).toBe(true);
       expect(mesh.authFrames.length).toBe(before);
     } finally {
