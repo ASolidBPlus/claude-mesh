@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as net from 'net';
-import { getAgentById, setOnline, clearAllOnline, touchAgent, touchAlive, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
+import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
 import { validateToken } from './auth.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
@@ -14,9 +14,18 @@ import {
 } from './router.ts';
 import { incMsgStatus, incReceived, incBytes } from './metrics.ts';
 
+/** F1a (§5.1): the only inbound peer protocol this mesh speaks. A version is a
+ *  property of a LIVE CONNECTION, never of a stored row (D7) — which is why it
+ *  is checked at auth and not persisted on `peers`. */
+export const PEER_PROTOCOL_VERSION = 1;
+
 export interface WsServerHandle {
   wss: WebSocketServer;
   agentIndex: Map<string, WebSocket>;
+  /** F1a: alias -> the peer mesh's live socket. Separate from agentIndex on
+   *  purpose: a peer is not an agent, and merging them would let one lookup
+   *  return something with the other's semantics. */
+  peerIndex: Map<string, WebSocket>;
   observerIndex: Map<string, WebSocket>;
   shutdown(): Promise<void>;
 }
@@ -24,6 +33,10 @@ export interface WsServerHandle {
 interface ConnState {
   ws: WebSocket;
   agentId: string | null;
+  /** F1a: set iff this socket authenticated as a PEER MESH. Mutually exclusive
+   *  with agentId by construction — the credential decides which, and #98's
+   *  collision gates guarantee an alias and an agent id cannot coincide. */
+  peerAlias: string | null;
   authed: boolean;
 }
 
@@ -428,6 +441,11 @@ export function startWsServer(
     const registry = new Map<WebSocket, ConnState>();
     // Reverse index: agentId -> ws
     const agentIndex = new Map<string, WebSocket>();
+    // F1a: alias -> peer socket. In memory ONLY, and deliberately so: it is the
+    // online truth for peers, and after #87 a durable liveness claim that
+    // outlives the process is exactly what must not exist. A restart clears it,
+    // which is correct — no peer is connected to a process that just started.
+    const peerIndex = new Map<string, WebSocket>();
     // Per-agent presence debounce state (Sprint 15). Keyed by agentId.
     const presenceState = new Map<string, PresenceState>();
     let shutdownStarted = false;
@@ -474,7 +492,7 @@ export function startWsServer(
       wss.on('connection', (ws: WebSocket) => {
         connections.add(ws);
 
-        const state: ConnState = { ws, agentId: null, authed: false };
+        const state: ConnState = { ws, agentId: null, peerAlias: null, authed: false };
         registry.set(ws, state);
 
         let authed = false;
@@ -531,6 +549,89 @@ export function startWsServer(
                 ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'missing agent_id or token' }));
               } catch (_) { /* ignore */ }
               ws.close(1008, 'auth failed');
+              return;
+            }
+
+            // ── F1a (§5.1): PEER AUTH ──────────────────────────────────
+            //
+            // THE DISCRIMINATOR IS THE CREDENTIAL, NEVER THE CLIENT'S FIELD.
+            // A socket is a peer because its token authenticates against
+            // peers.token_hash, and an agent because it authenticates against
+            // agents.token_hash. `protocol` is validated only AFTER a peer
+            // credential has matched, and is never consulted to decide which
+            // table to try — otherwise a client could choose its own semantics
+            // by setting a field, which is the whole class of bug that "trust
+            // the credential, not the claim" exists to prevent.
+            //
+            // TABLES READ HERE: `peers` (this lookup) and `agents` (below).
+            // The union is total for an authenticating id because #98's three
+            // collision gates guarantee an alias and an agent id can never
+            // coincide — so the alias-keyed lookup IS the credential lookup,
+            // and there is no id for which both or neither could match.
+            const peerRow = getPeerByAlias(db, agentId);
+            if (peerRow !== null && validateToken(token, peerRow.token_hash)) {
+              // (a) disabled first, and with the EXACT message of the
+              // invalid-token path: a revoked peer must not be able to tell
+              // "my key was revoked" from "my token is wrong".
+              if (peerRow.disabled === 1) {
+                try {
+                  ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'invalid token' }));
+                } catch (_) { /* ignore */ }
+                ws.close(1008, 'auth failed');
+                return;
+              }
+
+              // (b) protocol AFTER the credential matched.
+              const claimed = (frame as { protocol?: unknown }).protocol;
+              if (claimed !== PEER_PROTOCOL_VERSION) {
+                console.warn(JSON.stringify({
+                  evt: 'peer.protocol_mismatch', alias: agentId,
+                  claimed: claimed ?? null, supported: PEER_PROTOCOL_VERSION, at: Date.now(),
+                }));
+                try {
+                  ws.send(JSON.stringify({
+                    type: 'error', code: 'PROTOCOL_MISMATCH',
+                    message: `unsupported protocol; this mesh speaks ${PEER_PROTOCOL_VERSION}`,
+                  }));
+                } catch (_) { /* ignore */ }
+                ws.close(1008, 'protocol mismatch');
+                return;
+              }
+
+              // (c) peer connection state. agentId stays NULL — a peer is not
+              // an agent, and every agent-shaped path keys off agentId.
+              authed = true;
+              state.authed = true;
+              state.peerAlias = agentId;
+              clearTimeout(authTimer);
+
+              // NEWER WINS (D11): close the older socket BEFORE the index is
+              // overwritten, so the close handler's identity guard sees that it
+              // is no longer the indexed socket and leaves the new one alone.
+              const existing = peerIndex.get(agentId);
+              if (existing !== undefined && existing !== ws) {
+                try {
+                  existing.send(JSON.stringify({
+                    type: 'error', code: 'PEER_REPLACED',
+                    message: 'another socket authenticated for this alias',
+                  }));
+                } catch (_) { /* ignore */ }
+                try { existing.close(1008, 'peer replaced'); } catch (_) { /* ignore */ }
+              }
+              peerIndex.set(agentId, ws);
+              touchPeer(db, agentId);
+
+              console.log(JSON.stringify({ evt: 'peer.connected', alias: agentId, at: Date.now() }));
+
+              // (e) peer auth_ok: no queue fields — a peer has no mailbox here.
+              try {
+                ws.send(JSON.stringify({ type: 'auth_ok', peer: agentId, protocol: PEER_PROTOCOL_VERSION }));
+              } catch (_) { /* ignore */ }
+
+              // EXPLICIT EARLY RETURN. The agent post-auth block below uses the
+              // LOCAL agentId variable and is not guarded by state.agentId, so
+              // falling through would run setOnline / agentIndex.set / pending
+              // drains / broadcastStatus for an id that names no agent.
               return;
             }
 
@@ -613,6 +714,50 @@ export function startWsServer(
           // keyed by frame type in POST_AUTH_HANDLERS. A non-string or unknown
           // type falls through to NOT_IMPLEMENTED, exactly as the prior if-chain.
           const frameType = frame.type;
+
+          // ── F1a (§5.1): the peer frame ALLOWLIST ────────────────────────
+          //
+          // A peer socket may send `relay` and `ping`, nothing else. Written as
+          // an ALLOWLIST, not a denylist of agent frames: a denylist silently
+          // admits every frame type added later, and the failure mode there is
+          // a peer reaching an agent-only path with peer credentials.
+          //
+          // The reverse is guarded too — `relay` from an AGENT socket. Without
+          // it, an agent could relay as though it were a mesh, which is the
+          // forge #98's collision gates make impossible at the identity level
+          // and this makes impossible at the frame level.
+          if (state.peerAlias !== null) {
+            if (frameType === 'ping') {
+              // A peer's proof of life. Stamps last_seen and nothing else: no
+              // `online` column exists on `peers`, and after #87 a durable
+              // liveness claim is precisely what must not be invented.
+              touchPeer(db, state.peerAlias);
+              try { ws.send(JSON.stringify({ type: 'pong' })); } catch (_) { /* ignore */ }
+              return;
+            }
+            if (frameType !== 'relay') {
+              try {
+                ws.send(JSON.stringify({
+                  type: 'error', code: 'NOT_ALLOWED',
+                  message: 'peer sockets may send relay or ping only',
+                  ...(typeof frame.msg_id === 'string' ? { ref: frame.msg_id } : {}),
+                }));
+              } catch (_) { /* ignore */ }
+              return;
+            }
+            // `relay` itself lands in F1b; until then it is not implemented,
+            // and says so rather than being silently accepted.
+          } else if (frameType === 'relay') {
+            try {
+              ws.send(JSON.stringify({
+                type: 'error', code: 'NOT_ALLOWED',
+                message: 'relay is a peer frame',
+                ...(typeof frame.msg_id === 'string' ? { ref: frame.msg_id } : {}),
+              }));
+            } catch (_) { /* ignore */ }
+            return;
+          }
+
           const handler = typeof frameType === 'string' ? POST_AUTH_HANDLERS[frameType] : undefined;
           if (handler !== undefined) {
             // #94 CLASS FIX, the same guard #68 gave the HTTP dispatcher. A
@@ -677,6 +822,21 @@ export function startWsServer(
           const connState = registry.get(ws);
           registry.delete(ws);
 
+          // F1a: a peer socket branches FIRST and never touches agentIndex or
+          // setOnline — those are agent semantics and a peer has none.
+          //
+          // IDENTITY-GUARDED delete (#92's shape): evict only if the indexed
+          // socket IS this one. Without the guard a replaced socket's late
+          // close evicts the REPLACEMENT, leaving the alias unroutable while a
+          // healthy socket sits connected — the map and the world disagreeing
+          // with nothing reporting it.
+          if (connState?.peerAlias != null) {
+            const alias = connState.peerAlias;
+            if (peerIndex.get(alias) === ws) peerIndex.delete(alias);
+            console.log(JSON.stringify({ evt: 'peer.disconnected', alias, at: Date.now() }));
+            return;
+          }
+
           if (connState && connState.authed && connState.agentId !== null) {
             const agentId = connState.agentId;
             setOnline(db, agentId, false);
@@ -713,6 +873,7 @@ export function startWsServer(
       const handle: WsServerHandle = {
         wss,
         agentIndex,
+        peerIndex,
         observerIndex,
         shutdown(): Promise<void> {
           if (shutdownStarted) {
