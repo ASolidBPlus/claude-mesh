@@ -592,6 +592,7 @@ export function startWsServer(
               // impossible — correct by a distant invariant is not the same as
               // correct, and this is a refusal path where that distinction is
               // the whole point.
+              // FOLDED PER C9: disabled and wrong-token are one refusal.
               if (peerRow.disabled === 1 || !validateToken(token, peerRow.token_hash)) {
                 try {
                   ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
@@ -600,7 +601,10 @@ export function startWsServer(
                 return;
               }
 
-              // (b) protocol AFTER the credential matched.
+              // (b) protocol AFTER the credential matched — ORDERED PER C9.
+              // Cheap-checks-first is faster and tidier and would leak: a
+              // protocol answer before the credential tells an unauthenticated
+              // caller that the alias exists.
               const claimed = (frame as { protocol?: unknown }).protocol;
               if (claimed !== PEER_PROTOCOL_VERSION) {
                 console.warn(JSON.stringify({

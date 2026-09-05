@@ -127,7 +127,19 @@ describe('F1b: every non-rate refusal is indistinguishable', () => {
     db.close();
   });
 
-  it('one hop only — a ":" in to is refused', () => {
+  // THIS TEST IS THE MASKED FORM, and is kept deliberately — read the next
+  // paragraph before treating it as the one-hop rule's pin.
+  //
+  // It asserts the CONTRACT ("a ':' in `to` is refused"), which is true and
+  // worth holding. It does NOT pin the RULE: with the one-hop check deleted,
+  // `third:b` is refused anyway by the later to-exists lookup, with identical
+  // bytes, so the mutant SURVIVES here.
+  //
+  // The pin that admits under mutation is outbound-peers.test.ts (the REQUIRED
+  // test, #106 finding 2): it uses a LEGACY colon-id LOCAL agent so to-exists
+  // passes, making the one-hop rule the only thing that can refuse. Change the
+  // rule and that test delivers; this one stays green.
+  it('one hop only — a ":" in to is refused (contract, not the rule — see comment)', () => {
     const db = setup();
     expect(routeRelay(db, new Map(), getPeerByAlias(db, 'othermesh')!, relayFrame({ to: 'third:b' })).ok).toBe(false);
     db.close();

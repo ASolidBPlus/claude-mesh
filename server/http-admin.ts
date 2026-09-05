@@ -39,6 +39,7 @@ import { generateToken, hashToken, timingSafeEqual } from './auth.ts';
 import {
   PEER_ALIAS_RE, RESERVED_ALIAS, insertPeerKey, listPeerKeys, getLivePeerKeyForAlias,
   getPeerKeyBySecret, revokePeerKey, getPeerByAlias, upsertPeer, getPeerKeyById, type PeerKey,
+  insertOutboundPeer, getOutboundPeer, listOutboundPeers, updateOutboundPeer, endOutboundPeering, type OutboundPeer,
 } from './db.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
@@ -81,6 +82,19 @@ function requireAdmin(
 //
 // It is NEVER a grant. Every consumer must treat it as strictly less privileged
 // than 'agent': no scope, no ownership, no admin.
+/**
+ * F2a: how the admin API starts and stops border forwarders.
+ *
+ * `create` is optional BY DESIGN. F2a declares the interface; F2b registers the
+ * implementation. Until then `POST /outbound-peers` answers 503 and writes no
+ * row, so main cannot reach the state where sends are accepted and acked for a
+ * peering nothing will ever drain.
+ */
+export interface ForwarderRegistry {
+  create?: (row: OutboundPeer) => void;
+  stop?: (alias: string) => void;
+}
+
 export type AuthResult = { mode: 'admin' } | { mode: 'agent'; agentId: string } | { mode: 'unauthenticated' };
 
 // Resolve auth for a route that accepts EITHER the admin token OR an agent's
@@ -147,6 +161,10 @@ interface AdminCtx {
   /** F1a: alias -> peer socket. Present so revocation and re-registration can
    *  close a live peer connection immediately. */
   peerIndex: Map<string, WebSocket>;
+  /** F2a: the outbound forwarder registry. `create` is ABSENT until F2b
+   *  registers it — which is what makes POST /outbound-peers refuse with 503
+   *  and keeps the front half inert between the two merges. */
+  forwarders: ForwarderRegistry;
   maxFileBytes: number;
   filesDir: string;
   // Authenticated caller. 'admin' for admin-token routes; for 'agentOrAdmin'
@@ -1404,10 +1422,15 @@ function handlePeerKeyDelete(ctx: AdminCtx): void {
   res.end(JSON.stringify({ revoked: true, id }));
 }
 
-/** Every registration refusal returns THIS — one body, one status, no detail.
-    A peer presenting a wrong, revoked, expired, or nonexistent key learns only
-    that it was refused: distinguishing them would turn this endpoint into an
-    oracle for which keys exist. */
+/** UNIFORM PER C9 — one 403 body for every cause, the reason to the LOG only.
+ *  This door is reached by a caller outside the trust boundary presenting a
+ *  secret, so distinguishing "unknown key" from "revoked" from "expired" would
+ *  make it an oracle for which keys exist. The operator still gets the reason,
+ *  because a structured log is not the prober-reachable surface.
+ *
+ *  Every registration refusal returns THIS — one body, one status, no detail.
+ *  A peer presenting a wrong, revoked, expired, or nonexistent key learns only
+ *  that it was refused. */
 /** Why a presented key was not live, FOR THE LOG LINE ONLY. Reads the columns
  *  directly and deliberately: it feeds a diagnostic string and never a branch,
  *  so it cannot become a second authority on liveness. The 403 body is uniform
@@ -1508,7 +1531,218 @@ async function handlePeerRegister(ctx: AdminCtx): Promise<void> {
   }));
 }
 
+// ─── Outbound peerings (F2a — §4, §5.3, §5.6, §6) ───────────────────────────
+//
+// C9 SCOPE, stated per door: these are ADMIN-authenticated. C9 binds refusals
+// reachable from OUTSIDE the trust boundary; an admin holding the token can
+// already enumerate agents, peers, keys and peerings, so distinguishable
+// refusals here teach nothing and their diagnostic value is real. Uniform
+// errors on this door would be the #107 mistake — applying a property of the
+// prober-reachable surface to the system.
+//
+// Every refusal below is therefore SPECIFIC on purpose. That is a decision, not
+// an omission.
+
+/** Public shape of an outbound peering. NEVER includes `token` (C7): it is a
+ *  live credential, and a read API that returned it would put it in every
+ *  operator's shell history and every log of this endpoint. */
+function publicOutboundFields(row: OutboundPeer) {
+  return {
+    alias: row.alias,
+    url: row.url,
+    assigned_alias: row.assigned_alias,
+    kinds: JSON.parse(row.kinds) as string[],
+    rate_per_min: row.rate_per_min,
+    enabled: row.enabled === 1,
+    created_at: row.created_at,
+    last_alive: row.last_alive,
+  };
+}
+
+async function handleOutboundPeerPost(ctx: AdminCtx): Promise<void> {
+  const { req, res, db, forwarders } = ctx;
+  const raw = await readBody(req);
+  let body: Record<string, unknown>;
+  try { body = JSON.parse(raw); } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid JSON' })); return;
+  }
+
+  // THE JOIN IN TIME. Between F2a and F2b merging, main would be a complete
+  // front half with no back half: a peering could be created, sends to it
+  // accepted and ACKED (D8), and the rows would sit forever because nothing
+  // drains them — the exact state endOutboundPeering exists to prevent, reached
+  // through a scheduling door rather than a code one.
+  //
+  // So the front half REFUSES until a forwarder factory is registered. F2b
+  // registers the real one. A refusal holds regardless of merge order; a
+  // process rule holds only while someone remembers it.
+  if (forwarders.create === undefined) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'no forwarder available' })); return;
+  }
+
+  const alias = body.alias;
+  if (typeof alias !== 'string' || !PEER_ALIAS_RE.test(alias)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'alias must match ^[a-z0-9][a-z0-9-]{0,62}$' })); return;
+  }
+  if (alias === RESERVED_ALIAS) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `alias '${RESERVED_ALIAS}' is reserved` })); return;
+  }
+
+  // An outbound alias must not PREFIX a legacy local id. `assertPeeringAllowed`
+  // classifies `legacy:node` as LOCAL when such an agent exists — so creating an
+  // outbound peering named `legacy` would make that population addressable as
+  // remote, and routeDirect's remote branch would capture sends meant for the
+  // local agent. The population the classifier calls local must stay local.
+  const prefixed = db.prepare('SELECT id FROM agents WHERE id >= ? AND id < ? LIMIT 1')
+    .get(`${alias}:`, `${alias};`) as { id: string } | null;
+  if (prefixed !== null) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `alias would shadow the local agent '${prefixed.id}'` })); return;
+  }
+
+  const url = body.url;
+  if (typeof url !== 'string' || !/^wss?:\/\//.test(url)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'url must be ws:// or wss://' })); return;
+  }
+  const token = body.token;
+  if (typeof token !== 'string' || token.length === 0) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'token is required' })); return;
+  }
+  const assigned_alias = body.assigned_alias;
+  if (typeof assigned_alias !== 'string' || assigned_alias.length === 0) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'assigned_alias is required' })); return;
+  }
+  if (getOutboundPeer(db, alias) !== null) {
+    res.writeHead(409, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'an outbound peering already exists for this alias' })); return;
+  }
+
+  let kinds: string[] = ['direct'];
+  if (body.kinds !== undefined) {
+    if (!Array.isArray(body.kinds) || !body.kinds.every(k => typeof k === 'string')) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'kinds must be an array of strings' })); return;
+    }
+    kinds = body.kinds as string[];
+  }
+  let rate_per_min = 600;
+  if (body.rate_per_min !== undefined) {
+    if (typeof body.rate_per_min !== 'number' || !Number.isInteger(body.rate_per_min) || body.rate_per_min <= 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'rate_per_min must be a positive integer' })); return;
+    }
+    rate_per_min = body.rate_per_min;
+  }
+
+  const row = insertOutboundPeer(db, {
+    alias, url, token, assigned_alias,
+    kinds: JSON.stringify(kinds), rate_per_min, created_at: Date.now(),
+  });
+  // Event-driven, never polled: the handler that changed the state starts the
+  // forwarder. C7 — the row carries the token, so nothing here logs the row.
+  forwarders.create(row);
+  console.log(JSON.stringify({ evt: 'outbound_peering.created', alias, url, assigned_alias, at: Date.now() }));
+
+  res.writeHead(201, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(publicOutboundFields(row)));
+}
+
+function handleOutboundPeerGet(ctx: AdminCtx): void {
+  const { res, db } = ctx;
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ peerings: listOutboundPeers(db).map(publicOutboundFields) }));
+}
+
+function handleOutboundPeerDelete(ctx: AdminCtx): void {
+  const { res, db, params, forwarders } = ctx;
+  const alias = params.id as string;
+  if (getOutboundPeer(db, alias) === null) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'no such outbound peering' })); return;
+  }
+  // Stop first, then end: a forwarder still draining while its rows are being
+  // expired would race its own teardown.
+  forwarders.stop?.(alias);
+  const { expired, edges } = endOutboundPeering(db, alias, 'deleted_by_admin', { delete: true });
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ deleted: true, alias, expired_rows: expired, removed_edges: edges }));
+}
+
+async function handleOutboundPeerPatch(ctx: AdminCtx): Promise<void> {
+  const { req, res, db, params, forwarders } = ctx;
+  const alias = params.id as string;
+  const raw = await readBody(req);
+  let body: Record<string, unknown>;
+  try { body = JSON.parse(raw); } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid JSON' })); return;
+  }
+  if (getOutboundPeer(db, alias) === null) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'no such outbound peering' })); return;
+  }
+
+  const patch: { enabled?: boolean; token?: string; url?: string; rate_per_min?: number } = {};
+  if (body.enabled !== undefined) {
+    if (typeof body.enabled !== 'boolean') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'enabled must be a boolean' })); return;
+    }
+    patch.enabled = body.enabled;
+  }
+  if (body.token !== undefined) {
+    if (typeof body.token !== 'string' || body.token.length === 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'token must be a non-empty string' })); return;
+    }
+    patch.token = body.token;
+  }
+  if (body.url !== undefined) {
+    if (typeof body.url !== 'string' || !/^wss?:\/\//.test(body.url)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'url must be ws:// or wss://' })); return;
+    }
+    patch.url = body.url;
+  }
+  if (body.rate_per_min !== undefined) {
+    if (typeof body.rate_per_min !== 'number' || !Number.isInteger(body.rate_per_min) || body.rate_per_min <= 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'rate_per_min must be a positive integer' })); return;
+    }
+    patch.rate_per_min = body.rate_per_min;
+  }
+
+  updateOutboundPeer(db, alias, patch);
+  const row = getOutboundPeer(db, alias)!;
+
+  // PATCH {enabled:false} is a PAUSE — reversible, and it keeps both the queued
+  // rows and the outbound ACL edges. It deliberately does NOT call
+  // endOutboundPeering: pausing and ending are different operations, and a
+  // paused peering is expected to come back.
+  forwarders.stop?.(alias);
+  if (row.enabled === 1) forwarders.create!(row);
+
+  console.log(JSON.stringify({
+    evt: 'outbound_peering.patched', alias,
+    // C7: which FIELDS changed, never their values — token must not reach a log.
+    fields: Object.keys(patch), at: Date.now(),
+  }));
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(publicOutboundFields(row)));
+}
+
 export const ROUTES: Route[] = [
+  { method: 'POST',   match: exact('/outbound-peers'),               handler: handleOutboundPeerPost },
+  { method: 'GET',    match: exact('/outbound-peers'),               handler: handleOutboundPeerGet },
+  { method: 'DELETE', match: idMatch(/^\/outbound-peers\/([^/]+)$/), handler: handleOutboundPeerDelete },
+  { method: 'PATCH',  match: idMatch(/^\/outbound-peers\/([^/]+)$/), handler: handleOutboundPeerPatch },
   { method: 'POST',   match: exact('/peer-keys'),                    handler: handlePeerKeyPost },
   { method: 'GET',    match: exact('/peer-keys'),                    handler: handlePeerKeyGet },
   { method: 'DELETE', match: idMatch(/^\/peer-keys\/([^/]+)$/),      handler: handlePeerKeyDelete },
@@ -1549,6 +1783,10 @@ export function startHttpAdmin(
   // rather than waiting for the sweep. Defaulted, so every existing caller and
   // test is unchanged.
   peerIndex: Map<string, WebSocket> = new Map(),
+  // F2a: parameter 8, following agentIndex (6) and observerIndex (7) — the
+  // same positional convention. Defaulted to an EMPTY registry, so every
+  // existing caller and test is unchanged AND gets the inert front half.
+  forwarders: ForwarderRegistry = {},
 ): Promise<HttpAdminHandle> {
   return new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
@@ -1593,7 +1831,7 @@ export function startHttpAdmin(
         // request fails loudly instead of the whole mesh dying quietly: log,
         // 500 if the head isn't out yet, sever the socket if it is.
         try {
-          await matched.handler({ req, res, db, url, params, agentIndex, observerIndex, peerIndex, maxFileBytes, filesDir, auth });
+          await matched.handler({ req, res, db, url, params, agentIndex, observerIndex, peerIndex, forwarders, maxFileBytes, filesDir, auth });
         } catch (err) {
           console.error(`[http-admin] handler crashed: ${method} ${pathname}:`, err);
           if (!res.headersSent) {

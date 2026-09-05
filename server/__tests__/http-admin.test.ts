@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { openDb, registerAgent, upsertPeer, aclGrant, aclCheck, setOnline, insertFile, getAgentById, getFile, insertMessage, subscribe, getOrCreateTopic } from '../db.ts';
+import { openDb, registerAgent, upsertPeer, aclGrant, insertOutboundPeer, aclCheck, setOnline, insertFile, getAgentById, getFile, insertMessage, subscribe, getOrCreateTopic } from '../db.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
 import { hashToken } from '../auth.ts';
 import { Database } from 'bun:sqlite';
@@ -148,6 +148,33 @@ describe('http-admin', () => {
   // F0a §5.4 — ONE RULE AT THE CHOKEPOINT. Before this, the HTTP door 404'd a
   // remote endpoint while the MCP door accepted it: two doors, two rules, on
   // the exact pair #82 pinned for door parity.
+  // F2a: the OUTBOUND half of the peering rule, at this door. Paired with the
+  // MCP door's equivalent so ONE mutation in the chokepoint reds both.
+  it('POST /acl refuses local → alias:x without an outbound peering', async () => {
+    registerAgent(db, { id: 'agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
+    const res = await fetch(`${base}/acl`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_agent: 'agent-a', to_agent: 'far:them' }),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json() as Record<string, unknown>).error).toBe('no peering');
+  });
+
+  it('POST /acl accepts local → alias:x once an outbound peering exists', async () => {
+    registerAgent(db, { id: 'agent-a', token_hash: 'a'.repeat(64), hostname: 'host1' });
+    insertOutboundPeer(db, {
+      alias: 'far', url: 'ws://far:1', token: 'T', assigned_alias: 'us',
+      kinds: '["direct"]', rate_per_min: 600, created_at: Date.now(),
+    });
+    const res = await fetch(`${base}/acl`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_agent: 'agent-a', to_agent: 'far:them' }),
+    });
+    expect(res.status).toBe(201);
+  });
+
   // F1b: the peering rule lives in aclGrant; this door only MAPS it. Paired
   // with the MCP door's equivalent so ONE mutation in the chokepoint reds both
   // — the structural pattern F0a established for door parity.

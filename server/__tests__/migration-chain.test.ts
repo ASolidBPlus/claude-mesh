@@ -302,6 +302,34 @@ describe('migration chain — openDb over databases that predate the current sch
     db.close();
   });
 
+  it('★ F2a: failed_code arrives on an upgraded database, and the SECOND boot survives', () => {
+    // The house pattern is try/catch around ALTER, and the reason is this test:
+    // a BARE exec passes a migrate-once check and throws on the second boot,
+    // because the column already exists. Opening twice is the whole point.
+    const path = tmpDb('failedcode');
+    preFederationDb(path);
+
+    const first = openDb(path);
+    expect(columns(first, 'messages')).toContain('failed_code');
+    expect(getAgentByToken(first, 'prod-token')?.id).toBe('prod-agent');
+    first.close();
+
+    const second = openDb(path);              // must not throw
+    expect(columns(second, 'messages')).toContain('failed_code');
+    expect(getAgentByToken(second, 'prod-token')?.id).toBe('prod-agent');
+    second.close();
+  });
+
+  it('★ F2a: outbound_peers exists after migrating an old database', () => {
+    const path = tmpDb('outbound');
+    preFederationDb(path);
+    const db = openDb(path);
+    const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[])
+      .map(r => r.name);
+    expect(tables).toContain('outbound_peers');
+    db.close();
+  });
+
   it('a fresh database still works — the from-empty path is not regressed', () => {
     const db = openDb(':memory:');
     registerAgent(db, { id: 'new', token_hash: hashToken('new-token'), hostname: 'h' });

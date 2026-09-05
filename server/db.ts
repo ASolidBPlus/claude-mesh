@@ -206,6 +206,27 @@ export function openDb(path: string): Database {
       online       INTEGER NOT NULL DEFAULT 0
     );
 
+    -- F2a (SS4): OUTBOUND peerings -- the meshes WE relay to. A separate table
+    -- from peers (who may relay to us) because the two directions are
+    -- independent decisions by different admins; one row cannot mean both.
+    --
+    -- C7: token is a LIVE CREDENTIAL at rest. It is the only such value in this
+    -- database -- every other secret is stored hashed -- so backups, dumps and
+    -- exports of this file now carry something that grants access to a remote
+    -- mesh. Never returned by a read API, never logged, never a metric label;
+    -- exactly one production site reads it (the forwarder's auth).
+    CREATE TABLE IF NOT EXISTS outbound_peers (
+      alias          TEXT PRIMARY KEY,
+      url            TEXT NOT NULL,
+      token          TEXT NOT NULL, /* C7 — live credential, see above */
+      assigned_alias TEXT NOT NULL,
+      kinds          TEXT NOT NULL DEFAULT '["direct"]',
+      rate_per_min   INTEGER NOT NULL DEFAULT 600,
+      enabled        INTEGER NOT NULL DEFAULT 1,
+      created_at     INTEGER NOT NULL,
+      last_alive     INTEGER
+    );
+
     -- F0b (§3, §4): PEER MESHES. A peer is another claude-mesh, not an agent.
     -- No FKs anywhere in these tables for the same reason acl lost its own: the
     -- ids they carry are remote by construction.
@@ -397,6 +418,15 @@ export function openDb(path: string): Database {
   // indistinguishable). ADDITIVE: existing rows get NULL and last_seen keeps its
   // exact current meaning for every consumer.
   try { db.exec('ALTER TABLE agents ADD COLUMN last_alive INTEGER'); } catch {}
+
+  // F2a migration: why a queued message can never be delivered. Set together
+  // with expires_at = now on a PERMANENT remote refusal, so the row stops being
+  // pending without pretending it was delivered.
+  //
+  // The house pattern — try/catch around ALTER — is not decoration: a bare
+  // exec passes a migrate-once test and throws on the SECOND boot, which is
+  // why the migration test opens the database twice.
+  try { db.exec('ALTER TABLE messages ADD COLUMN failed_code TEXT'); } catch {}
 
   // #113 migration: DECLARED LINEAGE on a peer key. A rotation NAMES the key
   // it replaces; a rebind names nothing. Additive, existing rows get NULL —
@@ -909,10 +939,14 @@ export function getPeerKeyBySecret(db: Database, secret: string, now: number = D
   // revoked_at and expires_at itself and agreed with the gate by coincidence.
   // It is now the same sentence, evaluated by SQLite.
   //
-  // Selected as a column rather than moved into the WHERE deliberately: the
-  // AMBIGUITY check must still see EVERY row sharing this hash, live or not.
-  // Two keys with one hash is an alarming data condition whichever of them is
-  // revoked, and filtering first would hide half of it.
+  // Selected as a column rather than moved into the WHERE deliberately (#109):
+  // the AMBIGUITY check must still see EVERY row sharing this hash, live or not.
+  //
+  // With liveness in the WHERE, one live + one revoked key sharing a hash
+  // returns ONE row, the ambiguity branch never fires, and THE LIVE KEY
+  // AUTHENTICATES — the refusal and the only signal of the collision are both
+  // destroyed. Not "half hidden": a fail-closed check silently narrowed by a
+  // change that looks like applying the rule.
   const rows = db.prepare(
     `SELECT *, (${LIVE_PEER_KEY_SQL}) AS is_live FROM peer_keys WHERE key_hash = ? LIMIT 2`
   ).all(now, hash) as (PeerKey & { is_live: number })[];
@@ -1002,8 +1036,133 @@ export function hasInboundPeer(db: Database, alias: string): boolean {
  * F2 fills this in instead of re-plumbing the rule through aclGrant, and the
  * refusal reads as "no outbound peering" rather than as a hardcoded no.
  */
-export function hasOutboundPeer(_db: Database, _alias: string): boolean {
-  return false;
+export function hasOutboundPeer(db: Database, alias: string): boolean {
+  // TABLE READ: outbound_peers. Total for the outbound question because a
+  // peering we relay TO exists iff an admin created a row here — there is no
+  // other writer, and an inbound `peers` row says nothing about whether we may
+  // send. Enabled-only: a PATCH-disabled peering is paused, not deleted, and a
+  // paused peering must not accept new edges.
+  const row = db.prepare('SELECT 1 FROM outbound_peers WHERE alias = ? AND enabled = 1').get(alias);
+  return row !== null;
+}
+
+export interface OutboundPeer {
+  alias: string;
+  url: string;
+  /** C7 — LIVE CREDENTIAL. Never returned by a read API, never logged, never a
+   *  metric label. Exactly one production site reads it: the forwarder's auth. */
+  token: string;
+  assigned_alias: string;
+  kinds: string;
+  rate_per_min: number;
+  enabled: number;
+  created_at: number;
+  last_alive: number | null;
+}
+
+export function insertOutboundPeer(
+  db: Database,
+  row: {
+    alias: string; url: string; token: string; assigned_alias: string;
+    kinds: string; rate_per_min: number; created_at: number;
+  }
+): OutboundPeer {
+  db.prepare(`
+    INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(row.alias, row.url, row.token, row.assigned_alias, row.kinds, row.rate_per_min, row.created_at);
+  return getOutboundPeer(db, row.alias)!;
+}
+
+export function getOutboundPeer(db: Database, alias: string): OutboundPeer | null {
+  return db.prepare('SELECT * FROM outbound_peers WHERE alias = ?').get(alias) as OutboundPeer | null;
+}
+
+export function listOutboundPeers(db: Database): OutboundPeer[] {
+  return db.prepare('SELECT * FROM outbound_peers ORDER BY alias').all() as OutboundPeer[];
+}
+
+/** Enabled outbound peerings, for the forwarder set at boot. */
+export function listEnabledOutboundPeers(db: Database): OutboundPeer[] {
+  return db.prepare('SELECT * FROM outbound_peers WHERE enabled = 1 ORDER BY alias').all() as OutboundPeer[];
+}
+
+export function updateOutboundPeer(
+  db: Database,
+  alias: string,
+  patch: { enabled?: boolean; token?: string; url?: string; rate_per_min?: number }
+): boolean {
+  const sets: string[] = [];
+  const args: (string | number)[] = [];
+  if (patch.enabled !== undefined) { sets.push('enabled = ?'); args.push(patch.enabled ? 1 : 0); }
+  if (patch.token !== undefined) { sets.push('token = ?'); args.push(patch.token); }
+  if (patch.url !== undefined) { sets.push('url = ?'); args.push(patch.url); }
+  if (patch.rate_per_min !== undefined) { sets.push('rate_per_min = ?'); args.push(patch.rate_per_min); }
+  if (sets.length === 0) return getOutboundPeer(db, alias) !== null;
+  args.push(alias);
+  return db.prepare(`UPDATE outbound_peers SET ${sets.join(', ')} WHERE alias = ?`).run(...args).changes > 0;
+}
+
+/**
+ * END an outbound peering — §5.6, and the ONLY place that decides what "ended"
+ * means. ONE transaction, three effects that must not be separable:
+ *
+ *   1. the peering stops (row deleted, or enabled = 0 for a non-DELETE caller);
+ *   2. every UNDELIVERED row addressed to alias:* is expired (expires_at = now);
+ *   3. the alias's OUTBOUND acl edges are removed (#113's helper, other direction).
+ *
+ * (2) is the one that is easy to miss and expensive to omit. This is the ONLY
+ * moment anyone knows those rows are undeliverable: the sender was acked (D8),
+ * the row is pending, and a ttl-less row would otherwise sit in the queue
+ * forever waiting for a forwarder that is never coming back. A DOWN peering is
+ * a different thing — it is expected to return, and its rows must survive.
+ *
+ * Called by DELETE /outbound-peers (an operator ending it) and, in F2b, by the
+ * forwarder on a FATAL AUTH_FAILED — receiver-side revocation, the door where
+ * nobody typed a command and the less observable of the two.
+ *
+ * PATCH {enabled:false} deliberately does NOT call this: pausing is reversible
+ * and keeps both rows and edges. Ending and pausing are different operations,
+ * not two spellings of one.
+ */
+export function endOutboundPeering(
+  db: Database,
+  alias: string,
+  reason: string,
+  opts: { delete?: boolean } = {}
+): { expired: number; edges: number } {
+  const tx = db.transaction(() => {
+    const now = Date.now();
+    if (opts.delete === true) {
+      db.prepare('DELETE FROM outbound_peers WHERE alias = ?').run(alias);
+    } else {
+      db.prepare('UPDATE outbound_peers SET enabled = 0 WHERE alias = ?').run(alias);
+    }
+    // Prefix range, not LIKE — index-servable and immune to % or _ in an alias.
+    //
+    // `now - 1`, not `now`, and the off-by-one is deliberate. Every "still
+    // deliverable" predicate in this file is `expires_at >= now` (pending
+    // counts, the retention sweep's exclusion), while every "has expired" one
+    // is `expires_at < now`. A row stamped with exactly `now` is therefore
+    // still PENDING until the clock moves — a brief but real lie about a row
+    // nobody can deliver, and one that made the deterministic test for this
+    // function fail. Strictly-before is what "undeliverable from this instant"
+    // actually requires.
+    const expired = db.prepare(
+      `UPDATE messages SET expires_at = ?
+       WHERE to_agent >= ? AND to_agent < ?
+         AND delivered_at IS NULL
+         AND (expires_at IS NULL OR expires_at >= ?)`
+    ).run(now - 1, `${alias}:`, `${alias};`, now).changes;
+    const edges = deletePeeringEdges(db, alias, 'outbound');
+    return { expired, edges };
+  });
+  const result = tx() as { expired: number; edges: number };
+  console.log(JSON.stringify({
+    evt: 'outbound_peering.ended', alias, reason,
+    expired_rows: result.expired, removed_edges: result.edges, at: Date.now(),
+  }));
+  return result;
 }
 
 /**
@@ -1311,7 +1470,7 @@ export function sweepRetention(db: Database, retentionMs: number): number {
   const result = db.prepare(
     `DELETE FROM messages
      WHERE sent_at < ?
-       AND NOT (delivered_at IS NULL AND (expires_at IS NULL OR expires_at >= ?))`
+       AND NOT (delivered_at IS NULL AND failed_code IS NULL AND (expires_at IS NULL OR expires_at >= ?))`
   ).run(cutoff, now);
   return result.changes;
 }
@@ -1327,9 +1486,15 @@ export function countAgentsOnline(db: Database): number {
 }
 export function countPendingMessages(db: Database): number {
   const now = Date.now();
+  // F2a: a row with failed_code is NOT pending. A permanent remote refusal set
+  // it together with expires_at = now, so the expiry clause alone would already
+  // exclude it — the explicit condition is here because "not pending" must not
+  // depend on two writes having stayed in step. If a future path sets
+  // failed_code without expiring the row, this query is still right.
   return (db.prepare(
     `SELECT COUNT(*) AS c FROM messages
-     WHERE delivered_at IS NULL AND (expires_at IS NULL OR expires_at >= ?)`
+     WHERE delivered_at IS NULL AND failed_code IS NULL
+       AND (expires_at IS NULL OR expires_at >= ?)`
   ).get(now) as { c: number }).c;
 }
 

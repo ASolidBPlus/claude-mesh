@@ -76,6 +76,14 @@ describe('#8 — mesh_acl_allow / mesh_acl_deny require the admin token', () => 
   });
 
   // F0a — the revoke rule is EDGE existence at BOTH doors.
+  // F2a: outbound half at the MCP door — one mutation in aclGrant reds this
+  // AND the HTTP door's equivalent.
+  it('mesh_acl_allow reports NO_PEERING for local → alias:x without an outbound peering', async () => {
+    const r = await call('mesh_acl_allow', { agent_id: 'A', as_agent: 'far:them', admin_token: ADMIN });
+    expect(r.isError).toBe(true);
+    expect(JSON.parse((r.content as { text: string }[])[0]!.text).error).toBe('NO_PEERING');
+  });
+
   // F1b: the other half of the door-parity pair. One mutation in aclGrant's
   // peering rule must red this AND the HTTP door's equivalent.
   it('mesh_acl_allow reports NO_PEERING for a remote endpoint with no peering', async () => {
