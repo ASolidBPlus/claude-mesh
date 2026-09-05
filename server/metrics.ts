@@ -118,12 +118,22 @@ function renderHistogram(name: string, help: string, h: Histogram, lines: string
   lines.push(`${name}_count ${h.count}`);
 }
 
-/** Supplies the live peer aliases for mesh_peer_up. Set once at boot by
- *  server.ts from the WS handle's peerIndex; defaults to none so every existing
- *  caller of renderMetrics (and every test) is unchanged. */
-let peerUpAliases: () => Iterable<string> = () => [];
-export function setPeerUpSource(fn: () => Iterable<string>): void {
-  peerUpAliases = fn;
+/**
+ * Supplies mesh_peer_up's series: EVERY CONFIGURED PEER with its state, not
+ * only the connected ones (#108).
+ *
+ * The distinction is the whole point. A gauge emitted only when up produces a
+ * series that APPEARS on connect and VANISHES on disconnect — and you cannot
+ * alert on a series that is absent, because "no data" is indistinguishable from
+ * "never configured". The alert an operator wants is "this peering went to 0",
+ * which requires the 0 to exist.
+ *
+ * Set once at boot by server.ts; defaults to none so every existing caller of
+ * renderMetrics (and every test) is unchanged.
+ */
+let peerUpSource: () => Iterable<{ alias: string; up: boolean }> = () => [];
+export function setPeerUpSource(fn: () => Iterable<{ alias: string; up: boolean }>): void {
+  peerUpSource = fn;
 }
 
 export function renderMetrics(db: Database): string {
@@ -229,14 +239,14 @@ export function renderMetrics(db: Database): string {
     lines.push(`mesh_peer_relays_total{alias="${escapeLabelValue(alias ?? '')}",direction="${escapeLabelValue(direction ?? '')}",outcome="${escapeLabelValue(outcome ?? '')}"} ${v}`);
   }
 
-  // mesh_peer_up {alias} — 1 iff a socket is currently held for that alias.
-  // Read from the LIVE index, not from a stored column: peers has no `online`
-  // field and after #87 a durable liveness claim that outlives the process is
-  // exactly what must not be invented.
-  lines.push('# HELP mesh_peer_up Whether a peer mesh currently holds an authenticated socket.');
+  // mesh_peer_up {alias} — 0 or 1 for EVERY configured peering, both
+  // directions (#108). State is read LIVE (the socket index, the forwarder's
+  // connection), never from a stored column: after #87, a durable liveness
+  // claim that outlives the process is exactly what must not be invented.
+  lines.push('# HELP mesh_peer_up Whether a configured peering currently holds an authenticated socket.');
   lines.push('# TYPE mesh_peer_up gauge');
-  for (const alias of peerUpAliases()) {
-    lines.push(`mesh_peer_up{alias="${escapeLabelValue(alias)}"} 1`);
+  for (const { alias, up } of peerUpSource()) {
+    lines.push(`mesh_peer_up{alias="${escapeLabelValue(alias)}"} ${up ? 1 : 0}`);
   }
 
   return lines.join('\n') + '\n';

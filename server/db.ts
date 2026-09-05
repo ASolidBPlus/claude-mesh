@@ -43,6 +43,10 @@ export interface Message {
   expires_at: number | null;
   delivered_at: number | null;
   acked_at: number | null;
+  /** F2a: why this row can never be delivered — set with expires_at on a
+   *  PERMANENT remote refusal. A row carrying it is not pending and was not
+   *  delivered; it records the outcome rather than pretending either. */
+  failed_code: string | null;
 }
 
 export interface Topic {
@@ -1083,6 +1087,56 @@ export function listOutboundPeers(db: Database): OutboundPeer[] {
 }
 
 /** Enabled outbound peerings, for the forwarder set at boot. */
+/**
+ * F2b: the forwarder's DRAIN query — rows queued for one outbound peering.
+ *
+ * RANGE, not LIKE. `to_agent >= 'alias:' AND to_agent < 'alias;'` (';' is ':'
+ * plus one) is served by idx_messages_to_agent; a LIKE pattern full-scans, and
+ * an alias containing % or _ would also change what it matches. A test asserts
+ * the plan SEARCHes that index and contains no SCAN — the ORDER BY's temp
+ * b-tree is expected and is not a failure.
+ *
+ * `sent_at >= now - RELAY_DEDUPE_MS` because the RECEIVER forgets a remote
+ * msg_id after that window: re-sending an older row would be delivered twice,
+ * once now and once by whatever already arrived. The two bounds are the same
+ * constant on purpose, and a row past it is expired rather than sent.
+ */
+export function drainOutbound(
+  db: Database,
+  alias: string,
+  now: number,
+  dedupeMs: number,
+  limit: number
+): Message[] {
+  return db.prepare(
+    `SELECT * FROM messages
+     WHERE to_agent >= ? AND to_agent < ?
+       AND delivered_at IS NULL
+       AND failed_code IS NULL
+       AND (expires_at IS NULL OR expires_at >= ?)
+       AND sent_at >= ?
+     ORDER BY sent_at LIMIT ?`
+  ).all(`${alias}:`, `${alias};`, now, now - dedupeMs, limit) as Message[];
+}
+
+/** Rows past the receiver's dedupe window: undeliverable, so expired rather
+ *  than sent. Same now-1 reason as endOutboundPeering — the pending predicate
+ *  is `expires_at >= now`, so exactly `now` would still read as deliverable. */
+export function expireStaleOutbound(db: Database, alias: string, now: number, dedupeMs: number): number {
+  return db.prepare(
+    `UPDATE messages SET expires_at = ?
+     WHERE to_agent >= ? AND to_agent < ?
+       AND delivered_at IS NULL AND failed_code IS NULL
+       AND sent_at < ?
+       AND (expires_at IS NULL OR expires_at >= ?)`
+  ).run(now - 1, `${alias}:`, `${alias};`, now - dedupeMs, now).changes;
+}
+
+/** A permanent remote refusal: the row can never be delivered, and says why. */
+export function markMessageFailed(db: Database, id: string, code: string, now: number): void {
+  db.prepare('UPDATE messages SET failed_code = ?, expires_at = ? WHERE id = ?').run(code, now - 1, id);
+}
+
 export function listEnabledOutboundPeers(db: Database): OutboundPeer[] {
   return db.prepare('SELECT * FROM outbound_peers WHERE enabled = 1 ORDER BY alias').all() as OutboundPeer[];
 }

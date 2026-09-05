@@ -4,6 +4,7 @@ import * as http from 'http';
 import * as net from 'net';
 import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
 import { validateToken } from './auth.ts';
+import { PEER_PROTOCOL_VERSION } from '../client/src/protocol.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
 import {
@@ -16,8 +17,13 @@ import { incMsgStatus, incReceived, incBytes } from './metrics.ts';
 
 /** F1a (§5.1): the only inbound peer protocol this mesh speaks. A version is a
  *  property of a LIVE CONNECTION, never of a stored row (D7) — which is why it
- *  is checked at auth and not persisted on `peers`. */
-export const PEER_PROTOCOL_VERSION = 1;
+ *  is checked at auth and not persisted on `peers`.
+ *
+ *  F2b: re-exported, not redefined. The definition is in the wire module
+ *  (client/src/protocol.ts) because all three readers must agree by
+ *  construction; keeping a copy here is exactly what let registration advertise
+ *  a version auth rejected. */
+export { PEER_PROTOCOL_VERSION };
 
 export interface WsServerHandle {
   wss: WebSocketServer;

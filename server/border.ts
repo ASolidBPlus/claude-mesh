@@ -32,3 +32,242 @@ export const borderEvents = new EventEmitter();
 
 /** Payload of the only event F2a emits: the alias whose queue just grew. */
 export type EnqueuedEvent = string;
+
+// ──────────────────────────────────────────────
+// The forwarder (F2b)
+// ──────────────────────────────────────────────
+
+import { PeerClient } from '../client/src/peer-client.ts';
+import {
+  drainOutbound, expireStaleOutbound, markMessageFailed, markDelivered,
+  listEnabledOutboundPeers, endOutboundPeering,
+  type OutboundPeer, type Message,
+} from './db.ts';
+import { RELAY_DEDUPE_MS } from './cleanup.ts';
+import { incPeerRelay } from './metrics.ts';
+import type { Database } from 'bun:sqlite';
+import type { WebSocket } from 'ws';
+
+/** Backstop tick — the drain also runs on connect and on borderEvents, so this
+ *  only catches a missed signal. Not the primary trigger. */
+const BACKSTOP_MS = 30_000;
+const BACKOFF_MIN_MS = 1_000;
+const BACKOFF_MAX_MS = 60_000;
+
+/**
+ * One outbound peering's forwarder.
+ *
+ * PACING IS SENDER-SIDE AND DELIBERATE. The receiver has its own bucket and
+ * answers RATE_LIMITED, but arriving at its limit and being refused is worse
+ * than not arriving: the refusal costs a round trip, counts against the
+ * receiver's bucket (refused relays count, by design), and leaves the row to
+ * retry. So we pace to the rate the peering was configured with and treat a
+ * RATE_LIMITED as evidence our estimate is too high.
+ */
+export class Forwarder {
+  private client: PeerClient | null = null;
+  private inFlight = new Set<string>();
+  private tokens: number;
+  private lastRefill = Date.now();
+  private refillPerMin: number;
+  private backoff = BACKOFF_MIN_MS;
+  private backoffTimer: ReturnType<typeof setTimeout> | null = null;
+  private tick: ReturnType<typeof setInterval> | null = null;
+  private stopped = false;
+  private readonly cap: number;
+
+  constructor(
+    private readonly db: Database,
+    private row: OutboundPeer,
+    private readonly agentIndex: Map<string, WebSocket>,
+  ) {
+    this.refillPerMin = row.rate_per_min;
+    this.tokens = row.rate_per_min;              // burst == sustained
+    this.cap = Math.max(1, Math.min(50, Math.floor(row.rate_per_min / 4)));
+  }
+
+  get alias(): string { return this.row.alias; }
+  /** For #108's gauge: 0 or 1, never absent. */
+  get connected(): boolean { return this.client !== null; }
+
+  start(): void {
+    if (this.stopped) return;
+    // C7: the ONLY production read of outbound_peers.token. It goes to the
+    // SDK's auth frame and nowhere else — not to a log, not to a metric label.
+    this.client = new PeerClient({
+      serverUrl: this.row.url,
+      agentId: this.row.assigned_alias,
+      agentToken: this.row.token,
+    });
+    this.client.on('error', (e: unknown) => this.onFatal(e as { code?: string }));
+    this.client.connect().then(() => this.drain()).catch(() => this.scheduleRetry());
+    this.tick = setInterval(() => this.drain(), BACKSTOP_MS);
+  }
+
+  stop(): void {
+    this.stopped = true;
+    if (this.tick !== null) { clearInterval(this.tick); this.tick = null; }
+    if (this.backoffTimer !== null) { clearTimeout(this.backoffTimer); this.backoffTimer = null; }
+    try { this.client?.close(); } catch { /* ignore */ }
+    this.client = null;
+  }
+
+  private scheduleRetry(): void {
+    if (this.stopped || this.backoffTimer !== null) return;
+    this.backoffTimer = setTimeout(() => {
+      this.backoffTimer = null;
+      this.drain();
+    }, this.backoff);
+    this.backoff = Math.min(this.backoff * 2, BACKOFF_MAX_MS);
+  }
+
+  /** A FATAL error means the far side will not accept us unaided (§5.6). */
+  private onFatal(err: { code?: string }): void {
+    if (err?.code !== 'AUTH_FAILED') return;
+    // Receiver-side revocation: the door where nobody typed a command, and the
+    // less observable of the two. A revoked peering is NOT a down peering — it
+    // will not recover — so its queued rows are undeliverable from this instant
+    // and would otherwise sit pending forever.
+    console.error(JSON.stringify({
+      evt: 'outbound_peering.revoked_by_receiver', alias: this.row.alias, at: Date.now(),
+    }));
+    endOutboundPeering(this.db, this.row.alias, 'revoked_by_receiver');
+    this.stop();
+  }
+
+  private refill(now: number): void {
+    const elapsed = now - this.lastRefill;
+    if (elapsed <= 0) return;
+    this.lastRefill = now;
+    this.tokens = Math.min(this.refillPerMin, this.tokens + (this.refillPerMin * elapsed) / 60_000);
+  }
+
+  /** Drain what the bucket and the in-flight cap both allow. */
+  drain(): void {
+    if (this.stopped || this.client === null) return;
+    const now = Date.now();
+
+    // Past the receiver's dedupe window: it has forgotten these ids, so a
+    // re-send would be delivered a second time. Expire rather than send.
+    expireStaleOutbound(this.db, this.row.alias, now, RELAY_DEDUPE_MS);
+
+    this.refill(now);
+    const budget = Math.min(Math.floor(this.tokens), this.cap - this.inFlight.size);
+    if (budget <= 0) return;
+
+    const rows = drainOutbound(this.db, this.row.alias, now, RELAY_DEDUPE_MS, budget)
+      .filter(r => !this.inFlight.has(r.id));
+    for (const row of rows) this.send(row, now);
+  }
+
+  private send(row: Message, now: number): void {
+    if (this.client === null) return;
+    this.tokens -= 1;
+    this.inFlight.add(row.id);
+
+    const remote = row.to_agent!.slice(row.to_agent!.indexOf(':') + 1);
+    // Never 0 for a stored row: ttl 0 means ephemeral, and this row is queued.
+    const ttl = row.expires_at === null ? undefined : Math.max(1, row.expires_at - now);
+
+    this.client.relay({
+      type: 'relay',
+      msg_id: row.id,
+      kind: 'direct',
+      from: row.from_agent,
+      to: remote,
+      payload: row.payload,
+      content_type: row.content_type,
+      ...(ttl !== undefined ? { ttl_ms: ttl } : {}),
+    }).then(
+      () => {
+        this.inFlight.delete(row.id);
+        // delivered_at is set ONLY on the peer's ack — never on send.
+        markDelivered(this.db, row.id);
+        incPeerRelay(this.row.alias, 'outbound', 'delivered');
+        this.backoff = BACKOFF_MIN_MS;
+        this.drain();
+      },
+      (err: { code?: string }) => {
+        this.inFlight.delete(row.id);
+        this.onSendError(row, err);
+      },
+    );
+  }
+
+  private onSendError(row: Message, err: { code?: string }): void {
+    const code = err?.code ?? 'UNKNOWN';
+
+    if (code === 'RELAY_REFUSED') {
+      // PERMANENT. The far side will refuse this message every time — no
+      // amount of retrying changes a border decision.
+      markMessageFailed(this.db, row.id, code, Date.now());
+      incPeerRelay(this.row.alias, 'outbound', 'refused');
+      // Tell the originating agent if it is still here (D5). Best-effort: a
+      // sender that has gone offline learns nothing, which is why failed_code
+      // is on the row rather than only in a frame.
+      const sock = this.agentIndex.get(row.from_agent);
+      if (sock !== undefined) {
+        try {
+          sock.send(JSON.stringify({ type: 'error', code: 'REMOTE_REFUSED', ref: row.id }));
+        } catch { /* ignore */ }
+      }
+      return;
+    }
+
+    if (code === 'RATE_LIMITED') {
+      // Our estimate of the receiver's capacity is too high. Halve the local
+      // refill until the next success rather than retrying at the same rate —
+      // otherwise an over-stated rate_per_min loops instead of converging.
+      this.refillPerMin = Math.max(1, Math.floor(this.refillPerMin / 2));
+      incPeerRelay(this.row.alias, 'outbound', 'rate_limited');
+      this.scheduleRetry();
+      return;
+    }
+
+    // ACK_TIMEOUT / CONNECTION_RESET / anything else: TRANSIENT. The row stays
+    // pending and leaves in-flight, so the next drain picks it up.
+    incPeerRelay(this.row.alias, 'outbound', 'transient');
+    this.scheduleRetry();
+  }
+}
+
+/** alias -> forwarder, for the admin handlers and the gauge. */
+export const forwarders = new Map<string, Forwarder>();
+
+/**
+ * Wire the border into a running server: register the factory the admin API
+ * refuses to work without, start a forwarder per ENABLED row, and drain on
+ * enqueue.
+ *
+ * BOOT IS F2b's. F2a starts nothing and passes no registry — that is what keeps
+ * the front half inert between the two merges, and it means the boot path had
+ * no owner until now.
+ */
+export function startBorder(db: Database, agentIndex: Map<string, WebSocket>): {
+  create: (row: OutboundPeer) => void;
+  stop: (alias: string) => void;
+  stopAll: () => void;
+} {
+  const create = (row: OutboundPeer): void => {
+    forwarders.get(row.alias)?.stop();
+    const f = new Forwarder(db, row, agentIndex);
+    forwarders.set(row.alias, f);
+    f.start();
+  };
+  const stop = (alias: string): void => {
+    forwarders.get(alias)?.stop();
+    forwarders.delete(alias);
+  };
+
+  for (const row of listEnabledOutboundPeers(db)) create(row);
+
+  borderEvents.on('enqueued', (alias: EnqueuedEvent) => {
+    // The listener owns its try/catch: EventEmitter delivers synchronously, so
+    // a throw here would reach routeDirect's emit site.
+    try { forwarders.get(alias)?.drain(); } catch (err) {
+      console.error(JSON.stringify({ evt: 'border.drain_threw', alias, error: String(err), at: Date.now() }));
+    }
+  });
+
+  return { create, stop, stopAll: () => { for (const f of forwarders.values()) f.stop(); forwarders.clear(); } };
+}

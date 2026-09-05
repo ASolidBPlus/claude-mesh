@@ -25,7 +25,11 @@ export const PEER_SWEEP_INTERVAL_MS = 15_000;
 
 export function startCleanup(
   db: Database,
-  agentIndex: Map<string, WebSocket>,
+  /** Kept in the signature, unused in the body since #84's agent sweep was not
+   *  carried forward: every caller passes it positionally, and removing it
+   *  would silently shift `intervalMs` into its place at four call sites. The
+   *  underscore says "deliberately unused", not "forgotten". */
+  _agentIndex: Map<string, WebSocket>,
   intervalMs?: number,
   retentionMs?: number | null,
   // F1a: alias -> peer socket, so the sweep can close a revoked peer's live

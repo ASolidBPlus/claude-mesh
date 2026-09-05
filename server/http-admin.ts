@@ -41,6 +41,7 @@ import {
   getPeerKeyBySecret, revokePeerKey, getPeerByAlias, upsertPeer, getPeerKeyById, type PeerKey,
   insertOutboundPeer, getOutboundPeer, listOutboundPeers, updateOutboundPeer, endOutboundPeering, type OutboundPeer,
 } from './db.ts';
+import { PEER_PROTOCOL_VERSION } from '../client/src/protocol.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
 import { renderMetrics } from './metrics.ts';
@@ -1527,7 +1528,10 @@ async function handlePeerRegister(ctx: AdminCtx): Promise<void> {
     token, // shown ONCE
     kinds: JSON.parse(peer.kinds) as string[],
     rate_per_min: peer.rate_per_min,
-    protocol: 1,
+    // The ONE constant. A literal here advertises a version auth may not
+    // accept — registration succeeds, authentication always fails, and it
+    // looks like a peer-side fault.
+    protocol: PEER_PROTOCOL_VERSION,
   }));
 }
 

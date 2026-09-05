@@ -1,5 +1,6 @@
-import { openDb, findPeerAliasCollisions } from './db.ts';
+import { openDb, findPeerAliasCollisions, listPeers, listOutboundPeers } from './db.ts';
 import { setPeerUpSource } from './metrics.ts';
+import { startBorder, forwarders } from './border.ts';
 import { startWsServer, WsServerHandle } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
@@ -189,9 +190,29 @@ async function main() {
   // F1b: mesh_peer_up reads the LIVE index rather than a stored column —
   // `peers` has no `online` field, and after #87 a durable liveness claim that
   // outlives the process is exactly what must not exist.
-  setPeerUpSource(() => peerIndex.keys());
+  // #108, BOTH HALVES: mesh_peer_up must be emitted at 0 OR 1 for every
+  // CONFIGURED peer, never only for connected ones. A series that appears only
+  // once set cannot be alerted on — "no data" and "never configured" look
+  // identical, and the alert you want is exactly "this peering went to 0".
+  setPeerUpSource(() => {
+    const out: { alias: string; up: boolean }[] = [];
+    // Inbound: every peer that has registered, up iff a socket is held.
+    for (const p of listPeers(db)) out.push({ alias: p.alias, up: peerIndex.has(p.alias) });
+    // Outbound: every configured peering, up iff its forwarder is connected.
+    for (const row of listOutboundPeers(db)) {
+      out.push({ alias: row.alias, up: forwarders.get(row.alias)?.connected === true });
+    }
+    return out;
+  });
 
-  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, observerIndex, peerIndex);
+  // F2b: the border. Registering the factory is what makes POST
+  // /outbound-peers work at all — F2a refuses with 503 while `create` is
+  // absent, which is what kept main inert between the two merges. This call
+  // also starts one forwarder per ENABLED row, the boot path F2a had no owner
+  // for.
+  const border = startBorder(db, wsHandle.agentIndex);
+
+  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, observerIndex, peerIndex, border);
 
   let cleanupHandle: CleanupHandle | null = null;
   let reminderHandle: ReminderSchedulerHandle | null = null;
