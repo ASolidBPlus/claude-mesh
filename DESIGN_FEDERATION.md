@@ -410,6 +410,16 @@ fleet — meaning the fleet god view necessarily sees every tenant's intra-org t
 With it, the operator chooses per grant: `home`-scoped for fleet observability,
 global (`NULL`) only where cross-tenant visibility is actually wanted.
 
+**And "reserved" must be enforced, not asserted** *(lane finding)*: §3/§5.1 already
+refuse `home` at `POST /agents` and key minting, but a reserved word is only reserved
+if **one validator** refuses it at **every** namespace-writing surface. Rule: a
+single tenant-name validator — rejecting `home`, `mesh`, and any future reserved
+scope word, with the reason stated at the validator — applied at `POST /agents`,
+`PATCH /agents/:id` (the previously-unguarded surface: an admin PATCH could have
+minted a tenant literally named `home`, making every `home`-scoped observer grant
+ambiguous between fleet scope and that tenant's traffic), and
+`POST /registration-keys`.
+
 **Disclosure owed to third-party tenants** — stated here because it is a property of
 the design, not a bug: a **global tap exists** and the host operator can hold one, so
 the operator *can* observe all bus traffic, including a tenant's intra-org messages;
@@ -517,18 +527,35 @@ layer do the isolation. One primitive, two consumers.
 | 3 | Scoped observers (§7) | 1 |
 | 4 | README §federation + deploy-contract cross-ref (#71); worked example | 2,3 |
 
-**Link-creation gate** *(consumer-review amendment — this class of hazard would
-silently defeat C4)*: consumers that hold the admin token and write ACL edges in bulk
-can auto-satisfy the "per-pair ACL on top" layer for a whole tenant the moment a link
+**Tenant-grant refusal** *(consumer-review amendment, upgraded from an obligation to
+a bus-side refusal after lane review — this class of hazard would silently defeat
+C4)*: consumers that hold the admin token and write ACL edges in bulk can
+auto-satisfy the "per-pair ACL on top" layer for a whole tenant the moment a link
 exists. The known instance: mesh-chat's ACL reconciler expands orchestrator-role
 groups against the entire `GET /agents` roster and grants bidirectional user↔agent
 edges — tenant-minted agents would be auto-granted to every orchestrator-tier user.
-**Rule: no federation link may be created until every bulk `granted_by` writer
-(mesh-chat reconciler — fix in flight: "mesh-chat reconciler home-tenant filter
-(#72 C4)", chat-planner will supply the PR number; and any spawner:lifecycle-class
-writer) filters its grant targets to the home tenant (`namespace IS NULL`).** The
-fleet operator holds this gate. New bulk ACL writers inherit the same obligation:
-grant into `home` only, unless a tenant grant is the explicit, reviewed intent.
+
+The first version of this gate read "no link until *every* bulk `granted_by` writer
+filters to the home tenant" — a universal quantifier over an unenumerated set,
+spanning repositories the link-creator cannot read, held by a person, with no
+mechanism. It could only ever be believed released, not proven released. **The bus
+owns the ACL table, so the rule is a refusal instead** (lands in Phase 2, before the
+links API): **the shared grant path (`aclGrant` — reached from both `POST /acl` and
+the MCP grant tool) refuses any edge whose endpoint is a non-home-tenant agent
+unless the request carries an explicit `tenant_grant: true` field.** A writer that
+doesn't know about tenants — today's reconciler, any spawner:lifecycle-class writer,
+any future bulk granter — physically cannot grant into one; a deliberate tenant
+grant says so in the request, which is the "explicit, reviewed intent" made a field
+instead of a convention. The release condition collapses from "all writers
+everywhere comply" to "the refusal is deployed" — verifiable from this repo alone.
+
+The terminology guard (§3) is part of the same finding, not a tidiness item: the
+obligation version required every writer to filter by a field whose name means
+something *else* in the very codebase holding the known instance — compliance was
+fragile by construction; the refusal is immune to the vocabulary. mesh-chat's
+reconciler filter (Dinfra/mesh-chat #77, in flight — merge SHA + deploy confirmation
+to follow from chat-planner) remains worth shipping as defense-in-depth and hygiene,
+but **it is no longer the gate**.
 
 Builder briefs will be functionality-framed per fleet convention, cite this doc + ticket
 numbers, and go through the normal review lane; I do not implement.
