@@ -51,7 +51,7 @@ function connectWs(port: number): Promise<WebSocket> {
   });
 }
 
-function authConnect(port: number, db: Database, id: string, token: string): Promise<WebSocket> {
+function authConnect(port: number, id: string, token: string): Promise<WebSocket> {
   return connectWs(port).then(ws => new Promise<WebSocket>((resolve) => {
     ws.on('message', (data) => {
       const m = JSON.parse(data.toString());
@@ -86,14 +86,14 @@ async function aclQueriesForConnectEvent(peers: number): Promise<number> {
   const ids = seed(db, peers);
   const sockets: WebSocket[] = [];
   try {
-    for (const id of ids) sockets.push(await authConnect(port, db, id, `tok-${id}`));
+    for (const id of ids) sockets.push(await authConnect(port, id, `tok-${id}`));
     await wait(50);
 
     // Measure ONLY the hub's connect, which fires one presence broadcast to a
     // registry holding `peers` connected, ACL-related agents.
     const counter = countAclQueries(db);
     counter.reset();
-    sockets.push(await authConnect(port, db, 'hub', 'tok-hub'));
+    sockets.push(await authConnect(port, 'hub', 'tok-hub'));
     await wait(80);
     return counter.count();
   } finally {
