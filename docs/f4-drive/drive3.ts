@@ -25,6 +25,8 @@
 // later head replaces f62fca6c713259767a62a6bf536b7586ac45dbba (PR #172,
 // ASolidBPlus/claude-mesh, branch feat/f4-topics-across-peerings).
 const CHECKOUT = 'mesh-f4';
+/** ORIGIN_STAMPED=1: the receiving mesh prefixes `origin` with the alias it delivered through (F4 follow-up after #172). */
+const STAMP = process.env.ORIGIN_STAMPED === '1';
 import { MeshClient, PeerClient } from './mesh-f4/client/src/index.ts';
 import type { Inbound } from './mesh-f4/client/src/index.ts';
 
@@ -469,7 +471,7 @@ async function main(): Promise<void> {
   expect('p15', 'delivered_once_per_peering_not_per_subscriber', [p15.pod1_relay_in_topic, p15.pod2_relay_in_topic], [1, 1],
     'one outbound row per pod, asserted through the border counter — the admin API exposes no message rows');
   expect('p15', 'delivery_shape', [p15.delivery?.kind, p15.delivery?.from, p15.delivery?.topic, p15.delivery?.origin],
-    ['topic', `orch:${TROLLBOX}`, `orch:${TROLLBOX}`, HUBPUB],
+    ['topic', `orch:${TROLLBOX}`, `orch:${TROLLBOX}`, STAMP ? `orch:${HUBPUB}` : HUBPUB],
     'stampedFrom is the topic principal; origin is the hub publisher for a hub-originated post');
   // CONTROL — pod1 has TWO subscribers; a per-subscriber frame would make the
   // border counter +2 and sub1b a recipient. Neither may happen.
@@ -543,7 +545,7 @@ async function main(): Promise<void> {
   expect('p17', 'granted_remote_subscriber_receives_exactly_once', p17.pod2_received, 1);
   expect('p17', 'publishers_own_mesh_receives_the_echo', p17.pod1_echo, 1,
     'one frame per peering cannot exclude the publisher; suppression would mean routing on origin');
-  expect('p17', 'origin_names_the_real_speaker', [remote?.origin, echo?.origin], [`pod1:${PUB1}`, `pod1:${PUB1}`]);
+  expect('p17', 'origin_names_the_real_speaker', [remote?.origin, echo?.origin], STAMP ? [`orch:pod1:${PUB1}`, `orch:pod1:${PUB1}`] : [`pod1:${PUB1}`, `pod1:${PUB1}`]);
   expect('p17', 'from_is_the_topic_principal_on_both_spokes', [remote?.from, echo?.from], [`orch:${TROLLBOX}`, `orch:${TROLLBOX}`]);
   expect('p17', 'pod2_msg_id_differs_from_pod1', remote !== null && echo !== null && remote.msgId !== echo.msgId, true,
     'each mesh mints a fresh crypto.randomUUID() per copy; the SDK does not expose the publisher-side msg_id, so pod1\'s id is read from its own delivery');
@@ -617,7 +619,7 @@ async function main(): Promise<void> {
   });
   expect('p18b', 'forged_frame_accepted_at_the_border', forged.ok, true);
   expect('p18b', 'from_agent_unchanged_by_origin', [forgedDelivery?.from, forgedDelivery?.topic], [`orch:${TROLLBOX}`, `orch:${TROLLBOX}`]);
-  expect('p18b', 'origin_carried_verbatim_and_display_only', forgedDelivery?.origin, 'orch:admin');
+  expect('p18b', 'origin_carried_verbatim_and_display_only', forgedDelivery?.origin, STAMP ? 'orch:orch:admin' : 'orch:admin');
   expect('p18b', 'granted_subscriber_still_receives', got(sub2, forgedMarker).length, 1);
   // CONTROL — the whole point: an edge from the FORGED principal must buy
   // nothing. If sub2b receives, `origin` became the ACL principal.
