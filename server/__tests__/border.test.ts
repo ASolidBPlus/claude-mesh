@@ -47,6 +47,22 @@ function sourceFiles(dir: string): string[] {
   return out;
 }
 
+// THE edge classifier, used by BOTH #131 guards below (the reader/specifier pin
+// and the threshold walker). One function, so the two cannot disagree about
+// what an import is, and so a single test can pin it against the tool.
+//
+// Deliberately Bun.Transpiler rather than a regex: this is the component whose
+// behaviour the #131 invariant is about, and hand-parsing imports is where this
+// class flips from fail-safe to fail-open — a value edge misread as erased
+// returns clean on exactly the state the guard exists to catch.
+function importSpecifiers(src: string): string[] {
+  return new Bun.Transpiler({ loader: 'ts' }).scanImports(src).map(i => i.path);
+}
+
+function crossPackageSpecifiers(src: string): string[] {
+  return importSpecifiers(src).filter(p => p.startsWith('../client/'));
+}
+
 function peering(alias: string, rate = 600): void {
   insertOutboundPeer(db, {
     alias, url: `ws://127.0.0.1:7300`, token: 'SECRET-TOKEN-VALUE',
@@ -388,7 +404,7 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
       let emitted: string;
       try { emitted = transpiler.transformSync(src); } catch { emitted = ''; }
       if (!/\bPEER_PROTOCOL_VERSION\b/.test(emitted)) continue;   // not a reader
-      const providers = transpiler.scanImports(src).filter(i => PROVIDER.test(i.path)).map(i => i.path);
+      const providers = importSpecifiers(src).filter(p => PROVIDER.test(p));
       readers.push(`${f.slice(root.length + 1)} <- ${providers.length > 0 ? providers.sort().join(', ') : '(defines it)'}`);
     }
 
@@ -421,20 +437,59 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
   // server/ today, which is precisely why a regex would have kept looking right.
   // Comments need no stripping: the transpiler does not see them.
   //
-  // Positive-controlled on a synthetic file carrying all six forms: `import type`
-  // absent (erased), `import { type B, C }` present (C is a value), side-effect
-  // present, `export *` present, dynamic present, commented-out absent.
+  // The classifier both guards share is itself pinned against the tool, on every
+  // import form, by *`#131: the edge classifier sees every import form`* below.
+  // That test used to be this sentence — a claim of a positive control that
+  // existed only as prose, with nothing feeding a synthetic source to anything.
+  // Same class as the size invariant two commits earlier: described, not
+  // enforced.
+  // Pins OUR filter against the tool on every form an import can take. It is a
+  // real assertion rather than a claim that one was run: both #131 guards are
+  // only as good as this classifier, and if a future bun changes what
+  // scanImports emits, this is what says so instead of the guards quietly
+  // going blind.
+  //
+  // `import type` must be ABSENT — erased before any module edge exists, which
+  // is why router.ts is not in the edge set. Everything else must be present,
+  // including the four forms a `from`-anchored regex cannot see at all
+  // (side-effect, `export *`, dynamic, require) and the double-quoted form that
+  // was measured fail-open in the previous pin.
+  //
+  // The two commented-out imports — one line, one block — must also be absent.
+  // That is the property which justified deleting this file's comment-stripping
+  // code when the classifier moved to the transpiler; without it in the control,
+  // that deletion rests on a claim rather than a check.
+  it('#131: the edge classifier sees every import form', () => {
+    const synthetic = [
+      `import type { A } from '../client/x-type.ts';`,          // erased
+      `import { B } from '../client/x-single.ts';`,
+      `import { C } from "../client/x-double.ts";`,             // quote style is not a rule here
+      `import '../client/x-side-effect.ts';`,                   // no `from` clause
+      `export * from '../client/x-star.ts';`,
+      `const d = await import('../client/x-dynamic.ts');`,
+      `const e = require('../client/x-require.ts');`,
+      `// import { F } from '../client/x-line-comment.ts';`,    // not code
+      `/* import { G } from '../client/x-block-comment.ts'; */`, // not code either
+      `void [B, C, d, e];`,
+    ].join('\n');
+
+    expect(crossPackageSpecifiers(synthetic).sort()).toEqual([
+      '../client/x-double.ts',
+      '../client/x-dynamic.ts',
+      '../client/x-require.ts',
+      '../client/x-side-effect.ts',
+      '../client/x-single.ts',
+      '../client/x-star.ts',
+    ]);
+  });
+
   it('#131: no server file with a runtime cross-package import reaches the cache threshold', () => {
     const THRESHOLD = 51_200;   // fine-bisected: 51,197 -> 0 cache entries, 51,497 -> 1
     const root = join(import.meta.dir, '..', '..');
-    const transpiler = new Bun.Transpiler({ loader: 'ts' });
 
     const rows: { file: string; size: number; specs: string[] }[] = [];
     for (const f of sourceFiles(join(root, 'server'))) {
-      const specs = transpiler
-        .scanImports(readFileSync(f, 'utf8'))
-        .filter(i => i.path.startsWith('../client/'))
-        .map(i => `${i.path} (${i.kind})`);
+      const specs = crossPackageSpecifiers(readFileSync(f, 'utf8'));
       if (specs.length > 0) rows.push({ file: f.slice(root.length + 1), size: statSync(f).size, specs });
     }
 
