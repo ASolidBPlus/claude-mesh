@@ -353,3 +353,10 @@ C14. **Peering arithmetic for the docs:** N pods cost the hub 2N peering rows + 
 Superseded by this section: B2's `orch:topic:` remote spelling; B1's "per-subscriber ACL with publisher id
 'pod1:publisher'" on the hub; v0's "kind is NOT a label"; B1's "the mesh where the topic row is local".
 Unchanged: the operator's decisions 1–5, the topology, B3's kinds set, A1–A14 except as refined by C11/C12.
+
+---
+# DRIVE RESULT — 2026-09-06 17:55Z — sandbox at 332de94 (== merged tree of #172, main a3a75aa)
+f2-verify/drive3.ts (three-mesh sandbox: pod1 7432/7433, orch 7442/7443, pod2 7452/7453; identity labels off).
+SUMMARY: PASS — 61 checks, 0 failed, 14 controls, 67.6 s, first run. Steps: setup 3, P13 mint 15, P14 registry+C9 12, P15 hub publish 7, P16 pause 6, P17 spoke post/transit/echo 8, P18a refused post 4, P18b forged origin 6.
+Plan-vs-code settled by the drive: P16 — a PAUSED hub→spoke peering gets NO row (drop, not queue); plan §12 was wrong; decision = drop (consistent with direct's paused refusal); doc+test in the follow-up PR.
+Run log: f2-verify/run-f4-332de94.jsonl. Caveat: observes a sandbox built from the PR head, not production.
