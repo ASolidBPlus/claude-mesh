@@ -1,9 +1,16 @@
 name: CI
 
 # The repository's single CI workflow, and the ONLY place the test suite and
-# the typecheck ratchet run — on EVERY pull request regardless of its base
-# branch, and on every push to main. (Stacked PRs test head-merged-into-parent;
-# a base filter would silently exempt them.)
+# the typecheck ratchet run.
+#
+# WHICH EVENTS RUN THE SUITE: push (main + v* tags), every pull_request
+# regardless of its base branch, merge_group (the merge queue), and
+# workflow_dispatch.
+# WHICH EVENTS PUBLISH: push, and only push. The ghcr login and the image push
+# are both gated `== 'push'`, so every other event builds and publishes nothing.
+#
+# (Stacked PRs test head-merged-into-parent; a base filter would silently
+# exempt them.)
 # Jobs:
 #   test      — bun test, server and client
 #   typecheck — the error-count ratchet (.github/scripts/typecheck-ratchet.sh);
@@ -54,6 +61,23 @@ on:
   #
   # (This comment used to say it was for branches whose runs had been "filtered
   # away" — the bug this same change removes. That reason no longer exists.)
+  # The merge queue. GitHub runs required checks on a merge_group ref — the
+  # queued PRs merged together with the base — and a queue whose checks never
+  # run either blocks forever or merges unverified, depending on how it is
+  # configured. Bare, like the other two: every merge_group event runs the
+  # suite.
+  #
+  # It PUBLISHES NOTHING. The ghcr gates below are `== 'push'`, so this event is
+  # excluded by construction rather than by remembering to exclude it — which is
+  # the whole reason those gates stopped being `!= 'pull_request'`: a
+  # denial-listed condition admits every event added later, and this is the
+  # third event added since.
+  #
+  # Its provenance lines print the event and ref rather than parents, which is
+  # right: a merge_group ref is not refs/pull/N/merge, and PR evidence comes
+  # from pull_request runs.
+  merge_group:
+
   workflow_dispatch:
 
 concurrency:
