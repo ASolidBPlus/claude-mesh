@@ -153,6 +153,10 @@ function formatAgent(agent: Agent): Record<string, unknown> {
     registered_at: agent.registered_at,
     last_seen: agent.last_seen,
     last_alive: agent.last_alive ?? null,
+    // #133: the LOOP's proof-of-life, beside the transport's. null until the
+    // emitter ships (spawner#346) — a null is honest; a number that meant
+    // something else is what this exists to stop.
+    last_responded: agent.last_responded ?? null,
   };
 }
 
@@ -1625,6 +1629,12 @@ function publicOutboundFields(row: OutboundPeer) {
     rate_per_min: row.rate_per_min,
     enabled: row.enabled === 1,
     created_at: row.created_at,
+    // NO last_responded here. This serialises an OutboundPeer — a PEERING —
+    // and its last_alive is the peering's liveness, a different subject from an
+    // agent's. #133 exists because one entity's liveness was read as another's;
+    // adding a loop-liveness field to a peering row would be the same
+    // conflation, committed while fixing it. (It was: an edit matching
+    // `last_alive` by name landed here first.)
     last_alive: row.last_alive,
   };
 }

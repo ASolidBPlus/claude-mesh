@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as net from 'net';
-import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
+import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
 import { validateToken } from './auth.ts';
 import { PEER_PROTOCOL_VERSION } from './wire-version.ts';  // #131: via the tiny module, never cross-package from here
 import { parseDuration } from './duration.ts';
@@ -104,6 +104,35 @@ function handlePing(ctx: FrameCtx): void {
     // the two fields distinct is the whole point of last_alive.
     touchAlive(db, state.agentId);
   }
+}
+
+/**
+ * #133 — the agent's LOOP reports that it is alive, as distinct from its
+ * transport.
+ *
+ * WHY A SEPARATE FRAME rather than inferring it from traffic. Every existing
+ * frame is sent by the plugin, and the plugin is a separate process that keeps
+ * working while the agent's loop is stuck: an agent wedged for 55 minutes had a
+ * last_alive fresh to the second. Advancing this on `send` or `publish` would
+ * reproduce exactly that defect one field over, because the plugin emits those
+ * on the agent's behalf too.
+ *
+ * SO THE SERVER SHIPS THIS INERT. Nothing sends `loop_alive` today; the emitter
+ * is spawner#346, which must emit it from the turn loop rather than a timer.
+ * Until then last_responded stays null everywhere, and null is the honest
+ * answer — "we do not know whether the loop is alive" is what the roster could
+ * truthfully say all along.
+ *
+ * WHAT THE SERVER CANNOT VERIFY, said here because the field is worth exactly
+ * this much: it sees a socket and bytes, and cannot tell a loop-originated
+ * frame from one a timer produced. last_responded is a CLAIM BY THE EMITTER,
+ * like turn_status. The server's job is to keep that claim distinguishable from
+ * the transport's, not to authenticate it — and the way it does that is by
+ * having a frame nothing else sends.
+ */
+function handleLoopAlive(ctx: FrameCtx): void {
+  const { state, db } = ctx;
+  if (state.agentId !== null) touchResponded(db, state.agentId);
 }
 
 function handleSend(ctx: FrameCtx): void {
@@ -388,7 +417,7 @@ function handleListPresence(ctx: FrameCtx): void {
   const peers = listAclPeers(db, caller);
   const result = all
     .filter(a => a.id === caller || peers.has(a.id))
-    .map(a => ({ id: a.id, online: a.online === 1, last_seen: a.last_seen, last_alive: a.last_alive ?? null }));
+    .map(a => ({ id: a.id, online: a.online === 1, last_seen: a.last_seen, last_alive: a.last_alive ?? null, last_responded: a.last_responded ?? null }));
   const resp: { type: string; ref?: string; agents: typeof result } = { type: 'presence_list', agents: result };
   if (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) resp.ref = frame.msg_id;
   try {
@@ -405,6 +434,7 @@ function handleListPresence(ctx: FrameCtx): void {
 // this map.
 export const POST_AUTH_HANDLERS: Record<string, FrameHandler> = {
   ping: handlePing,
+  loop_alive: handleLoopAlive,   // #133
   send: handleSend,
   ack: handleAck,
   publish: handlePublish,
@@ -485,7 +515,8 @@ export function startWsServer(
     // event — and the only reachable case requires both a second socket AND a
     // self-edge, but it is a behaviour change and is pinned by a test.
     function broadcastStatus(agentId: string, online: boolean, lastSeen: number, excludeWs: WebSocket | null) {
-      const statusMsg = JSON.stringify({ type: 'agent_status', agent_id: agentId, online, last_seen: lastSeen, last_alive: getAgentById(db, agentId)?.last_alive ?? null });
+      const subject = getAgentById(db, agentId);
+      const statusMsg = JSON.stringify({ type: 'agent_status', agent_id: agentId, online, last_seen: lastSeen, last_alive: subject?.last_alive ?? null, last_responded: subject?.last_responded ?? null });
       const peers = listAclPeers(db, agentId);
       for (const [otherWs, otherState] of registry) {
         if (otherWs === excludeWs) continue;

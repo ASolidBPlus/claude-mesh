@@ -259,6 +259,7 @@ function handleMeshDiscover(ctx: ToolCtx): ToolResult {
     metadata: JSON.parse(agent.metadata) as Record<string, unknown>,
     last_seen: agent.last_seen,
     last_alive: agent.last_alive ?? null,
+    last_responded: agent.last_responded ?? null,
     registered_at: agent.registered_at,
   }));
 

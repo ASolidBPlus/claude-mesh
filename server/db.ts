@@ -20,6 +20,7 @@ export interface Agent {
       it last alive" are different questions, and overloading last_seen would
       silently change its meaning for every existing consumer. */
   last_alive: number | null;
+  last_responded: number | null;
   online: number;          // 0 | 1
 }
 
@@ -229,7 +230,8 @@ export function openDb(path: string): Database {
       rate_per_min   INTEGER NOT NULL DEFAULT 600,
       enabled        INTEGER NOT NULL DEFAULT 1,
       created_at     INTEGER NOT NULL,
-      last_alive     INTEGER
+      last_alive     INTEGER,
+      last_responded INTEGER
     );
 
     -- F0b (§3, §4): PEER MESHES. A peer is another claude-mesh, not an agent.
@@ -431,6 +433,13 @@ export function openDb(path: string): Database {
   // exact current meaning for every consumer.
   try { db.exec('ALTER TABLE agents ADD COLUMN last_alive INTEGER'); } catch {}
 
+  // #133 migration: `last_responded` — proof the agent's LOOP is alive, as
+  // distinct from its transport. Existing rows get NULL and stay NULL until
+  // something writes it, which is the honest answer: the server half ships
+  // before the emitter (spawner#346), and a roster showing `null` is better
+  // than one showing a number that means something else.
+  try { db.exec('ALTER TABLE agents ADD COLUMN last_responded INTEGER'); } catch {}
+
   // F3 migration: observer grants made before federation existed are LOCAL-ONLY.
   // The default is 0 rather than 1 on purpose — an operator who granted "see
   // everything" in a mesh with no borders did not consent to cross-border
@@ -577,6 +586,33 @@ export function touchAgent(db: Database, id: string): void {
     NOT touch last_seen, so "last acted" stays untouched by mere liveness. */
 export function touchAlive(db: Database, id: string): void {
   db.prepare('UPDATE agents SET last_alive = ? WHERE id = ?').run(Date.now(), id);
+}
+
+/**
+ * #133 — stamp proof that the agent's LOOP responded, not its transport.
+ *
+ * WHY A THIRD FIELD RATHER THAN FIXING last_alive. The keepalive that advances
+ * last_alive is answered by the mesh PLUGIN, which is a separate process with
+ * its own WebSocket client. It keeps ponging while the agent's loop is stuck:
+ * measured on 2026-09-06, an agent wedged for 55 minutes had a last_alive fresh
+ * to the second. last_alive is not wrong — it truthfully reports that the
+ * transport is alive. It is read as something it never claimed.
+ *
+ * So last_alive keeps its name and its meaning and nothing is renamed to hide
+ * the difference; a fourth reading is added instead. `online` = has a socket,
+ * `last_seen` = last acted, `last_alive` = transport answered,
+ * `last_responded` = the loop emitted something only the loop can emit.
+ *
+ * WHAT THE SERVER CAN AND CANNOT VERIFY, stated because the field is only worth
+ * what this sentence says. The server cannot tell a loop-originated frame from
+ * one the transport synthesised — it sees a socket and bytes. `last_responded`
+ * is therefore a CLAIM BY THE EMITTER, exactly like turn_status: it is only as
+ * true as the plugin's discipline in emitting it from the turn loop rather than
+ * from a timer. The server's job is to keep the claim distinguishable from the
+ * transport's, not to authenticate it.
+ */
+export function touchResponded(db: Database, id: string): void {
+  db.prepare('UPDATE agents SET last_responded = ? WHERE id = ?').run(Date.now(), id);
 }
 
 /**
