@@ -97,7 +97,7 @@ if [ "${1:-}" = --selftest ]; then
   # and a deleted explainer (one) both fail.
   n=$(grep -c '^# 5 ' "$0"); [ "$n" = 2 ] || { echo "SELFTEST FAIL: marker '# 5' appears $n times (expected 2: definition explainer + invocation)"; exit 1; }
   # sub-markers for the checks that have no numbered line of their own
-  for mk in '# 3a' '# 6b' '# 6c'; do n=$(grep -c "^$mk " "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: marker '$mk' appears $n times"; exit 1; }; done
+  for mk in '# 3a' '# 3b' '# 6b' '# 6c'; do n=$(grep -c "^$mk " "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: marker '$mk' appears $n times"; exit 1; }; done
   # INVOCATION, not just definition: a predicate defined once and called zero times still
   # "exists" (sec-reviewer's mutant on #151: the join_check call deleted, inventory quiet).
   # Each predicate must be called from the gate body exactly once, at column 0.
@@ -210,6 +210,23 @@ fi
 if [ "${REFRESH:-0}" = 1 ]; then
   for i in $(seq 1 60); do nr=$(gh api "repos/$R/actions/runs?head_sha=$HEAD&event=pull_request" --jq '.workflow_runs|sort_by(.created_at)|last|"\(.id) \(.status)"'); set -- $nr; [ "${2:-}" = completed ] && break; sleep 10; done
   note "newest run: ${nr:-none}"
+fi
+# 3b REACHABILITY — what merged since this head was reviewed. Two correct PRs composed into an
+# unreachable feature (#147 shipped a field only loop_alive advances; #145, merged hours later,
+# made the obvious way to send it displace the primary socket). No diff, suite, or range
+# question asked of either alone can see that; the only vantage is merge time, with the list
+# of intervening merges in front of a human. The gate cannot judge reachability; it can stop
+# the question being asked from memory.
+# DELIBERATELY UNFILTERED. Do not narrow this list by file overlap: overlap is a proxy for a
+# relation it does not capture ("what can DRIVE this code", not "what files does it share").
+# The one instance we have happened to overlap in ws-server.ts, but the missing door was in
+# client.ts, which #145 never touched — an overlap filter would have caught it by luck.
+since=$(git log --oneline --first-parent "$(git merge-base "$HEAD" "$maintip")..$maintip" 2>/dev/null)
+if [ -n "$since" ]; then
+  note "merged since this head's merge-base with main ($(wc -l <<<"$since") commits) — ask: does any of these change what this PR can be DRIVEN BY, or make a workaround it relies on harmful?"
+  while IFS= read -r l; do echo "      $l"; done <<<"$since"
+else
+  note "nothing merged to main since this head's merge-base — no reachability question"
 fi
 # 4 — `event=pull_request` is deliberate and must stay: a merge_group run (the merge queue)
 # prints event/ref instead of parents, which is correct there and byte-identical to the
