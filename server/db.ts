@@ -605,6 +605,11 @@ export function touchAlive(db: Database, id: string): void {
  * `last_seen` = last acted, `last_alive` = transport answered,
  * `last_responded` = the loop emitted something only the loop can emit.
  *
+ * THIS IS THE CANONICAL DEFINITION. README's presence section expands it for
+ * operators — deliberately an expansion, not a copy, because prose for a reader
+ * mid-incident needs more than a four-clause sentence. If the model changes,
+ * change it here first; the README then follows.
+ *
  * WHAT THE SERVER CAN AND CANNOT VERIFY, stated because the field is only worth
  * what this sentence says. The server cannot tell a loop-originated frame from
  * one the transport synthesised — it sees a socket and bytes. `last_responded`

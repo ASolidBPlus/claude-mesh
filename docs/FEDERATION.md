@@ -265,6 +265,12 @@ into a statement your deployment either satisfies or does not, visible at boot.
 
 ### Break-glass: attributing a flood
 
+> **This section is the single home for the break-glass procedure and for which
+> counter attributes which class.** The README's env-table row and counters line
+> point here rather than restating it. They restated it once, the two copies
+> drifted, and the copy an operator reads mid-incident was the stale one — so if
+> you change what the flag attributes, change it here and nowhere else.
+
 **The problem this solves, and its exact scope.** With
 `MESH_METRICS_IDENTITY_LABELS` unset — the default, and the right default —
 `mesh_acl_denied_total` collapses to an aggregate: the rate stays visible and
