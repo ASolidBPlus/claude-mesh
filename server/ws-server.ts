@@ -96,15 +96,6 @@ interface AuthCtx {
   observerIndex: Map<string, WebSocket>;
   presenceState: Map<string, PresenceState>;
   broadcastStatus: (agentId: string, online: boolean, lastSeen: number, excludeWs: WebSocket | null) => void;
-  /** The peer arm clears the auth timer a SECOND time. The call site already
-   *  cleared it before dispatching here, so this is a no-op on an
-   *  already-cleared timer — but it is in the code being moved, so it moves,
-   *  and removing it is a behaviour question that does not belong in a
-   *  mechanical commit. Passed as a callback rather than dropped, so the move
-   *  stays verbatim and the redundancy stays VISIBLE instead of being quietly
-   *  resolved by the refactor. Found by the characterisation tests on the first
-   *  run of this extraction: `ReferenceError: authTimer is not defined`. */
-  clearAuthTimer: () => void;
 }
 
 /**
@@ -128,7 +119,7 @@ interface AuthCtx {
  * function that has no other reason to know about it.
  */
 function handleAuthFrame(ctx: AuthCtx): void {
-  const { ws, state, db, frame, parsed, agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus, clearAuthTimer } = ctx;
+  const { ws, state, db, frame, parsed, agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus } = ctx;
 
   if (typeof parsed !== 'object' || parsed === null || frame.type !== 'auth') {
     try {
@@ -223,7 +214,18 @@ function handleAuthFrame(ctx: AuthCtx): void {
     // an agent, and every agent-shaped path keys off agentId.
     state.authed = true;
     state.peerAlias = agentId;
-    clearAuthTimer();
+    // NO auth-timer clear here. It used to sit on this line and it was a no-op:
+    // the ONE caller clears the timer before dispatching into this function, so
+    // this ran on an already-cleared timer. Measured before removing it — the
+    // review-suggested black-box test (peer auth, wait past the 5 s timeout,
+    // assert the socket lives) passes identically with and without the line,
+    // because the property is defended twice over: the call-site clear AND the
+    // timer callback's own `!state.authed` guard. A line no test can see is a
+    // line no test should be written to freeze.
+    //
+    // What makes that safe is the call site, not this comment: the timer is
+    // cleared on every path into here, pinned by the one-call-site test in
+    // auth-seam.test.ts.
 
     // NEWER WINS (D11). ORDER IS LOAD-BEARING: index the new socket
     // FIRST, then close the old one.
@@ -1128,7 +1130,6 @@ export function startWsServer(
             handleAuthFrame({
               ws, state, db, frame, parsed,
               agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus,
-              clearAuthTimer: () => clearTimeout(authTimer),
             });
             return;
           }

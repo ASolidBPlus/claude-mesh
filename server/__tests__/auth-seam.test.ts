@@ -237,6 +237,43 @@ describe('#143 auth seam, characterised before the cut', () => {
     c.ws.close();
   }, 20_000);
 
+  // THE CALL-SITE CLEAR IS THE WHOLE DEFENCE, so the thing to pin is that there
+  // is only one call site and that it clears.
+  //
+  // The peer arm used to clear the auth timer a second time. It was a no-op —
+  // measured: the black-box test above passes identically with and without it,
+  // because the property is defended twice (this clear AND the timer callback's
+  // own `!state.authed` guard). It is deleted rather than frozen by a test that
+  // cannot discriminate it. What replaces it is this: read the source, find
+  // every call of handleAuthFrame, and require that the block making the call
+  // clears the timer first.
+  //
+  // WHAT THIS CANNOT SEE, said because it is a source scan and those overstate:
+  // it reads call sites by name, so a call reached through an alias or a
+  // dynamic dispatch is invisible to it. That is acceptable while the function
+  // is module-private with one caller — which is exactly what the first
+  // assertion pins, and the assertion fails the moment it stops being true.
+  it('handleAuthFrame has ONE call site, and that site clears the auth timer', async () => {
+    const src = await Bun.file(join(import.meta.dir, '../ws-server.ts')).text();
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+
+    // The definition is `function handleAuthFrame(`; a call is any other
+    // occurrence followed by `(`.
+    const occurrences = [...code.matchAll(/\bhandleAuthFrame\s*\(/g)];
+    const definitions = [...code.matchAll(/function\s+handleAuthFrame\s*\(/g)];
+    expect(definitions.length).toBe(1);
+    expect(occurrences.length - definitions.length).toBe(1);
+
+    // ...and the call is preceded, in the same block, by the clear. Sliced
+    // backwards from the call to the enclosing `if (!state.authed) {`, so this
+    // is about the path INTO the function rather than about the whole file
+    // happening to contain a clearTimeout somewhere.
+    const callIdx = code.lastIndexOf('handleAuthFrame(');
+    const blockIdx = code.lastIndexOf('if (!state.authed) {', callIdx);
+    expect(blockIdx).toBeGreaterThan(-1);
+    expect(code.slice(blockIdx, callIdx)).toContain('clearTimeout(authTimer)');
+  });
+
   // `authed` (a captured local) and `state.authed` (on the registry row) are
   // set together at both assignment sites and read by different consumers: the
   // local by the pre-auth guard and the auth timer, the field by the presence
