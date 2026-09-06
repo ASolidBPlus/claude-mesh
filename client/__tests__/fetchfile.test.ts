@@ -84,8 +84,32 @@ describe('MeshClient.fetchFile (#56 F2b, over F3)', () => {
     expect(err?.status).toBe(404);
   });
 
-  it('rejects when serverUrl/token are missing (resolveConfig)', async () => {
-    const bad = new MeshClient({ httpUrl });
-    await expect(bad.fetchFile(FILE_ID)).rejects.toThrow();
+  // #100 moved the serverUrl check from resolveConfig (at call time) to the
+  // constructor. This test used to assert the LAZY behaviour — construct
+  // without a serverUrl, then watch fetchFile reject — and it is inverted here
+  // rather than deleted, because the property it guards still matters: a client
+  // that cannot know where to connect must not be usable. It just fails sooner.
+  it('#100 refuses at CONSTRUCTION when serverUrl is missing and the env is empty', () => {
+    const saved = process.env.MESH_SERVER_URL;
+    delete process.env.MESH_SERVER_URL;
+    try {
+      expect(() => new MeshClient({ httpUrl })).toThrow(/serverUrl is required/);
+    } finally {
+      if (saved !== undefined) process.env.MESH_SERVER_URL = saved;
+    }
+  });
+
+  // The env fallback is KEPT — production plugins depend on it. Constructing
+  // with no serverUrl is fine when the environment supplies one, which is the
+  // half of the behaviour #100 must not break.
+  it('#100 the environment fallback still constructs', () => {
+    const saved = process.env.MESH_SERVER_URL;
+    process.env.MESH_SERVER_URL = 'ws://127.0.0.1:1';
+    try {
+      expect(() => new MeshClient({ httpUrl })).not.toThrow();
+    } finally {
+      if (saved === undefined) delete process.env.MESH_SERVER_URL;
+      else process.env.MESH_SERVER_URL = saved;
+    }
   });
 });
