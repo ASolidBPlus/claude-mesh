@@ -342,6 +342,13 @@ Every admin authentication writes one structured event, **success and failure**
 (`server/http-admin.ts` `recordAdminAuth`), and every mutation that succeeded
 writes an `admin.mutation` event naming the route and the object in its path.
 
+**One route is outside that: `/metrics`.** It is answered before the dispatcher
+(`server/http-admin.ts` `startHttpAdmin`) and writes no event, because it is
+unauthenticated by design on this port — there is no credential to record the
+use of. So a reader scraping metrics leaves no trace here, and that is not a
+gap in the audit: nothing grants it, and the boot line already declares the
+port's exposure. Do not read "every admin authentication" as "every request".
+
 | field | read it as |
 |---|---|
 | `outcome`, `reason` | `reason` is `absent` or `invalid` and appears **only here** — the 401 body is identical for both, so a caller cannot use the difference (C9) |

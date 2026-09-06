@@ -23,6 +23,14 @@
  * `/[//]/`. Pinned in the helper's own tests as a KNOWN limitation rather than
  * left for someone to discover — a scanner whose limits are undocumented gets
  * trusted past them.
+ *
+ * A DEFINITION MAY CARRY TYPE PARAMETERS — `function f<T = {}>(…)` — and the
+ * definition regexes allow one flat `<…>` group. NESTED generics
+ * (`<T extends Map<string, number>>`) are NOT matched: `[^>]*` stops at the
+ * first `>`. The failure is loud and misleading rather than silent — the
+ * consumer is told "no definition of f" when the definition is right there —
+ * so it is written down here and fixtured below. Prevention: no function in
+ * this repo takes a type parameter today (seat 1, adversarial run on #173).
  */
 
 /** Which literal context a character sits in. */
@@ -139,7 +147,7 @@ export function codeOnly(src: string): string {
 
 /** `function name(` and `export [default] [async] function name(`, in code. */
 export function definitions(src: string, name: string): number {
-  const re = new RegExp(`(?:^|[^.\\w])(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${name}\\s*\\(`, 'g');
+  const re = new RegExp(`(?:^|[^.\\w])(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${name}\\s*(?:<[^>]*>)?\\s*\\(`, 'g');
   return [...codeOnly(src).matchAll(re)].length;
 }
 
@@ -201,7 +209,7 @@ export function isExported(src: string, name: string): boolean {
  */
 export function bodyOf(src: string, name: string): string {
   const code = codeOnly(src);
-  const defRe = new RegExp(`(?:^|[^.\\w])(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${name}\\s*\\(`, 'm');
+  const defRe = new RegExp(`(?:^|[^.\\w])(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${name}\\s*(?:<[^>]*>)?\\s*\\(`, 'm');
   const m = defRe.exec(code);
   if (m === null) throw new Error(`source-scan: no definition of ${name}`);
   const start = m.index + (m[0]!.startsWith('function') || m[0]!.startsWith('export') ? 0 : 1);
