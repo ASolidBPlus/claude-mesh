@@ -12,7 +12,7 @@ import { renderMetrics, setPeerUpSource, incPeerRelay, incSent, incReceived, inc
 import { Database } from 'bun:sqlite';
 import type { WebSocket } from 'ws';
 import { readFileSync, readdirSync, statSync, mkdtempSync } from 'fs';
-import { join, dirname, resolve, relative, isAbsolute } from 'path';
+import { join, dirname, resolve, relative } from 'path';
 import { tmpdir } from 'os';
 import { startWsServer } from '../ws-server.ts';
 import { upsertPeer, aclCheck, getPeerByAlias } from '../db.ts';
@@ -70,26 +70,33 @@ function importSpecifiers(src: string): string[] {
 // guards exist to catch. Third defect in this filter stage, all three the same
 // shape: the classification step was cheap to write and wrong at the edges.
 const REPO_ROOT = join(import.meta.dir, '..', '..');
-const CLIENT_ROOT = join(REPO_ROOT, 'client');
-
-function insideClient(abs: string): boolean {
-  const rel = relative(CLIENT_ROOT, abs);
-  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
-}
+const SERVER_ROOT = join(REPO_ROOT, 'server');
 
 /**
- * Cross-package edges out of one source file, as repo-relative target paths.
+ * Cross-package edges out of one server source file, as repo-relative targets.
  *
- * `fromDir` is the importing file's directory: without it the same specifier
- * means different targets at different depths, which is the assumption that
- * made the prefix version fail open. Returning repo-relative targets rather
- * than raw specifiers makes the printed rows depth-independent too.
+ * CROSS-PACKAGE MEANS THE RESOLVED PATH LEAVES THE SERVER ROOT. `fromDir` is
+ * the importing file's directory: without it the same specifier names different
+ * targets at different depths, which is the assumption that made the previous
+ * prefix-matching version fail open.
+ *
+ * Two properties of this test worth knowing before changing it. Bare package
+ * specifiers ('ws') resolve inside the root and are correctly in-package. And a
+ * hypothetical `'../design/x.ts'` would count as cross-package even though it is
+ * not client/ — that OVER-reports, which is the safe direction for a guard that
+ * fails open when it under-reports.
+ *
+ * Scoped to server files by construction: it asks "does this leave server/",
+ * so do not reuse it for the client walk.
+ *
+ * Verified equivalent to a client/-containment test on every real import in
+ * server/ at this head — wire-version and border cross, http-admin and db do
+ * not — so the swap changes no verdict today and only closes the depth hole.
  */
 function crossPackageEdges(src: string, fromDir: string): string[] {
   return importSpecifiers(src)
-    .filter(spec => spec.startsWith('.'))          // bare packages are not path edges
     .map(spec => resolve(fromDir, spec))
-    .filter(insideClient)
+    .filter(abs => relative(SERVER_ROOT, abs).startsWith('..'))
     .map(abs => relative(REPO_ROOT, abs));
 }
 
