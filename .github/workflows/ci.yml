@@ -10,15 +10,17 @@ name: CI
 #               fails when the count goes UP, lists what disappeared when it goes down
 #   docker    — build the server image; publish to GitHub Container Registry
 #               (ghcr.io/<owner>/claude-mesh) on pushes to main and on version
-#               tags, and NEVER from dispatch or pull_request runs. Those build
-#               but do not push — validating the Dockerfile without publishing.
+#               tags, and FROM NO OTHER EVENT. Everything else builds but does
+#               not push — validating the Dockerfile without publishing.
+#               Derived, not enumerated, on purpose: the enumerated form listed
+#               the non-publishing events, and the commit that ADDED a third
+#               event is the one that left the list at two.
 #
 # "docker ✅" alone does NOT mean the tests ran — check the test/typecheck jobs.
 #
-# COST OF `edited`: every title or body edit now triggers a full run, and
-# cancel-in-progress will cancel an in-flight synchronize run when it does —
-# leaving a CANCELLED check. Cancelled is a THIRD state: re-run it, never read
-# it as a pass.
+# COST OF `edited`: every title or body edit now triggers a full run, which can
+# cancel an in-flight run for the same ref — see the concurrency block below for
+# what a cancelled check means.
 # No secrets to configure: GHCR auth uses the built-in GITHUB_TOKEN.
 # Note: production (spawner-mesh) currently git-pulls the source rather than
 # pulling this image, so the published image is for external `docker run`
@@ -56,6 +58,16 @@ on:
   # away" — the bug this same change removes. That reason no longer exists.)
   workflow_dispatch:
 
+# CANCELLED IS A THIRD STATE — not a pass and not a failure. cancel-in-progress
+# means a newer run for the same ref supersedes an in-flight one, so a check can
+# end cancelled without anything being wrong with the code: a title edit during a
+# run, or a queue re-running a ref, both do it. Re-run it. Never read a cancelled
+# check as a pass.
+#
+# It lives here rather than beside any one trigger because the mechanism is
+# workflow-level: an operator asking "why is this check cancelled" during a
+# merge-queue run needs to find the answer at the thing that cancels, not under
+# whichever event happened to prompt it.
 concurrency:
   group: docker-${{ github.ref }}
   cancel-in-progress: true
