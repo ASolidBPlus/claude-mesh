@@ -127,14 +127,22 @@ describe('#153 GET /peers', () => {
   // The guide is an authority a human reads under pressure, and it is the one
   // that drifted: §4 promised this route while it 404'd. This walks the row
   // back to the ROUTES table rather than trusting either.
+  //
+  // THE CITATION HALF HAS MOVED, and this is what is left of it. The version
+  // that shipped compared the row against the literal 'handlePeerGet', so
+  // renaming the handler left the guide citing a symbol that no longer existed
+  // with this test still green — the citation could go stale silently, inside
+  // the test written to stop the guide going stale silently (seat 1). It now
+  // lives in guide-citations.test.ts, which reads the symbol OUT OF the guide
+  // and asks the source, for every row and every citation in the document.
+  //
+  // What stays here is the part that belongs to THIS route: the row exists and
+  // the route it names answers.
   it('the guide\'s GET /peers row names a route that exists', async () => {
     const guide = await Bun.file(join(import.meta.dir, '../../docs/FEDERATION.md')).text();
     const row = guide.split('\n').find(l => l.includes('`GET /peers`'));
     expect(row).toBeDefined();
     // Derived, not asserted from memory: the route answers, right now.
     expect((await get('/peers')).status).toBe(200);
-    // ...and the row cites the handler, which is what the rows that stayed
-    // true have and the row that drifted did not.
-    expect(row).toContain('handlePeerGet');
   });
 });
