@@ -12,7 +12,7 @@ import { renderMetrics, setPeerUpSource, incPeerRelay, incSent, incReceived, inc
 import { Database } from 'bun:sqlite';
 import type { WebSocket } from 'ws';
 import { readFileSync, readdirSync, statSync, mkdtempSync } from 'fs';
-import { join } from 'path';
+import { join, dirname, resolve, relative, isAbsolute } from 'path';
 import { tmpdir } from 'os';
 import { startWsServer } from '../ws-server.ts';
 import { upsertPeer, aclCheck, getPeerByAlias } from '../db.ts';
@@ -59,8 +59,45 @@ function importSpecifiers(src: string): string[] {
   return new Bun.Transpiler({ loader: 'ts' }).scanImports(src).map(i => i.path);
 }
 
-function crossPackageSpecifiers(src: string): string[] {
-  return importSpecifiers(src).filter(p => p.startsWith('../client/'));
+// The repo layout, computed once. Everything below is expressed by RESOLVING
+// specifiers against the importing file's directory rather than by matching a
+// prefix string, because a prefix encodes an assumption about DEPTH: server/ is
+// flat today, `sourceFiles()` recurses, and a nested `server/sub/deep.ts`
+// reaching `'../../client/src/peer-client.ts'` is a real cross-package edge
+// that `startsWith('../client/')` does not match. Measured before this change:
+// such a file at 51,678 B passed all three guards, 3 pass 0 fail, and never
+// appeared in the printed rows — failing open in exactly the direction these
+// guards exist to catch. Third defect in this filter stage, all three the same
+// shape: the classification step was cheap to write and wrong at the edges.
+const REPO_ROOT = join(import.meta.dir, '..', '..');
+const CLIENT_ROOT = join(REPO_ROOT, 'client');
+
+function insideClient(abs: string): boolean {
+  const rel = relative(CLIENT_ROOT, abs);
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+}
+
+/**
+ * Cross-package edges out of one source file, as repo-relative target paths.
+ *
+ * `fromDir` is the importing file's directory: without it the same specifier
+ * means different targets at different depths, which is the assumption that
+ * made the prefix version fail open. Returning repo-relative targets rather
+ * than raw specifiers makes the printed rows depth-independent too.
+ */
+function crossPackageEdges(src: string, fromDir: string): string[] {
+  return importSpecifiers(src)
+    .filter(spec => spec.startsWith('.'))          // bare packages are not path edges
+    .map(spec => resolve(fromDir, spec))
+    .filter(insideClient)
+    .map(abs => relative(REPO_ROOT, abs));
+}
+
+/** Same resolution, for the reader pin's question (which module PROVIDES it). */
+function resolvedSpecifiers(src: string, fromDir: string): string[] {
+  return importSpecifiers(src)
+    .filter(spec => spec.startsWith('.'))
+    .map(spec => relative(REPO_ROOT, resolve(fromDir, spec)));
 }
 
 function peering(alias: string, rate = 600): void {
@@ -404,7 +441,7 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
       let emitted: string;
       try { emitted = transpiler.transformSync(src); } catch { emitted = ''; }
       if (!/\bPEER_PROTOCOL_VERSION\b/.test(emitted)) continue;   // not a reader
-      const providers = importSpecifiers(src).filter(p => PROVIDER.test(p));
+      const providers = resolvedSpecifiers(src, dirname(f)).filter(p => PROVIDER.test(p));
       readers.push(`${f.slice(root.length + 1)} <- ${providers.length > 0 ? providers.sort().join(', ') : '(defines it)'}`);
     }
 
@@ -412,11 +449,11 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
     for (const r of readers) console.log(`  ${r}`);
 
     expect(readers.sort()).toEqual([
-      'client/src/peer-client.ts <- ./protocol.ts',            // in-package
-      'client/src/protocol.ts <- (defines it)',                // the one definition
-      'server/http-admin.ts <- ./wire-version.ts',             // cached; must not cross
-      'server/wire-version.ts <- ../client/src/protocol.ts',   // THE server-side cross-package edge
-      'server/ws-server.ts <- ./wire-version.ts',              // inside the band; must not cross
+      'client/src/peer-client.ts <- client/src/protocol.ts',       // in-package
+      'client/src/protocol.ts <- (defines it)',                    // the one definition
+      'server/http-admin.ts <- server/wire-version.ts',            // cached; must not cross
+      'server/wire-version.ts <- client/src/protocol.ts',          // THE server-side cross-package edge
+      'server/ws-server.ts <- server/wire-version.ts',             // inside the band; must not cross
     ]);
   });
 
@@ -465,35 +502,56 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
   // That is the property which justified deleting this file's comment-stripping
   // code when the classifier moved to the transpiler; without it in the control,
   // that deletion rests on a claim rather than a check.
-  it('#131: the edge classifier sees every import form', () => {
-    const synthetic = [
-      `import type { A } from '../client/x-type.ts';`,          // erased
-      `import { B } from '../client/x-single.ts';`,
-      `import { C } from "../client/x-double.ts";`,             // quote style is not a rule here
-      `import '../client/x-side-effect.ts';`,                   // no `from` clause
-      `export * from '../client/x-star.ts';`,
-      `const d = await import('../client/x-dynamic.ts');`,
-      `const e = require('../client/x-require.ts');`,
-      `// import { F } from '../client/x-line-comment.ts';`,    // not code
-      `/* import { G } from '../client/x-block-comment.ts'; */`, // not code either
+  it('#131: the edge classifier sees every import form, at any depth', () => {
+    // Every form an import can take, written for a file directly under server/.
+    const forms = (toClient: string) => [
+      `import type { A } from '${toClient}/x-type.ts';`,          // erased
+      `import { B } from '${toClient}/x-single.ts';`,
+      `import { C } from "${toClient}/x-double.ts";`,             // quote style is not a rule here
+      `import '${toClient}/x-side-effect.ts';`,                   // no `from` clause
+      `export * from '${toClient}/x-star.ts';`,
+      `const d = await import('${toClient}/x-dynamic.ts');`,
+      `const e = require('${toClient}/x-require.ts');`,
+      `// import { F } from '${toClient}/x-line-comment.ts';`,    // not code
+      `/* import { G } from '${toClient}/x-block-comment.ts'; */`, // not code either
       // TRUE NEGATIVES FOR THE FILTER, distinct from the type import's true
       // negative for the transpiler. Measured: without these, a classifier that
-      // dropped the '../client/' filter entirely and returned EVERY import still
-      // passed this test — because every other import here happens to be
+      // returned EVERY import still passed — everything else here is
       // cross-package, so there was nothing for the filter to exclude.
-      `import { H } from './a-sibling.ts';`,                    // in-package relative
-      `import { WebSocket } from 'ws';`,                        // bare package
+      `import { H } from './a-sibling.ts';`,                      // in-package relative
+      `import { WebSocket } from 'ws';`,                          // bare package
       `void [B, C, d, e, H, WebSocket];`,
     ].join('\n');
 
-    expect(crossPackageSpecifiers(synthetic).sort()).toEqual([
-      '../client/x-double.ts',
-      '../client/x-dynamic.ts',
-      '../client/x-require.ts',
-      '../client/x-side-effect.ts',
-      '../client/x-single.ts',
-      '../client/x-star.ts',
-    ]);
+    const EXPECTED = [
+      'client/x-double.ts',
+      'client/x-dynamic.ts',
+      'client/x-require.ts',
+      'client/x-side-effect.ts',
+      'client/x-single.ts',
+      'client/x-star.ts',
+    ];
+
+    // Flat: a file directly under server/, which is every server file today.
+    expect(crossPackageEdges(forms('../client'), join(REPO_ROOT, 'server')).sort()).toEqual(EXPECTED);
+
+    // NESTED, two levels down, with the specifier that reaches the same targets
+    // from there. Identical resolved set: depth is resolved, not assumed. This
+    // is the case a `startsWith('../client/')` prefix could not see, and it is
+    // how a nested oversize importer passed all three guards at 3 pass 0 fail.
+    //
+    // THIS CASE IS THE ONLY EXERCISER OF THE RECURSION AT :44 WHILE server/ IS
+    // FLAT; DELETING IT AS REDUNDANT SILENTLY RESTORES DEPTH BLINDNESS WITH THE
+    // SUITE GREEN. `sourceFiles()` skips __tests__, which is the only
+    // subdirectory server/ has, so the recursion is dead code today — present,
+    // never reached — which is why no run of the suite could have surfaced this
+    // and why the finding had to be constructed by hand.
+    const nestedDir = join(REPO_ROOT, 'server', 'a', 'b');
+    expect(crossPackageEdges(forms('../../../client'), nestedDir).sort()).toEqual(EXPECTED);
+
+    // A relative specifier that resolves OUTSIDE client/ from that same nested
+    // directory must not be counted — the prefix version had no way to ask.
+    expect(crossPackageEdges(`import { Z } from '../../server/x.ts'; void Z;`, nestedDir)).toEqual([]);
   });
 
   it('#131: no server file with a runtime cross-package import reaches the cache threshold', () => {
@@ -502,7 +560,7 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
 
     const rows: { file: string; size: number; specs: string[] }[] = [];
     for (const f of sourceFiles(join(root, 'server'))) {
-      const specs = crossPackageSpecifiers(readFileSync(f, 'utf8'));
+      const specs = crossPackageEdges(readFileSync(f, 'utf8'), dirname(f));
       if (specs.length > 0) rows.push({ file: f.slice(root.length + 1), size: statSync(f).size, specs });
     }
 
