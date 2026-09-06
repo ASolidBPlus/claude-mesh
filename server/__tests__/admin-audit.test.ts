@@ -209,15 +209,36 @@ describe('#161 admin audit', () => {
   // route added is the one whose entry nobody remembers. This walks the ROUTES
   // table and requires every mutating route to produce a record — so a route
   // added tomorrow is covered by existing code, or this reds.
+  //
+  // AND THE FIRST VERSION OF THIS TEST DID NOT DO IT (seat 2). It computed
+  // `mutators`, asserted only its SIZE, and never used it again — so the
+  // derived-coverage guarantee lived in the name and the comment, not in an
+  // assertion. Their mutant proves it: change the dispatcher's
+  // `method !== 'GET'` to `method === 'POST'` — exactly the enumeration this
+  // test exists to forbid — and all fifteen tests stay green while every PATCH
+  // and DELETE goes silent. The methods are walked now.
   it('EVERY mutating route in the table emits a mutation record', async () => {
     const mutators = ROUTES.filter(r => r.method !== 'GET');
     // Control on the derivation: the table is real and non-trivial.
     expect(mutators.length).toBeGreaterThanOrEqual(15);
+    // ...and it really does contain more than one method, which is the
+    // premise the walk below rests on.
+    expect([...new Set(mutators.map(r => r.method))].sort()).toEqual(['DELETE', 'PATCH', 'POST']);
 
-    // One representative succeeding call, exercised through the dispatcher.
-    await call('/agents', { method: 'POST', body: JSON.stringify({ id: 'walker', hostname: 'h' }) });
-    const [m] = events('admin.mutation');
-    expect(m).toMatchObject({ method: 'POST', path: '/agents', status: 201 });
+    // One succeeding call PER METHOD in the derived set, each through the
+    // dispatcher. Asserting the events' methods — not merely that some event
+    // appeared — is what makes a narrowed predicate visible.
+    const perMethod: [string, () => Promise<Response>][] = [
+      ['POST', () => call('/agents', { method: 'POST', body: JSON.stringify({ id: 'walker', hostname: 'h' }) })],
+      ['PATCH', () => call('/agents/walker', { method: 'PATCH', body: JSON.stringify({ hostname: 'h2' }) })],
+      ['DELETE', () => call('/agents/walker', { method: 'DELETE' })],
+    ];
+    for (const [meth, send] of perMethod) {
+      lines.length = 0;
+      const res = await send();
+      expect({ meth, status: res.status }).toEqual({ meth, status: res.status >= 200 && res.status < 300 ? res.status : -1 });
+      expect({ meth, got: events('admin.mutation').map(e => e.method) }).toEqual({ meth, got: [meth] });
+    }
 
     // The record is produced by the DISPATCHER, so its coverage is a property
     // of the route table rather than of the handlers: every mutator reaches
