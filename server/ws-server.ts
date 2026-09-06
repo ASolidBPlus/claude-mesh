@@ -1253,11 +1253,12 @@ export function startWsServer(
             //                exclusion that removal was for.
             //   loop_alive — the LOOP's proof of life, emitted every turn
             //                whether the agent did anything or not (#133).
-            //                Counting it would make "last acted" mean "the loop
-            //                is running" for every agent carrying the emitter —
-            //                a second copy of `last_responded` under a name
-            //                that promises something else, which is the exact
-            //                conflation #133 exists to prevent.
+            //                COUNTING IT WOULD MAKE `last_seen` A SECOND
+            //                `last_responded` — "the loop is running" wearing a
+            //                name that promises "the agent acted" — which is
+            //                the conflation #133 exists to prevent. The lane
+            //                confirmed this exclusion; it is not an oversight
+            //                to be tidied away.
             //
             // The issue asked for `ping` alone; `loop_alive` shipped between
             // its filing and this fix, and including it would have undone #133

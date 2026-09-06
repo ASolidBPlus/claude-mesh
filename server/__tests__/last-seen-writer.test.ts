@@ -6,7 +6,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { openDb, registerAgent, aclGrant, getAgentById } from '../db.ts';
 import { hashToken } from '../auth.ts';
-import { startWsServer, WsServerHandle } from '../ws-server.ts';
+import { startWsServer, WsServerHandle, POST_AUTH_HANDLERS } from '../ws-server.ts';
 
 // #171 — `last_seen` is documented as "last acted" and had NO act-path writer.
 //
@@ -142,6 +142,76 @@ describe('#171 last_seen advances on an act, through the dispatch path', () => {
     await delay(150);
 
     expect(lastSeen()).toBeGreaterThan(atConnect);
+    ws.close();
+  }, 20_000);
+
+  // EVERY ACT-PATH FRAME TYPE, WALKED — not two of them (seat 1).
+  //
+  // The first version of this file drove `send` and `list_presence` and never
+  // referenced the handler map. Seat 1's mutant: narrow the writer to exactly
+  // (send || list_presence), and EIGHT frame types silently stop stamping
+  // while this file stays 6/0 green. That is #162's defect one PR over —
+  // there I computed a derived set and asserted its size; here I tested two
+  // members of a set I never derived at all.
+  //
+  // The walk is cheap only because of the design: the write happens BEFORE the
+  // handler, so a bare `{type: k}` with no valid payload still stamps. Ten
+  // valid frames would have been a fixture nobody maintains.
+  it('EVERY act-path frame type advances it, walked from the handler map', async () => {
+    const EXCLUDED = ['ping', 'loop_alive'];
+    const actTypes = Object.keys(POST_AUTH_HANDLERS).filter(t => !EXCLUDED.includes(t));
+
+    // Control on the derivation: the map is real, and the exclusions are IN it
+    // — a typo in either name would silently widen the walk.
+    expect(actTypes.length).toBeGreaterThanOrEqual(8);
+    for (const ex of EXCLUDED) expect(Object.keys(POST_AUTH_HANDLERS)).toContain(ex);
+
+    const ws = await auth('actor', 'tok-a');
+    await delay(60);
+
+    const notStamped: string[] = [];
+    for (const type of actTypes) {
+      const before = lastSeen();
+      await delay(25);
+      ws.send(JSON.stringify({ type }));
+      await delay(90);
+      if (!(lastSeen()! > before!)) notStamped.push(type);
+    }
+    expect(notStamped).toEqual([]);
+    ws.close();
+  }, 30_000);
+
+  // THE PLACEMENT, pinned for free once the walk showed which frames throw.
+  //
+  // A bare `{type:'send'}` throws inside the handler (the dispatcher's #94
+  // guard catches it and answers INTERNAL). An agent whose frames are crashing
+  // a handler is the last one an operator should see as idle.
+  //
+  // WHICH "AFTER" THIS DISCRIMINATES, measured rather than assumed. Moving the
+  // write below the try/catch leaves this GREEN — the catch swallows the throw
+  // and execution continues, so that position behaves identically. What reds
+  // it is the write moved INSIDE the try, after the handler call, where a
+  // throw actually skips it. So this pins "not inside the try after the
+  // handler", not "before the handler" in general; the two are the same only
+  // if you already know where the catch is.
+  it('a frame whose handler THROWS still advances it — the write is before the handler', async () => {
+    const ws = await auth('actor', 'tok-a');
+    await delay(60);
+    const before = lastSeen();
+    await delay(60);
+
+    const errors: Record<string, unknown>[] = [];
+    ws.on('message', (d: Buffer) => {
+      const m = JSON.parse(d.toString()) as Record<string, unknown>;
+      if (m.type === 'error') errors.push(m);
+    });
+    ws.send(JSON.stringify({ type: 'send' }));         // no msg_id/to/payload
+    await delay(150);
+
+    // POSITIVE CONTROL: the handler really did fail, so this is the placement
+    // and not a frame that quietly succeeded.
+    expect(errors.map(e => e.code)).toEqual(['INTERNAL']);
+    expect(lastSeen()).toBeGreaterThan(before!);
     ws.close();
   }, 20_000);
 
