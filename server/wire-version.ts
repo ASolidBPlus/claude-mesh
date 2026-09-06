@@ -6,9 +6,10 @@
  * #131 was an intermittent link failure on `PEER_PROTOCOL_VERSION`: an import
  * would fail to resolve a binding that demonstrably exists, dropping a whole
  * test file from the suite population. The only importer that ever failed was
- * the one that was BOTH over the on-disk transpiler-cache threshold (~45-60 KB
- * on bun 1.3.14, bisected) AND crossing the package boundary. A cached
- * cross-package importer is the shape the defect was measured in.
+ * the one that was BOTH at or over the on-disk transpiler-cache threshold —
+ * 51,200 B, fine-bisected at 51,197 B -> 0 entries and 51,497 B -> 1 — AND
+ * crossing the package boundary. A cached cross-package importer is the shape
+ * the defect was measured in.
  *
  * THE INVARIANT, scoped to cross-package EDGES rather than to this constant:
  * after this change, the set of `server/` files that are BOTH >= 51,200 B (the

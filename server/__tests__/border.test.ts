@@ -346,21 +346,21 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
     expect(literals).toEqual([]);
   });
 
-  // #131. The definition stays in the wire module; what changed is WHERE
-  // http-admin reads it from. It is the only importer that ever hit the
-  // intermittent link failure, and the only one both over the on-disk
-  // transpiler-cache threshold (>=50 KB; bisected 45-60 KB) AND crossing the
-  // package boundary — ws-server.ts (46 KB, uncached) and peer-client.ts (same
-  // package) never failed. Reading it from './ws-server.ts', which re-exports
-  // it, removes that edge.
+  // #131. The definition stays in the wire module; what changed is HOW the
+  // server side reads it. `server/wire-version.ts` is a bare re-export barrel
+  // and is the only server-side file carrying a RUNTIME cross-package import of
+  // it; `ws-server.ts` and `http-admin.ts` both read it from that barrel.
+  //
+  // The threshold is 51,200 B — the on-disk transpiler cache, fine-bisected at
+  // 51,197 B -> 0 entries and 51,497 B -> 1. The failure only ever appeared at
+  // an importer that was both cached and cross-package.
   //
   // This pins the SPECIFIER, not just the definition, because the natural
-  // tidy-up — "why is http-admin importing a wire constant from the ws server?"
-  // — silently reinstates exactly the edge that was removed. Whoever makes that
-  // change should have to read this.
+  // tidy-up — "why is this reading a wire constant from a barrel?" — silently
+  // reinstates the edge that was removed. Whoever makes that change should have
+  // to read this.
   //
-  // Not a proof of mechanism: a removal of the measured asymmetry
-  // (cached AND cross-package). #131 stays open.
+  // Not a proof of mechanism: a removal of the only failing shape. #131 open.
   it('#131: every reader imports the constant from its pinned specifier', () => {
     // NOTE: `export { PEER_PROTOCOL_VERSION };` in ws-server.ts has no `from`
     // clause — it re-exports an already-imported binding and introduces no
@@ -382,8 +382,55 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
       'client/src/peer-client.ts <- ./protocol.ts',            // in-package
       'server/http-admin.ts <- ./wire-version.ts',             // 80,951 B — must not cross
       'server/wire-version.ts <- ../client/src/protocol.ts',   // THE only server-side cross-package edge
-      'server/ws-server.ts <- ./wire-version.ts',              // 46,780 B — inside the band, must not cross
+      'server/ws-server.ts <- ./wire-version.ts',              // 46,780 B — must not cross
     ]);
+  });
+
+  // #131 ENFORCED, not merely described. The comments above state the invariant
+  // and comments do not fail. This is the assertion.
+  //
+  // RUNTIME imports only: `import type` is erased before anything is executed,
+  // so it cannot participate in a link failure. router.ts imports its wire
+  // types with `import type` and is therefore NOT a runtime cross-package edge,
+  // despite naming the same module — which is exactly the kind of distinction a
+  // grep for the path would get wrong.
+  it('#131: no server file with a runtime cross-package import reaches the cache threshold', () => {
+    const THRESHOLD = 51_200;   // fine-bisected: 51,197 -> 0 cache entries, 51,497 -> 1
+    const root = join(import.meta.dir, '..', '..');
+
+    const rows: { file: string; size: number; specs: string[] }[] = [];
+    for (const f of sourceFiles(join(root, 'server'))) {
+      const src = readFileSync(f, 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')     // block comments: a path in prose is not an edge
+        .replace(/\/\/.*$/gm, '');             // line comments, same reason
+      // For each cross-package `from '...'`, walk BACK to the keyword that owns
+      // it and ask whether that statement is type-only. Matching forward from
+      // the keyword does NOT work: a lazy `[\s\S]*?` runs past the end of one
+      // import statement into the next one's `from`, which made this walker
+      // report router.ts — an `import type` — as a runtime edge. The printed
+      // rows are what caught it; the verdict was green either way.
+      const specs: string[] = [];
+      for (const m of src.matchAll(/from\s*'(\.\.\/client\/[^']+)'/g)) {
+        const before = src.slice(0, m.index!);
+        const kw = Math.max(before.lastIndexOf('import'), before.lastIndexOf('export'));
+        if (kw === -1) continue;
+        // Type-only if `type` is the very next token after the keyword. Note the
+        // limit: an inline `import { type A, B }` counts as runtime here, which
+        // is the safe direction — it over-reports rather than missing an edge.
+        if (!/^(?:import|export)\s+type\b/.test(src.slice(kw))) specs.push(m[1]!);
+      }
+      if (specs.length > 0) rows.push({ file: f.slice(root.length + 1), size: statSync(f).size, specs });
+    }
+
+    // Print what the walk found, not just its verdict: a green here is worth
+    // exactly the set it examined.
+    console.log('#131 runtime cross-package edges in server/:');
+    for (const r of rows) console.log(`  ${r.file} — ${r.size} B (margin ${THRESHOLD - r.size}) — ${r.specs.join(', ')}`);
+
+    expect(rows.length).toBeGreaterThan(0);          // the walk found something
+
+    const over = rows.filter(r => r.size >= THRESHOLD);
+    expect(over.map(r => `${r.file} is ${r.size} B, at or over the ${THRESHOLD} B cache threshold with a runtime cross-package import (#131 reopens)`)).toEqual([]);
   });
 });
 
