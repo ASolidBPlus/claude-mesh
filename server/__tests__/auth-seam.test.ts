@@ -248,11 +248,13 @@ describe('#143 auth seam, characterised before the cut', () => {
   // every call of handleAuthFrame, and require that the block making the call
   // clears the timer first.
   //
-  // WHAT THIS CANNOT SEE, said because it is a source scan and those overstate:
-  // it reads call sites by name, so a call reached through an alias or a
-  // dynamic dispatch is invisible to it. That is acceptable while the function
-  // is module-private with one caller — which is exactly what the first
-  // assertion pins, and the assertion fails the moment it stops being true.
+  // WHAT THIS CAN AND CANNOT SEE, said because it is a source scan and those
+  // overstate. It now rejects any MENTION of the name that is not a call, so
+  // the alias route (`const h = handleAuthFrame`) is closed rather than merely
+  // noted. What remains outside it is genuinely dynamic dispatch — a call
+  // reached through a computed property or a value that never names the
+  // function in source. That residual is accepted while the function is
+  // module-private, which the definition count pins.
   it('handleAuthFrame has ONE call site, and that site clears the auth timer', async () => {
     const src = await Bun.file(join(import.meta.dir, '../ws-server.ts')).text();
     const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
@@ -263,6 +265,15 @@ describe('#143 auth seam, characterised before the cut', () => {
     const definitions = [...code.matchAll(/function\s+handleAuthFrame\s*\(/g)];
     expect(definitions.length).toBe(1);
     expect(occurrences.length - definitions.length).toBe(1);
+
+    // AND NO MENTION THAT IS NOT A CALL (seat 2). Counting `handleAuthFrame(`
+    // leaves an alias — `const h = handleAuthFrame; … h(ctx)` — invisible: it
+    // adds a caller that never clears the timer, and the count above stays at
+    // one. Measured green under that mutant before this line existed.
+    //
+    // This is the check the previous comment DESCRIBED as an accepted residual.
+    // It was one line to close, so describing it was the wrong trade.
+    expect([...code.matchAll(/\bhandleAuthFrame\b(?!\s*\()/g)].length).toBe(0);
 
     // ...and the call is preceded, in the same block, by the clear. Sliced
     // backwards from the call to the enclosing `if (!state.authed) {`, so this
@@ -327,6 +338,12 @@ describe('#143 socket teardown clears the auth timer', () => {
     try {
       let cleared = 0;
       const ws = { readyState: 3 } as unknown as WebSocket;
+      // CONTROL, against the real subject. The version that shipped asserted a
+      // local noop against itself — it could not fail, and proved nothing about
+      // the counter used below (seat 2). Reading 0 HERE, immediately before the
+      // call, is the same counter and the same closure the assertion afterwards
+      // depends on.
+      expect(cleared).toBe(0);
       handleSocketClose({
         ws,
         db,
@@ -346,12 +363,5 @@ describe('#143 socket teardown clears the auth timer', () => {
     }
   });
 
-  // CONTROL: the counter is capable of staying 0, so `toBe(1)` above is the
-  // clear happening rather than a fixture that increments regardless.
-  it('CONTROL: the counter reads 0 when nothing calls it', () => {
-    let cleared = 0;
-    const noop = (_: () => void) => { /* deliberately does not call it */ };
-    noop(() => { cleared += 1; });
-    expect(cleared).toBe(0);
-  });
+
 });
