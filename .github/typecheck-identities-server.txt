@@ -1,115 +1,115 @@
-__tests__/cron-tz.test.ts:2:TS6133
-__tests__/db.test.ts:1171:TS2532
-__tests__/db.test.ts:1:TS6133
-__tests__/db.test.ts:491:TS6133
-__tests__/http-admin-file-header-dos.test.ts:101:TS2345
-__tests__/http-admin-file-header-dos.test.ts:154:TS2532
-__tests__/http-admin-messages-pagination.test.ts:57:TS2345
-__tests__/http-admin-messages-pagination.test.ts:60:TS2345
-__tests__/http-admin-messages-pagination.test.ts:91:TS2345
-__tests__/http-admin.test.ts:339:TS2532
-__tests__/http-admin.test.ts:860:TS2532
-__tests__/http-admin.test.ts:861:TS2532
-__tests__/http-admin.test.ts:862:TS2532
-__tests__/list-presence.test.ts:28:TS2532
-__tests__/list-presence.test.ts:28:TS2532
-__tests__/mcp-server.test.ts:101:TS2532
-__tests__/mcp-server.test.ts:113:TS2532
-__tests__/mcp-server.test.ts:145:TS2532
-__tests__/mcp-server.test.ts:161:TS2532
-__tests__/mcp-server.test.ts:182:TS2532
-__tests__/mcp-server.test.ts:193:TS2532
-__tests__/mcp-server.test.ts:202:TS2532
-__tests__/mcp-server.test.ts:207:TS18048
-__tests__/mcp-server.test.ts:208:TS18048
-__tests__/mcp-server.test.ts:209:TS18048
-__tests__/mcp-server.test.ts:210:TS18048
-__tests__/mcp-server.test.ts:211:TS18048
-__tests__/mcp-server.test.ts:212:TS18048
-__tests__/mcp-server.test.ts:213:TS18048
-__tests__/mcp-server.test.ts:223:TS2532
-__tests__/mcp-server.test.ts:226:TS2532
-__tests__/mcp-server.test.ts:227:TS2532
-__tests__/mcp-server.test.ts:246:TS2532
-__tests__/mcp-server.test.ts:249:TS2532
-__tests__/mcp-server.test.ts:276:TS2532
-__tests__/mcp-server.test.ts:279:TS2532
-__tests__/mcp-server.test.ts:289:TS2532
-__tests__/mcp-server.test.ts:302:TS2532
-__tests__/mcp-server.test.ts:323:TS2532
-__tests__/mcp-server.test.ts:337:TS2532
-__tests__/mcp-server.test.ts:349:TS2532
-__tests__/mcp-server.test.ts:7:TS6192
-__tests__/mcp-server.test.ts:90:TS2532
-__tests__/metrics.test.ts:405:TS6133
-__tests__/metrics.test.ts:412:TS6133
-__tests__/presence-debounce.test.ts:4:TS6133
-__tests__/reminders.test.ts:220:TS2345
-__tests__/reminders.test.ts:23:TS6133
-__tests__/reminders.test.ts:313:TS2769
-__tests__/reminders.test.ts:341:TS2532
-__tests__/reminders.test.ts:342:TS2532
-__tests__/router-topic.test.ts:161:TS2532
-__tests__/router-topic.test.ts:162:TS2532
-__tests__/router-topic.test.ts:200:TS2345
-__tests__/router-topic.test.ts:20:TS6133
-__tests__/router-topic.test.ts:21:TS6133
-__tests__/router-topic.test.ts:22:TS6133
-__tests__/router-topic.test.ts:231:TS2532
-__tests__/router-topic.test.ts:239:TS2345
-__tests__/router-topic.test.ts:87:TS2345
-__tests__/router-topic.test.ts:97:TS2532
-__tests__/router.test.ts:11:TS6133
-__tests__/router.test.ts:141:TS2345
-__tests__/router.test.ts:296:TS2345
-__tests__/router.test.ts:397:TS2345
-__tests__/router.test.ts:418:TS2345
-__tests__/router.test.ts:449:TS2345
-__tests__/router.test.ts:515:TS2345
-__tests__/router.test.ts:537:TS2345
-__tests__/router.test.ts:82:TS2345
-__tests__/server.test.ts:19:TS6133
-__tests__/server.test.ts:1:TS6133
-__tests__/server.test.ts:46:TS2375
-__tests__/tap.test.ts:100:TS2532
-__tests__/tap.test.ts:112:TS2532
-__tests__/tap.test.ts:142:TS2769
-__tests__/tap.test.ts:66:TS6133
-__tests__/tap.test.ts:99:TS2532
-__tests__/ws-server.test.ts:135:TS2322
-__tests__/ws-server.test.ts:139:TS18048
-__tests__/ws-server.test.ts:141:TS18048
-__tests__/ws-server.test.ts:143:TS2532
-__tests__/ws-server.test.ts:143:TS2532
-cron.ts:100:TS2345
-cron.ts:101:TS2345
-cron.ts:231:TS2345
-cron.ts:312:TS2345
-cron.ts:97:TS2345
-cron.ts:98:TS2345
-cron.ts:99:TS2345
-db.ts:1829:TS2345
-db.ts:783:TS2345
-duration.ts:21:TS2538
-http-admin.ts:1253:TS2345
-http-admin.ts:1367:TS2345
-http-admin.ts:1375:TS2345
-http-admin.ts:1381:TS2345
-http-admin.ts:37:TS6133
-http-admin.ts:3:TS6133
-http-admin.ts:40:TS6133
-http-admin.ts:523:TS2345
-http-admin.ts:527:TS2345
-http-admin.ts:715:TS2345
-http-admin.ts:728:TS2345
-http-admin.ts:740:TS2345
-http-admin.ts:881:TS2379
-http-admin.ts:941:TS2345
-mcp-server.ts:2:TS6133
-metrics.ts:189:TS2532
-metrics.ts:35:TS2532
-metrics.ts:35:TS2532
-router.ts:26:TS6133
-router.ts:28:TS6133
-server.ts:5:TS6133
-ws-server.ts:16:TS6192
+__tests__/cron-tz.test.ts:TS6133:'wallTimeToUtc' is declared but its value is never read.
+__tests__/db.test.ts:TS2532:Object is possibly 'undefined'.
+__tests__/db.test.ts:TS6133:'beforeEach' is declared but its value is never read.
+__tests__/db.test.ts:TS6133:'msg' is declared but its value is never read.
+__tests__/http-admin-file-header-dos.test.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+__tests__/http-admin-file-header-dos.test.ts:TS2532:Object is possibly 'undefined'.
+__tests__/http-admin-messages-pagination.test.ts:TS2345:Argument of type '{ id: string; sent_at: number; } | undefined' is not assignable to parameter of type '{ id: string; sent_at: number; }'.
+__tests__/http-admin-messages-pagination.test.ts:TS2345:Argument of type '{ id: string; sent_at: number; } | undefined' is not assignable to parameter of type '{ id: string; sent_at: number; }'.#2
+__tests__/http-admin-messages-pagination.test.ts:TS2345:Argument of type '{ id: string; sent_at: number; } | undefined' is not assignable to parameter of type '{ id: string; sent_at: number; }'.#3
+__tests__/http-admin.test.ts:TS2532:Object is possibly 'undefined'.
+__tests__/http-admin.test.ts:TS2532:Object is possibly 'undefined'.#2
+__tests__/http-admin.test.ts:TS2532:Object is possibly 'undefined'.#3
+__tests__/http-admin.test.ts:TS2532:Object is possibly 'undefined'.#4
+__tests__/list-presence.test.ts:TS2532:Object is possibly 'undefined'.
+__tests__/list-presence.test.ts:TS2532:Object is possibly 'undefined'.#2
+__tests__/mcp-server.test.ts:TS18048:'agent' is possibly 'undefined'.
+__tests__/mcp-server.test.ts:TS18048:'agent' is possibly 'undefined'.#2
+__tests__/mcp-server.test.ts:TS18048:'agent' is possibly 'undefined'.#3
+__tests__/mcp-server.test.ts:TS18048:'agent' is possibly 'undefined'.#4
+__tests__/mcp-server.test.ts:TS18048:'agent' is possibly 'undefined'.#5
+__tests__/mcp-server.test.ts:TS18048:'agent' is possibly 'undefined'.#6
+__tests__/mcp-server.test.ts:TS18048:'agent' is possibly 'undefined'.#7
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#10
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#11
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#12
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#13
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#14
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#15
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#16
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#17
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#18
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#19
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#2
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#20
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#3
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#4
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#5
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#6
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#7
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#8
+__tests__/mcp-server.test.ts:TS2532:Object is possibly 'undefined'.#9
+__tests__/mcp-server.test.ts:TS6192:All imports in import declaration are unused.
+__tests__/metrics.test.ts:TS6133:'connectWs' is declared but its value is never read.
+__tests__/metrics.test.ts:TS6133:'waitFor' is declared but its value is never read.
+__tests__/presence-debounce.test.ts:TS6133:'WsServerHandle' is declared but its value is never read.
+__tests__/reminders.test.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+__tests__/reminders.test.ts:TS2532:Object is possibly 'undefined'.
+__tests__/reminders.test.ts:TS2532:Object is possibly 'undefined'.#2
+__tests__/reminders.test.ts:TS2769:No overload matches this call.
+__tests__/reminders.test.ts:TS6133:'mkdirSync' is declared but its value is never read.
+__tests__/router-topic.test.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+__tests__/router-topic.test.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#2
+__tests__/router-topic.test.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#3
+__tests__/router-topic.test.ts:TS2532:Object is possibly 'undefined'.
+__tests__/router-topic.test.ts:TS2532:Object is possibly 'undefined'.#2
+__tests__/router-topic.test.ts:TS2532:Object is possibly 'undefined'.#3
+__tests__/router-topic.test.ts:TS2532:Object is possibly 'undefined'.#4
+__tests__/router-topic.test.ts:TS6133:'PublishFrame' is declared but its value is never read.
+__tests__/router-topic.test.ts:TS6133:'SubscribeFrame' is declared but its value is never read.
+__tests__/router-topic.test.ts:TS6133:'UnsubscribeFrame' is declared but its value is never read.
+__tests__/router.test.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+__tests__/router.test.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#2
+__tests__/router.test.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#3
+__tests__/router.test.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#4
+__tests__/router.test.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#5
+__tests__/router.test.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#6
+__tests__/router.test.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#7
+__tests__/router.test.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#8
+__tests__/router.test.ts:TS6133:'mockWs' is declared but its value is never read.
+__tests__/server.test.ts:TS2375:Type '{ config: Config | undefined; exitCode: number | undefined; }' is not assignable to type '{ config?: Config; exitCode?: number; }' with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' to the types of the target's properties.
+__tests__/server.test.ts:TS6133:'mock' is declared but its value is never read.
+__tests__/server.test.ts:TS6133:'origExit' is declared but its value is never read.
+__tests__/tap.test.ts:TS2532:Object is possibly 'undefined'.
+__tests__/tap.test.ts:TS2532:Object is possibly 'undefined'.#2
+__tests__/tap.test.ts:TS2532:Object is possibly 'undefined'.#3
+__tests__/tap.test.ts:TS2769:No overload matches this call.
+__tests__/tap.test.ts:TS6133:'db' is declared but its value is never read.
+__tests__/ws-server.test.ts:TS18048:'byte0' is possibly 'undefined'.
+__tests__/ws-server.test.ts:TS18048:'byte1' is possibly 'undefined'.
+__tests__/ws-server.test.ts:TS2322:Type 'string | NonSharedBuffer' is not assignable to type 'Uint8Array<ArrayBufferLike>'.
+__tests__/ws-server.test.ts:TS2532:Object is possibly 'undefined'.
+__tests__/ws-server.test.ts:TS2532:Object is possibly 'undefined'.#2
+cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#2
+cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#3
+cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#4
+cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#5
+cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#6
+cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#7
+db.ts:TS2345:Argument of type 'unknown[]' is not assignable to parameter of type 'SQLQueryBindings[] | [null] | [string] | [number] | [bigint] | [false] | [true] | [BigInt64Array<ArrayBufferLike>] | [BigUint64Array<...>] | ... 10 more ... | [...]'.
+db.ts:TS2345:Argument of type 'unknown[]' is not assignable to parameter of type 'SQLQueryBindings[] | [null] | [string] | [number] | [bigint] | [false] | [true] | [BigInt64Array<ArrayBufferLike>] | [BigUint64Array<...>] | ... 10 more ... | [...]'.#2
+duration.ts:TS2538:Type 'undefined' cannot be used as an index type.
+http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#10
+http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#2
+http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#3
+http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#4
+http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#5
+http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#6
+http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#7
+http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#8
+http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#9
+http-admin.ts:TS2379:Argument of type '{ agent: string | undefined; topic: string | undefined; since: number | undefined; limit: number | undefined; before: { sentAt: number; id: string; } | undefined; kinds: string[] | undefined; }' is not assignable to parameter of type '{ agent?: string; topic?: string; since?: number; limit?: number; before?: { sentAt: number; id: string; }; kinds?: string[]; }' with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' to the types of the target's properties.
+http-admin.ts:TS6133:'Reminder' is declared but its value is never read.
+http-admin.ts:TS6133:'isObserver' is declared but its value is never read.
+http-admin.ts:TS6133:'net' is declared but its value is never read.
+mcp-server.ts:TS6133:'StdioServerTransport' is declared but its value is never read.
+metrics.ts:TS2532:Object is possibly 'undefined'.
+metrics.ts:TS2532:Object is possibly 'undefined'.#2
+metrics.ts:TS2532:Object is possibly 'undefined'.#3
+router.ts:TS6133:'Message' is declared but its value is never read.
+router.ts:TS6133:'getFile' is declared but its value is never read.
+server.ts:TS6133:'McpServerHandle' is declared but its value is never read.
+ws-server.ts:TS6192:All imports in import declaration are unused.
