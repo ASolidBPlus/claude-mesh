@@ -915,13 +915,22 @@ export function startWsServer(
               // count transitions or infer session boundaries from the stream
               // — mesh-chat's roster among them.
               //
-              // KEYED ON PRESENCE, NOT ON THE SOCKET. The `displaced` local a
-              // few lines up is the same answer today, and the two were checked
-              // against each other. This branch states the invariant the stream
-              // actually needs — do not announce an arrival for an agent the
-              // stream already places here — rather than the bookkeeping detail
-              // that currently implies it, so a second path to a doubled socket
-              // is covered without being remembered.
+              // KEYED ON PRESENCE, NOT ON THE SOCKET, and the reason needs no
+              // prediction about future code. This branch suppresses a
+              // broadcast because OBSERVERS ALREADY BELIEVE THIS AGENT IS
+              // ONLINE — and `onlineBroadcast` IS that fact, the variable whose
+              // meaning is the premise. The `displaced` local a few lines up is
+              // EVIDENCE FOR the fact, not the fact. A branch should test its
+              // own premise rather than a correlate; the day the two diverge,
+              // code keyed on the correlate is wrong for a reason invisible at
+              // the line.
+              //
+              // The two are equivalent today and that was checked rather than
+              // assumed, structurally as well as by test: agentIndex.delete has
+              // exactly one site, behind #92's identity guard, so no reachable
+              // state separates them. A corollary of keying on the premise is
+              // that a second path to a doubled socket is covered without being
+              // remembered — a corollary, not the reason.
               //
               // PRE-EXISTING, NOT #145's. This block is byte-identical to
               // e3de095^ (verified). #145 changed how OFTEN it is reached, by
