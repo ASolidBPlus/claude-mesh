@@ -437,6 +437,109 @@ function handleAuthFrame(ctx: AuthCtx): void {
   return;
 }
 
+/**
+ * #143 — what a socket teardown needs from the connection scope. Same rule as
+ * AuthCtx: every field is a LIVE reference, never a snapshot.
+ */
+interface CloseCtx {
+  ws: WebSocket;
+  db: Database;
+  registry: Map<WebSocket, ConnState>;
+  connections: Set<WebSocket>;
+  agentIndex: Map<string, WebSocket>;
+  peerIndex: Map<string, WebSocket>;
+  observerIndex: Map<string, WebSocket>;
+  presenceState: Map<string, PresenceState>;
+  presenceDebounceMs: number;
+  broadcastStatus: (agentId: string, online: boolean, lastSeen: number, excludeWs: WebSocket | null) => void;
+  clearAuthTimer: () => void;
+}
+
+/**
+ * #143 — SOCKET TEARDOWN, lifted verbatim out of the connection callback.
+ *
+ * Both identity guards live here (#92 for agents, D11 for peers) and both are
+ * the difference between a reconnect and an outage, so this moves with its
+ * reasoning and nothing else.
+ *
+ * It has no early-return hazard of the kind the auth extraction had: every
+ * `return` in it already meant "this teardown is done", and there is no code
+ * after the handler to fall through to.
+ */
+function handleSocketClose(ctx: CloseCtx): void {
+  const { ws, db, registry, connections, agentIndex, peerIndex, observerIndex,
+          presenceState, presenceDebounceMs, broadcastStatus, clearAuthTimer } = ctx;
+  clearAuthTimer();
+  connections.delete(ws);
+  const connState = registry.get(ws);
+  registry.delete(ws);
+
+  // F1a: a peer socket branches FIRST and never touches agentIndex or
+  // setOnline — those are agent semantics and a peer has none.
+  //
+  // IDENTITY-GUARDED delete (#92's shape): evict only if the indexed
+  // socket IS this one. Without the guard a replaced socket's late
+  // close evicts the REPLACEMENT, leaving the alias unroutable while a
+  // healthy socket sits connected — the map and the world disagreeing
+  // with nothing reporting it.
+  if (connState?.peerAlias != null) {
+    const alias = connState.peerAlias;
+    if (peerIndex.get(alias) === ws) peerIndex.delete(alias);
+    console.log(JSON.stringify({ evt: 'peer.disconnected', alias, at: Date.now() }));
+    return;
+  }
+
+  if (connState && connState.authed && connState.agentId !== null) {
+    const agentId = connState.agentId;
+
+    // #92 — IDENTITY-GUARDED TEARDOWN, the other half of newer-wins.
+    //
+    // When a second auth displaces this socket, THIS handler runs for
+    // the displaced one while the agent is still very much online on
+    // the newer socket. Unguarded, it would delete the agentIndex entry
+    // that now points at the LIVE socket, mark the agent offline, and
+    // broadcast a presence departure — turning a successful reconnect
+    // into an outage. The peer path has carried this guard since D11;
+    // the agent path did not, which is why displacement could not be
+    // added without it.
+    //
+    // A late close from an already-replaced socket is the same case and
+    // is handled by the same test.
+    if (agentIndex.get(agentId) !== ws) {
+      try { registry.delete(ws); } catch (_) { /* never throw on close */ }
+      return;
+    }
+
+    setOnline(db, agentId, false);
+    agentIndex.delete(agentId);
+    try { observerIndex.delete(agentId); } catch (_) { /* never throw on close */ }
+
+    const disconnectTime = Date.now();
+    const ps = presenceState.get(agentId);
+    // Only schedule/emit offline if peers currently believe this agent
+    // is online. (ps undefined is not reachable in the normal flow, but
+    // the guard is conservatively safe.)
+    if (ps && ps.onlineBroadcast) {
+      if (presenceDebounceMs === 0) {
+        // Legacy / debounce-disabled: broadcast offline immediately.
+        broadcastStatus(agentId, false, disconnectTime, null);
+        presenceState.delete(agentId);
+      } else {
+        // Debounced: arm a timer. If the agent reconnects before it
+        // fires, the connect handler cancels it. If it fires, the agent
+        // is still gone → offline.
+        if (ps.pendingOfflineTimer !== null) clearTimeout(ps.pendingOfflineTimer);
+        ps.pendingOfflineTimer = setTimeout(() => {
+          // Reaching here means the connect handler did NOT cancel us →
+          // still offline.
+          broadcastStatus(agentId, false, Date.now(), null);
+          presenceState.delete(agentId);
+        }, presenceDebounceMs);
+      }
+    }
+  }
+}
+
 // Handlers are synchronous TODAY. The return type admits a promise anyway so
 // the dispatcher's guard is COLOUR-BLIND (#94): a guard whose coverage depends
 // on handlers staying sync is one `async` keyword away from being disabled,
@@ -1164,75 +1267,11 @@ export function startWsServer(
         });
 
         ws.on('close', () => {
-          clearTimeout(authTimer);
-          connections.delete(ws);
-          const connState = registry.get(ws);
-          registry.delete(ws);
-
-          // F1a: a peer socket branches FIRST and never touches agentIndex or
-          // setOnline — those are agent semantics and a peer has none.
-          //
-          // IDENTITY-GUARDED delete (#92's shape): evict only if the indexed
-          // socket IS this one. Without the guard a replaced socket's late
-          // close evicts the REPLACEMENT, leaving the alias unroutable while a
-          // healthy socket sits connected — the map and the world disagreeing
-          // with nothing reporting it.
-          if (connState?.peerAlias != null) {
-            const alias = connState.peerAlias;
-            if (peerIndex.get(alias) === ws) peerIndex.delete(alias);
-            console.log(JSON.stringify({ evt: 'peer.disconnected', alias, at: Date.now() }));
-            return;
-          }
-
-          if (connState && connState.authed && connState.agentId !== null) {
-            const agentId = connState.agentId;
-
-            // #92 — IDENTITY-GUARDED TEARDOWN, the other half of newer-wins.
-            //
-            // When a second auth displaces this socket, THIS handler runs for
-            // the displaced one while the agent is still very much online on
-            // the newer socket. Unguarded, it would delete the agentIndex entry
-            // that now points at the LIVE socket, mark the agent offline, and
-            // broadcast a presence departure — turning a successful reconnect
-            // into an outage. The peer path has carried this guard since D11;
-            // the agent path did not, which is why displacement could not be
-            // added without it.
-            //
-            // A late close from an already-replaced socket is the same case and
-            // is handled by the same test.
-            if (agentIndex.get(agentId) !== ws) {
-              try { registry.delete(ws); } catch (_) { /* never throw on close */ }
-              return;
-            }
-
-            setOnline(db, agentId, false);
-            agentIndex.delete(agentId);
-            try { observerIndex.delete(agentId); } catch (_) { /* never throw on close */ }
-
-            const disconnectTime = Date.now();
-            const ps = presenceState.get(agentId);
-            // Only schedule/emit offline if peers currently believe this agent
-            // is online. (ps undefined is not reachable in the normal flow, but
-            // the guard is conservatively safe.)
-            if (ps && ps.onlineBroadcast) {
-              if (presenceDebounceMs === 0) {
-                // Legacy / debounce-disabled: broadcast offline immediately.
-                broadcastStatus(agentId, false, disconnectTime, null);
-                presenceState.delete(agentId);
-              } else {
-                // Debounced: arm a timer. If the agent reconnects before it
-                // fires, the connect handler cancels it. If it fires, the agent
-                // is still gone → offline.
-                if (ps.pendingOfflineTimer !== null) clearTimeout(ps.pendingOfflineTimer);
-                ps.pendingOfflineTimer = setTimeout(() => {
-                  // Reaching here means the connect handler did NOT cancel us →
-                  // still offline.
-                  broadcastStatus(agentId, false, Date.now(), null);
-                  presenceState.delete(agentId);
-                }, presenceDebounceMs);
-              }
-            }
-          }
+          handleSocketClose({
+            ws, db, registry, connections, agentIndex, peerIndex, observerIndex,
+            presenceState, presenceDebounceMs, broadcastStatus,
+            clearAuthTimer: () => clearTimeout(authTimer),
+          });
         });
       });
 
