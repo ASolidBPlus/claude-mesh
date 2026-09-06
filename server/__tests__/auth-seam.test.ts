@@ -8,7 +8,7 @@ import {
   openDb, registerAgent, getAgentById, insertMessage, insertPeerKey, upsertPeer, aclGrant,
 } from '../db.ts';
 import { hashToken } from '../auth.ts';
-import { startWsServer, WsServerHandle, PEER_PROTOCOL_VERSION } from '../ws-server.ts';
+import { startWsServer, WsServerHandle, PEER_PROTOCOL_VERSION, handleSocketClose } from '../ws-server.ts';
 
 // #143 — CHARACTERISATION TESTS FOR THE AUTH SEAM. Written BEFORE the cut, and
 // this is the whole reason they exist: a mechanical split is judged by "every
@@ -237,6 +237,66 @@ describe('#143 auth seam, characterised before the cut', () => {
     c.ws.close();
   }, 20_000);
 
+  // THE CALL-SITE CLEAR IS THE WHOLE DEFENCE, so the thing to pin is that there
+  // is only one call site and that it clears.
+  //
+  // The peer arm used to clear the auth timer a second time. It was a no-op —
+  // measured: the black-box test above passes identically with and without it,
+  // because the property is defended twice (this clear AND the timer callback's
+  // own `!state.authed` guard). It is deleted rather than frozen by a test that
+  // cannot discriminate it. What replaces it is this: read the source, find
+  // every call of handleAuthFrame, and require that the block making the call
+  // clears the timer first.
+  //
+  // WHAT THIS CAN AND CANNOT SEE, said because it is a source scan and those
+  // overstate. It now rejects any MENTION of the name that is not a call, so
+  // the alias route (`const h = handleAuthFrame`) is closed rather than merely
+  // noted. What remains outside it is genuinely dynamic dispatch — a call
+  // reached through a computed property or a value that never names the
+  // function in source. That residual is accepted while the function is
+  // module-private — which the export assertion pins, not the definition count.
+  //
+  // Together the four assertions close every route in: an unexported single
+  // definition (nothing outside the file can reach it), no mention that is not
+  // a call (nothing inside can capture it), exactly one call, and that call
+  // preceded in-block by the clear.
+  it('handleAuthFrame has ONE call site, and that site clears the auth timer', async () => {
+    const src = await Bun.file(join(import.meta.dir, '../ws-server.ts')).text();
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+
+    // The definition is `function handleAuthFrame(`; a call is any other
+    // occurrence followed by `(`.
+    const occurrences = [...code.matchAll(/\bhandleAuthFrame\s*\(/g)];
+    const definitions = [...code.matchAll(/function\s+handleAuthFrame\s*\(/g)];
+    expect(definitions.length).toBe(1);
+    expect(occurrences.length - definitions.length).toBe(1);
+
+    // AND NO MENTION THAT IS NOT A CALL (seat 2). Counting `handleAuthFrame(`
+    // leaves an alias — `const h = handleAuthFrame; … h(ctx)` — invisible: it
+    // adds a caller that never clears the timer, and the count above stays at
+    // one. Measured green under that mutant before this line existed.
+    //
+    // This is the check the previous comment DESCRIBED as an accepted residual.
+    // It was one line to close, so describing it was the wrong trade.
+    expect([...code.matchAll(/\bhandleAuthFrame\b(?!\s*\()/g)].length).toBe(0);
+
+    // AND THE DEFINITION IS NOT EXPORTED (seat 2, round three). The count above
+    // matches `export function handleAuthFrame(` exactly once too, so adding
+    // `export` left this green while opening a route in from any other file —
+    // and the comment below claimed the count pinned module-privacy. It did
+    // not. Measured: 11/0 under the export mutant before this line.
+    expect(code).not.toMatch(/export\s+(async\s+)?function\s+handleAuthFrame\b/);
+
+    // ...and the call is preceded, in the same block, by the clear. Sliced
+    // backwards from the call to the enclosing `if (!state.authed) {`, so this
+    // is about the path INTO the function rather than about the whole file
+    // happening to contain a clearTimeout somewhere.
+    const callIdx = code.lastIndexOf('handleAuthFrame(');
+    const blockIdx = code.lastIndexOf('if (!state.authed) {', callIdx);
+    expect(blockIdx).toBeGreaterThan(-1);
+    expect(code.slice(blockIdx, callIdx)).toContain('clearTimeout(authTimer)');
+  });
+
   // `authed` (a captured local) and `state.authed` (on the registry row) are
   // set together at both assignment sites and read by different consumers: the
   // local by the pre-auth guard and the auth timer, the field by the presence
@@ -260,4 +320,60 @@ describe('#143 auth seam, characterised before the cut', () => {
     expect(agent.types()).toEqual(['auth_ok']);
     watcher.ws.close(); agent.ws.close();
   }, 20_000);
+});
+
+// ── the close handler's auth-timer clear (#143 follow-up) ────────────────────
+//
+// THE ONLY AUTH-TIMER CLEAR IN THIS FILE THAT DOES ANYTHING, and the only one
+// no black-box test can reach.
+//
+// Every other clear is on the MESSAGE path, so a socket that connects and
+// closes WITHOUT EVER SENDING reaches only handleSocketClose's. Measured with
+// it removed — three connect-and-close sockets, then past the 5 s timeout:
+// callbacks that ran went 0 -> 3, and all three took action.
+//
+// The effect is invisible from outside BY CONSTRUCTION: the callback's
+// `ws.send` throws on a closed socket and is caught, and its `ws.close` is a
+// no-op on one already closed. Nothing reaches the wire. So a reviewer's no-op
+// of that line left the whole suite green — not a coverage gap in the ordinary
+// sense, but an effect with no observable. The cost is retention: one timer
+// holding a socket's `ws` and `state` for up to five seconds per
+// connect-and-close.
+//
+// Hence a UNIT test at the seam rather than a protocol one. It pins the
+// property directly — teardown clears the timer — instead of a proxy that
+// cannot discriminate. Do not replace it with an end-to-end test; that is what
+// was tried, and it could not tell the two trees apart.
+describe('#143 socket teardown clears the auth timer', () => {
+  it('handleSocketClose calls clearAuthTimer', () => {
+    const db = openDb(':memory:');
+    try {
+      let cleared = 0;
+      const ws = { readyState: 3 } as unknown as WebSocket;
+      // CONTROL, against the real subject. The version that shipped asserted a
+      // local noop against itself — it could not fail, and proved nothing about
+      // the counter used below (seat 2). Reading 0 HERE, immediately before the
+      // call, is the same counter and the same closure the assertion afterwards
+      // depends on.
+      expect(cleared).toBe(0);
+      handleSocketClose({
+        ws,
+        db,
+        registry: new Map(),
+        connections: new Set(),
+        agentIndex: new Map(),
+        peerIndex: new Map(),
+        observerIndex: new Map(),
+        presenceState: new Map(),
+        presenceDebounceMs: 0,
+        broadcastStatus: () => { /* no peers in this fixture */ },
+        clearAuthTimer: () => { cleared += 1; },
+      });
+      expect(cleared).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+
+
 });

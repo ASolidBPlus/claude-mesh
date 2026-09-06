@@ -96,15 +96,6 @@ interface AuthCtx {
   observerIndex: Map<string, WebSocket>;
   presenceState: Map<string, PresenceState>;
   broadcastStatus: (agentId: string, online: boolean, lastSeen: number, excludeWs: WebSocket | null) => void;
-  /** The peer arm clears the auth timer a SECOND time. The call site already
-   *  cleared it before dispatching here, so this is a no-op on an
-   *  already-cleared timer — but it is in the code being moved, so it moves,
-   *  and removing it is a behaviour question that does not belong in a
-   *  mechanical commit. Passed as a callback rather than dropped, so the move
-   *  stays verbatim and the redundancy stays VISIBLE instead of being quietly
-   *  resolved by the refactor. Found by the characterisation tests on the first
-   *  run of this extraction: `ReferenceError: authTimer is not defined`. */
-  clearAuthTimer: () => void;
 }
 
 /**
@@ -128,7 +119,7 @@ interface AuthCtx {
  * function that has no other reason to know about it.
  */
 function handleAuthFrame(ctx: AuthCtx): void {
-  const { ws, state, db, frame, parsed, agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus, clearAuthTimer } = ctx;
+  const { ws, state, db, frame, parsed, agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus } = ctx;
 
   if (typeof parsed !== 'object' || parsed === null || frame.type !== 'auth') {
     try {
@@ -223,7 +214,18 @@ function handleAuthFrame(ctx: AuthCtx): void {
     // an agent, and every agent-shaped path keys off agentId.
     state.authed = true;
     state.peerAlias = agentId;
-    clearAuthTimer();
+    // NO auth-timer clear here. It used to sit on this line and it was a no-op:
+    // the ONE caller clears the timer before dispatching into this function, so
+    // this ran on an already-cleared timer. Measured before removing it — the
+    // review-suggested black-box test (peer auth, wait past the 5 s timeout,
+    // assert the socket lives) passes identically with and without the line,
+    // because the property is defended twice over: the call-site clear AND the
+    // timer callback's own `!state.authed` guard. A line no test can see is a
+    // line no test should be written to freeze.
+    //
+    // What makes that safe is the call site, not this comment: the timer is
+    // cleared on every path into here, pinned by the one-call-site test in
+    // auth-seam.test.ts.
 
     // NEWER WINS (D11). ORDER IS LOAD-BEARING: index the new socket
     // FIRST, then close the old one.
@@ -441,7 +443,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
  * #143 — what a socket teardown needs from the connection scope. Same rule as
  * AuthCtx: every field is a LIVE reference, never a snapshot.
  */
-interface CloseCtx {
+export interface CloseCtx {
   ws: WebSocket;
   db: Database;
   registry: Map<WebSocket, ConnState>;
@@ -466,9 +468,27 @@ interface CloseCtx {
  * `return` in it already meant "this teardown is done", and there is no code
  * after the handler to fall through to.
  */
-function handleSocketClose(ctx: CloseCtx): void {
+export function handleSocketClose(ctx: CloseCtx): void {
   const { ws, db, registry, connections, agentIndex, peerIndex, observerIndex,
           presenceState, presenceDebounceMs, broadcastStatus, clearAuthTimer } = ctx;
+  // LOAD-BEARING, and the only one of this file's auth-timer clears that is.
+  // Every other clear sits on the MESSAGE path, so a socket that connects and
+  // closes WITHOUT EVER SENDING reaches only this one. Measured with it removed
+  // — three connect-and-close sockets, then a wait past the 5 s timeout:
+  //
+  //   with this line:     timer callbacks that ran 0, that acted 0
+  //   without this line:  timer callbacks that ran 3, that acted 3
+  //
+  // NO BLACK-BOX TEST CAN SEE IT, which is why the suite stayed green under a
+  // reviewer's no-op of this line and why the unit test beside it is not
+  // ceremony. The callback's `ws.send` throws on a closed socket and is caught;
+  // its `ws.close` is a no-op on one already closed. Nothing reaches the wire.
+  //
+  // THE COST IS RETENTION ONLY, and the number matters so nobody later
+  // "hardens" this into something bigger than it is: one timer per
+  // connect-and-close, holding that socket's `ws` and `state` for at most five
+  // seconds. Bounded at 5 s x connection rate — an unnecessary hold, not an
+  // amplifier.
   clearAuthTimer();
   connections.delete(ws);
   const connState = registry.get(ws);
@@ -1128,7 +1148,6 @@ export function startWsServer(
             handleAuthFrame({
               ws, state, db, frame, parsed,
               agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus,
-              clearAuthTimer: () => clearTimeout(authTimer),
             });
             return;
           }
