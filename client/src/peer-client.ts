@@ -17,13 +17,36 @@ import type { ErrorFrame } from './protocol.ts';
 
 /** The relay frame a peer sends. `msg_id` is the REMOTE mesh's id for the
  *  message, which is what the receiving side dedupes on. */
+/**
+ * A frame on a peering. The shape depends on `kind`, and F4 added four kinds
+ * that are not `direct`:
+ *
+ *   direct            from, to, payload
+ *   topic             from = the bare topic name, topic, payload, origin?
+ *   topic-publish     from = the bare publisher id, topic, payload
+ *   topic-subscribe   from, topic
+ *   topic-unsubscribe from, topic
+ *
+ * `to`, `payload` and `topic` are therefore OPTIONAL HERE and required per kind
+ * by the receiver — `routeRelay` refuses a topic frame carrying a `to`, and a
+ * direct frame missing one, with the same uniform RELAY_REFUSED. This type
+ * describes what may appear on the wire; it is not the enforcement, and writing
+ * it as a discriminated union would put a second copy of the rules in a package
+ * that cannot see the refusals.
+ */
 export interface RelayFrame {
   type: 'relay';
   msg_id: string;
   kind: string;
   from: string;
-  to: string;
-  payload: string;
+  /** `direct` only. Absent on every topic kind. */
+  to?: string;
+  /** Absent on `topic-subscribe` / `topic-unsubscribe`, which carry no message. */
+  payload?: string;
+  /** Every topic kind. Bare — a ':' would name a topic on a third mesh. */
+  topic?: string;
+  /** `topic` only. Display-only provenance set by the sending mesh. */
+  origin?: string;
   content_type?: string;
   ttl_ms?: number;
 }

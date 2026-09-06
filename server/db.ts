@@ -2014,6 +2014,45 @@ export function getTopicSubscribers(db: Database, topic: string): string[] {
   return rows.map(r => r.agent_id);
 }
 
+/**
+ * F4 §7 — the subscribers on ONE peered mesh for one topic.
+ *
+ * A PREFIX RANGE, not `LIKE 'alias:%'`: index-servable, and it cannot be
+ * confused by a '%' or '_' inside an alias. (';' is ':' + 1 — the same idiom as
+ * `deletePeeringEdges`.)
+ */
+export function listRemoteSubscribers(db: Database, alias: string, topic: string): string[] {
+  return (db.prepare(
+    'SELECT agent_id FROM subscriptions WHERE topic = ? AND agent_id >= ? AND agent_id < ? ORDER BY agent_id'
+  ).all(topic, `${alias}:`, `${alias};`) as { agent_id: string }[]).map(r => r.agent_id);
+}
+
+/**
+ * F4 §7 — every subscription a peered mesh holds here, for `GET
+ * /peers/:alias/subscriptions`. The operator-facing answer to "why is this pod
+ * not receiving?", which is otherwise only visible in the database.
+ */
+export function listPeerSubscriptions(
+  db: Database, alias: string,
+): { agent_id: string; topic: string; subscribed_at: number }[] {
+  return db.prepare(
+    `SELECT agent_id, topic, subscribed_at FROM subscriptions
+     WHERE agent_id >= ? AND agent_id < ? ORDER BY topic, agent_id`
+  ).all(`${alias}:`, `${alias};`) as { agent_id: string; topic: string; subscribed_at: number }[];
+}
+
+/**
+ * F4 §7 — remove every subscription a peered mesh holds here.
+ *
+ * Called where a peering ENDS, for the same reason `deletePeeringEdges` is: a
+ * new key may be minted for the same alias, and a subscription that outlived
+ * its peering would silently belong to whoever next holds the name.
+ */
+export function deleteRemoteSubscriptions(db: Database, alias: string): number {
+  return db.prepare('DELETE FROM subscriptions WHERE agent_id >= ? AND agent_id < ?')
+    .run(`${alias}:`, `${alias};`).changes;
+}
+
 export function getAgentSubscriptions(db: Database, agent_id: string): string[] {
   const rows = db.prepare('SELECT topic FROM subscriptions WHERE agent_id = ?').all(agent_id) as { topic: string }[];
   return rows.map(r => r.topic);

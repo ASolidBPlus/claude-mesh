@@ -215,20 +215,51 @@ export class Forwarder {
     this.tokens -= 1;
     this.inFlight.add(row.id);
 
-    const remote = row.to_agent!.slice(row.to_agent!.indexOf(':') + 1);
     // Never 0 for a stored row: ttl 0 means ephemeral, and this row is queued.
     const ttl = row.expires_at === null ? undefined : Math.max(1, row.expires_at - now);
+    const base = { type: 'relay' as const, msg_id: row.id, ...(ttl !== undefined ? { ttl_ms: ttl } : {}) };
 
-    this.client.relay({
-      type: 'relay',
-      msg_id: row.id,
-      kind: 'direct',
-      from: row.from_agent,
-      to: remote,
-      payload: row.payload,
-      content_type: row.content_type,
-      ...(ttl !== undefined ? { ttl_ms: ttl } : {}),
-    }).then(
+    // F4 — the wire shape is decided by the ROW's kind.
+    //
+    // `msg_id` is `row.id`, a fresh uuid per row, on every arm: the receiver
+    // dedupes on it, and reusing an id across the hub would make a retry
+    // indistinguishable from a redelivery.
+    //
+    // The sliced remote is computed ONLY in the direct arm. A topic row's
+    // `to_agent` is the bare peering (`pod1:`), so slicing it would yield an
+    // empty string and put a `to: ""` on a frame that must carry none.
+    let frame;
+    switch (row.kind) {
+      case 'topic':
+        // `from` is the BARE topic name — the principal, which the receiver
+        // stamps with its own alias for us. No `to`: a topic frame names a
+        // topic, and a second address would contradict it.
+        frame = {
+          ...base, kind: 'topic' as const, from: row.topic!, topic: row.topic!,
+          ...(row.origin !== null ? { origin: row.origin } : {}),
+          payload: row.payload, content_type: row.content_type,
+        };
+        break;
+      case 'topic-publish':
+        frame = {
+          ...base, kind: 'topic-publish' as const, from: row.from_agent, topic: row.topic!,
+          payload: row.payload, content_type: row.content_type,
+        };
+        break;
+      case 'topic-subscribe':
+      case 'topic-unsubscribe':
+        // State changes, not messages: no payload, no content_type.
+        frame = { ...base, kind: row.kind, from: row.from_agent, topic: row.topic! };
+        break;
+      default:
+        frame = {
+          ...base, kind: 'direct' as const, from: row.from_agent,
+          to: row.to_agent!.slice(row.to_agent!.indexOf(':') + 1),
+          payload: row.payload, content_type: row.content_type,
+        };
+    }
+
+    this.client.relay(frame).then(
       () => this.onSendAck(row),
       (err: { code?: string }) => {
         this.inFlight.delete(row.id);
