@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { openDb, registerAgent, insertFile } from '../db.ts';
+import { openDb, registerAgent } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { startHttpAdmin, HttpAdminHandle, ROUTES, contentDispositionFor, safeContentType } from '../http-admin.ts';
 import { Database } from 'bun:sqlite';
@@ -32,11 +32,19 @@ describe('GET /files/:id — header injection cannot kill the server', () => {
   const addFile = async (id: string, filename: string, content_type: string) => {
     const filePath = join(filesDir, id);
     await Bun.write(filePath, BYTES);
-    insertFile(db, {
-      id, from_agent: 'A', to_agent: 'B', filename, content_type,
-      size_bytes: BYTES.byteLength, file_path: filePath,
-      sent_at: Date.now(), expires_at: null,
-    });
+    // #70 normalises filename and content_type at insertFile, so poison can no
+    // longer be stored THROUGH the API. These tests are about the other case
+    // and it is the one that outlives the fix: rows already in a production
+    // database, written before ingest-safety existed. Serving must stay safe
+    // for them forever, and the only faithful way to set that up is to write
+    // the row the way it was written then — raw, past the chokepoint.
+    //
+    // Going through insertFile here would have quietly turned these into tests
+    // of the ingest normaliser, passing while proving nothing about serving.
+    db.prepare(
+      `INSERT INTO files (id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+    ).run(id, 'A', 'B', filename, content_type, BYTES.byteLength, filePath, Date.now());
   };
 
   const get = (path: string, token: string) =>

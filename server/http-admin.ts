@@ -763,12 +763,15 @@ export function contentDispositionFor(filename: string): string {
  * parameters, printable-ASCII only) passes through; anything else serves as
  * octet-stream rather than 500ing a file whose bytes are fine.
  */
-const SAFE_CONTENT_TYPE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+(?:\s*;\s*[\x20-\x7e]*)?$/;
-
-export function safeContentType(ct: string | null | undefined): string {
-  if (typeof ct === 'string' && ct.length <= 256 && SAFE_CONTENT_TYPE.test(ct)) return ct;
-  return 'application/octet-stream';
-}
+// #70: the grammar and the helper now live in file-hygiene.ts, so INGEST and
+// SERVING share one authority. Re-exported here because this module is where
+// the header-DoS fix (#68) put them and existing importers name that path —
+// the definition moved, the surface did not.
+export { safeContentType, SAFE_CONTENT_TYPE } from './file-hygiene.ts';
+// ...and imported, not only re-exported: `export { x } from` forwards the name
+// to importers WITHOUT binding it in this module's scope, so the serving path
+// below saw an undefined identifier. Caught by the #68 tests going 500.
+import { safeContentType } from './file-hygiene.ts';
 
 async function handleFileById(ctx: AdminCtx): Promise<void> {
   const { res, db, params, auth } = ctx;

@@ -1,4 +1,5 @@
 import { Database } from 'bun:sqlite';
+import { safeFilename, safeContentType } from './file-hygiene.ts';
 
 // ──────────────────────────────────────────────
 // Types
@@ -1689,6 +1690,13 @@ export function insertFile(
     group_id?: string | null;
   }
 ): FileRecord {
+  // #70: normalise at the CHOKEPOINT, not at each caller. Every path that
+  // stores a file goes through here — including the ones that do not exist
+  // yet, which is the whole reason ingest-safety is worth having on top of
+  // #68's serving-safety. See server/file-hygiene.ts for what is stripped and
+  // what is deliberately kept.
+  const filename = safeFilename(file.filename);
+  const content_type = safeContentType(file.content_type);
   const caption = file.caption ?? null;
   const reply_to_msg_id = file.reply_to_msg_id ?? null;
   const group_id = file.group_id ?? null;
@@ -1696,7 +1704,7 @@ export function insertFile(
   db.prepare(`
     INSERT INTO files (id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at, caption, reply_to_msg_id, group_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
-  `).run(file.id, file.from_agent, file.to_agent, file.filename, file.content_type, file.size_bytes, file.file_path, file.sent_at, file.expires_at, caption, reply_to_msg_id, group_id);
+  `).run(file.id, file.from_agent, file.to_agent, filename, content_type, file.size_bytes, file.file_path, file.sent_at, file.expires_at, caption, reply_to_msg_id, group_id);
 
   return getFile(db, file.id) as FileRecord;
 }
