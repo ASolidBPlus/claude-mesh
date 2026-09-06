@@ -570,12 +570,30 @@ export function routeRelay(
   // `origin` is ATTACKER-SUPPLIED and display-only: shape-checked here and then
   // carried verbatim. It is never routed on and never an ACL principal, so the
   // only thing that can go wrong with it is size.
-  if (frame.origin !== undefined) {
-    if (typeof frame.origin !== 'string' || Buffer.byteLength(frame.origin, 'utf8') > 256) {
-      return refuse('bad_origin');
-    }
-  }
-  const origin = typeof frame.origin === 'string' ? frame.origin : null;
+  // ORIGIN IS STAMPED BY THIS MESH, exactly as a relayed `from` is.
+  //
+  // A peer sends `origin: "pod1:alice"` (a spoke's poster) or `origin: "alice"`
+  // (its own local publisher). Stored raw, both are ambiguous here: `alice`
+  // would read as a LOCAL agent id, and `pod1:alice` names a mesh whose alias
+  // is pod1's business, not ours. Stamping with the alias we delivered through
+  // makes the string true from where it is read:
+  //
+  //   hub's own publisher   alice        -> orch:alice        (a real remote id)
+  //   a spoke's poster      pod1:alice   -> orch:pod1:alice   (two colons)
+  //
+  // The two-colon form is DELIBERATELY UNROUTABLE — the one-hop grammar refuses
+  // it everywhere — and that is the honest shape: this mesh can say who the
+  // post came through, and cannot offer a path back to a mesh it does not peer
+  // with. Never reply to an origin.
+  //
+  // Server-stamped, so a peer cannot forge a replyable form: whatever it sends
+  // acquires our alias for it as a prefix, and the alias is ours to choose.
+  //
+  // The 256-byte bound is checked AFTER stamping, because the stamp is what
+  // goes on the wire and into the row.
+  if (frame.origin !== undefined && typeof frame.origin !== 'string') return refuse('bad_origin');
+  const origin = typeof frame.origin === 'string' ? `${alias}:${frame.origin}` : null;
+  if (origin !== null && Buffer.byteLength(origin, 'utf8') > 256) return refuse('bad_origin');
 
   // ONE HOP. `from`/`to` must be bare — a ':' would mean this peer is relaying
   // on behalf of a THIRD mesh, which is transitive federation nobody agreed to:

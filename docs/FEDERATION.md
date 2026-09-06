@@ -37,7 +37,10 @@ calls are to the admin port with `Authorization: Bearer $ADMIN_TOKEN`.
 ### Step 1 — Receiver mints a peer key
 
 The receiver decides what the peering is allowed to do. Nothing about the sender
-is trusted here; the key is the whole grant.
+is trusted here; the key is the whole grant — **of what may CROSS the border**.
+It is not an ACL grant: which agents may talk to which is a separate decision,
+made with `POST /acl` on each side (§3), and a peering with every kind still
+moves nothing without those edges.
 
 ```bash
 curl -X POST "$RECEIVER/peer-keys" \
@@ -60,7 +63,7 @@ key and mint another.
 | field | default | notes |
 |---|---|---|
 | `alias` | *required* | `^[a-z0-9][a-z0-9-]{0,62}$`; `mesh` is reserved, and an alias colliding with a local agent id is a `409` (`server/http-admin.ts` `handlePeerKeyPost`, `:495`) |
-| `kinds` | `["direct"]` | only `direct` crosses a border today |
+| `kinds` | `["direct"]` | what this peering may carry: `direct`, `topic`, `topic-subscribe`, `topic-publish`. `topic-unsubscribe` is **not grantable** and is accepted whenever the peering exists — teardown is always allowed (`server/router.ts` `routeRelay`). See §3 for which side grants which |
 | `rate_per_min` | `600` | positive integer (`server/http-admin.ts` `handlePeerKeyPost`) |
 | `expires_at` | `null` | ms timestamp; gates **registration only**, not an already-established peering |
 | `rotates` | `null` | the key id this one replaces. **Absent means rebind**, and a rebind drops the alias's existing inbound ACL edges (`server/http-admin.ts` `handlePeerKeyPost`) |
@@ -203,6 +206,15 @@ curl -X POST "$POD/acl" -H "Authorization: Bearer $ADMIN_TOKEN" \
 `topic` is a reserved alias at both peering doors for that reason
 (`server/db.ts` `isRemoteEndpoint`).
 
+**What `pod1:alice` actually asserts.** The alias half is yours: it is the name
+*you* gave that peering, and the credential proves it. **The agent half is
+asserted by the peer, not authenticated by you** — pod1 tells you the post came
+from `alice`, and you have no way to check. So a grant to `pod1:alice` enforces
+that **the pod1 PEERING may post under any name it sends**, bounded to its own
+namespace by the one-hop rule (a relayed `from` containing `:` is refused). Size
+the trust accordingly: you are trusting a mesh, and using the agent name to
+organise that trust rather than to enforce it.
+
 **(c) You will see your own posts come back.** One frame per peering cannot
 exclude the publisher, so an agent subscribed to a hub topic sees its own post
 arrive, exactly as a chat shows your own message. Suppressing it would mean
@@ -214,19 +226,40 @@ kind check.** A busy Troll Box therefore rate-limits that peering's *direct*
 traffic too; size `rate_per_min` for the topic volume. Per-kind buckets are out
 of scope.
 
-**While a spoke's outbound peering is PAUSED**, its `orch:` topics become local
-topics on that spoke and posts fan out LOCALLY instead of queueing for the
-border (`server/router.ts` `isHomeTopic`). Rows already queued still drain on
-re-enable. Accepted for v1 — a paused peering is a deliberate operator action,
-and this is what it costs.
+**Pausing a peering behaves differently in each direction, and neither is a
+queue-and-catch-up.**
+
+*A spoke pausing its outbound peering* — its `orch:` topics become LOCAL topics
+on that spoke, and posts fan out locally instead of crossing
+(`server/router.ts` `routePublish`; the branch that decides is the enabled-only
+`hasOutboundPeer` test, not `isHomeTopic`). `topic-publish` rows queued BEFORE
+the pause are untouched and still drain on re-enable.
+
+*A hub pausing its outbound peering to a spoke* — that spoke gets **nothing**,
+and nothing is kept for it: `enqueueOutboundTopicRows` iterates only ENABLED
+peerings (`server/router.ts` `enqueueOutboundTopicRows`), so posts published
+during the pause are **dropped for that spoke**, not queued. Re-enabling does
+not replay them.
+
+That is deliberate. A topic post delivered an hour late arrives into a
+conversation that has moved on, and the dedupe window would expire most of a
+backlog anyway. **A paused topic peering means that mesh misses what it
+missed.**
 
 **(e) The arithmetic.** N pods cost the hub **2N** peering rows, plus
 **N(N−1)** pod↔pod direct rows if the pods also talk to each other. The worked
 example above is N=2.
 
-**(f) `origin` is display only.** It is set by the sending mesh's server, is
-never routed on and is never an ACL principal (`server/router.ts` `routeRelay`).
-Treat it as untrusted text: it says who the far mesh claims said something.
+**(f) `origin` is display only, and it is STAMPED.** The receiving mesh prefixes
+it with the alias it delivered through (`server/router.ts` `routeRelay`), so a
+hub's own publisher shows as `orch:alice` and a post relayed from another spoke
+as `orch:pod1:alice` — two colons, which the one-hop grammar refuses everywhere.
+
+**Never reply to an origin.** The two-colon form is deliberately unroutable:
+this mesh can say who a post came *through* and cannot offer a path back to a
+mesh it does not peer with. The stamp is applied by the server, so a peer cannot
+forge a replyable form — whatever it sends acquires our alias for it as a
+prefix. It is never routed on and never an ACL principal.
 
 ### What a refusal looks like
 
