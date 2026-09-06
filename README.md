@@ -108,7 +108,7 @@ All frames are JSON with a `type` field. The client must send `auth` first (with
 ```json
 { "type": "publish", "msg_id": "m-2", "topic": "alerts", "payload": "disk full" }
 ```
-`→ subscribe` / `→ unsubscribe` — manage your topic subscriptions (exact-topic; no wildcards)
+`→ subscribe` / `→ unsubscribe` — manage your topic subscriptions (exact-topic; no wildcards). **`unsubscribe` is idempotent and always succeeds**, including for a topic that does not exist or one you were never subscribed to — it deliberately does not report topic existence, because the topic list is admin-only and a per-guess answer would enumerate it (#129).
 ```json
 { "type": "subscribe", "topic": "alerts" }
 { "type": "unsubscribe", "topic": "alerts" }
@@ -190,7 +190,7 @@ The recipient downloads the bytes via `GET /files/<file_id>`. Max size is `MESH_
 This is about **client-frame → server-reply** correlation, not message request/reply. If a frame you send carries a `msg_id`, the matching server reply echoes it back as `ref` (acks, `reminders_list`, `presence_list`, and errors all do this). Key every outstanding frame by its `msg_id` and resolve it when a frame with that `ref` arrives — one correlation path for everything.
 
 ### Errors
-`{ "type": "error", "ref": "<msg_id>", "code": "<CODE>", "message": "..." }`. Codes: `ACL_DENIED`, `AGENT_NOT_FOUND`, `TOPIC_NOT_FOUND`, `MESSAGE_TOO_LARGE`, `PAYLOAD_TOO_LARGE`, `INVALID_REQUEST`, `NOT_IMPLEMENTED` (unknown frame type), `INVALID_CRON`, `INVALID_TZ`, `INVALID_WHEN`, `REMINDER_NOT_FOUND`, plus file codes (`FILE_TOO_LARGE`, `INVALID_BASE64`, `CAPTION_TOO_LARGE`). Handshake failures (`AUTH_FAILED` / `AUTH_REQUIRED` / `AUTH_TIMEOUT`) are covered in [Handshake](#handshake).
+`{ "type": "error", "ref": "<msg_id>", "code": "<CODE>", "message": "..." }`. Codes: `ACL_DENIED`, `AGENT_NOT_FOUND`, `MESSAGE_TOO_LARGE`, `PAYLOAD_TOO_LARGE`, `INVALID_REQUEST`, `NOT_IMPLEMENTED` (unknown frame type), `INVALID_CRON`, `INVALID_TZ`, `INVALID_WHEN`, `REMINDER_NOT_FOUND`, plus file codes (`FILE_TOO_LARGE`, `INVALID_BASE64`, `CAPTION_TOO_LARGE`). Handshake failures (`AUTH_FAILED` / `AUTH_REQUIRED` / `AUTH_TIMEOUT`) are covered in [Handshake](#handshake).
 
 ---
 
