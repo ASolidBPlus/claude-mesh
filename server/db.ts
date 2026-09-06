@@ -691,14 +691,92 @@ export function updateAgent(
   return getAgentById(db, id);
 }
 
-export function deleteAgent(db: Database, id: string): void {
-  db.prepare('DELETE FROM topics WHERE created_by = ?').run(id);
-  // F0a: was an ON DELETE CASCADE on acl's foreign keys. Now explicit, because
-  // the table is FK-less (see the acl DDL) — and because a cascade performed
-  // this deletion invisibly, in DDL, where nobody reviewing what deleting an
-  // agent destroys would think to look.
-  db.prepare('DELETE FROM acl WHERE from_agent = ? OR to_agent = ?').run(id, id);
-  db.prepare('DELETE FROM agents WHERE id = ?').run(id);
+/**
+ * #91 — DELETING AN AGENT REMOVES THE IDENTITY, NOT THE HISTORY.
+ *
+ * `messages` and `files` carry no REFERENCES on their agent columns, so every
+ * row naming a deleted agent used to survive as an orphan — including `files`
+ * rows whose bytes stayed on disk forever, since no sweep reaches them once
+ * they are delivered.
+ *
+ * That is a semantics question before it is a fix, and the answer is: purge
+ * only what CAN NEVER BE USED. Rows addressed to the deleted id and never
+ * delivered can never be delivered now — pure waste, and for files, leaked
+ * bytes. Everything else is also THE OTHER PARTY'S history of that
+ * conversation, and destroying it here would take it out from under
+ * MESH_RETENTION_MS, which is the thing that is supposed to govern how long
+ * history lives.
+ *
+ * NO FOREIGN-KEY CASCADE, deliberately, and it is the same argument the acl
+ * deletion below already carries: a cascade would take the purge-EVERYTHING
+ * branch of this decision silently, in DDL, where nobody reviewing what
+ * deleting an agent destroys would think to look. A schema constraint must not
+ * decide a semantics question.
+ *
+ * PREDICATE: `to_agent = ? AND delivered_at IS NULL`. Equality excludes NULL by
+ * construction, which matters because the schema permits a NULL `to_agent`
+ * even though no writer produces one today.
+ *
+ * THE FORM TO AVOID IS AN EXPLICIT `OR to_agent IS NULL`, not a negated one —
+ * measured, because the issue's note says the opposite and I nearly wrote it
+ * down as fact. Against a table holding a NULL row, a `doomed` row and a
+ * `bystander` row:
+ *
+ *     to_agent = 'doomed'            -> [match]
+ *     NOT (to_agent != 'doomed')     -> [match]        <- same, not a hazard
+ *     to_agent NOT IN ('bystander')  -> [match]        <- same, not a hazard
+ *     (to_agent = 'doomed' OR to_agent IS NULL) -> [null-row, match]  <- HAZARD
+ *
+ * Three-valued logic makes the negated forms NULL-safe in the SAME direction
+ * as equality: `to_agent != x` is NULL for a NULL row, and `NOT NULL` is NULL,
+ * which is not true, so the row is not matched. The way a NULL row gets swept
+ * in is by someone adding the OR deliberately, which is what the test pins.
+ *
+ * (The issue's note says stored TOPIC rows have a NULL `to_agent` and that the
+ * equality form is what protects them. Measured against the tree: they do not
+ * — routePublish persists per-subscriber copies with `to_agent = subscriber_id`
+ * on both the online and offline paths, and no writer in the tree produces a
+ * NULL. The note's premise appears to come from `buildDeliverFrame`, the WIRE
+ * frame, which does carry `to_agent: null` twelve lines from the insert that
+ * does not. The predicate is right regardless; what changes is that an
+ * undelivered topic COPY addressed to the deleted agent IS purged, which is
+ * correct — a per-subscriber copy for an identity that no longer exists can
+ * never be delivered. Pinned as its own test rather than left implicit.)
+ *
+ * RETURNS THE PURGED FILE PATHS so the caller unlinks AFTER the rows are gone
+ * (#85's ordering, same as deleteExpiredFiles): a crash between the two leaves
+ * an orphan file, which is recoverable, never a row pointing at missing bytes,
+ * which reads as corruption. This function touches no filesystem — that is
+ * what makes the wrong order unrepresentable here rather than merely avoided.
+ *
+ * ATOMIC, which the multi-statement version was not. BEYOND THE BRIEF and
+ * called out as such: it mattered less when this deleted only acl and topics,
+ * but a partial failure now leaves an agent still live with its pending mail
+ * destroyed. The unlink stays outside, after the commit.
+ */
+export function deleteAgent(db: Database, id: string): string[] {
+  const tx = db.transaction(() => {
+    // Files first, so the paths are captured inside the same transaction that
+    // removes the rows.
+    const purged = db.prepare(
+      `DELETE FROM files
+       WHERE to_agent = ? AND delivered_at IS NULL
+       RETURNING file_path`
+    ).all(id) as { file_path: string }[];
+
+    db.prepare('DELETE FROM messages WHERE to_agent = ? AND delivered_at IS NULL').run(id);
+
+    db.prepare('DELETE FROM topics WHERE created_by = ?').run(id);
+    // F0a: was an ON DELETE CASCADE on acl's foreign keys. Now explicit, because
+    // the table is FK-less (see the acl DDL) — and because a cascade performed
+    // this deletion invisibly, in DDL, where nobody reviewing what deleting an
+    // agent destroys would think to look.
+    db.prepare('DELETE FROM acl WHERE from_agent = ? OR to_agent = ?').run(id, id);
+    db.prepare('DELETE FROM agents WHERE id = ?').run(id);
+
+    return purged.map(r => r.file_path);
+  });
+  return tx() as string[];
 }
 
 // ──────────────────────────────────────────────
