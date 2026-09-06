@@ -57,6 +57,13 @@ describe('#79 one token-comparison helper', () => {
     // identity comparison. An earlier, wider version matched
     // `typeof provided !== 'string'` — a type guard, not a compare — which is
     // the kind of false positive that gets a scan deleted rather than fixed.
+    //
+    // THE COST OF THAT NARROWING, since the benefit is already written above.
+    // This list is closed — a credential compared under an identifier not named
+    // here is invisible to this scan; the door set-equality test below is what
+    // covers a door dropping the helper, and adding a credential name here is
+    // part of adding a door. Neither catches a NEW door with a NEW credential
+    // name; that residual is accepted.
     const CREDENTIAL = /(?:===|!==)\s*(?:`Bearer|adminToken|configured|token_hash|key_hash|storedHash)\b|\b(?:adminToken|storedHash|token_hash|key_hash)\s*(?:===|!==)/;
     const offenders: string[] = [];
     for (const f of sourceFiles(SERVER_ROOT)) {
