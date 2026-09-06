@@ -1,6 +1,10 @@
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as net from 'net';
+// The only filesystem call in this file. File BYTES are written and read
+// through Bun.write/Bun.file; this is the delete side, and it matches
+// cleanup.ts's unlink so the two behave identically on a missing path.
+import { unlinkSync } from 'fs';
 import { WebSocket } from 'ws';
 import {
   getAgentById,
@@ -600,14 +604,30 @@ function handleAgentDelete(ctx: AdminCtx): void {
     res.end(JSON.stringify({ error: 'agent not found' }));
     return;
   }
+  let purgedPaths: string[];
   try {
-    deleteAgent(db, id);
+    purgedPaths = deleteAgent(db, id);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     res.writeHead(409, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'delete failed', detail: msg }));
     return;
   }
+  // #91/#85: unlink AFTER the rows are gone, never before — a crash between
+  // the two leaves an orphan file, never a row pointing at missing bytes. An
+  // unlink failure is logged, never fatal: leaked bytes are recoverable, a
+  // half-finished delete reported as a 409 is not (the identity is already
+  // gone by the time we get here).
+  let unlinked = 0;
+  for (const p of purgedPaths) {
+    try { unlinkSync(p); unlinked++; } catch (err) {
+      console.warn(`[admin] file bytes not unlinked (row already removed): ${p}: ${(err as Error).message}`);
+    }
+  }
+  console.log(JSON.stringify({
+    evt: 'agent.deleted', agent_id: id,
+    purged_files: purgedPaths.length, unlinked, at: Date.now(),
+  }));
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ok: true }));
 }
