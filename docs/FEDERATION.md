@@ -1,10 +1,10 @@
 # Federation — operator guide
 
-> **Describes `main` as of `a56b66d`.** Every behavioural claim below cites the
-> file and line it was read from, at the head named in that section. Sections
-> marked **lands with #126** or **lands with #128** describe behaviour that is
-> *not on `main` yet* — they are written in the future tense on purpose, and the
-> header SHA is updated to the real `main` when this PR merges.
+> **Describes `main` as of `62e30ec`.** Every behavioural claim below cites the
+> file and the function or route it was read from — deliberately not a line
+> number, which drifts on every merge (see the PR for the measurement).
+> Everything here describes behaviour that is on `main` today; there are no
+> pending-feature caveats left in this guide.
 >
 > You do not need to read `DESIGN_FEDERATION_V2.md` to use this guide. That
 > document explains *why*; this one explains *what to type*.
@@ -20,12 +20,12 @@
    traffic is two peerings, configured independently on each side.
 3. **Remote agents are addressed `alias:agent`** — the alias is the name *your*
    mesh gave the peer, so the same remote mesh may be `partner` to you and
-   `us` to them (`server/router.ts:313-340`).
+   `us` to them (`server/router.ts` `routeDirect`).
 4. **One hop.** A peer may not relay on behalf of a third mesh; a `from` or `to`
-   containing `:` is refused (`server/router.ts:225-226`).
+   containing `:` is refused (`server/router.ts` `routeRelay`).
 5. **Direct messages only, and both sides must still approve the pair.** A
    peering does not grant agent-to-agent access: the ordinary ACL grant is
-   required as well, on the receiving side (`server/router.ts:364-366`).
+   required as well, on the receiving side (`server/router.ts` `routeDirect`).
 
 ---
 
@@ -54,20 +54,20 @@ curl -X POST "$RECEIVER/peer-keys" \
 ```
 
 **`key` is shown exactly once and is never stored in the clear or returned by
-any read API** (`server/http-admin.ts:1383`). If you lose it, revoke the
+any read API** (`server/http-admin.ts` `handlePeerKeyPost`). If you lose it, revoke the
 key and mint another.
 
 | field | default | notes |
 |---|---|---|
-| `alias` | *required* | `^[a-z0-9][a-z0-9-]{0,62}$`; `mesh` is reserved, and an alias colliding with a local agent id is a `409` (`server/http-admin.ts:1298`, `:495`) |
+| `alias` | *required* | `^[a-z0-9][a-z0-9-]{0,62}$`; `mesh` is reserved, and an alias colliding with a local agent id is a `409` (`server/http-admin.ts` `handlePeerKeyPost`, `:495`) |
 | `kinds` | `["direct"]` | only `direct` crosses a border today |
-| `rate_per_min` | `600` | positive integer (`server/http-admin.ts:1336`) |
+| `rate_per_min` | `600` | positive integer (`server/http-admin.ts` `handlePeerKeyPost`) |
 | `expires_at` | `null` | ms timestamp; gates **registration only**, not an already-established peering |
-| `rotates` | `null` | the key id this one replaces. **Absent means rebind**, and a rebind drops the alias's existing inbound ACL edges (`server/http-admin.ts:1358`) |
+| `rotates` | `null` | the key id this one replaces. **Absent means rebind**, and a rebind drops the alias's existing inbound ACL edges (`server/http-admin.ts` `handlePeerKeyPost`) |
 
 Only **one live key per alias** exists at a time — minting a second is a `409`,
 so revoking one cannot leave a door open you believed you had closed
-(`server/http-admin.ts:1320`).
+(`server/http-admin.ts` `handlePeerKeyPost`).
 
 ### Step 2 — Sender registers with the key
 
@@ -86,12 +86,12 @@ curl -X POST "$RECEIVER/peers/register" \
 ```
 
 This route takes **no admin token** — the key *is* the credential
-(`server/http-admin.ts:1456`). The returned `token` is the sender's
+(`server/http-admin.ts` `handlePeerRegister`). The returned `token` is the sender's
 long-lived credential for the border socket, and is likewise shown once.
 
 > **Every failure of this step returns the same `403 {"error":"registration
 > refused"}`** — bad key, revoked key, expired key, unknown alias, malformed
-> JSON, all of it (`server/http-admin.ts:1448`). This is deliberate (C9):
+> JSON, all of it (`server/http-admin.ts` `refusePeerRegistration`). This is deliberate (C9):
 > a caller who is not yet trusted must not be able to tell *which* thing was
 > wrong, because the differences are exactly what an attacker would enumerate.
 > **The real reason is in the receiver's log**, as `evt:"peer.register_refused"`
@@ -115,7 +115,7 @@ curl -X POST "$SENDER/outbound-peers" \
 ```
 
 **The response never contains `token`, and neither does `GET /outbound-peers`**
-(`server/http-admin.ts:1549`) — it is a live credential, and returning it
+(`server/http-admin.ts` `publicOutboundFields`) — it is a live credential, and returning it
 would put it in every operator's shell history.
 
 ### Step 4 — Reverse the whole thing for two-way traffic
@@ -151,11 +151,11 @@ direction (`inbound-alias:their-agent` → `local-agent`).
 
 | code | meaning |
 |---|---|
-| `AGENT_NOT_FOUND` | **the catch-all.** No such peering, no ACL grant, unknown remote agent, or a second `:` in the address — all one code, so a sender cannot map the far mesh (`server/router.ts:346-366`) |
-| `KIND_NOT_ALLOWED` | the message kind is not in *your own* outbound `kinds`. A deliberate exception: it reveals only the sender's own configuration and crosses no border (`server/router.ts:373-374`) |
-| `DUPLICATE_MSG_ID` | this `msg_id` is already stored (`server/router.ts:380`) |
-| `RELAY_REFUSED` | seen by the *peer*, not by your agents: the far side refused a relayed frame and says nothing about why (`server/router.ts:205-211`) |
-| `RATE_LIMITED` | the peering's `rate_per_min` bucket is empty — distinct from `RELAY_REFUSED` on purpose, because a sender that must back off needs to know (`server/router.ts:245`) |
+| `AGENT_NOT_FOUND` | **the catch-all.** No such peering, no ACL grant, unknown remote agent, or a second `:` in the address — all one code, so a sender cannot map the far mesh (`server/router.ts` `routeDirect`) |
+| `KIND_NOT_ALLOWED` | the message kind is not in *your own* outbound `kinds`. A deliberate exception: it reveals only the sender's own configuration and crosses no border (`server/router.ts` `routeDirect`) |
+| `DUPLICATE_MSG_ID` | this `msg_id` is already stored (`server/router.ts` `routeDirect`) |
+| `RELAY_REFUSED` | seen by the *peer*, not by your agents: the far side refused a relayed frame and says nothing about why (`server/router.ts` `routeRelay`) |
+| `RATE_LIMITED` | the peering's `rate_per_min` bucket is empty — distinct from `RELAY_REFUSED` on purpose, because a sender that must back off needs to know (`server/router.ts` `routeRelay`) |
 
 If `AGENT_NOT_FOUND` surprises you, check in this order: the peering exists and
 is enabled; the ACL grant exists on **both** meshes; the remote id has exactly
@@ -163,7 +163,7 @@ one `:`.
 
 **`ttl_ms: 0` keeps its local meaning across a border** — deliver live or drop,
 never queue. For a remote id, "online" means the peering socket is connected
-(`server/router.ts:391`).
+(`server/router.ts` `routeDirect`).
 
 ---
 
@@ -174,30 +174,30 @@ never queue. For a remote id, "online" means the peering socket is connected
 | call | shows |
 |---|---|
 | `GET /peers` | inbound peerings that have registered |
-| `GET /peer-keys` | minted keys, **never the secrets** (`server/http-admin.ts:1387`) |
+| `GET /peer-keys` | minted keys, **never the secrets** (`server/http-admin.ts` `handlePeerKeyGet`) |
 | `GET /outbound-peers` | configured outbound links, **never the tokens** |
 
 ### Metrics
 
 `/metrics` is Prometheus text on the admin port.
 
-- **`mesh_peer_up`** — **lands with #126.** Today on `main` it is emitted only
-  for *connected* aliases (`server/metrics.ts:239`), so a peering that is down
-  is indistinguishable from one that was never configured — you cannot alert on
-  it. #126 will emit `0` or `1` for **every configured peer**, inbound and
-  outbound (`server/server.ts:193-206` at `0a8ef40`), which is what makes
-  `mesh_peer_up == 0` a usable alert.
+- **`mesh_peer_up`** — emitted as `0` or `1` for **every configured peer**,
+  inbound and outbound — the source is supplied at boot (`server/server.ts` `main`)
+  into the metrics seam (`server/metrics.ts` `setPeerUpSource`). That is what
+  makes `mesh_peer_up == 0` a usable alert: a peering that is down looks
+  different from one that was never configured. **This is the series to alert
+  on.**
 - **`mesh_peer_relays_total{direction,outcome}`** — relayed messages;
   `outcome` is one of `delivered`, `refused`, `rate_limited`, `duplicate`,
   `transient`.
 - **Aggregates** (`mesh_agents_online`, `mesh_agent_up_count{state}`,
   `mesh_peer_up_count{state}`) carry no identities and stay alertable.
 
-#### `MESH_METRICS_IDENTITY_LABELS` — **lands with #126**
+#### `MESH_METRICS_IDENTITY_LABELS`
 
-**Unset (the default) no metric label will name a party** — no agent id, no peer
-alias. Setting it to `1` will turn on every party-naming label at once
-(`server/metrics.ts:154-155` at `0a8ef40`).
+**Unset (the default), no metric label names a party** — no agent id, no peer
+alias. Setting it to `1` turns on every party-naming label at once
+(`server/metrics.ts` `identityLabelsEnabled`).
 
 It defaults off because **`/metrics` is unauthenticated**. `mesh_agent_up{agent}`
 would hand any reader the complete registered agent roster — including agents
@@ -210,11 +210,11 @@ flag on is your acceptance that the admin port is genuinely internal-only.**
 An observer receives a live copy of bus traffic. It is an admin-only grant, and
 it deliberately bypasses ACL — guard it accordingly.
 
-#### The `cross_border` scope — **lands with #128**
+#### The `cross_border` scope
 
 "Observers see everything" is a *category*, and federation widened it without
-anyone editing a grant. #128 will make cross-border traffic a **second, explicit
-grant**, defaulting to `0` (`server/db.ts:402` at `1402264`):
+anyone editing a grant. Cross-border traffic is therefore a **second, explicit
+grant**, defaulting to `0` (`server/db.ts` `listCrossBorderObservers`):
 
 ```bash
 curl -X POST "$MESH/observers" -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -222,13 +222,13 @@ curl -X POST "$MESH/observers" -H "Authorization: Bearer $ADMIN_TOKEN" \
   -d '{"agent_id":"watcher","cross_border":true}'
 ```
 
-- Without it, an observer will see local traffic only and never a frame whose
-  sender or recipient is a remote id (`server/tap.ts:62` at `1402264`).
-- `cross_border` must be a real `true`; `"true"`, `1` and `"yes"` will be
-  rejected with `400` (`server/http-admin.ts:372-375` at `1402264`) — a scope
-  that widened on a typo is the failure it exists to prevent.
-- **Existing grants, including every grant made before federation shipped, will
-  be local-only.** They are not grandfathered into the wider scope.
+- Without it, an observer sees local traffic only and never a frame whose
+  sender or recipient is a remote id (`server/tap.ts` `emitTap`).
+- `cross_border` must be a real `true`; `"true"`, `1` and `"yes"` are rejected
+  with `400` (`server/http-admin.ts` `handleObserverPost`) — a scope that
+  widened on a typo is the failure it exists to prevent.
+- **Existing grants, including every grant made before federation shipped, are
+  local-only.** They are not grandfathered into the wider scope.
 - A re-grant *overwrites*, so the same call narrows a scope as well as widening
   it.
 
@@ -251,8 +251,28 @@ curl -X DELETE "$RECEIVER/peer-keys/$KEY_ID" -H "Authorization: Bearer $ADMIN_TO
 ```
 
 → `{"revoked": true, "id": "…"}`. **The peer's live socket is closed
-immediately**, not at the next sweep (`server/http-admin.ts:1407`).
+immediately**, not at the next sweep (`server/http-admin.ts` `handlePeerKeyDelete`).
 A `404 {"error":"no such live peer key"}` means it was already revoked.
+
+#### What this costs the SENDER, which is more than it looks
+
+A revocation on your side is a **fatal `AUTH_FAILED`** on theirs, and their mesh
+does not merely stop: `endOutboundPeering` runs there
+(`server/db.ts` `endOutboundPeering`) and
+
+1. **disables their outbound peering row**,
+2. **expires their queued messages for your alias** — not delivered, not left
+   pending, and
+3. **deletes their outbound ACL edges** to your agents.
+
+So recovery on the sender's side is **`PATCH {enabled:true}` *plus* re-granting
+every ACL edge** — and **the queue is not recoverable at all.** An operator who
+expects re-enabling to restore the link finds traffic still refused with
+`AGENT_NOT_FOUND`, because the edges are gone.
+
+**If you only need the link to stop, do not revoke — disable it.** See
+[Disable without deleting](#disable-without-deleting), which keeps both the
+edges and the queue.
 
 ### Delete an outbound peering (sender side)
 
@@ -264,14 +284,19 @@ curl -X DELETE "$SENDER/outbound-peers/partner" -H "Authorization: Bearer $ADMIN
 
 **What happens to queued messages: they are expired, not delivered and not left
 pending.** `endOutboundPeering` stamps still-deliverable rows for that alias as
-expired in the same transaction that removes the peering (`server/db.ts:1128`). `expired_rows` is how many were affected and
+expired in the same transaction that removes the peering (`server/db.ts` `endOutboundPeering`). `expired_rows` is how many were affected and
 `removed_edges` how many ACL edges went with it. **This is not reversible by
-re-creating the peering** — recreate it and senders must send again.
+re-creating the peering** — recreate it and senders must send again, and the
+ACL edges must be re-granted. If you only need the link to stop, use
+[Disable without deleting](#disable-without-deleting) instead.
 
 ### Disable without deleting
 
 `PATCH /outbound-peers/:alias` with `{"enabled": false}` stops the link while
-keeping its configuration.
+keeping its configuration — **and, unlike a delete or a revocation, it keeps the
+queued messages and the ACL edges.** This is the reversible option: `{"enabled":
+true}` restores the link with nothing else to redo. Prefer it for maintenance,
+incidents, and anything you intend to undo.
 
 ---
 
@@ -279,7 +304,7 @@ keeping its configuration.
 
 | not supported | why |
 |---|---|
-| **Multi-hop / transitive federation** | Your admin's decision covers *this* peer, not that peer's peers. A relayed `from`/`to` containing `:` is refused (`server/router.ts:225-226`) |
+| **Multi-hop / transitive federation** | Your admin's decision covers *this* peer, not that peer's peers. A relayed `from`/`to` containing `:` is refused (`server/router.ts` `routeRelay`) |
 | **Topics across a border** | Federated pub/sub raises ownership and fan-out questions that are not answered; topics stay local |
 | **Files across a border** | Direct messages only for v1 |
 | **Presence across a border** | You cannot see whether a remote agent is online — only whether the *peering* is connected |
