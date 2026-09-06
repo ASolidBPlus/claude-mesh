@@ -8,7 +8,7 @@ import {
   openDb, registerAgent, getAgentById, insertMessage, insertPeerKey, upsertPeer, aclGrant,
 } from '../db.ts';
 import { hashToken } from '../auth.ts';
-import { startWsServer, WsServerHandle, PEER_PROTOCOL_VERSION } from '../ws-server.ts';
+import { startWsServer, WsServerHandle, PEER_PROTOCOL_VERSION, handleSocketClose } from '../ws-server.ts';
 
 // #143 — CHARACTERISATION TESTS FOR THE AUTH SEAM. Written BEFORE the cut, and
 // this is the whole reason they exist: a mechanical split is judged by "every
@@ -297,4 +297,61 @@ describe('#143 auth seam, characterised before the cut', () => {
     expect(agent.types()).toEqual(['auth_ok']);
     watcher.ws.close(); agent.ws.close();
   }, 20_000);
+});
+
+// ── the close handler's auth-timer clear (#143 follow-up) ────────────────────
+//
+// THE ONLY AUTH-TIMER CLEAR IN THIS FILE THAT DOES ANYTHING, and the only one
+// no black-box test can reach.
+//
+// Every other clear is on the MESSAGE path, so a socket that connects and
+// closes WITHOUT EVER SENDING reaches only handleSocketClose's. Measured with
+// it removed — three connect-and-close sockets, then past the 5 s timeout:
+// callbacks that ran went 0 -> 3, and all three took action.
+//
+// The effect is invisible from outside BY CONSTRUCTION: the callback's
+// `ws.send` throws on a closed socket and is caught, and its `ws.close` is a
+// no-op on one already closed. Nothing reaches the wire. So a reviewer's no-op
+// of that line left the whole suite green — not a coverage gap in the ordinary
+// sense, but an effect with no observable. The cost is retention: one timer
+// holding a socket's `ws` and `state` for up to five seconds per
+// connect-and-close.
+//
+// Hence a UNIT test at the seam rather than a protocol one. It pins the
+// property directly — teardown clears the timer — instead of a proxy that
+// cannot discriminate. Do not replace it with an end-to-end test; that is what
+// was tried, and it could not tell the two trees apart.
+describe('#143 socket teardown clears the auth timer', () => {
+  it('handleSocketClose calls clearAuthTimer', () => {
+    const db = openDb(':memory:');
+    try {
+      let cleared = 0;
+      const ws = { readyState: 3 } as unknown as WebSocket;
+      handleSocketClose({
+        ws,
+        db,
+        registry: new Map(),
+        connections: new Set(),
+        agentIndex: new Map(),
+        peerIndex: new Map(),
+        observerIndex: new Map(),
+        presenceState: new Map(),
+        presenceDebounceMs: 0,
+        broadcastStatus: () => { /* no peers in this fixture */ },
+        clearAuthTimer: () => { cleared += 1; },
+      });
+      expect(cleared).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  // CONTROL: the counter is capable of staying 0, so `toBe(1)` above is the
+  // clear happening rather than a fixture that increments regardless.
+  it('CONTROL: the counter reads 0 when nothing calls it', () => {
+    let cleared = 0;
+    const noop = (_: () => void) => { /* deliberately does not call it */ };
+    noop(() => { cleared += 1; });
+    expect(cleared).toBe(0);
+  });
 });

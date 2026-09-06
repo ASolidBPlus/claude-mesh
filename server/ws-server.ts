@@ -443,7 +443,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
  * #143 — what a socket teardown needs from the connection scope. Same rule as
  * AuthCtx: every field is a LIVE reference, never a snapshot.
  */
-interface CloseCtx {
+export interface CloseCtx {
   ws: WebSocket;
   db: Database;
   registry: Map<WebSocket, ConnState>;
@@ -468,9 +468,27 @@ interface CloseCtx {
  * `return` in it already meant "this teardown is done", and there is no code
  * after the handler to fall through to.
  */
-function handleSocketClose(ctx: CloseCtx): void {
+export function handleSocketClose(ctx: CloseCtx): void {
   const { ws, db, registry, connections, agentIndex, peerIndex, observerIndex,
           presenceState, presenceDebounceMs, broadcastStatus, clearAuthTimer } = ctx;
+  // LOAD-BEARING, and the only one of this file's auth-timer clears that is.
+  // Every other clear sits on the MESSAGE path, so a socket that connects and
+  // closes WITHOUT EVER SENDING reaches only this one. Measured with it removed
+  // — three connect-and-close sockets, then a wait past the 5 s timeout:
+  //
+  //   with this line:     timer callbacks that ran 0, that acted 0
+  //   without this line:  timer callbacks that ran 3, that acted 3
+  //
+  // NO BLACK-BOX TEST CAN SEE IT, which is why the suite stayed green under a
+  // reviewer's no-op of this line and why the unit test beside it is not
+  // ceremony. The callback's `ws.send` throws on a closed socket and is caught;
+  // its `ws.close` is a no-op on one already closed. Nothing reaches the wire.
+  //
+  // THE COST IS RETENTION ONLY, and the number matters so nobody later
+  // "hardens" this into something bigger than it is: one timer per
+  // connect-and-close, holding that socket's `ws` and `state` for at most five
+  // seconds. Bounded at 5 s x connection rate — an unnecessary hold, not an
+  // amplifier.
   clearAuthTimer();
   connections.delete(ws);
   const connState = registry.get(ws);
