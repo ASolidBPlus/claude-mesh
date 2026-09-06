@@ -60,7 +60,16 @@ describe('#136 topic fan-out counting', () => {
 
     // ...and the outcome is visible where it belongs.
     expect(series('mesh_topic_fanout_total')).toContain('mesh_topic_fanout_total{outcome="filtered"} 1');
-    expect(series('mesh_topic_fanout_total')).toContain('mesh_topic_fanout_total{outcome="delivered"} 1');
+    expect(series('mesh_topic_fanout_total')).toContain('mesh_topic_fanout_total{outcome="allowed"} 1');
+
+    // ALLOWED IS NOT DELIVERED, and the pair proves it rather than asserting
+    // the name. This publish is ttl=0 with no connected subscriber, so the one
+    // subscriber that passed the ACL filter was NOT delivered to — and
+    // mesh_messages_total, the authority on delivery, says dropped. A counter
+    // named `delivered` here would have contradicted it on every turn event.
+    const dropped = renderMetrics(db).split('\n')
+      .filter(l => l.startsWith('mesh_messages_total') && l.includes('status="dropped"'));
+    expect(dropped.some(l => !l.trim().endsWith(' 0'))).toBe(true);
   });
 
   // It is the SEMANTICS, not the topic name: an ordinary topic behaves the same.

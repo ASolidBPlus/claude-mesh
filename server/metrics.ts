@@ -78,6 +78,16 @@ export function incPeerRelay(alias: string, direction: string, outcome: string):
  * refusal storm would have been invisible in it. The topic was the messenger;
  * the defect is the semantics.
  *
+ * THE OUTCOMES ARE `allowed` / `filtered`, NOT `delivered` / `filtered`, and the
+ * distinction is the same class of defect this series exists to fix. The
+ * increment happens where the ACL decision is made, which is BEFORE the
+ * online/offline branch: one message to an offline subscriber produced
+ * `delivered` here and `dropped` in mesh_messages_total at the same time. On a
+ * ttl=0 topic like the turn feed, offline subscribers are the systematic case,
+ * not the edge. The counter measures "passed the ACL filter" and now says so.
+ * There is no third outcome: delivery is already counted by mesh_messages_total,
+ * and a second authority on it is how counters start disagreeing.
+ *
  * THE LABEL SET IS CLOSED BECAUSE THERE IS NO NAME LABEL. Topic names are
  * agent-chosen — `routeSubscribe` calls `getOrCreateTopic` with whatever an
  * agent asks for — so a `topic` label CANNOT be made party-free by any guard:
@@ -87,7 +97,7 @@ export function incPeerRelay(alias: string, direction: string, outcome: string):
  * subscriber put that id in the unauthenticated document. The fix is not a
  * better guard on the name; it is having no name.
  */
-export function incTopicFanout(outcome: 'delivered' | 'filtered'): void {
+export function incTopicFanout(outcome: 'allowed' | 'filtered'): void {
   try { bump(topicFanout, s(outcome)); } catch (_) { /* metrics must never affect delivery */ }
 }
 
@@ -217,7 +227,7 @@ export function renderMetrics(db: Database): string {
   // #136: mesh_topic_fanout_total {outcome} — per-subscriber outcomes of topic
   // fan-out. NO topic label: names are agent-chosen, so the label set is closed
   // only because there is no name in it.
-  lines.push('# HELP mesh_topic_fanout_total Per-subscriber outcomes of topic fan-out. ACL filtering here is NOT counted in mesh_acl_denied_total or mesh_errors_total, which count DIRECT sends where the sender chose the recipient.');
+  lines.push('# HELP mesh_topic_fanout_total Per-subscriber ACL outcomes of topic fan-out: allowed = passed the ACL filter, filtered = refused by it. NOT delivery — a subscriber that is offline is counted allowed here and dropped in mesh_messages_total, which is the authority on delivery. ACL filtering here is NOT counted in mesh_acl_denied_total or mesh_errors_total, which count DIRECT sends where the sender chose the recipient.');
   lines.push('# TYPE mesh_topic_fanout_total counter');
   for (const [outcome, v] of topicFanout) {
     lines.push(`mesh_topic_fanout_total{outcome="${escapeLabelValue(outcome)}"} ${v}`);

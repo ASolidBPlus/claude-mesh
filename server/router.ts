@@ -640,7 +640,10 @@ export function routePublish(
       incTopicFanout('filtered');
       continue;
     }
-    incTopicFanout('delivered');
+    // 'allowed', not 'delivered': this is where the ACL decision is made, and
+    // the online/offline branch below has not run yet. mesh_messages_total is
+    // the authority on delivery.
+    incTopicFanout('allowed');
 
     // 5b. Unique msg_id per subscriber copy
     const msgId = crypto.randomUUID();
