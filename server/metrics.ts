@@ -9,6 +9,7 @@ type LabeledCounter = Map<string, number>;
 // Key encoding: label VALUES joined by NUL (\0) in a FIXED order. NUL cannot
 // appear in agent ids / kinds / statuses / error codes.
 const msgStatus: LabeledCounter   = new Map(); // key = `${kind}\0${status}`
+const topicFanout: LabeledCounter = new Map(); // #136: key = outcome. NO topic label — see incTopicFanout.
 const sent: LabeledCounter        = new Map(); // key = from_agent
 const received: LabeledCounter    = new Map(); // key = to_agent
 const aclDenied: LabeledCounter   = new Map(); // key = from_agent
@@ -60,6 +61,44 @@ export function escapeLabelValue(v: string): string {
  */
 export function incPeerRelay(alias: string, direction: string, outcome: string): void {
   try { bump(peerRelays, `${s(alias)}\0${s(direction)}\0${s(outcome)}`); } catch (_) { /* metrics must never affect delivery */ }
+}
+
+/**
+ * #136 — per-subscriber outcomes of a TOPIC fan-out.
+ *
+ * WHY THIS IS NOT `incAclDenied`. On a topic publish the sender does NOT choose
+ * the recipients: it names a topic, and the ACL filters the subscriber list.
+ * Counting each filtered subscriber as an "ACL-denied send attempt by sender"
+ * is a semantics error for EVERY topic — the sender attempted one publish, not
+ * N sends to N agents it never named.
+ *
+ * It surfaced on `sys.presence.turn` because that topic is published ~2/s
+ * fleet-wide by the turn-status publisher, producing ~5,800 "denials" an hour
+ * attributed to no client and swamping the counter so completely that a real
+ * refusal storm would have been invisible in it. The topic was the messenger;
+ * the defect is the semantics.
+ *
+ * THE OUTCOMES ARE `allowed` / `filtered`, NOT `delivered` / `filtered`, and the
+ * distinction is the same class of defect this series exists to fix. The
+ * increment happens where the ACL decision is made, which is BEFORE the
+ * online/offline branch: one message to an offline subscriber produced
+ * `delivered` here and `dropped` in mesh_messages_total at the same time. On a
+ * ttl=0 topic like the turn feed, offline subscribers are the systematic case,
+ * not the edge. The counter measures "passed the ACL filter" and now says so.
+ * There is no third outcome: delivery is already counted by mesh_messages_total,
+ * and a second authority on it is how counters start disagreeing.
+ *
+ * THE LABEL SET IS CLOSED BECAUSE THERE IS NO NAME LABEL. Topic names are
+ * agent-chosen — `routeSubscribe` calls `getOrCreateTopic` with whatever an
+ * agent asks for — so a `topic` label CANNOT be made party-free by any guard:
+ * a prefix check only decides which agent-chosen strings get in. An earlier
+ * revision of this series carried `{topic}` behind a `sys.` prefix check and
+ * was reachable — an agent publishing to `sys.<victim-id>` with one other
+ * subscriber put that id in the unauthenticated document. The fix is not a
+ * better guard on the name; it is having no name.
+ */
+export function incTopicFanout(outcome: 'allowed' | 'filtered'): void {
+  try { bump(topicFanout, s(outcome)); } catch (_) { /* metrics must never affect delivery */ }
 }
 
 export function incReminderFired(): void {
@@ -177,9 +216,6 @@ export function setPeerUpSource(fn: () => Iterable<{ alias: string; up: boolean 
  *   outcome     'delivered'|'refused'|'rate_limited'|'duplicate'|'transient'
  *   state       'online'|'offline' / 'up'|'down'
  *   status      'delivered'|'queued'|'dropped'|'expired'
- *
- * Adding an entry here to make a test pass is the failure this constant exists
- * to prevent: if a label's values can name a party, it is gated, not listed.
  */
 export const PARTY_FREE_LABELS: ReadonlySet<string> = new Set([
   'direction', 'error_code', 'kind', 'le', 'outcome', 'state', 'status',
@@ -187,6 +223,15 @@ export const PARTY_FREE_LABELS: ReadonlySet<string> = new Set([
 
 export function renderMetrics(db: Database): string {
   const lines: string[] = [];
+
+  // #136: mesh_topic_fanout_total {outcome} — per-subscriber outcomes of topic
+  // fan-out. NO topic label: names are agent-chosen, so the label set is closed
+  // only because there is no name in it.
+  lines.push('# HELP mesh_topic_fanout_total Per-subscriber ACL outcomes of topic fan-out: allowed = passed the ACL filter, filtered = refused by it. NOT delivery — a subscriber that is offline is counted allowed here and dropped in mesh_messages_total, which is the authority on delivery. ACL filtering here is NOT counted in mesh_acl_denied_total or mesh_errors_total, which count DIRECT sends where the sender chose the recipient.');
+  lines.push('# TYPE mesh_topic_fanout_total counter');
+  for (const [outcome, v] of topicFanout) {
+    lines.push(`mesh_topic_fanout_total{outcome="${escapeLabelValue(outcome)}"} ${v}`);
+  }
 
   // mesh_messages_total {kind,status}
   lines.push('# HELP mesh_messages_total Messages by kind and delivery status.');
@@ -230,7 +275,7 @@ export function renderMetrics(db: Database): string {
 
   // mesh_acl_denied_total — identity label, gated.
   if (identityLabelsEnabled()) {
-    lines.push('# HELP mesh_acl_denied_total ACL-denied send attempts, by sender.');
+    lines.push('# HELP mesh_acl_denied_total ACL-denied DIRECT send attempts, by sender — sends where the sender chose the recipient. Topic fan-out filtering is counted in mesh_topic_fanout_total (#136).');
     lines.push('# TYPE mesh_acl_denied_total counter');
     for (const [key, v] of aclDenied) {
       lines.push(`mesh_acl_denied_total{from_agent="${escapeLabelValue(key)}"} ${v}`);
@@ -238,7 +283,7 @@ export function renderMetrics(db: Database): string {
   } else {
     let total = 0;
     for (const [, v] of aclDenied) total += v;
-    lines.push('# HELP mesh_acl_denied_total ACL-denied send attempts, by sender. (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)');
+    lines.push('# HELP mesh_acl_denied_total ACL-denied DIRECT send attempts, by sender — sends where the sender chose the recipient. Topic fan-out filtering is counted in mesh_topic_fanout_total (#136). (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)');
     lines.push('# TYPE mesh_acl_denied_total counter');
     lines.push(`mesh_acl_denied_total ${total}`);
   }
@@ -382,6 +427,7 @@ export function renderMetrics(db: Database): string {
 
 export function __resetMetricsForTest(): void {
   msgStatus.clear();
+  topicFanout.clear();
   sent.clear();
   received.clear();
   aclDenied.clear();

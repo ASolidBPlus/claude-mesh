@@ -23,7 +23,7 @@ import {
   FileRecord,
   listCrossBorderObservers,
 } from './db.ts';
-import { incMsgStatus, incSent, incReceived, incAclDenied, incError, incBytes, incFile, observePayloadBytes, incPeerRelay } from './metrics.ts';
+import { incMsgStatus, incSent, incReceived, incAclDenied, incTopicFanout, incError, incBytes, incFile, observePayloadBytes, incPeerRelay } from './metrics.ts';
 import { emitTap, LOCAL_ONLY, type TapAudience } from './tap.ts';
 import { borderEvents } from './border.ts';
 
@@ -616,12 +616,34 @@ export function routePublish(
 
   // 5. Fan out to each subscriber
   for (const subscriber_id of subscribers) {
-    // 5a. ACL check
+    // 5a. ACL check.
+    //
+    // THE GATE STAYS. Removing it for system topics was one of the options on
+    // #136 and it is wrong: routeSubscribe calls getOrCreateTopic with no ACL
+    // check, so ANY authenticated agent can subscribe to sys.presence.turn.
+    // Ungating the fan-out would hand every subscriber the activity of the
+    // entire roster — the same enumeration #125, #128 and #129 exist to close.
+    //
+    // WHAT CHANGES IS THE COUNTING, and it is not about system topics at all.
+    // On a topic publish the sender does NOT choose the recipients: it names a
+    // topic, and the ACL filters the subscriber list. Counting each filtered
+    // subscriber as an "ACL-denied send attempt by sender" is a semantics error
+    // for EVERY topic — the sender attempted one publish, not N sends to N
+    // agents it never named. sys.presence.turn only made it visible, by being
+    // published ~2/s fleet-wide.
+    //
+    // mesh_acl_denied_total and mesh_errors_total{ACL_DENIED} are therefore for
+    // DIRECT sends, where the sender did choose the recipient. Fan-out outcomes
+    // go to mesh_topic_fanout_total, which carries no topic label because topic
+    // names are agent-chosen.
     if (!aclCheck(db, from_agent, subscriber_id)) {
-      incError('ACL_DENIED');
-      incAclDenied(from_agent);
+      incTopicFanout('filtered');
       continue;
     }
+    // 'allowed', not 'delivered': this is where the ACL decision is made, and
+    // the online/offline branch below has not run yet. mesh_messages_total is
+    // the authority on delivery.
+    incTopicFanout('allowed');
 
     // 5b. Unique msg_id per subscriber copy
     const msgId = crypto.randomUUID();

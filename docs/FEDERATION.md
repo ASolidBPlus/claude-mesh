@@ -252,16 +252,35 @@ into a statement your deployment either satisfies or does not, visible at boot.
 
 ### Break-glass: attributing a flood
 
-**The problem this solves.** With `MESH_METRICS_IDENTITY_LABELS` unset — the
-default, and the right default — `mesh_acl_denied_total` collapses to an
-aggregate. **The rate stays visible and the *who* goes dark**, which is exactly
-the attribution incident response needs.
+**The problem this solves, and its exact scope.** With
+`MESH_METRICS_IDENTITY_LABELS` unset — the default, and the right default —
+`mesh_acl_denied_total` collapses to an aggregate: the rate stays visible and
+the *who* goes dark. That is the attribution incident response needs, **for the
+class this counter covers, which is direct sends only.** For topic fan-out the
+*who* is not recorded at all, so there is nothing for the flag to reveal — see
+the table in step 2.
 
 **The procedure. It is a deploy action, not a code change:**
 
 1. Set `MESH_METRICS_IDENTITY_LABELS=1` on the bus and restart it.
-2. Scrape `/metrics` and read the identity-labelled series —
-   `mesh_acl_denied_total{from_agent}` names the sources.
+2. Scrape `/metrics` and read the identity-labelled series. **Which classes
+   this actually attributes:**
+
+   | class | attributed by the flag? |
+   |---|---|
+   | **Direct** sends refused by ACL | **Yes** — `mesh_acl_denied_total{from_agent}` names the sources |
+   | **Topic fan-out** filtered by ACL | **No.** `mesh_topic_fanout_total` has no party dimension at all, by construction — not hidden behind the flag, absent |
+
+   The fan-out class has no party dimension because topic names and subscriber
+   lists are agent-chosen, so any label carrying one would put an agent-chosen
+   string into unauthenticated `/metrics`. **The flag cannot reveal what is
+   not recorded**, and turning it on for a fan-out flood costs two restarts and
+   a roster-exposure window and returns nothing.
+
+   This matters because the flood that produced this procedure — the
+   `sys.presence.turn` fan-out — was exactly the class the flag does not
+   attribute. For that class the only route is the source-socket bucketing
+   described below, which is **not built**.
 3. **Unset it and restart again.** Do not leave it on: while set, `/metrics`
    hands the complete registered agent roster to any reader of an
    unauthenticated endpoint.
@@ -271,8 +290,9 @@ find yourself leaving it on "for now", the honest alternative is to restrict the
 admin port with `MESH_ADMIN_BIND` and accept the exposure permanently — that is
 at least a decision someone made.
 
-**An attribution path that needs no flag** exists in principle: bucket refusals
-by *source socket*, since each plugin host holds one distinguishable connection
+**An attribution path that needs no flag** — and for topic fan-out it is the
+ONLY one, not a nice-to-have: bucket refusals by *source socket*, since each
+plugin host holds one distinguishable connection
 to the bus. That is not built; it is recorded here so the break-glass procedure
 is understood as the current answer rather than the intended one.
 

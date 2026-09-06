@@ -555,7 +555,25 @@ export function startWsServer(
     // DIFFERENT audiences. The WS port must be reachable by every agent and
     // every peering; the admin port need only be reachable by operators and the
     // spawner stack. One variable for both would force the more permissive.
-    httpServer.listen({ port, host: process.env.MESH_WS_BIND }, () => {
+    const wsBindHost = process.env.MESH_WS_BIND;
+    httpServer.listen({ port, host: wsBindHost }, () => {
+      // #139 shipped MESH_WS_BIND without this line, which made the two ports
+      // asymmetric in exactly the way that matters: the admin port announces
+      // where it bound and what is unauthenticated on it, while the port every
+      // agent and peering must reach announced nothing. A deployer restricting
+      // one and not the other had no way to see it. Same shape as the admin
+      // line, and it fires when nothing is set — the case that needs telling.
+      const addr = httpServer.address();
+      const bound = typeof addr === 'object' && addr !== null ? `${addr.address}:${addr.port}` : String(addr);
+      console.log(JSON.stringify({
+        evt: 'ws.listening',
+        bind: wsBindHost ?? '(all interfaces)',
+        bound,
+        note: wsBindHost === undefined
+          ? 'agent/peer port bound to ALL interfaces — every agent and peering must reach it, so restricting it is a deployment decision with reachability consequences'
+          : 'agent/peer port restricted; every agent and peering must be able to reach this address',
+        at: Date.now(),
+      }));
       wss.on('connection', (ws: WebSocket) => {
         connections.add(ws);
 
