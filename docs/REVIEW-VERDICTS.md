@@ -1,11 +1,14 @@
 # Review verdicts — the form the merge gate reads
 
-The merge gate (`.github/scripts/gate.sh`) decides whether a pull request may merge by
-reading **comments on the PR**. The strings below are an interface: the gate parses them,
-so a verdict written in another form is not seen, and the PR does not merge. This page
-documents the form where writers write it; the gate's predicates (`seat_of`, `chk_verdict`,
-`is_amend`) are the authority, and this page is checked against them by the gate's selftest
-fixtures.
+This page describes the **claude-mesh** merge gate (`.github/scripts/gate.sh`; the
+claude-spawner gate has its own vocabulary). The gate decides whether a pull request may
+merge by reading **comments on the PR**. The strings below are an interface: the gate
+parses them, so a verdict written in another form is not seen, and the PR does not merge.
+This page documents the form where writers write it. The gate's predicates (`seat_of`,
+`chk_verdict`, `is_amend`) are the authority; this page was transcribed from them by hand
+and is not yet checked against them mechanically — a citations-style test that runs the
+page's stated forms through the predicates is tracked as a follow-up. If the page and the
+predicates disagree, the predicates win and the page is wrong.
 
 ## A verdict comment
 
@@ -16,12 +19,18 @@ Three things, each on its own line, in the same comment:
    `` **`sec-reviewer-2` — …** ``. The gate reads seat 2 before seat 1 because
    `sec-reviewer` is a prefix of `sec-reviewer-2`. A comment whose first line names no seat
    is rejected as unattributable.
-2. **A verdict line**, beginning `Verdict:` (leading `**`, `>`, `-` or backticks allowed):
+2. **A verdict line**, beginning `Verdict:` after optional leading whitespace, `**`, `_`,
+   `>`, `-` or backticks:
    - `Verdict: GO — binds <full 40-hex head sha>`
    - `Verdict: NO-GO — …`
    - `Verdict: GO-WITH-AMENDMENTS — binds <sha>` (see below)
-   The value after `Verdict:` is what counts. A body that *mentions* "NO-GO" or a superseded
-   "GO-WITH-AMENDMENTS" elsewhere is not a verdict; only the anchored line is read.
+   The value after `Verdict:` is what counts. **Only a line whose start matches `Verdict:`
+   is read — and that includes lines that begin with `>`, `-`, `*`, `_` or whitespace.** So
+   a *quoted* or *bulleted* `Verdict: NO-GO` line still counts as a NO-GO, and a quoted
+   earlier `Verdict: GO-WITH-AMENDMENTS` line makes the comment read as an amendments
+   verdict. Quoting a prior verdict line will block or downgrade the merge. Refer to an
+   earlier verdict by PR number, comment id and SHA, never by reproducing its verdict line.
+   Prose that mentions "NO-GO" mid-sentence is not read.
 3. **The full 40-character head SHA** somewhere in the body. A short SHA does not bind; the
    gate compares the branch ref, the PR head and this string byte for byte.
 
@@ -42,9 +51,11 @@ A `GO-WITH-AMENDMENTS` verdict does not merge on its own. It merges when either
 - the author lands the amendment and the **same seat** posts a new `Verdict: GO` binding
   the new head, or
 - the amendment is deliberately deferred and the **same seat** posts a **discharge**
-  comment containing the full head SHA and naming where the amendment lands; the gate is
-  run with `DISCHARGED=<comment-id>` (and, for a conditional discharge, `REQUIRE_MERGED=<pr>`
-  and `REQUIRE_MAIN=path:regex` so the condition is mechanical, not prose).
+  comment containing the full head SHA; the gate is run with `DISCHARGED=<comment-id>`.
+  The gate enforces the seat match and the SHA. Naming where the amendment lands, and
+  running the gate with `REQUIRE_MERGED=<pr>` / `REQUIRE_MAIN=path:regex` so a conditional
+  discharge is checked mechanically, are **operator discipline** the gate does not compel —
+  the gate-holder's rule is to do both.
 
 A discharge by any other party is not accepted: that is how an amendment quietly becomes
 optional.
