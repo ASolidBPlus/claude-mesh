@@ -175,8 +175,8 @@ never queue. For a remote id, "online" means the peering socket is connected
 |---|---|
 | `GET /peers` | inbound peerings that have registered, **never their `token_hash`** — alias, the key that minted them, kinds, rate, `last_seen`, `disabled` (`server/http-admin.ts` `handlePeerGet`) |
 | `GET /peer-keys` | minted keys, **never the secrets** (`server/http-admin.ts` `handlePeerKeyGet`) |
-| `GET /outbound-peers` | configured outbound links, **never the tokens** |
-| `GET /agents` | the local roster, including four liveness readings — see below |
+| `GET /outbound-peers` | configured outbound links, **never the tokens** (`server/http-admin.ts` `handleOutboundPeerGet`) |
+| `GET /agents` | the local roster, including four liveness readings — see below (`server/http-admin.ts` `handleAgentGet`) |
 
 **The roster's four liveness readings answer different questions**, and the
 difference matters when you are deciding whether an agent is stuck:
