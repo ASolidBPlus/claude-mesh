@@ -699,13 +699,32 @@ export function updateAgent(
  * rows whose bytes stayed on disk forever, since no sweep reaches them once
  * they are delivered.
  *
- * That is a semantics question before it is a fix, and the answer is: purge
- * only what CAN NEVER BE USED. Rows addressed to the deleted id and never
- * delivered can never be delivered now — pure waste, and for files, leaked
- * bytes. Everything else is also THE OTHER PARTY'S history of that
- * conversation, and destroying it here would take it out from under
+ * That is a semantics question before it is a fix, and the answer for MESSAGES
+ * AND FILES is: purge only what CAN NEVER BE USED. Rows addressed to the
+ * deleted id and never delivered can never be delivered now — pure waste, and
+ * for files, leaked bytes. Everything else is also THE OTHER PARTY'S history of
+ * that conversation, and destroying it here would take it out from under
  * MESH_RETENTION_MS, which is the thing that is supposed to govern how long
  * history lives.
+ *
+ * WHAT ELSE THIS DELETES, stated exactly, because the rule above does not cover
+ * it and reading it as if it did would be wrong (seat 1 on #159):
+ *
+ *   - Every acl edge naming the id, in both directions. Not tidiness: an id can
+ *     be registered again, and without this the new holder INHERITS its
+ *     predecessor's grants. Measured with the line removed — 2 rows before, 2
+ *     after, and aclCheck true both ways for a re-registered id.
+ *   - Every topic the agent CREATED — and, through
+ *     `subscriptions.topic REFERENCES topics(name) ON DELETE CASCADE`, every
+ *     other agent's subscriptions to those topics. Those subscriptions WERE
+ *     usable, so this is the one place the rule above overstates. Pre-existing
+ *     and kept deliberately; pinned by a test so it is a choice on record
+ *     rather than a surprise.
+ *
+ * The topics line is also not optional cleanup: `topics.created_by REFERENCES
+ * agents(id)` has no ON DELETE clause, so with it removed, deleting an agent
+ * that ever created a topic FAILS with SQLITE_CONSTRAINT_FOREIGNKEY rather than
+ * leaving an orphan (measured). It is what makes the delete possible at all.
  *
  * NO FOREIGN-KEY CASCADE, deliberately, and it is the same argument the acl
  * deletion below already carries: a cascade would take the purge-EVERYTHING
