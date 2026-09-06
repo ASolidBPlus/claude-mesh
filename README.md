@@ -532,3 +532,5 @@ The repo is a small monorepo: `server/` is the bus, `client/` is the SDK, and th
 | `client/src/client.ts` | `MeshClient` — the [SDK](#41-with-the-sdk) |
 
 One rule when you extend this: the bus moves messages and emits raw observability — everything analytic is a consumer.
+
+> **Review verdicts.** Merges are gated by `.github/scripts/gate.sh`, which reads reviewer verdicts from PR comments in a fixed form — see [`docs/REVIEW-VERDICTS.md`](docs/REVIEW-VERDICTS.md).

@@ -18,6 +18,8 @@
 #     "Verdict: GO", no "NO-GO"; GO-WITH-AMENDMENTS fails without DISCHARGED;
 #     no NO-GO anywhere in issue comments or PR reviews
 #   7 closing keywords name issues only
+# The verdict-comment FORM these checks read is documented for writers in
+# docs/REVIEW-VERDICTS.md; the predicates below are the authority, that page the interface.
 # (Retired 2026-09-06: a retarget cycle through pinned away branches — it did not rebuild
 #   the merge ref for PRs whose head had never moved, on four attempts across three pins.)
 set -u
