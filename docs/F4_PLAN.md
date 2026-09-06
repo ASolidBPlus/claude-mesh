@@ -189,8 +189,8 @@ cd /path/to/claude-mesh/server && bun test __tests__/guide-citations.test.ts \
     __tests__/observer-cross-border.test.ts __tests__/border.test.ts __tests__/relay.test.ts
 cd /path/to/claude-mesh/client && bun test
 # single call site, as a shell check (the test above is the CI-enforced version):
-grep -n 'enqueueOutboundTopicRows' server/router.ts        # exactly 2 hits: 1 definition, 1 call
-grep -n 'emitTap(' server/router.ts                        # every hit inside routeDirect/routeRelay/routePublish/routeFile
+grep -n 'enqueueOutboundTopicRows' server/router.ts | grep -v '^[0-9]*:\s*//'   # exactly 2 NON-COMMENT hits: 1 definition, 1 call (doc comments may name it; the CI structural test strips comments and is the authority)
+grep -n 'emitTap(' server/router.ts | grep -v '^[0-9]*:\s*//'                 # every NON-COMMENT hit inside routeDirect/routeRelay/routePublish/routeFile
 # ratchet: server baseline 116 in .github/typecheck-baseline-server.txt — new code must add ZERO
 # type errors. NEVER edit the baseline or the identity file; a count that goes UP fails CI.
 bash .github/scripts/typecheck-ratchet.sh                  # requires `bun install` in server/ and client/
