@@ -6,7 +6,7 @@ import {
 import { hashToken } from '../auth.ts';
 import { startWsServer, WsServerHandle } from '../ws-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
-import { emitTap, TapFrame, TAP_BUFFER_LIMIT_BYTES } from '../tap.ts';
+import { emitTap, TapFrame, TAP_BUFFER_LIMIT_BYTES, LOCAL_ONLY } from '../tap.ts';
 import { routeDirect, routePublish } from '../router.ts';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
@@ -546,7 +546,7 @@ describe('tap — emitTap unit safety/backpressure', () => {
     const f: Record<string, unknown> = { type: 'tap' };
     f.self = f;
     const map = new Map<string, WebSocket>();
-    expect(() => emitTap(map, f as unknown as TapFrame)).not.toThrow();
+    expect(() => emitTap(map, f as unknown as TapFrame, LOCAL_ONLY)).not.toThrow();
   });
 
   it('20. backpressure: over-threshold observer is skipped, healthy one sent', () => {
@@ -560,7 +560,7 @@ describe('tap — emitTap unit safety/backpressure', () => {
       type: 'tap', msg_id: 'm', kind: 'direct', from: 'a', to: 'b',
       topic: null, correlation_id: null, sent_at: Date.now(), size: 1, payload: 'x',
     };
-    emitTap(map, frame);
+    emitTap(map, frame, LOCAL_ONLY);
 
     expect(overSends).toBe(0);
     expect(healthySends).toBe(1);

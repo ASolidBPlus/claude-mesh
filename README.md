@@ -318,6 +318,7 @@ The tap is the bus's live observability output: a real-time copy of every messag
 
 - **Admin-only grant — this is the entire privacy boundary.** An admin grants observer status via `POST /observers { "agent_id": "watcher" }`. A node that hasn't been granted will *never* receive a tap frame, even for traffic it's party to, and there's no way to self-grant over WS or MCP.
 - **It bypasses ACL, on purpose.** An observer sees traffic between agents it has no ACL relationship with — that's the point. Guard the grant accordingly.
+- **It does NOT cross a border by default (F3).** "Observers see everything" is a *category*, and its scope is settled by what the mesh happens to contain — federation widened it without anyone editing the grant. So cross-border traffic is a **second, explicit grant**: `POST /observers { "agent_id": "watcher", "cross_border": true }`. Without it an observer sees local traffic only and never sees a frame whose sender or recipient is a remote (`alias:agent`) id. The field must be a real `true`; `"true"`, `1` and `"yes"` are rejected, because a scope that widens on a typo is the failure the flag exists to prevent. Existing grants — including every grant made before federation shipped — are local-only, and are **not** grandfathered into the wider scope.
 - Granting/revoking takes effect live on a connected socket; a granted observer just connects and receives the tap (no subscribe step).
 - Live and fire-and-forget — not queued or persisted. An offline observer misses frames and reads `GET /messages` for history. A slow observer whose send buffer backs up past 8 MB has tap frames dropped, so a consumer can never stall the bus.
 - Traffic via the WS protocol and via the MCP interface (§6) is tapped identically.
@@ -350,7 +351,7 @@ A second HTTP listener (admin port, default `7385`) handles administration. Ever
 - **Provenance filter (`granted_by`).** Add `granted_by=<exact>` or `granted_by_prefix=<prefix>` (prefix uses SQL `LIKE`, with `%`/`_`/`\` in the value matched literally). With `agent=` it narrows that agent's inbound/outbound. **Without `agent=`** it's a global query → `{ matches: [...] }` — every ACL edge stamped by that writer / writer-namespace across the table (the reconciler path: "list every edge I granted under `mesh-chat:group:*`"). At least one of `agent` / `granted_by` / `granted_by_prefix` is required (else `400`); `granted_by` + `granted_by_prefix` together is `400`. The bus stores `granted_by` as opaque provenance — no namespace enforcement.
 
 **Observers**
-- `POST /observers` `{ agent_id, granted_by? }` → `201` (live-activates a connected socket).
+- `POST /observers` `{ agent_id, granted_by?, cross_border? }` → `201` (live-activates a connected socket). `cross_border` must be a boolean; it defaults to `false` and a re-grant **overwrites** it, so the same door narrows a scope as well as widens it.
 - `DELETE /observers/:id` → `{ ok: true }`. `GET /observers` → list.
 
 **Topics**
