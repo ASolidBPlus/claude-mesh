@@ -506,6 +506,45 @@ export class MeshClient {
     return new Uint8Array(await res.arrayBuffer());
   }
 
+  /**
+   * #133 — report that the agent's LOOP is alive. Fire-and-forget: one frame on
+   * the EXISTING socket, no ack awaited, and a no-op when not connected.
+   *
+   * WHY THIS METHOD HAS TO EXIST. #147 added the `loop_alive` frame server-side
+   * and the emitter (spawner#346) had no door to send it through: every public
+   * method on this client awaits an ack, and the socket is private. The obvious
+   * workaround is actively harmful — opening a second socket to emit the frame
+   * would, under #145's newer-wins, DISPLACE the plugin's primary socket. A
+   * feature reachable only by breaking the connection it reports on is not
+   * reachable.
+   *
+   * A NO-OP WHEN DISCONNECTED, not a throw. This is a liveness beat: the caller
+   * is a turn loop, not error-handling code, and making it wrap every call in a
+   * try/catch invites the catch that swallows everything. A missed beat is
+   * already indistinguishable from a stale one — both leave last_responded
+   * behind — so failing loudly here buys nothing and costs a crash in a hot
+   * path.
+   *
+   * WHOSE DISCIPLINE IS WHOSE. The client cannot know who called this; it sees a
+   * method call. That only the turn loop calls it is the EMITTER's discipline,
+   * enforced in spawner's plugin, and #147's rule that "nothing emitting on the
+   * agent's behalf may advance the field" is about the transport's keepalive —
+   * which the plugin answers while the loop is stuck — not about the loop's own
+   * tool for saying it is running. Calling this from a timer would make
+   * last_responded exactly as untrue as last_alive, and nothing here can stop
+   * that; the server likewise treats it as a claim, not a proof.
+   */
+  loopAlive(): void {
+    const ws = this.ws;
+    if (ws === null || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(JSON.stringify({ type: 'loop_alive' }));
+    } catch (_) {
+      // Fire-and-forget: a send that fails is a missed beat, which the staleness
+      // of last_responded already expresses.
+    }
+  }
+
   close(): void {
     this.shouldReconnect = false;
     if (this.reconnectTimer !== null) {

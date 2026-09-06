@@ -157,6 +157,15 @@ export interface AgentStatusFrame {
   last_responded?: number | null;
 }
 
+/**
+ * #133 — the agent's LOOP reporting that it is alive, as distinct from the
+ * transport's keepalive `ping`. Fire-and-forget: the server stamps
+ * last_responded and sends nothing back, so this frame has no reply shape.
+ */
+export interface LoopAliveFrame {
+  type: 'loop_alive';
+}
+
 export interface PresenceListFrame {
   type: 'presence_list';
   ref?: string;
