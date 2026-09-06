@@ -246,10 +246,23 @@ export class MeshClient {
    * What changes is that the fallback can no longer be reached by accident.
    */
   private static assertKnownKeys(config: MeshClientConfig): void {
-    const KNOWN = [
-      'serverUrl', 'agentId', 'agentToken', 'httpUrl',
-      'pingIntervalMs', 'pongDeadlineMs', 'ackTimeoutMs',
-    ];
+    // DERIVED FROM THE TYPE, not maintained beside it. As a bare string[] the
+    // seven keys were written three times — the interface, this list, and the
+    // control test — with nothing tying them together, so adding a config field
+    // and forgetting this line would make the new field a THROWN ERROR at
+    // construction. Typing the object as Record<keyof MeshClientConfig, true>
+    // makes the typecheck job enforce both directions: a key here that is not
+    // on the interface is an error, and a key on the interface missing here is
+    // an error too.
+    //
+    // It fails safe either way — a forgotten key throws loudly rather than
+    // being silently ignored, which is the behaviour this guard exists to
+    // provide — but "the compiler checks it" beats "someone remembers".
+    const KNOWN_KEYS: Record<keyof MeshClientConfig, true> = {
+      serverUrl: true, agentId: true, agentToken: true, httpUrl: true,
+      pingIntervalMs: true, pongDeadlineMs: true, ackTimeoutMs: true,
+    };
+    const KNOWN = Object.keys(KNOWN_KEYS);
     const unknown = Object.keys(config).filter(k => !KNOWN.includes(k));
     if (unknown.length > 0) {
       throw new Error(
