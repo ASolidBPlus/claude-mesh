@@ -5,8 +5,13 @@ import {
   openDb, registerAgent, aclGrant, grantObserver, listObservers, listCrossBorderObservers,
   insertOutboundPeer, upsertPeer, getPeerByAlias,
 } from '../db.ts';
-import { routeDirect, routeRelay, routePublish } from '../router.ts';
+import { routeDirect, routeRelay, routePublish, routeFile } from '../router.ts';
 import { emitTap, LOCAL_ONLY, type TapFrame } from '../tap.ts';
+import { startHttpAdmin } from '../http-admin.ts';
+import { mkdtempSync, readFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import * as net from 'net';
 
 // A stand-in observer socket that records what it was sent. Only the two
 // members emitTap touches are implemented.
@@ -98,6 +103,59 @@ describe('F3: observer cross_border scope', () => {
     expect(narrow.got.length).toBe(0);
   });
 
+  // The functions the drive below calls. Named once, asserted against the code
+  // by the scan test, and used by both the SET test and its CONTROL so the two
+  // can never drift apart.
+  const DRIVEN = ['routeDirect', 'routeRelay', 'routePublish', 'routeFile'];
+
+  // Sets up peers/ACL and drives every emitting route. Returns nothing: the
+  // tests read what the observer RECEIVED, never what this returned.
+  function driveEveryEmittingRoute(observerIndex: Map<string, WebSocket>): void {
+    insertOutboundPeer(db, { alias: 'far', url: 'wss://far.example/ws', token: 't'.repeat(32), assigned_alias: 'us', kinds: '["direct"]', rate_per_min: 600, created_at: Date.now() });
+    upsertPeer(db, { alias: 'inbound', token_hash: 'e'.repeat(64), minted_by_key: 'k', kinds: '["direct"]', rate_per_min: 600 });
+    aclGrant(db, 'local-a', 'far:remote-b', 'system');
+    aclGrant(db, 'inbound:remote-c', 'local-b', 'system');
+
+    const agentIndex = new Map<string, WebSocket>();
+    const filesDir = mkdtempSync(join(tmpdir(), 'mesh-f3-files-'));
+
+    routeDirect(db, agentIndex, 'local-a', { type: 'send', msg_id: 'd1', to: 'local-b', payload: 'local' } as never, observerIndex);
+    routeDirect(db, agentIndex, 'local-a', { type: 'send', msg_id: 'd2', to: 'far:remote-b', payload: 'outbound' } as never, observerIndex);
+    routeRelay(db, agentIndex, getPeerByAlias(db, 'inbound')!, { type: 'relay', msg_id: 'r1', from: 'remote-c', to: 'local-b', kind: 'direct', payload: 'inbound', sent_at: Date.now(), ttl_ms: 60_000 } as never, observerIndex);
+    routePublish(db, agentIndex, 'local-a', { type: 'publish', msg_id: 'p1', topic: 'general', payload: 'topic' } as never, observerIndex);
+    // routeFile — the site the first version of this test did NOT drive, which
+    // made the whole assertion vacuous for that path (seat 2's finding).
+    routeFile(db, agentIndex, 'local-a', {
+      type: 'file_send', msg_id: 'f1', to: 'local-b',
+      filename: 'x.txt', content_type: 'text/plain',
+      data: Buffer.from('hello').toString('base64'),
+    } as never, 10_485_760, filesDir, observerIndex);
+  }
+
+  // THE SCAN. The drive list above IS an enumeration — the type makes an
+  // unstated audience uncompilable, but nothing stops the drive list going
+  // stale. This derives the truth from the code: every function in router.ts
+  // containing an `emitTap(` call must be one this file drives.
+  //
+  // A COUNT would not do. A count reds when a site is ADDED and stays quiet
+  // when one is MOVED from a driven function into an undriven one — which
+  // loses coverage silently and is the same magnitude. Scanning for the SET of
+  // names reds on add, on move, and on rename.
+  it('SCAN: the drive list equals the set of router functions that emit a tap', () => {
+    const src = readFileSync(join(import.meta.dir, '..', 'router.ts'), 'utf8').split('\n');
+    const emitting = new Set<string>();
+    let current = '';
+    for (const line of src) {
+      const fn = line.match(/^(?:export )?function ([A-Za-z0-9_]+)\s*\(/);
+      if (fn !== null) current = fn[1]!;
+      if (line.includes('emitTap(') && !line.trim().startsWith('*') && !line.trim().startsWith('//')) {
+        if (current !== '') emitting.add(current);
+      }
+    }
+    expect(emitting.size).toBeGreaterThan(0);              // the scan found something
+    expect([...emitting].sort()).toEqual([...DRIVEN].sort());
+  });
+
   // ── the set test, derived from OUTPUT ──────────────────────────────
 
   // THE SET TEST. It does not check that each route function passes the right
@@ -109,21 +167,11 @@ describe('F3: observer cross_border scope', () => {
   // then the same operation: a new federated path that forgets its audience
   // reds here without anyone remembering to add it.
   it('SET: a narrow observer receives no frame naming a remote party, across every emitting path', () => {
-    insertOutboundPeer(db, { alias: 'far', url: 'wss://far.example/ws', token: 't'.repeat(32), assigned_alias: 'us', kinds: '["direct"]', rate_per_min: 600, created_at: Date.now() });
-    upsertPeer(db, { alias: 'inbound', token_hash: 'e'.repeat(64), minted_by_key: 'k', kinds: '["direct"]', rate_per_min: 600 });
-    aclGrant(db, 'local-a', 'far:remote-b', 'system');
-    aclGrant(db, 'inbound:remote-c', 'local-b', 'system');
-
     const narrow = fakeSocket();
     grantObserver(db, 'watcher', 'system');                 // narrow, on purpose
     const observerIndex = new Map<string, WebSocket>([['watcher', narrow.ws]]);
-    const agentIndex = new Map<string, WebSocket>();
 
-    // Every path that emits a tap frame today.
-    routeDirect(db, agentIndex, 'local-a', { type: 'send', msg_id: 'd1', to: 'local-b', payload: 'local' } as never, observerIndex);
-    routeDirect(db, agentIndex, 'local-a', { type: 'send', msg_id: 'd2', to: 'far:remote-b', payload: 'outbound' } as never, observerIndex);
-    routeRelay(db, agentIndex, getPeerByAlias(db, 'inbound')!, { type: 'relay', msg_id: 'r1', from: 'remote-c', to: 'local-b', kind: 'direct', payload: 'inbound', sent_at: Date.now(), ttl_ms: 60_000 } as never, observerIndex);
-    routePublish(db, agentIndex, 'local-a', { type: 'publish', msg_id: 'p1', topic: 'general', payload: 'topic' } as never, observerIndex);
+    driveEveryEmittingRoute(observerIndex);
 
     expect(narrow.got.length).toBeGreaterThan(0);           // the drive did something
 
@@ -141,33 +189,71 @@ describe('F3: observer cross_border scope', () => {
   // observer must actually receive the cross-border frames. Without this, the
   // set test passes just as well when the routers emit nothing at all.
   it('CONTROL: the same drive DOES deliver cross-border frames to a scoped observer', () => {
-    insertOutboundPeer(db, { alias: 'far', url: 'wss://far.example/ws', token: 't'.repeat(32), assigned_alias: 'us', kinds: '["direct"]', rate_per_min: 600, created_at: Date.now() });
-    upsertPeer(db, { alias: 'inbound', token_hash: 'e'.repeat(64), minted_by_key: 'k', kinds: '["direct"]', rate_per_min: 600 });
-    aclGrant(db, 'local-a', 'far:remote-b', 'system');
-    aclGrant(db, 'inbound:remote-c', 'local-b', 'system');
-
     const wide = fakeSocket();
     grantObserver(db, 'wide-watcher', 'system', true);
     const observerIndex = new Map<string, WebSocket>([['wide-watcher', wide.ws]]);
-    const agentIndex = new Map<string, WebSocket>();
 
-    routeDirect(db, agentIndex, 'local-a', { type: 'send', msg_id: 'd2', to: 'far:remote-b', payload: 'outbound' } as never, observerIndex);
-    routeRelay(db, agentIndex, getPeerByAlias(db, 'inbound')!, { type: 'relay', msg_id: 'r1', from: 'remote-c', to: 'local-b', kind: 'direct', payload: 'inbound', sent_at: Date.now(), ttl_ms: 60_000 } as never, observerIndex);
+    driveEveryEmittingRoute(observerIndex);
 
     const ALIASES = ['far', 'inbound'];
     const remote = wide.got.filter(f =>
       ALIASES.some(a => (f.from ?? '').startsWith(`${a}:`) || (f.to ?? '').startsWith(`${a}:`)));
+    // Counted, not merely non-empty: this is what makes the SET test's empty
+    // result meaningful rather than vacuous, and it is what caught the relay
+    // arm silently refusing when this file was first written.
     expect(remote.length).toBe(2);
+    // And the local paths did arrive, so a narrow observer's empty leak-list
+    // above is not the result of nothing being driven at all.
+    expect(wide.got.length).toBeGreaterThan(2);
   });
 
   // ── admin door ─────────────────────────────────────────────────────
 
-  it('cross_border must be a real boolean, not merely truthy', () => {
-    // Guarded at the handler; asserted here at the seam the handler uses, so
-    // the rule is stated where the value is interpreted.
-    for (const v of ['true', 1, 'yes', {}]) {
-      expect(v === true).toBe(false);       // none of these mean "asked for it"
+  // Drives the REAL admin door. The test this replaces was
+  // `for (const v of ['true', 1, 'yes', {}]) expect(v === true).toBe(false)` —
+  // an assertion about JavaScript's `===` that invoked no handler, could not
+  // fail, and could not fail when the guard was deleted. Its comment claimed it
+  // asserted "at the seam the handler uses" while using no seam. A guard whose
+  // only test is a tautology is a guard protected by nothing.
+  //
+  // Note WHAT is asserted: the 400 AND the state. A status code alone passes
+  // against a handler that 400s and grants anyway, and the thing that matters
+  // here is whether a wide observer exists afterwards.
+  it('the admin door refuses a non-boolean cross_border AND grants nothing', async () => {
+    const admin = 'admin-token-for-tests';
+    const handle = await startHttpAdmin(
+      0, db, admin, 10_485_760, mkdtempSync(join(tmpdir(), 'mesh-f3-')),
+      new Map(), new Map(), new Map(),
+    );
+    const base = `http://localhost:${(handle.server.address() as net.AddressInfo).port}`;
+    const post = (body: unknown) => fetch(`${base}/observers`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${admin}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    try {
+      // Every value that is truthy-but-not-true. The `!!body.cross_border`
+      // mutant ADMITS all of these — it grants a wide observer — so the state
+      // assertion below is what catches it, not the status.
+      for (const v of ['true', 1, 'yes', {}, [], 'false']) {
+        const res = await post({ agent_id: 'watcher', cross_border: v });
+        expect(res.status).toBe(400);
+        expect(listCrossBorderObservers(db).has('watcher')).toBe(false);
+      }
+
+      // Absent field = narrow grant, and a pre-F3 client sends exactly this.
+      const bare = await post({ agent_id: 'watcher' });
+      expect(bare.status).toBe(201);
+      expect(listCrossBorderObservers(db).has('watcher')).toBe(false);
+
+      // POSITIVE CONTROL: without this, a handler that 400s on everything and
+      // never grants would pass every assertion above.
+      const real = await post({ agent_id: 'wide-watcher', cross_border: true });
+      expect(real.status).toBe(201);
+      expect(listCrossBorderObservers(db).has('wide-watcher')).toBe(true);
+    } finally {
+      await handle.shutdown().catch(() => {});
     }
-    expect(true === true).toBe(true);
   });
 });
