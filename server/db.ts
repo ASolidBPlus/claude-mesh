@@ -952,16 +952,51 @@ function assertLocalEndpointExists(db: Database, endpoint: string): void {
  * reads nothing yet — `outbound_peers` is F2's — so it refuses, which is the
  * honest answer rather than a permissive default.
  */
+/**
+ * F4 — the LOCAL TOPIC PRINCIPAL prefix.
+ *
+ * `topic:trollbox` names a topic as an ACL principal, so a hub can express
+ * "this topic may be heard by pod1:sub" and "pod1:publisher may post to this
+ * topic" as ordinary acl edges rather than as a second grammar.
+ *
+ * It is deliberately in the SAME namespace shape as a remote id — one colon,
+ * a reserved prefix — which is why the alias `topic` is refused at both peering
+ * doors (`http-admin.ts` `handlePeerKeyPost`, `handleOutboundPeerPost`). The
+ * exemption below and that reservation are two halves of one decision: with the
+ * exemption alone, a peering called `topic` would make every topic principal
+ * read as remote and a revocation's prefix-range DELETE would take them all.
+ */
+export const TOPIC_PRINCIPAL_PREFIX = 'topic:';
+
+/**
+ * F4 — the ONE definition of "this endpoint names another mesh".
+ *
+ * Was a closure inside assertPeeringAllowed. Exported and named because F4 adds
+ * a second caller (the topic fan-out must skip remote subscribers) and two
+ * copies of a routing predicate is one predicate and one hole waiting to open —
+ * #79's argument, applied to a rule instead of to a credential compare.
+ *
+ * The AGENT LOOKUP is what distinguishes a remote id from a legacy local one:
+ * a colon alone is not decisive, because legacy colon ids are a preserved
+ * population (reported at boot, never rejected).
+ *
+ * A TOPIC PRINCIPAL IS NEITHER remote nor an agent. It is local by
+ * construction, and returning true for it would demand a peering aliased
+ * `topic`, which can never exist.
+ */
+export function isRemoteEndpoint(db: Database, endpoint: string): boolean {
+  if (endpoint.startsWith(TOPIC_PRINCIPAL_PREFIX)) return false;
+  return endpoint.includes(':') && getAgentById(db, endpoint) === null;
+}
+
 function assertPeeringAllowed(db: Database, from_agent: string, to_agent: string): void {
   const fail = (msg: string): never => {
     const err = new Error(msg) as Error & { code?: string };
     err.code = 'NO_PEERING';
     throw err;
   };
-  // The lookup is what distinguishes a remote id from a legacy local one.
-  const isRemote = (endpoint: string) => endpoint.includes(':') && getAgentById(db, endpoint) === null;
-  const fromRemote = isRemote(from_agent);
-  const toRemote = isRemote(to_agent);
+  const fromRemote = isRemoteEndpoint(db, from_agent);
+  const toRemote = isRemoteEndpoint(db, to_agent);
 
   if (fromRemote) {
     const alias = from_agent.slice(0, from_agent.indexOf(':'));
@@ -1902,6 +1937,76 @@ export function subscribe(db: Database, agent_id: string, topic: string): Subscr
 
 export function unsubscribe(db: Database, agent_id: string, topic: string): void {
   db.prepare('DELETE FROM subscriptions WHERE agent_id = ? AND topic = ?').run(agent_id, topic);
+}
+
+/**
+ * F4 §7 — is this an existing topic on THIS mesh's `topics` table?
+ *
+ * Row existence only. Whether it is a HOME topic (ours to fan out) or a remote
+ * one we merely mirror is a different question, answered by the prefix test in
+ * `isHomeTopic` — a spoke really does hold a local `topics` row named
+ * `orch:trollbox`, so row existence cannot decide ownership.
+ */
+export function topicExists(db: Database, name: string): boolean {
+  return db.prepare('SELECT 1 FROM topics WHERE name = ?').get(name) !== null;
+}
+
+/**
+ * F4 §7 — may a NEW topic take this name?
+ *
+ * Returns a reason, or null to permit. Two rules, both about NEW names only:
+ *
+ *   ':' — the mesh/agent separator. A local topic `a:b` is indistinguishable
+ *         from a remote topic on a mesh aliased `a`, and the moment an outbound
+ *         peering `a` exists, `isHomeTopic` calls it foreign and stops fanning
+ *         it out locally. The topic would go quiet with nothing reporting why.
+ *   256 bytes — the same bound the wire applies to every other identifier, so a
+ *         name that cannot cross a border cannot be created either. Measured in
+ *         BYTES, not characters: a 200-character name of 2-byte codepoints is
+ *         400 bytes on the wire.
+ *
+ * PRE-EXISTING NAMES ARE NEVER REJECTED — the F0b rule that spared legacy colon
+ * agent ids, for the same reason: a live topic that can no longer be published
+ * to is a worse outcome than an ambiguous name, and only the operator can
+ * decide to rename it. They are surfaced by `findInvalidTopicNames` at boot.
+ */
+export function topicNameRefusal(db: Database, name: string): string | null {
+  if (topicExists(db, name)) return null;
+  if (name.includes(':')) return "topic name must not contain ':'";
+  if (Buffer.byteLength(name, 'utf8') > 256) return 'topic name must be at most 256 bytes';
+  return null;
+}
+
+/**
+ * F4 §7, §16 M — boot report: topic names that predate the rules above.
+ *
+ * A colon name is only ambiguous if its prefix names NO outbound peering; when
+ * it does, `orch:trollbox` is exactly what a mirrored remote topic is called
+ * and reporting it would be noise.
+ *
+ * The peering lookup deliberately has NO `enabled` filter (§16 M): pausing a
+ * peering is an operator action that must not turn that mesh's topics into boot
+ * warnings. A paused link is still a configured one.
+ */
+export function findInvalidTopicNames(db: Database): string[] {
+  return (db.prepare(`
+    SELECT name FROM topics
+    WHERE (name LIKE '%:%' AND substr(name, 1, instr(name, ':') - 1) NOT IN (SELECT alias FROM outbound_peers))
+       OR length(CAST(name AS BLOB)) > 256
+  `).all() as { name: string }[]).map(r => r.name);
+}
+
+/**
+ * F4 §7 — boot report: agent ids inside the reserved `topic:` range.
+ *
+ * `POST /agents` has refused any ':' since F0b, so such an id can only predate
+ * that rule — which is why this reports rather than guards. A prefix RANGE, not
+ * `LIKE 'topic%'`: the latter would also catch `topics-team`, an ordinary id
+ * that is none of this rule's business. (';' is ':' + 1.)
+ */
+export function findTopicPrefixAgents(db: Database): string[] {
+  return (db.prepare("SELECT id FROM agents WHERE id >= 'topic:' AND id < 'topic;' ORDER BY id")
+    .all() as { id: string }[]).map(r => r.id);
 }
 
 export function getTopicSubscribers(db: Database, topic: string): string[] {

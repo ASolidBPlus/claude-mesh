@@ -444,6 +444,8 @@ describe('F2a: POST /outbound-peers and the forwarder-factory refusal', () => {
     await start({ create: (row) => created.push(row.alias) });
     expect((await post({ ...VALID, url: 'http://far.example' })).status).toBe(400);
     expect((await post({ ...VALID, alias: 'mesh' })).status).toBe(400);
+    // F4: BOTH doors, because either one alone leaves the other as the way in.
+    expect((await post({ ...VALID, alias: 'topic' })).status).toBe(400);
     expect((await post(VALID)).status).toBe(201);
     expect((await post(VALID)).status).toBe(409);
 

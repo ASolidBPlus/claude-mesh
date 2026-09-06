@@ -1,4 +1,4 @@
-import { openDb, findPeerAliasCollisions, listPeers, listOutboundPeers } from './db.ts';
+import { openDb, findPeerAliasCollisions, findInvalidTopicNames, findTopicPrefixAgents, listPeers, listOutboundPeers } from './db.ts';
 import { setPeerUpSource } from './metrics.ts';
 import { startBorder, forwarders } from './border.ts';
 import { startWsServer, WsServerHandle } from './ws-server.ts';
@@ -150,6 +150,37 @@ async function main() {
       console.warn(JSON.stringify({
         evt: 'agents.legacy_colon_ids', count: legacy.length, ids: legacy,
         msg: "agent ids containing ':' predate the remote-id grammar and are ambiguous; rename when convenient",
+        at: Date.now(),
+      }));
+    }
+  } catch { /* never block boot on a diagnostic */ }
+
+  // F4 (§7): report topic names that predate the naming rules. A colon name is
+  // only ambiguous when its prefix names NO outbound peering — `orch:trollbox`
+  // is exactly what a mirrored remote topic is called — and a PAUSED peering
+  // still counts as configured (§16 M), so pausing a link never turns that
+  // mesh's topics into boot noise.
+  try {
+    const invalid = findInvalidTopicNames(db);
+    if (invalid.length > 0) {
+      console.warn(JSON.stringify({
+        evt: 'topics.invalid_names', count: invalid.length, names: invalid,
+        msg: "topic names containing ':' with no matching outbound peering, or over 256 bytes, cannot cross a border; rename when convenient",
+        at: Date.now(),
+      }));
+    }
+  } catch { /* never block boot on a diagnostic */ }
+
+  // F4 (§7): report agent ids inside the reserved `topic:` range. POST /agents
+  // has refused any ':' since F0b, so such an id can only predate that rule —
+  // which is why this reports rather than guards, exactly like the two above.
+  // Such an id and a topic principal are indistinguishable to the ACL.
+  try {
+    const topicIds = findTopicPrefixAgents(db);
+    if (topicIds.length > 0) {
+      console.warn(JSON.stringify({
+        evt: 'agents.topic_prefix_ids', count: topicIds.length, ids: topicIds,
+        msg: "agent ids in the reserved 'topic:' range are indistinguishable from topic ACL principals; rename when convenient",
         at: Date.now(),
       }));
     }

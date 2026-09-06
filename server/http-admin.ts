@@ -17,6 +17,7 @@ import {
   listAclByGrantedBy,
   listAclByGrantedByPrefix,
   getOrCreateTopic,
+  topicNameRefusal,
   listTopics,
   listAgents,
   Agent,
@@ -559,6 +560,16 @@ async function handleTopicPost(ctx: AdminCtx): Promise<void> {
     return;
   }
 
+  // F4: NEW names only — an existing topic is never rejected by its own name
+  // (the F0b rule). Consulted before getOrCreateTopic, which would otherwise
+  // create the row this refuses.
+  const nameRefusal = topicNameRefusal(db, name);
+  if (nameRefusal !== null) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: nameRefusal }));
+    return;
+  }
+
   if (getAgentById(db, created_by) === null) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'created_by agent not found' }));
@@ -632,6 +643,14 @@ async function handleAgentPost(ctx: AdminCtx): Promise<void> {
   if (id.includes(':')) {
     // ':' separates mesh from agent in a remote id. A local id containing one
     // would be indistinguishable from a remote address.
+    //
+    // F4 adds a SECOND reason and deliberately no second guard: `topic:` is the
+    // local topic-principal prefix, so an agent born in that range would be an
+    // ACL principal two different subsystems disagree about. This check already
+    // refuses every such id; a `topic:`-specific guard beside it would be a
+    // second rule for one question, which is how the two drift apart.
+    // Pre-existing `topic:*` ids are reported at boot (server.ts), never
+    // retroactively rejected.
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: "agent id must not contain ':'" }));
     return;
@@ -1493,12 +1512,17 @@ async function handlePeerKeyPost(ctx: AdminCtx): Promise<void> {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'alias must match ^[a-z0-9][a-z0-9-]{0,62}$' })); return;
   }
-  if (alias === RESERVED_ALIAS) {
+  // F4: `topic` joins `mesh` as a reserved alias, at BOTH doors — either one
+  // alone leaves the other as the way in. A peering called `topic` would make
+  // every LOCAL topic principal (`topic:trollbox`) read as a remote id, and
+  // revocation's prefix-range `deletePeeringEdges('topic', …)` would delete
+  // every topic grant on the mesh.
+  if (alias === RESERVED_ALIAS || alias === 'topic') {
     // 'mesh' names THIS mesh in every remote id. A peer holding it would make
     // its traffic indistinguishable from local traffic — refused at mint, the
     // only point where refusing is cheap.
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: `alias '${RESERVED_ALIAS}' is reserved` })); return;
+    res.end(JSON.stringify({ error: `alias '${alias}' is reserved` })); return;
   }
   if (getAgentById(db, alias) !== null) {
     // A peer alias and a local agent id share one id space at the point of
@@ -1886,9 +1910,14 @@ async function handleOutboundPeerPost(ctx: AdminCtx): Promise<void> {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'alias must match ^[a-z0-9][a-z0-9-]{0,62}$' })); return;
   }
-  if (alias === RESERVED_ALIAS) {
+  // F4: `topic` joins `mesh` as a reserved alias, at BOTH doors — either one
+  // alone leaves the other as the way in. A peering called `topic` would make
+  // every LOCAL topic principal (`topic:trollbox`) read as a remote id, and
+  // revocation's prefix-range `deletePeeringEdges('topic', …)` would delete
+  // every topic grant on the mesh.
+  if (alias === RESERVED_ALIAS || alias === 'topic') {
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: `alias '${RESERVED_ALIAS}' is reserved` })); return;
+    res.end(JSON.stringify({ error: `alias '${alias}' is reserved` })); return;
   }
 
   // An outbound alias must not PREFIX a legacy local id. `assertPeeringAllowed`

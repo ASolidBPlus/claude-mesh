@@ -84,6 +84,11 @@ describe('F0b: peer keys', () => {
     expect((await post('/peer-keys', { alias: 'Bad Alias' })).status).toBe(400);
     expect((await post('/peer-keys', { alias: '-leading' })).status).toBe(400);
     expect((await post('/peer-keys', { alias: 'mesh' })).status).toBe(400);
+    // F4: `topic` joins `mesh` as a reserved alias. A peering called `topic`
+    // would make every LOCAL topic principal (`topic:trollbox`) read as a
+    // remote id, and `deletePeeringEdges('topic', …)` — a prefix-range DELETE —
+    // would take every one of them out on revocation.
+    expect((await post('/peer-keys', { alias: 'topic' })).status).toBe(400);
 
     expect((await post('/peer-keys', { alias: 'dupe' })).status).toBe(201);
     // One live key per alias: two would mean two secrets register the same

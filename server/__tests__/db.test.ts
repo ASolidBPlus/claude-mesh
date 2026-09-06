@@ -38,6 +38,8 @@ import {
   subscribe,
   unsubscribe,
   getTopicSubscribers,
+  findInvalidTopicNames,
+  findTopicPrefixAgents,
   getAgentSubscriptions,
   insertFile,
   getFile,
@@ -1247,6 +1249,70 @@ describe('F4 subscriptions keep the topic foreign key', () => {
       expect(() => db.prepare('INSERT INTO subscriptions (agent_id, topic, subscribed_at) VALUES (?,?,?)')
         .run('pod1:alice', 'news', 1)).not.toThrow();
       expect(getTopicSubscribers(db, 'news')).toEqual(['pod1:alice']);
+    } finally { db.close(); }
+  });
+});
+
+// F4 §7 — the two boot reports. Neither rejects anything: they surface state
+// already on disk that the new gates can only stop from GROWING, exactly as
+// the legacy-colon-id and peer-alias-collision reports do.
+describe('F4 boot reports', () => {
+  it('findInvalidTopicNames flags a colon name with no matching peering, and IGNORES one with', () => {
+    const db = openDb(':memory:');
+    try {
+      registerAgent(db, { id: 'creator', token_hash: hashToken('t'), hostname: 'h' });
+      const t = (name: string) =>
+        db.prepare('INSERT INTO topics (name, created_at, created_by) VALUES (?,?,?)').run(name, 1, 'creator');
+      t('plain');
+      t('orch:news');        // legitimate: a remote topic on a peered mesh
+      t('bogus:news');       // no such peering — ambiguous, worth reporting
+      db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                  VALUES ('orch','wss://o.example','tok','pod1','["topic"]',600,?)`).run(1);
+
+      expect(findInvalidTopicNames(db).sort()).toEqual(['bogus:news']);
+    } finally { db.close(); }
+  });
+
+  // §16 M — a PAUSED peering must not turn its topics into boot noise. The
+  // operator disabled the link; the topics did not become invalid.
+  it('§16 M: a DISABLED outbound peering still spares its topic names', () => {
+    const db = openDb(':memory:');
+    try {
+      registerAgent(db, { id: 'creator', token_hash: hashToken('t'), hostname: 'h' });
+      db.prepare('INSERT INTO topics (name, created_at, created_by) VALUES (?,?,?)').run('orch:news', 1, 'creator');
+      db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at, enabled)
+                  VALUES ('orch','wss://o.example','tok','pod1','["topic"]',600,?,0)`).run(1);
+
+      expect(findInvalidTopicNames(db)).toEqual([]);
+    } finally { db.close(); }
+  });
+
+  it('findInvalidTopicNames flags an over-long name, measured in BYTES', () => {
+    const db = openDb(':memory:');
+    try {
+      registerAgent(db, { id: 'creator', token_hash: hashToken('t'), hostname: 'h' });
+      const wide = 'é'.repeat(200);          // 200 chars, 400 bytes
+      db.prepare('INSERT INTO topics (name, created_at, created_by) VALUES (?,?,?)').run(wide, 1, 'creator');
+      db.prepare('INSERT INTO topics (name, created_at, created_by) VALUES (?,?,?)').run('é'.repeat(100), 1, 'creator');
+      // 100 chars / 200 bytes is under the limit; 200 chars / 400 bytes is not.
+      expect(findInvalidTopicNames(db)).toEqual([wide]);
+    } finally { db.close(); }
+  });
+
+  it('findTopicPrefixAgents finds an agent id in the topic: range and nothing else', () => {
+    const db = openDb(':memory:');
+    try {
+      // POST /agents refuses any ':' today, so such an id can only predate the
+      // rule — which is precisely why a report exists rather than a guard.
+      db.prepare('INSERT INTO agents (id, token_hash, hostname, registered_at, last_seen) VALUES (?,?,?,?,?)')
+        .run('topic:legacy', hashToken('t'), 'h', 1, 1);
+      registerAgent(db, { id: 'ordinary', token_hash: hashToken('u'), hostname: 'h' });
+      // The prefix range must not swallow a neighbour: 'topics-team' sorts
+      // after 'topic:' and would be caught by a sloppy LIKE 'topic%'.
+      db.prepare('INSERT INTO agents (id, token_hash, hostname, registered_at, last_seen) VALUES (?,?,?,?,?)')
+        .run('topics-team', hashToken('v'), 'h', 1, 1);
+
+      expect(findTopicPrefixAgents(db)).toEqual(['topic:legacy']);
     } finally { db.close(); }
   });
 });
