@@ -1,4 +1,4 @@
-# F4 — topics across peerings (brief, v1, 2026-09-06 14:40Z — v0 + plan-eval amendments folded; F4_EVAL.md is the record, this file is self-contained)
+# F4 — topics across peerings (brief, v3 = v0 + A1–A14 + B1–B4 + C1–C14; each later section overrides earlier text where they differ; v1, 2026-09-06 14:40Z — v0 + plan-eval amendments folded; F4_EVAL.md is the record, this file is self-contained)
 
 Scoped by the operator 14:13Z: remote SUBSCRIBE allowed; a publish crosses the border ONCE and
 counts once against the peering rate; the receiving mesh fans out locally and filters per
@@ -278,3 +278,78 @@ confirm with the operator: Game State / Analytics are hub-published, pods listen
 ## Still open (operator): which topics take pod posts. (PLAN.md): origin storage column vs headers; local topic
 principal spelling in the acl table; whether a spoke may subscribe AND publish over one peering with only
 `topic-subscribe` granted (recommend: no — kinds are independent, publish needs its own kind).
+
+
+---
+# v3 (2026-09-06 15:00Z) — decisions folded from plan-eval #2 (F4_EVAL2.md, read at main 7717d16; main is now 04b242c)
+
+C1. **Local topic principal is `topic:<name>`; remote is `<alias>:<name>` (one colon, unchanged).** Main refuses the
+    local form today (`isRemote` at db.ts:860 calls any colon id without an agents row remote → `aclGrant` throws
+    NO_PEERING → POST /acl 409). Four edits make it legal, all in scope: (1) `TOPIC_PRINCIPAL_PREFIX = 'topic:'`
+    exemption inside `assertPeeringAllowed`'s isRemote — neither remote nor required to be an agent; (2) reserve the
+    alias `topic` at both alias doors (http-admin.ts:1496 and :1889) beside RESERVED_ALIAS; (3) refuse new agent ids in
+    the `topic:` prefix range, mirroring http-admin.ts:1894-1904; (4) an F0b-style boot report for pre-existing
+    `topic:*` agents. The mapping between spellings is `stampedFrom` (router.ts:299): a hub→spoke frame with bare
+    `from = trollbox` is stamped `orch:trollbox` on arrival — the remote principal falls out of existing code.
+    Drop B2's `orch:topic:trollbox` (two colons contradicts FEDERATION.md troubleshooting).
+C2. **Home-ness is the prefix test, not row existence.** `routeSubscribe` (router.ts:721) creates a local `topics` row
+    for `orch:trollbox` on the spoke, so "the topic row is local" is true everywhere. Define
+    `isHomeTopic(db,t) := topicExists(db,t) && !(t.includes(':') && hasOutboundPeer(db, t.slice(0, t.indexOf(':'))))`.
+C3. **Two grant classes per hub topic, both enumerable by the hub admin** (resolves B1 vs B2):
+    - RIGHT TO POST: at the spoke, outbound edge `publisher → orch:trollbox`; at the hub, inbound edge
+      `pod1:publisher → topic:trollbox`. Read-only hub topics (Game State, Analytics) are a HUB-side decision:
+      withhold the inbound edge. This is the sentence that sells B2.
+    - RIGHT TO HEAR: at the hub, local fan-out gates on `aclCheck(db, 'topic:trollbox', sub)` — NEVER
+      `pod1:publisher → sub`; at each spoke, `aclCheck(db, 'orch:trollbox', sub)` (A-invariant, unchanged).
+    Local (non-federated) topics keep today's publisher→subscriber per-pair semantics untouched.
+C4. **Factoring.** Extract router.ts:602-711 as `fanOutTopicLocal(db, agentIndex, {topic, from_agent, origin, payload,
+    content_type, sent_at, expires_at, ephemeral, aclPrincipal})`; called from `routePublish` (principal = publisher,
+    as today) and from both topic arms of `routeRelay` (principal = `topic:<name>`). `routeRelay` NEVER calls
+    `routePublish`. Per-step reuse/skip table is EVAL2 §1 and is binding: skip the size check (relay already
+    refused >1 MB), skip incSent/incBytes('in')/observePayloadBytes (remote ids get no local "sent"), skip
+    getOrCreateTopic (A6), derive expires_at/ephemeral from the ARRIVING frame's ttl via routeRelay:309-313 (never
+    routePublish's `?? 300_000` — otherwise a transited post gets up to 2× lifetime), tap audience =
+    `crossBorderAudience` not LOCAL_ONLY; reuse subscribers minus remote (A2/A5), per-subscriber aclCheck with the
+    C3 principal, copy rows, deliver/queue, incTopicFanout, incMsgStatus.
+C5. **Transit guard is a static property:** `enqueueOutboundTopicRows` has exactly ONE call site, inside the
+    `topic-publish` arm, after `isHomeTopic` (C2) passed. The `topic` DELIVERY arm calls `fanOutTopicLocal` and
+    nothing else. Mutants that must red: (a) move `enqueueOutboundTopicRows` into shared code → the control "a
+    `topic` delivery on pod2 with a `pod3:*` subscriber row yields no messages row with to_agent='pod3:'" fails;
+    (b) delete the isHomeTopic guard → a `topic-publish` naming `pod2:games` at the hub must yield no outbound row.
+C6. **`origin`:** new nullable column `messages.origin TEXT` via the repo's `try { db.exec('ALTER TABLE …') } catch {}`
+    idiom (db.ts:415-450). Wire: `buildDeliverFrame` adds `origin` (11th key). It SHIPS ALL THE WAY to agents in v1
+    (mesh-chat renders by `from` and will prefer `origin` for hub topics — chat-planner 14:54Z): three coordinated
+    client-side edits — `protocol.ts DeliverFrame`, `client.ts Inbound` + `normalizeDeliver` (:1085), plugin `meta`
+    (server.ts:320-332) — plus the SDK pin bump noted in the plan. `origin` is ATTACKER-SUPPLIED (from the spoke's
+    server): ≤256 bytes at the shape check, never routed or ACL'd on; pinned test: a `topic` frame carrying
+    `origin:'orch:admin'` changes no ACL outcome and no `from_agent`.
+C7. **Echo rule:** one frame per peering cannot exclude the publisher, so an agent subscribed to a hub topic receives
+    its own post back (as a chat shows your own message). Documented behaviour, not suppressed — suppression would
+    route on `origin`, which C6 forbids. Test pins it.
+C8. **Rate:** one bucket per peering, shared by all kinds, counted before kind/dedupe (router.ts:276/285/291) — a busy
+    Troll Box rate-limits that peering's DIRECT traffic, and the hub's outbound cost is O(pods) per post. v1 rule:
+    size `rate_per_min` for topic volume; per-kind buckets are OUT OF SCOPE (stated in FEDERATION.md). Observability
+    for it: C9.
+C9. **Metrics:** add `kind` label to `mesh_peer_relays_total` (closed set of four, already in PARTY_FREE_LABELS,
+    metrics.ts:240-242 — the walker sanctions it). Rewrite the v0 sentence to "topic NAMES are never a label".
+    `('in','delivered')` means "accepted at the border", even when the fan-out filtered everyone; state it in the doc.
+C10. **Dedupe:** hub outbound rows take fresh `crypto.randomUUID()` ids; `Forwarder.send` relays `msg_id: row.id`.
+    FORBIDDEN: preserving the original msg_id across the hub (destroys the hub's retry idempotency, router.ts:301-303).
+C11. **A1 precision — which `subscriptions` FK survives:** drop ONLY `agent_id`'s FK. Keep `topic REFERENCES
+    topics(name) ON DELETE CASCADE`. Consequence, documented and pinned: deleting the hub agent that created a topic
+    (`deleteAgent` → `DELETE FROM topics WHERE created_by = ?`, db.ts:788) destroys the topic and every spoke's remote
+    subscription row on the hub; spokes keep their local `orch:trollbox` rows and go quiet. Operators create hub
+    topics from a long-lived agent; `GET /peers/:alias/subscriptions` (A14) is how a spoke's silence is diagnosed.
+C12. **Topic-name validation (A7 completed):** new names refuse ':' AND are bounded to ≤256 bytes (a longer name makes
+    the hub emit a frame its own peer's :258 check refuses — silently undeliverable). Pre-existing names reported at
+    boot, never rejected.
+C13. **Three-mesh in-process fixture rules** (border.test.ts:666-800 is 1 live server + 1 router-only side; F4 needs
+    2 live + 1 router-only): every alias globally unique in the process (`forwarders` Map keyed by alias, border.ts:303;
+    `borderEvents` shared, :332-338; `relayBuckets` keyed by alias, router.ts:161); afterEach = `stopAll()` +
+    `forwarders.clear()` + `resetRelayBuckets()`; port offsets distinct from border.test.ts:673's `23500+Date.now()%400`.
+C14. **Peering arithmetic for the docs:** N pods cost the hub 2N peering rows + N(N−1) pod↔pod direct rows; minted in
+    the drive; FEDERATION.md example uses N=2 (the operator's diagram).
+
+Superseded by this section: B2's `orch:topic:` remote spelling; B1's "per-subscriber ACL with publisher id
+'pod1:publisher'" on the hub; v0's "kind is NOT a label"; B1's "the mesh where the topic row is local".
+Unchanged: the operator's decisions 1–5, the topology, B3's kinds set, A1–A14 except as refined by C11/C12.
