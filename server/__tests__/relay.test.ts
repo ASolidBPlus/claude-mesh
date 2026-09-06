@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'bun:test';
 import {
-  openDb, registerAgent, upsertPeer, aclGrant, getPeerByAlias, sweepRelays, getMessage,
+  openDb, registerAgent, upsertPeer, aclGrant, getPeerByAlias, sweepRelays, getMessage, getOrCreateTopic,
 } from '../db.ts';
 import { routeRelay, resetRelayBuckets } from '../router.ts';
 import { renderMetrics } from '../metrics.ts';
@@ -254,8 +254,11 @@ describe('F1b: metrics are labelled per ALIAS, never per remote agent', () => {
     process.env.MESH_METRICS_IDENTITY_LABELS = '1';
     const out = renderMetrics(db);
     delete process.env.MESH_METRICS_IDENTITY_LABELS;
-    expect(out).toContain('mesh_peer_relays_total{alias="othermesh",direction="in",outcome="delivered"} 1');
-    expect(out).toContain('mesh_peer_relays_total{alias="othermesh",direction="in",outcome="refused"} 1');
+    // F4: `kind` is the fourth label and renders LAST. It is party-free — a
+    // closed set of five relay kinds, clamped at the emitter — so it is
+    // present in BOTH arms, unlike `alias`.
+    expect(out).toContain('mesh_peer_relays_total{alias="othermesh",direction="in",outcome="delivered",kind="direct"} 1');
+    expect(out).toContain('mesh_peer_relays_total{alias="othermesh",direction="in",outcome="refused",kind="direct"} 1');
     // The remote AGENT id must not appear even with labels on — cardinality we
     // do not control, and a different disclosure from the alias.
     expect(out).not.toContain('their-agent');
@@ -322,6 +325,74 @@ describe('F1b: the peering rule lives in the chokepoint, both doors map it', () 
     // edge the bus cannot honour.
     const db = setup();
     expect(() => aclGrant(db, 'local-a', 'othermesh:their-agent', 'admin')).toThrow(/outbound peering/);
+    db.close();
+  });
+});
+
+// F4 §7 — `kind` on mesh_peer_relays_total.
+//
+// The label answers the question the metric could not: a peering's traffic is
+// now four different things, and "in/delivered 500" says nothing about whether
+// that was chat or a subscription storm. It is party-free by construction —
+// five fixed strings, clamped at the emitter — which is why it appears in the
+// aggregated arm too, where `alias` may not.
+describe('F4 mesh_peer_relays_total carries the relay kind', () => {
+  beforeEach(() => resetRelayBuckets());
+
+  it('a topic-kind relay is labelled with its kind, in both arms', () => {
+    const db = openDb(':memory:');
+    registerAgent(db, { id: 'owner', token_hash: 'o'.repeat(64), hostname: 'h' });
+    getOrCreateTopic(db, 'trollbox', 'owner');
+    upsertPeer(db, {
+      alias: 'kindlabelmesh', token_hash: 'c'.repeat(64), minted_by_key: 'k',
+      kinds: '["topic-subscribe"]', rate_per_min: 600,
+    });
+    db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                VALUES ('kindlabelmesh','wss://o.example','tok','us','["topic"]',600,?)`).run(Date.now());
+
+    routeRelay(db, new Map(), getPeerByAlias(db, 'kindlabelmesh')!, {
+      type: 'relay', msg_id: 'sub-1', kind: 'topic-subscribe', from: 'alice', topic: 'trollbox',
+    } as never);
+
+    // THE COUNT IS NOT PINNED HERE, and the reason is worth stating: the
+    // counters are MODULE-GLOBAL and accumulate across every test in the
+    // process, so `} 1` passed in isolation and failed in the full suite once
+    // another file relayed a topic-subscribe. What this test owns is the
+    // LABEL; "counted once per frame" is pinned where the frames are, in
+    // topic-federation.test.ts.
+    const aggregated = renderMetrics(db);
+    expect(aggregated).toMatch(/mesh_peer_relays_total\{direction="in",outcome="delivered",kind="topic-subscribe"\} \d+/);
+
+    process.env.MESH_METRICS_IDENTITY_LABELS = '1';
+    const labelled = renderMetrics(db);
+    delete process.env.MESH_METRICS_IDENTITY_LABELS;
+    // The alias arm IS pinned exactly, and the reason is the ALIAS, not the
+    // database: `kindlabelmesh` is used by no other test in the process, so
+    // nothing else can contribute to its series. (A fresh database would not
+    // have been enough — the counters outlive it.)
+    expect(labelled).toContain('mesh_peer_relays_total{alias="kindlabelmesh",direction="in",outcome="delivered",kind="topic-subscribe"} 1');
+    db.close();
+  });
+
+  // M11 — THE LABEL IS CLAMPED AT THE EMITTER. A peer chooses `kind` on the
+  // wire, so an unclamped label would let it write arbitrary strings into an
+  // unauthenticated document and mint unbounded series — the cardinality
+  // failure #136 exists to prevent, one metric over.
+  it('M11: an unknown kind renders as kind="unknown", not as the peer\'s string', () => {
+    const db = openDb(':memory:');
+    upsertPeer(db, {
+      alias: 'kindlabelmesh', token_hash: 'c'.repeat(64), minted_by_key: 'k',
+      kinds: '["direct"]', rate_per_min: 600,
+    });
+
+    routeRelay(db, new Map(), getPeerByAlias(db, 'kindlabelmesh')!, {
+      type: 'relay', msg_id: 'weird-1', kind: 'topic-🦑-injection', from: 'a', to: 'b', payload: 'x',
+    } as never);
+
+    const out = renderMetrics(db);
+    expect(out).toContain('kind="unknown"');
+    expect(out).not.toContain('🦑');
+    expect(out).not.toContain('injection');
     db.close();
   });
 });

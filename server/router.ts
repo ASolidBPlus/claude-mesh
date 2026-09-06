@@ -14,8 +14,15 @@ import {
   getPendingMessages,
   getOrCreateTopic,
   getTopicSubscribers,
+  isRemoteEndpoint,
+  topicExists,
+  topicNameRefusal,
+  subscribeCreated,
+  unsubscribeRemoved,
+  listEnabledOutboundPeers,
+  listRemoteSubscribers,
+  TOPIC_PRINCIPAL_PREFIX,
   subscribe as dbSubscribe,
-  unsubscribe as dbUnsubscribe,
   Message,
   insertFile,
   getFile,
@@ -57,6 +64,12 @@ export function buildDeliverFrame(msg: {
   payload: string;
   content_type: string;
   sent_at: number;
+  /** F4 §16 C — REQUIRED, not optional. Every call site states what the
+   *  provenance is, including the ones where it is `null`, because an optional
+   *  field would let a new delivery path forget it and ship a topic frame with
+   *  no origin that looks exactly like a local one. The callers that pass a
+   *  whole `Message` get it from the row for free. */
+  origin: string | null;
 }): string {
   return JSON.stringify({
     type: 'deliver',
@@ -69,6 +82,7 @@ export function buildDeliverFrame(msg: {
     payload: msg.payload,
     content_type: msg.content_type,
     sent_at: msg.sent_at,
+    origin: msg.origin,
   });
 }
 
@@ -114,6 +128,7 @@ export function deliverOrQueue(
       id: msg.id, kind: 'direct', from_agent: msg.from_agent, to_agent: msg.to_agent,
       topic: null, correlation_id: null, payload: msg.payload,
       content_type: msg.content_type, sent_at: msg.sent_at,
+      origin: null,   // a direct message has no cross-mesh provenance
     }));
     if (!msg.ephemeral) markDelivered(db, msg.id);
     incMsgStatus('direct', 'delivered');
@@ -188,6 +203,11 @@ export interface RelayFrameIn {
   payload?: unknown;
   content_type?: unknown;
   ttl_ms?: unknown;
+  /** F4: present on every topic kind, absent on `direct`. */
+  topic?: unknown;
+  /** F4: display-only provenance, set by the SENDING mesh. Attacker-supplied:
+   *  validated for shape and then carried, never routed on. */
+  origin?: unknown;
 }
 
 /**
@@ -215,6 +235,265 @@ export interface RelayFrameIn {
 const NO_OBSERVERS: ReadonlySet<string> = new Set();
 
 /**
+ * F4 §2 — is this topic OURS to fan out, or a mirror of another mesh's?
+ *
+ * THE TEST IS THE PREFIX, NEVER ROW EXISTENCE. A spoke really does hold a local
+ * `topics` row called `orch:trollbox` — `routeSubscribe` creates it so the
+ * subscription has something to point at — so "the row is here" would call
+ * every mirrored topic home and the hub-and-spoke direction would collapse.
+ *
+ * A name is foreign iff its prefix names an OUTBOUND peering: that is the
+ * peering the post would have to leave through, so if there is none, the name's
+ * colon is just a colon and the topic is local (a legacy name, or one created
+ * before its peering existed).
+ *
+ * §16 L, a consequence worth stating where it is decided: `hasOutboundPeer` is
+ * enabled-only, so while a spoke's peering is PAUSED its `orch:` topics become
+ * home topics and posts fan out LOCALLY instead of queueing for the border.
+ * Accepted for v1 — rows already queued still drain on re-enable.
+ */
+export function isHomeTopic(db: Database, t: string): boolean {
+  if (!topicExists(db, t)) return false;
+  const i = t.indexOf(':');
+  if (i <= 0) return true;
+  return !hasOutboundPeer(db, t.slice(0, i));
+}
+
+/**
+ * F4 §7 — the LOCAL half of a topic fan-out, extracted from `routePublish` so
+ * that both publish paths and the inbound border arm share exactly one copy.
+ *
+ * Three callers will exist and they differ only in their inputs: a local
+ * publish (`aclPrincipal` = the publisher), a hub re-originating a spoke's post
+ * (`aclPrincipal` = the topic principal), and a spoke delivering an arriving
+ * `topic` frame (`aclPrincipal` = the stamped remote topic). Everything they do
+ * to a subscriber is identical, and a second copy is how the ACL principal
+ * silently becomes the wrong one on one of the three.
+ *
+ * REMOTE SUBSCRIBERS ARE SKIPPED (A2). `subscriptions.agent_id` may now name
+ * `pod1:alice`, and this mesh cannot deliver to it: a `messages` row addressed
+ * to a bare remote id matches no drain range and is read by nobody, so it would
+ * sit in the queue until it expired. Remote subscribers are served by the
+ * border rows instead. The filter is `isRemoteEndpoint`, an AGENT LOOKUP rather
+ * than a colon test, so a legacy local id containing ':' still receives.
+ *
+ * CONTAINS NO `emitTap` AND NO BORDER ENQUEUE, deliberately. `observer-cross-
+ * border.test.ts` scans this file for the set of function names containing an
+ * `emitTap(` call and asserts equality with its driven list, and the border
+ * enqueue has exactly one call site by contract (§15); putting either here
+ * would break a guarantee that is checked structurally rather than by
+ * behaviour.
+ */
+export function fanOutTopicLocal(
+  db: Database,
+  agentIndex: Map<string, WebSocket>,
+  m: {
+    topic: string;
+    from_agent: string;
+    origin: string | null;
+    payload: string;
+    content_type: string;
+    sent_at: number;
+    expires_at: number | null;
+    ephemeral: boolean;
+    /** The principal the per-subscriber ACL is evaluated FROM. Not always
+     *  `from_agent`: on a hub it is the topic principal, so a subscriber's
+     *  right to hear is a property of the topic rather than of whoever posted. */
+    aclPrincipal: string;
+    payloadBytes: number;
+  },
+): void {
+  const subscribers = getTopicSubscribers(db, m.topic)
+    .filter(id => id !== m.from_agent)
+    .filter(id => !isRemoteEndpoint(db, id));
+
+  for (const subscriber_id of subscribers) {
+
+    // 5a. ACL check.
+    //
+    // THE GATE STAYS. Removing it for system topics was one of the options on
+    // #136 and it is wrong: routeSubscribe calls getOrCreateTopic with no ACL
+    // check, so ANY authenticated agent can subscribe to sys.presence.turn.
+    // Ungating the fan-out would hand every subscriber the activity of the
+    // entire roster — the same enumeration #125, #128 and #129 exist to close.
+    //
+    // WHAT CHANGES IS THE COUNTING, and it is not about system topics at all.
+    // On a topic publish the sender does NOT choose the recipients: it names a
+    // topic, and the ACL filters the subscriber list. Counting each filtered
+    // subscriber as an "ACL-denied send attempt by sender" is a semantics error
+    // for EVERY topic — the sender attempted one publish, not N sends to N
+    // agents it never named. sys.presence.turn only made it visible, by being
+    // published ~2/s fleet-wide.
+    //
+    // mesh_acl_denied_total and mesh_errors_total{ACL_DENIED} are therefore for
+    // DIRECT sends, where the sender did choose the recipient. Fan-out outcomes
+    // go to mesh_topic_fanout_total, which carries no topic label because topic
+    // names are agent-chosen.
+    if (!aclCheck(db, m.aclPrincipal, subscriber_id)) {
+      incTopicFanout('filtered');
+      continue;
+    }
+    // 'allowed', not 'delivered': this is where the ACL decision is made, and
+    // the online/offline branch below has not run yet. mesh_messages_total is
+    // the authority on delivery.
+    incTopicFanout('allowed');
+
+    // 5b. Unique msg_id per subscriber copy
+    const msgId = crypto.randomUUID();
+
+    // 5c. Online
+    const recipientWs = agentIndex.get(subscriber_id);
+    if (recipientWs !== undefined) {
+      // ttl_ms=0 = EPHEMERAL: deliver live, persist nothing (see routeDirect).
+      // Beat/heartbeat topics (e.g. turn-status) use this so they never
+      // accumulate as scrollback history and starve real-message reads.
+      if (!m.ephemeral) {
+        insertMessage(db, {
+          id: msgId,
+          kind: 'topic',
+          from_agent: m.from_agent,
+          to_agent: subscriber_id,
+          topic: m.topic,
+          payload: m.payload,
+          content_type: m.content_type,
+          sent_at: m.sent_at,
+          expires_at: m.expires_at,
+          origin: m.origin,
+        });
+      }
+      recipientWs.send(buildDeliverFrame({
+        id: msgId,
+        kind: 'topic',
+        from_agent: m.from_agent,
+        to_agent: null,
+        topic: m.topic,
+        correlation_id: null,
+        payload: m.payload,
+        content_type: m.content_type,
+        sent_at: m.sent_at,
+        origin: m.origin,
+      }));
+      if (!m.ephemeral) markDelivered(db, msgId);
+      incMsgStatus('topic', 'delivered');
+      incReceived(subscriber_id);
+      incBytes('out', m.payloadBytes);
+    } else {
+      // 5d. Offline
+      if (m.ephemeral) {
+        incMsgStatus('topic', 'dropped');
+        continue;
+      }
+      insertMessage(db, {
+        id: msgId,
+        kind: 'topic',
+        from_agent: m.from_agent,
+        to_agent: subscriber_id,
+        topic: m.topic,
+        payload: m.payload,
+        content_type: m.content_type,
+        sent_at: m.sent_at,
+        expires_at: m.expires_at,
+        origin: m.origin,
+      });
+      incMsgStatus('topic', 'queued');
+    }
+  }
+}
+
+/**
+ * F4 §7 — ONE outbound row per PEERING, never per remote subscriber.
+ *
+ * That is the entire economy of hub-and-spoke: a pod with fifty subscribers
+ * costs the hub one border frame and one rate token, and the pod fans out with
+ * its own ACL. Per-subscriber rows would multiply both, and the rate bucket is
+ * per peering — so a busy topic would rate-limit that peering's direct traffic
+ * fifty times faster.
+ *
+ * TWO GATES, BOTH ON THE SENDING SIDE, and neither substitutes for the other:
+ * the peering must be enabled AND carry kind `topic` (the admin's decision
+ * about what may leave), and at least one of that pod's subscribers must hold
+ * the RIGHT TO HEAR edge from the topic principal (the ACL's decision about
+ * whether the topic may reach that mesh at all). With no permitted subscriber
+ * nothing leaves — not "leaves and is filtered there".
+ *
+ * A FRESH `crypto.randomUUID()` per row (§16 A): `routePublish` has no
+ * duplicate check, so a reused id throws a bare SQLite constraint error, and
+ * reuse across the hub would also destroy the hub's retry idempotency.
+ *
+ * EXACTLY ONE CALL SITE, EVER — `fanOutHomeTopicPublish` below. Both publish
+ * paths route through that, so the guarantee survives having two callers. It is
+ * checked structurally, not by convention.
+ *
+ * Returns the rows it wrote so the caller can emit one cross-border tap each;
+ * emitting them here would break `observer-cross-border.test.ts`'s scan of
+ * which router functions contain `emitTap(`.
+ */
+export function enqueueOutboundTopicRows(
+  db: Database,
+  m: {
+    topic: string;
+    origin: string | null;
+    payload: string;
+    content_type: string;
+    sent_at: number;
+    expires_at: number | null;
+  },
+): { alias: string; id: string }[] {
+  const written: { alias: string; id: string }[] = [];
+  for (const peering of listEnabledOutboundPeers(db)) {
+    let kinds: string[];
+    try { kinds = JSON.parse(peering.kinds) as string[]; } catch { continue; }
+    if (!Array.isArray(kinds) || !kinds.includes('topic')) continue;
+
+    const subs = listRemoteSubscribers(db, peering.alias, m.topic);
+    if (!subs.some(id => aclCheck(db, `${TOPIC_PRINCIPAL_PREFIX}${m.topic}`, id))) continue;
+
+    const id = crypto.randomUUID();
+    insertMessage(db, {
+      id,
+      kind: 'topic',
+      from_agent: `${TOPIC_PRINCIPAL_PREFIX}${m.topic}`,
+      to_agent: `${peering.alias}:`,   // the peering, not an agent; the drain ranges on it
+      topic: m.topic,
+      payload: m.payload,
+      content_type: m.content_type,
+      sent_at: m.sent_at,
+      expires_at: m.expires_at,
+      origin: m.origin,
+    });
+    incMsgStatus('topic', 'queued');
+    borderEvents.emit('enqueued', peering.alias);
+    written.push({ alias: peering.alias, id });
+  }
+  return written;
+}
+
+/**
+ * F4 §15 note 1 — the ONE call site of `enqueueOutboundTopicRows`.
+ *
+ * Two paths publish a home topic: a local agent publishing it, and the hub
+ * re-originating a spoke's `topic-publish`. Both go through here, so "exactly
+ * one call site" survives having two callers — and the mutant that moves the
+ * enqueue into `fanOutTopicLocal` (which the `topic` DELIVERY arm also calls)
+ * still reds, because that arm would then re-originate.
+ */
+function fanOutHomeTopicPublish(
+  db: Database,
+  agentIndex: Map<string, WebSocket>,
+  m: Parameters<typeof fanOutTopicLocal>[2],
+): { alias: string; id: string }[] {
+  fanOutTopicLocal(db, agentIndex, m);
+  return enqueueOutboundTopicRows(db, {
+    topic: m.topic,
+    origin: m.origin,
+    payload: m.payload,
+    content_type: m.content_type,
+    sent_at: m.sent_at,
+    expires_at: m.expires_at,
+  });
+}
+
+/**
  * The audience for a frame that crosses a border (F3).
  *
  * The `observerIndex.size === 0` short-circuit is why this is a helper and not
@@ -238,27 +517,75 @@ export function routeRelay(
 ): { ok: true } | { ok: false; code: 'RELAY_REFUSED' | 'RATE_LIMITED'; ref?: string } {
   const alias = peer.alias;
   const ref = typeof frame.msg_id === 'string' && frame.msg_id.length > 0 ? frame.msg_id : undefined;
+  // F4 — THE METRIC LABEL IS CLAMPED HERE, at the only place that can tell a
+  // validated kind from a peer's string. `frame.kind` arrives on the wire, so
+  // labelling it raw would let a stranger mint unbounded series in an
+  // unauthenticated document (#136's cardinality failure, one metric over).
+  // Anything outside the closed set renders as `unknown`.
+  const RELAY_KINDS = ['direct', 'topic', 'topic-subscribe', 'topic-unsubscribe', 'topic-publish'];
+  const metricKind = typeof frame.kind === 'string' && RELAY_KINDS.includes(frame.kind)
+    ? frame.kind : 'unknown';
   const refuse = (reason: string) => {
-    incPeerRelay(alias, 'in', 'refused');
+    incPeerRelay(alias, 'in', 'refused', metricKind);
     console.log(JSON.stringify({ evt: 'peer.relay_refused', alias, reason, at: Date.now() }));
     return { ok: false as const, code: 'RELAY_REFUSED' as const, ...(ref !== undefined ? { ref } : {}) };
   };
 
   // ── Validation. Shape first, so a malformed frame never reaches a lookup.
-  const { msg_id, from, to, payload, kind } = frame;
+  //
+  // F4 restructures this: the KIND is dispatched on before the `to` check,
+  // because `to` is required for `direct` and must be ABSENT for every topic
+  // kind — a topic frame names a topic, and a `to` on one would be a second,
+  // contradictory address.
+  const { msg_id, from, payload, kind } = frame;
+  const to = frame.to;
   if (typeof msg_id !== 'string' || msg_id.length === 0) return refuse('bad_msg_id');
   if (typeof from !== 'string' || from.length === 0) return refuse('bad_from');
-  if (typeof to !== 'string' || to.length === 0) return refuse('bad_to');
-  if (typeof payload !== 'string') return refuse('bad_payload');
-  if (kind !== 'direct') return refuse('bad_kind');
+
+  const TOPIC_KINDS = ['topic', 'topic-subscribe', 'topic-unsubscribe', 'topic-publish'];
+  if (kind !== 'direct' && !TOPIC_KINDS.includes(kind as string)) return refuse('bad_kind');
+  const isTopicKind = kind !== 'direct';
+
+  if (isTopicKind) {
+    if (to !== undefined) return refuse('to_not_permitted');
+  } else {
+    if (typeof to !== 'string' || to.length === 0) return refuse('bad_to');
+  }
+
+  // `payload` is required for the kinds that carry one. Subscribe and
+  // unsubscribe carry none: they are state changes, not messages.
+  const carriesPayload = kind === 'direct' || kind === 'topic' || kind === 'topic-publish';
+  if (carriesPayload && typeof payload !== 'string') return refuse('bad_payload');
+
+  // The topic name, on every topic kind. Bare and bounded for the same reason
+  // `from` is: a ':' here would name a topic on a THIRD mesh.
+  let topicName = '';
+  if (isTopicKind) {
+    const t = frame.topic;
+    if (typeof t !== 'string' || t.length === 0) return refuse('bad_topic');
+    if (Buffer.byteLength(t, 'utf8') > 256 || t.includes(':')) return refuse('bad_topic');
+    topicName = t;
+  }
+
+  // `origin` is ATTACKER-SUPPLIED and display-only: shape-checked here and then
+  // carried verbatim. It is never routed on and never an ACL principal, so the
+  // only thing that can go wrong with it is size.
+  if (frame.origin !== undefined) {
+    if (typeof frame.origin !== 'string' || Buffer.byteLength(frame.origin, 'utf8') > 256) {
+      return refuse('bad_origin');
+    }
+  }
+  const origin = typeof frame.origin === 'string' ? frame.origin : null;
 
   // ONE HOP. `from`/`to` must be bare — a ':' would mean this peer is relaying
   // on behalf of a THIRD mesh, which is transitive federation nobody agreed to:
   // our admin's border decision covers this peer, not that peer's peers.
   if (Buffer.byteLength(from, 'utf8') > 256 || from.includes(':')) return refuse('from_not_one_hop');
-  if (Buffer.byteLength(to, 'utf8') > 256 || to.includes(':')) return refuse('to_not_one_hop');
+  if (!isTopicKind && (Buffer.byteLength(to as string, 'utf8') > 256 || (to as string).includes(':'))) {
+    return refuse('to_not_one_hop');
+  }
 
-  const payloadBytes = Buffer.byteLength(payload, 'utf8');
+  const payloadBytes = carriesPayload ? Buffer.byteLength(payload as string, 'utf8') : 0;
   if (payloadBytes > 1_048_576) return refuse('too_large');
 
   // ── Peer state, then rate, then border, then dedupe. Order matters: the rate
@@ -274,7 +601,7 @@ export function routeRelay(
 
   const now = Date.now();
   if (!withinRate(alias, peer.rate_per_min, now)) {
-    incPeerRelay(alias, 'in', 'rate_limited');
+    incPeerRelay(alias, 'in', 'rate_limited', metricKind);
     return { ok: false, code: 'RATE_LIMITED', ...(ref !== undefined ? { ref } : {}) };
   }
 
@@ -282,7 +609,12 @@ export function routeRelay(
   // and never from peer_keys — the key may have been re-minted since.
   let allowedKinds: string[];
   try { allowedKinds = JSON.parse(peer.kinds) as string[]; } catch { return refuse('bad_kinds_column'); }
-  if (!Array.isArray(allowedKinds) || !allowedKinds.includes(kind)) return refuse('kind_not_permitted');
+  if (!Array.isArray(allowedKinds)) return refuse('bad_kinds_column');
+  // §16 E: `topic-unsubscribe` skips ONLY this test — teardown is always
+  // allowed, because a peer that may not stop subscribing is worse than one
+  // that may. The JSON parse above still runs and still refuses a malformed
+  // column, so a broken row does not quietly become permissive for one kind.
+  if (kind !== 'topic-unsubscribe' && !allowedKinds.includes(kind as string)) return refuse('kind_not_permitted');
 
   // ── Dedupe on the REMOTE id, within RELAY_DEDUPE_MS. A repeat inside the
   // window is re-ACKed and delivered NOTHING: the peer's retry after a lost ack
@@ -290,20 +622,11 @@ export function routeRelay(
   // message BY DESIGN — a dedupe ledger that grew forever is the alternative.
   const seen = db.prepare('SELECT 1 FROM relays WHERE peer_alias = ? AND remote_msg_id = ?').get(alias, msg_id);
   if (seen !== null) {
-    incPeerRelay(alias, 'in', 'duplicate');
+    incPeerRelay(alias, 'in', 'duplicate', metricKind);
     return { ok: true };
   }
 
-  // ── Recipient and the inbound edge. Both answer the same RELAY_REFUSED.
-  if (getAgentById(db, to) === null) return refuse('to_unknown');
-  const stampedFrom = `${alias}:${from}`;
-  if (!aclCheck(db, stampedFrom, to)) return refuse('no_edge');
-
-  // ── Accept. A LOCAL id for messages.id: the remote id is the peer's
-  // namespace and could collide with one of ours, so it lives only in `relays`.
-  const localId = crypto.randomUUID();
-  db.prepare('INSERT INTO relays (peer_alias, remote_msg_id, seen_at) VALUES (?, ?, ?)')
-    .run(alias, msg_id, now);
+  const stampedFrom = isTopicKind ? `${alias}:${topicName}` : `${alias}:${from}`;
 
   // (b) A peer's ttl is untrusted input. Negative is malformed; enormous
   // promises storage past the dedupe window, which is never honoured.
@@ -311,11 +634,150 @@ export function routeRelay(
   if (!Number.isFinite(rawTtl) || rawTtl < 0) return refuse('bad_ttl');
   const ttl = Math.min(rawTtl, MAX_TTL_MS);
   const content_type = typeof frame.content_type === 'string' ? frame.content_type : 'text/plain';
+
+  // ── The SUBSCRIBE arms: state changes from a mesh whose agents want, or no
+  // longer want, one of OUR topics.
+  //
+  // THE SAME-ALIAS RETURN RULE (A3). `peers` and `outbound_peers` share no
+  // column, so the only way to know where this topic would be DELIVERED is to
+  // look for an outbound peering under the same alias. Without one — or with
+  // one that cannot carry `topic` — a subscription would be recorded that can
+  // never be served, which is worse than a refusal because nothing reports it.
+  //
+  // NO `getOrCreateTopic`: a remote caller never creates a topic here. A
+  // subscribe to a name this mesh does not own is refused, or any peer could
+  // populate our topics table one guess at a time.
+  if (kind === 'topic-subscribe' || kind === 'topic-unsubscribe') {
+    db.prepare('INSERT INTO relays (peer_alias, remote_msg_id, seen_at) VALUES (?, ?, ?)')
+      .run(alias, msg_id, now);
+    const remoteSubscriber = `${alias}:${from}`;
+
+    if (kind === 'topic-unsubscribe') {
+      // Teardown asks nothing of the return peering or the topic: whatever the
+      // state is, less of it is always allowed.
+      unsubscribeRemoved(db, remoteSubscriber, topicName);
+      incPeerRelay(alias, 'in', 'delivered', metricKind);
+      return { ok: true };
+    }
+
+    const returnPeering = getOutboundPeer(db, alias);
+    if (returnPeering === null || returnPeering.enabled !== 1) return refuse('no_return_peering');
+    let returnKinds: string[];
+    try { returnKinds = JSON.parse(returnPeering.kinds) as string[]; } catch { return refuse('no_return_peering'); }
+    if (!Array.isArray(returnKinds) || !returnKinds.includes('topic')) return refuse('no_return_peering');
+
+    if (!isHomeTopic(db, topicName)) return refuse('not_home_topic');
+
+    subscribeCreated(db, remoteSubscriber, topicName);
+    incPeerRelay(alias, 'in', 'delivered', metricKind);
+    return { ok: true };
+  }
+
+  // ── The POST arm: a spoke asking us, the OWNER, to publish.
+  //
+  // We re-originate: the post becomes ours, `from_agent` is the topic
+  // principal, and `origin` records who really said it — for display only. The
+  // hub is the ordering authority, which is why the poster's own mesh hears it
+  // as an echo of OUR delivery rather than of its own send.
+  if (kind === 'topic-publish') {
+    if (!isHomeTopic(db, topicName)) return refuse('not_home_topic');
+    // THE RIGHT TO POST, held by the remote publisher against our topic.
+    if (!aclCheck(db, `${alias}:${from}`, `${TOPIC_PRINCIPAL_PREFIX}${topicName}`)) return refuse('no_post_edge');
+
+    db.prepare('INSERT INTO relays (peer_alias, remote_msg_id, seen_at) VALUES (?, ?, ?)')
+      .run(alias, msg_id, now);
+
+    const principal = `${TOPIC_PRINCIPAL_PREFIX}${topicName}`;
+    fanOutHomeTopicPublish(db, agentIndex, {
+      topic: topicName,
+      from_agent: principal,
+      // THE TOPIC, not the poster: a subscriber's right to hear is a property
+      // of the topic. A hub subscriber holds `topic:x → me` and nothing from
+      // whoever posted on the far side.
+      aclPrincipal: principal,
+      origin: `${alias}:${from}`,
+      payload: payload as string,
+      content_type,
+      // THIS FRAME's budget, clamped — never a default. A spoke's short-lived
+      // post must not outlive its sender's intent on the way through.
+      sent_at: now,
+      expires_at: ttl === 0 ? null : now + ttl,
+      ephemeral: ttl === 0,
+      payloadBytes,
+    });
+
+    emitTap(observerIndex, {
+      type: 'tap', msg_id, kind: 'topic',
+      from: `${alias}:${from}`, to: null, topic: topicName, correlation_id: null,
+      sent_at: now, size: payloadBytes, payload: payload as string,
+    }, crossBorderAudience(db, observerIndex));
+
+    incPeerRelay(alias, 'in', 'delivered', metricKind);
+    return { ok: true };
+  }
+
+  // ── The TOPIC arm: a delivery from the mesh that OWNS the topic.
+  //
+  // The topic is stamped with our alias for them — `orch:trollbox` — which is
+  // the same convention that makes a relayed sender `orch:alice`, so a local
+  // agent can never be confused for a remote principal. The stamped name is
+  // also the ACL principal: on this mesh, the right to hear this topic is a
+  // property of the topic, not of whoever posted on the far side.
+  //
+  // AND NOTHING ELSE. No enqueue, so a delivery is never re-originated: a post
+  // crosses at most two borders and only through its home mesh. That is
+  // structural — the enqueue has one call site and it is not reachable from
+  // here — rather than a rule someone has to remember.
+  if (kind === 'topic') {
+    const localTopicId = crypto.randomUUID();
+    db.prepare('INSERT INTO relays (peer_alias, remote_msg_id, seen_at) VALUES (?, ?, ?)')
+      .run(alias, msg_id, now);
+
+    fanOutTopicLocal(db, agentIndex, {
+      topic: stampedFrom,
+      from_agent: stampedFrom,
+      aclPrincipal: stampedFrom,
+      origin,
+      payload: payload as string,
+      content_type,
+      sent_at: now,
+      expires_at: ttl === 0 ? null : now + ttl,
+      ephemeral: ttl === 0,
+      payloadBytes,
+    });
+
+    // ONE tap per BORDER FRAME, not per fanned-out copy: what crossed the
+    // border is one frame, and an observer counting deliveries would otherwise
+    // see this mesh's subscriber count leak into the cross-border stream.
+    emitTap(observerIndex, {
+      type: 'tap', msg_id: localTopicId, kind: 'topic',
+      from: stampedFrom, to: null, topic: stampedFrom, correlation_id: null,
+      sent_at: now, size: payloadBytes, payload: payload as string,
+    }, crossBorderAudience(db, observerIndex));
+
+    // 'delivered' means ACCEPTED AT THE BORDER, even when the local fan-out
+    // filtered every subscriber: the peering did its job, and what this mesh
+    // then chose to do with the frame is its own ACL's business, counted by
+    // mesh_topic_fanout_total.
+    incPeerRelay(alias, 'in', 'delivered', metricKind);
+    return { ok: true };
+  }
+
+  // ── Recipient and the inbound edge. Both answer the same RELAY_REFUSED.
+  if (getAgentById(db, to as string) === null) return refuse('to_unknown');
+  if (!aclCheck(db, stampedFrom, to as string)) return refuse('no_edge');
+
+  // ── Accept. A LOCAL id for messages.id: the remote id is the peer's
+  // namespace and could collide with one of ours, so it lives only in `relays`.
+  const localId = crypto.randomUUID();
+  db.prepare('INSERT INTO relays (peer_alias, remote_msg_id, seen_at) VALUES (?, ?, ?)')
+    .run(alias, msg_id, now);
+
   deliverOrQueue(db, agentIndex, {
     id: localId,
     from_agent: stampedFrom,
-    to_agent: to,
-    payload,
+    to_agent: to as string,
+    payload: payload as string,
     content_type,
     sent_at: now,
     expires_at: ttl === 0 ? null : now + ttl,
@@ -326,11 +788,11 @@ export function routeRelay(
   // CROSS-BORDER (inbound): `from` is a remote id stamped with the peer alias.
   emitTap(observerIndex, {
     type: 'tap', msg_id: localId, kind: 'direct',
-    from: stampedFrom, to, topic: null, correlation_id: null,
-    sent_at: now, size: payloadBytes, payload,
+    from: stampedFrom, to: to as string, topic: null, correlation_id: null,
+    sent_at: now, size: payloadBytes, payload: payload as string,
   }, crossBorderAudience(db, observerIndex));
 
-  incPeerRelay(alias, 'in', 'delivered');
+  incPeerRelay(alias, 'in', 'delivered', metricKind);
   return { ok: true };
 }
 
@@ -592,15 +1054,83 @@ export function routePublish(
     return { ok: false, error_code: 'MESSAGE_TOO_LARGE', error_message: 'payload exceeds 1 MB limit' };
   }
 
+  // 1b. REMOTE TOPIC (§16 D). Placed before the local counters, and counting
+  //     inside the branch only AFTER every refusal has passed — mirroring
+  //     routeDirect, where a refused remote send counts nothing. A refusal is
+  //     not traffic.
+  const topicColon = frame.topic.indexOf(':');
+  if (topicColon > 0 && hasOutboundPeer(db, frame.topic.slice(0, topicColon))) {
+    const alias = frame.topic.slice(0, topicColon);
+    const remote = frame.topic.slice(topicColon + 1);
+    const refuseRemote = (): RouterResult => {
+      incError('AGENT_NOT_FOUND');
+      return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown topic: ${frame.topic}` };
+    };
+    if (remote.length === 0 || remote.includes(':') || Buffer.byteLength(remote, 'utf8') > 256) return refuseRemote();
+
+    // THE RIGHT TO POST, held by the publisher against the topic as an
+    // endpoint. The SENDING mesh decides whether this topic may leave.
+    if (!aclCheck(db, from_agent, frame.topic)) return refuseRemote();
+
+    // The one non-uniform code on this path, and it sits BEHIND the ACL —
+    // which is what makes it affordable: a caller that reaches it has already
+    // proven an edge to this topic, so the answer reveals only its OWN mesh's
+    // configuration and crosses no border (#123).
+    const peering = getOutboundPeer(db, alias);
+    let kinds: string[];
+    try { kinds = JSON.parse(peering!.kinds) as string[]; } catch { return refuseRemote(); }
+    if (!Array.isArray(kinds) || !kinds.includes('topic-publish')) {
+      incError('KIND_NOT_ALLOWED');
+      return { ok: false, error_code: 'KIND_NOT_ALLOWED', error_message: `kind not permitted to ${alias}` };
+    }
+
+    incSent(from_agent);
+    incBytes('in', payloadBytes);
+    observePayloadBytes(payloadBytes);
+
+    const nowRemote = Date.now();
+    const rawTtlPub = frame.ttl_ms === 0 ? 0 : (frame.ttl_ms ?? 300_000);
+    const ttlPub = Math.min(rawTtlPub, MAX_TTL_MS);
+    const postId = crypto.randomUUID();
+    insertMessage(db, {
+      id: postId,
+      kind: 'topic-publish',
+      from_agent,                       // bare; the hub stamps it with its alias for us
+      to_agent: `${alias}:`,
+      topic: remote,
+      payload: frame.payload,
+      content_type: frame.content_type ?? 'text/plain',
+      sent_at: nowRemote,
+      expires_at: ttlPub === 0 ? null : nowRemote + ttlPub,
+    });
+    incMsgStatus('topic', 'queued');
+
+    emitTap(observerIndex, {
+      type: 'tap', msg_id: postId, kind: 'topic',
+      from: from_agent, to: null, topic: frame.topic, correlation_id: null,
+      sent_at: nowRemote, size: payloadBytes, payload: frame.payload,
+    }, crossBorderAudience(db, observerIndex));
+
+    borderEvents.emit('enqueued', alias);
+
+    // NO LOCAL FAN-OUT (C7). Local subscribers hear this when the hub's
+    // delivery returns — the hub is the ordering authority, and a local
+    // shortcut would show this mesh's own agents a different order from every
+    // other mesh's.
+    return { ok: true, msg_id: frame.msg_id };
+  }
+
   incSent(from_agent);
   incBytes('in', payloadBytes);
   observePayloadBytes(payloadBytes);
 
-  // 2. Ensure topic exists
+  // 2. Ensure topic exists. A NEW name still has to be a permissible one.
+  const publishNameRefusal = topicNameRefusal(db, frame.topic);
+  if (publishNameRefusal !== null) {
+    incError('AGENT_NOT_FOUND');
+    return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown topic: ${frame.topic}` };
+  }
   getOrCreateTopic(db, frame.topic, from_agent);
-
-  // 3. Get subscribers, remove publisher
-  const subscribers = getTopicSubscribers(db, frame.topic).filter(id => id !== from_agent);
 
   // 4. Compute expires_at
   let ttl: number;
@@ -614,96 +1144,34 @@ export function routePublish(
   const content_type = frame.content_type ?? 'text/plain';
   const sent_at = Date.now();
 
-  // 5. Fan out to each subscriber
-  for (const subscriber_id of subscribers) {
-    // 5a. ACL check.
-    //
-    // THE GATE STAYS. Removing it for system topics was one of the options on
-    // #136 and it is wrong: routeSubscribe calls getOrCreateTopic with no ACL
-    // check, so ANY authenticated agent can subscribe to sys.presence.turn.
-    // Ungating the fan-out would hand every subscriber the activity of the
-    // entire roster — the same enumeration #125, #128 and #129 exist to close.
-    //
-    // WHAT CHANGES IS THE COUNTING, and it is not about system topics at all.
-    // On a topic publish the sender does NOT choose the recipients: it names a
-    // topic, and the ACL filters the subscriber list. Counting each filtered
-    // subscriber as an "ACL-denied send attempt by sender" is a semantics error
-    // for EVERY topic — the sender attempted one publish, not N sends to N
-    // agents it never named. sys.presence.turn only made it visible, by being
-    // published ~2/s fleet-wide.
-    //
-    // mesh_acl_denied_total and mesh_errors_total{ACL_DENIED} are therefore for
-    // DIRECT sends, where the sender did choose the recipient. Fan-out outcomes
-    // go to mesh_topic_fanout_total, which carries no topic label because topic
-    // names are agent-chosen.
-    if (!aclCheck(db, from_agent, subscriber_id)) {
-      incTopicFanout('filtered');
-      continue;
-    }
-    // 'allowed', not 'delivered': this is where the ACL decision is made, and
-    // the online/offline branch below has not run yet. mesh_messages_total is
-    // the authority on delivery.
-    incTopicFanout('allowed');
+  // 5. Fan out locally AND across every peering that may carry this topic.
+  //    The hub is the ordering authority for a topic it owns.
+  const outbound = fanOutHomeTopicPublish(db, agentIndex, {
+    topic: frame.topic,
+    from_agent,
+    // The hub is the origin of its own post: the publisher's bare id, so a
+    // spoke can show who said it.
+    origin: from_agent,
+    aclPrincipal: from_agent,
+    payload: frame.payload,
+    content_type,
+    sent_at,
+    expires_at,
+    ephemeral: ttl === 0,
+    payloadBytes,
+  });
 
-    // 5b. Unique msg_id per subscriber copy
-    const msgId = crypto.randomUUID();
-
-    // 5c. Online
-    const recipientWs = agentIndex.get(subscriber_id);
-    if (recipientWs !== undefined) {
-      // ttl_ms=0 = EPHEMERAL: deliver live, persist nothing (see routeDirect).
-      // Beat/heartbeat topics (e.g. turn-status) use this so they never
-      // accumulate as scrollback history and starve real-message reads.
-      const ephemeral = ttl === 0;
-      if (!ephemeral) {
-        insertMessage(db, {
-          id: msgId,
-          kind: 'topic',
-          from_agent,
-          to_agent: subscriber_id,
-          topic: frame.topic,
-          payload: frame.payload,
-          content_type,
-          sent_at,
-          expires_at,
-        });
-      }
-      recipientWs.send(buildDeliverFrame({
-        id: msgId,
-        kind: 'topic',
-        from_agent,
-        to_agent: null,
-        topic: frame.topic,
-        correlation_id: null,
-        payload: frame.payload,
-        content_type,
-        sent_at,
-      }));
-      if (!ephemeral) markDelivered(db, msgId);
-      incMsgStatus('topic', 'delivered');
-      incReceived(subscriber_id);
-      incBytes('out', payloadBytes);
-    } else {
-      // 5d. Offline
-      if (ttl === 0) {
-        incMsgStatus('topic', 'dropped');
-        continue;
-      }
-      insertMessage(db, {
-        id: msgId,
-        kind: 'topic',
-        from_agent,
-        to_agent: subscriber_id,
-        topic: frame.topic,
-        payload: frame.payload,
-        content_type,
-        sent_at,
-        expires_at,
-      });
-      incMsgStatus('topic', 'queued');
-    }
+  // One CROSS-BORDER tap per outbound row, beside the LOCAL_ONLY tap below.
+  // Emitted here rather than inside the enqueue, so the set of tap-emitting
+  // router functions stays exactly what observer-cross-border.test.ts drives.
+  for (const row of outbound) {
+    emitTap(observerIndex, {
+      type: 'tap', msg_id: row.id, kind: 'topic',
+      from: `${TOPIC_PRINCIPAL_PREFIX}${frame.topic}`, to: null,
+      topic: frame.topic, correlation_id: null,
+      sent_at, size: payloadBytes, payload: frame.payload,
+    }, crossBorderAudience(db, observerIndex));
   }
-
   emitTap(observerIndex, {
     type: 'tap', msg_id: frame.msg_id, kind: 'topic',
     from: from_agent, to: null, topic: frame.topic, correlation_id: null,
@@ -713,11 +1181,79 @@ export function routePublish(
   return { ok: true, msg_id: frame.msg_id };
 }
 
+/**
+ * F4 §6, §7 — subscribe, local or across a border.
+ *
+ * ONE REFUSAL FOR EVERY CAUSE: `AGENT_NOT_FOUND` with `unknown topic: <what
+ * you asked for>`. There is deliberately no `KIND_NOT_ALLOWED` here, unlike
+ * the publish path — this door has NO ACL gate in front of it, so any
+ * authenticated agent could walk it, and a distinct code would hand them a
+ * free map of which aliases are peered and with which kinds. On the publish
+ * path the distinct code sits BEHIND an ACL check, which is what makes it
+ * affordable there (#123).
+ *
+ * The remote branch is tried FIRST, mirroring `routeDirect`: a prefix that
+ * names a live outbound peering means the caller is addressing another mesh.
+ * A prefix that names nothing falls through to the local path, where the
+ * new-name rule refuses it — so `ghost:trollbox` and `orch:` and `orch:a:b`
+ * all end at the same bytes by different routes.
+ */
 export function routeSubscribe(
   db: Database,
   agent_id: string,
   frame: SubscribeFrame
 ): RouterResult {
+  const refuse = (): RouterResult => {
+    incError('AGENT_NOT_FOUND');
+    return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown topic: ${frame.topic}` };
+  };
+
+  const colon = frame.topic.indexOf(':');
+  if (colon > 0 && hasOutboundPeer(db, frame.topic.slice(0, colon))) {
+    const alias = frame.topic.slice(0, colon);
+    const remote = frame.topic.slice(colon + 1);
+    // Bare and bounded: a second ':' would name a topic on a THIRD mesh, which
+    // is transitive federation nobody agreed to.
+    if (remote.length === 0 || remote.includes(':') || Buffer.byteLength(remote, 'utf8') > 256) return refuse();
+
+    const peering = getOutboundPeer(db, alias);
+    let kinds: string[];
+    try { kinds = JSON.parse(peering!.kinds) as string[]; } catch { return refuse(); }
+    if (!Array.isArray(kinds) || !kinds.includes('topic-subscribe')) return refuse();
+
+    // The local topics row carries the FULL remote name, and `created_by` is a
+    // local agent so the foreign key is satisfied. That row is what the
+    // subscription points at — and why home-ness is a PREFIX test rather than
+    // row existence.
+    getOrCreateTopic(db, frame.topic, agent_id);
+
+    // GATED ON A REAL STATE CHANGE. The SDK replays every subscription on
+    // reconnect, and a border row per replay would burn the peering's rate
+    // bucket to say nothing.
+    if (subscribeCreated(db, agent_id, frame.topic)) {
+      const now = Date.now();
+      insertMessage(db, {
+        id: crypto.randomUUID(),
+        kind: 'topic-subscribe',
+        from_agent: agent_id,          // bare; the hub stamps it with our alias
+        to_agent: `${alias}:`,
+        topic: remote,
+        payload: '',
+        sent_at: now,
+        // The DEDUPE window, not the message default: subscription state is not
+        // time-sensitive traffic and must survive a peering outage. A longer
+        // wait is diagnosed with GET /peers/:alias/subscriptions.
+        expires_at: now + MAX_TTL_MS,
+      });
+      borderEvents.emit('enqueued', alias);
+    }
+    return { ok: true };
+  }
+
+  // Local. A NEW name still has to be a permissible one.
+  const nameRefusal = topicNameRefusal(db, frame.topic);
+  if (nameRefusal !== null) return refuse();
+
   getOrCreateTopic(db, frame.topic, agent_id);
   dbSubscribe(db, agent_id, frame.topic);
   return { ok: true };
@@ -750,7 +1286,28 @@ export function routeUnsubscribe(
   // unconditional DELETE scoped by agent_id, so the refusal never protected
   // any state — it only reported. Idempotent unsubscribe is also the honest
   // contract for a caller retrying after a lost ack.
-  dbUnsubscribe(db, agent_id, frame.topic);
+  //
+  // F4: teardown crosses the border when there WAS something to tear down. It
+  // is enqueued regardless of the peering's `kinds` — a peer that may not stop
+  // subscribing is worse than one that may, and the receiving side skips the
+  // kind check for this one frame for the same reason (§16 E).
+  const removed = unsubscribeRemoved(db, agent_id, frame.topic);
+  const colon = frame.topic.indexOf(':');
+  if (removed && colon > 0 && hasOutboundPeer(db, frame.topic.slice(0, colon))) {
+    const alias = frame.topic.slice(0, colon);
+    const now = Date.now();
+    insertMessage(db, {
+      id: crypto.randomUUID(),
+      kind: 'topic-unsubscribe',
+      from_agent: agent_id,
+      to_agent: `${alias}:`,
+      topic: frame.topic.slice(colon + 1),
+      payload: '',
+      sent_at: now,
+      expires_at: now + MAX_TTL_MS,
+    });
+    borderEvents.emit('enqueued', alias);
+  }
   return { ok: true };
 }
 

@@ -146,3 +146,93 @@ describe('#153 GET /peers', () => {
     expect((await get('/peers')).status).toBe(200);
   });
 });
+
+// F4 §5 — GET /peers/:alias/subscriptions.
+//
+// The operator-facing answer to "why is this pod not receiving?", which was
+// otherwise only visible by opening the database. It is the diagnostic the
+// subscribe path's uniform refusal deliberately withholds from the PEER: the
+// peer learns nothing about why, and the operator of THIS mesh learns
+// everything, which is the correct split.
+describe('#153 + F4 GET /peers/:alias/subscriptions', () => {
+  let db: Database;
+  let handle: HttpAdminHandle;
+  let base: string;
+
+  beforeEach(async () => {
+    db = openDb(':memory:');
+    registerAgent(db, { id: 'owner', token_hash: hashToken('o'), hostname: 'h' });
+    for (const alias of ['partner', 'other']) {
+      insertPeerKey(db, {
+        id: `key-${alias}`, key_hash: hashToken(alias), alias,
+        kinds: '["topic-subscribe"]', rate_per_min: 600, created_at: Date.now(),
+      });
+      upsertPeer(db, {
+        alias, token_hash: hashToken(`${alias}-tok`), minted_by_key: `key-${alias}`,
+        kinds: '["topic-subscribe"]', rate_per_min: 600,
+      });
+    }
+    for (const t of ['trollbox', 'analytics']) db.prepare(
+      'INSERT INTO topics (name, created_at, created_by) VALUES (?,?,?)').run(t, 1, 'owner');
+    const sub = db.prepare('INSERT INTO subscriptions (agent_id, topic, subscribed_at) VALUES (?,?,?)');
+    sub.run('partner:alice', 'trollbox', 1000);
+    sub.run('partner:bob', 'analytics', 2000);
+    sub.run('other:carol', 'trollbox', 3000);
+    sub.run('owner', 'trollbox', 4000);              // a LOCAL subscriber
+    handle = await startHttpAdmin(0, db, ADMIN, 10_485_760, mkdtempSync(join(tmpdir(), 'mesh-f4-')), new Map());
+    base = `http://localhost:${(handle.server.address() as net.AddressInfo).port}`;
+  });
+  afterEach(async () => { await handle.shutdown().catch(() => {}); db.close(); });
+
+  const get = (path: string, token: string | null = ADMIN) =>
+    fetch(`${base}${path}`, { headers: token === null ? {} : { Authorization: `Bearer ${token}` } });
+
+  it('lists that peer\'s subscriptions, ordered, and NOBODY else\'s', async () => {
+    const res = await get('/peers/partner/subscriptions');
+    expect(res.status).toBe(200);
+    const body = await res.json() as { alias: string; subscriptions: { agent_id: string; topic: string }[] };
+    expect(body.alias).toBe('partner');
+    expect(body.subscriptions.map(s => [s.topic, s.agent_id])).toEqual([
+      ['analytics', 'partner:bob'],
+      ['trollbox', 'partner:alice'],
+    ]);
+  });
+
+  // PREFIX ISOLATION is the property, and it is why the query uses a range
+  // rather than a LIKE: `other:carol` and the local `owner` must not appear
+  // under `partner`, and a peer named `part` must not collect `partner`'s rows.
+  it('a second alias sees only its own', async () => {
+    const body = await (await get('/peers/other/subscriptions')).json() as
+      { subscriptions: { agent_id: string }[] };
+    expect(body.subscriptions.map(s => s.agent_id)).toEqual(['other:carol']);
+  });
+
+  it('CONTROL: a prefix that is a prefix of another alias collects nothing of its own', async () => {
+    upsertPeer(db, {
+      alias: 'part', token_hash: hashToken('part'), minted_by_key: 'key-partner',
+      kinds: '["topic-subscribe"]', rate_per_min: 600,
+    });
+    const body = await (await get('/peers/part/subscriptions')).json() as { subscriptions: unknown[] };
+    // `partner:alice` starts with "part" but is not in the `part:`..`part;`
+    // range. A LIKE 'part%' would have returned both of partner's rows.
+    expect(body.subscriptions).toEqual([]);
+  });
+
+  it('404 for an alias that is not a registered peer', async () => {
+    const res = await get('/peers/nosuchpeer/subscriptions');
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'no such peer' });
+  });
+
+  it('requires the admin token', async () => {
+    expect((await get('/peers/partner/subscriptions', null)).status).toBe(401);
+    expect((await get('/peers/partner/subscriptions', 'wrong')).status).toBe(401);
+  });
+
+  it('carries no token bytes, by name or by value', async () => {
+    const raw = await (await get('/peers/partner/subscriptions')).text();
+    expect(raw).not.toContain(hashToken('partner-tok'));
+    expect(raw).not.toContain('token_hash');
+    expect(raw).toContain('partner:alice');          // POSITIVE CONTROL
+  });
+});

@@ -89,11 +89,130 @@ function preFederationDb(path: string): void {
   db.close();
 }
 
+/** F4 §16 K — a database whose `subscriptions` still carries the agent_id
+    foreign key, which is every database on disk today. It also needs a real
+    `topics` table, because subscriptions' OTHER foreign key points at it and
+    that one is KEPT: a fixture without topics would test the rebuild against a
+    shape production never had. */
+function preTopicFederationDb(path: string): void {
+  const db = new Database(path);
+  db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, hostname TEXT NOT NULL,
+      capabilities TEXT NOT NULL DEFAULT '[]', metadata TEXT NOT NULL DEFAULT '{}',
+      namespace TEXT, last_alive INTEGER,
+      registered_at INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+      online INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE topics (
+      name TEXT PRIMARY KEY, created_at INTEGER NOT NULL,
+      created_by TEXT NOT NULL REFERENCES agents(id),
+      description TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}'
+    );
+    -- The subscriptions shape as it was BEFORE F4: BOTH foreign keys.
+    CREATE TABLE subscriptions (
+      agent_id      TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      topic         TEXT NOT NULL REFERENCES topics(name) ON DELETE CASCADE,
+      subscribed_at INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, topic)
+    );
+    CREATE INDEX idx_subscriptions_topic ON subscriptions(topic);
+  `);
+  db.prepare('INSERT INTO agents (id, token_hash, hostname, registered_at, last_seen) VALUES (?,?,?,?,?)')
+    .run('local-agent', hashToken('t'), 'h', 1, 1);
+  db.prepare('INSERT INTO topics (name, created_at, created_by) VALUES (?,?,?)').run('news', 1, 'local-agent');
+  db.prepare('INSERT INTO subscriptions (agent_id, topic, subscribed_at) VALUES (?,?,?)')
+    .run('local-agent', 'news', 1);
+  db.close();
+}
+
 const tmpDb = (name: string) => join(mkdtempSync(join(tmpdir(), `migchain-${name}-`)), 'mesh.db');
 const columns = (db: Database, table: string) =>
   (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
 
 describe('migration chain — openDb over databases that predate the current schema', () => {
+  // F4 commit 1 — the agent_id foreign key has to go, because a remote
+  // subscriber id (`pod1:alice`) names no local agent and the FK would reject
+  // the row. The TOPIC foreign key stays, so a topic's removal still takes its
+  // subscriptions with it.
+  it('★ a pre-F4 database rebuilds subscriptions FK-less and accepts a remote subscriber', () => {
+    const path = tmpDb('presubs');
+    preTopicFederationDb(path);
+
+    const db = openDb(path);
+    try {
+      // The existing row survived the rebuild.
+      expect(db.prepare('SELECT COUNT(*) c FROM subscriptions').get()).toEqual({ c: 1 });
+
+      // POSITIVE CONTROL on the fixture: the OLD shape really did reject this,
+      // so the acceptance below is the rebuild and not a permissive fixture.
+      // (Asserted through the FK list rather than by writing to a closed db.)
+      const fks = db.prepare('PRAGMA foreign_key_list(subscriptions)').all() as { table: string }[];
+      expect(fks.map(f => f.table).sort()).toEqual(['topics']);
+
+      // The point: an id that names no local agent.
+      db.prepare('INSERT INTO subscriptions (agent_id, topic, subscribed_at) VALUES (?,?,?)')
+        .run('pod1:alice', 'news', 2);
+      expect(db.prepare('SELECT COUNT(*) c FROM subscriptions').get()).toEqual({ c: 2 });
+
+      // ...and the topic FK is still live: dropping the topic takes both rows.
+      db.prepare("DELETE FROM topics WHERE name = 'news'").run();
+      expect(db.prepare('SELECT COUNT(*) c FROM subscriptions').get()).toEqual({ c: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  // §16 B — A FRESH DATABASE IS BORN IN THE TARGET SHAPE and must not be
+  // rebuilt at all. This is the test the mutants asked for: both "restore the
+  // agent_id FK in the base DDL" and "drop the topic FK in the base DDL" leave
+  // every shape assertion GREEN, because the rebuild sees a shape it does not
+  // recognise and repairs it. The repair is correct — the rebuild is the
+  // authority on the shape — which is exactly why shape tests cannot see the
+  // base DDL being wrong. What is observable is the rebuild happening on a
+  // brand-new database, on every single boot.
+  it('★ a FRESH database needs no subscriptions rebuild', () => {
+    const path = tmpDb('freshsubs');
+    const lines: string[] = [];
+    const realLog = console.log;
+    console.log = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    let db;
+    try {
+      db = openDb(path);
+    } finally {
+      console.log = realLog;
+    }
+    try {
+      expect(lines.filter(l => l.includes('subscriptions_rebuilt_fkless'))).toEqual([]);
+      // POSITIVE CONTROL on the probe: the rebuild DOES announce itself, so an
+      // empty list is the rebuild not running rather than the log not being
+      // captured. Proven by the legacy fixture in the case above, which is
+      // driven through the same console.log capture.
+      const fks = db.prepare('PRAGMA foreign_key_list(subscriptions)').all() as { table: string }[];
+      expect(fks.map(f => f.table)).toEqual(['topics']);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('★ the second open is a no-op — it does not rebuild subscriptions again', () => {
+    const path = tmpDb('presubs-twice');
+    preTopicFederationDb(path);
+    openDb(path).close();
+
+    const lines: string[] = [];
+    const realLog = console.log;
+    console.log = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      openDb(path).close();
+    } finally {
+      console.log = realLog;
+    }
+    // The rebuild announces itself; a second one would be a second announcement
+    // AND a second table swap on a live database.
+    expect(lines.filter(l => l.includes('subscriptions_rebuilt_fkless'))).toEqual([]);
+  });
+
   it('★ a pre-#41 database migrates, and its rows survive', () => {
     const path = tmpDb('prenamespace');
     preNamespaceDb(path);

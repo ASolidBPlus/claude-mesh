@@ -207,3 +207,59 @@ describe('every site that writes or deletes acl rows', () => {
     expect(aclCheck(db, 'partner:x', 'local-b')).toBe(false);
   });
 });
+
+// F4 §2, §7 — THE LOCAL TOPIC PRINCIPAL.
+//
+// Cross-border topic ACL needs a principal that is neither an agent nor a
+// remote id: `topic:trollbox` names the topic itself, so a hub can grant
+// "this topic may be heard by pod1:sub" and "pod1:publisher may post to this
+// topic" as ordinary acl edges.
+//
+// It contains a ':' and names no agent, which is exactly the shape
+// `assertPeeringAllowed` reads as REMOTE — so without an exemption every such
+// grant would demand a peering aliased `topic`, and there can never be one
+// (both peering doors reserve the alias). The exemption and the reservation are
+// two halves of one decision and neither is safe alone.
+describe('F4 topic principals in the ACL', () => {
+  it('a topic principal needs NO peering — it is local, not remote', () => {
+    // No peerings exist at all in this database.
+    expect(() => aclGrant(db, 'topic:trollbox', 'local-a', 'system')).not.toThrow();
+    expect(aclCheck(db, 'topic:trollbox', 'local-a')).toBe(true);
+  });
+
+  it('a topic principal may be granted TO a remote subscriber, which still needs its peering', () => {
+    // The RIGHT TO HEAR edge on a hub: topic -> a spoke's agent.
+    expect(() => aclGrant(db, 'topic:trollbox', 'pod1:sub', 'system')).toThrow();  // no peering yet
+
+    upsertPeer(db, {
+      alias: 'pod1', token_hash: hashToken('t'), minted_by_key: 'k',
+      kinds: '["direct"]', rate_per_min: 600,
+    });
+    db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                VALUES ('pod1','wss://pod1.example','tok','orch','["topic"]',600,?)`).run(Date.now());
+
+    expect(() => aclGrant(db, 'topic:trollbox', 'pod1:sub', 'system')).not.toThrow();
+    expect(aclCheck(db, 'topic:trollbox', 'pod1:sub')).toBe(true);
+  });
+
+  it('the RIGHT TO POST edge: a remote publisher may be granted to a topic principal', () => {
+    upsertPeer(db, {
+      alias: 'pod1', token_hash: hashToken('t'), minted_by_key: 'k',
+      kinds: '["topic-publish"]', rate_per_min: 600,
+    });
+    expect(() => aclGrant(db, 'pod1:publisher', 'topic:trollbox', 'system')).not.toThrow();
+    expect(aclCheck(db, 'pod1:publisher', 'topic:trollbox')).toBe(true);
+    // ...and the direction is not symmetric: holding the post edge is not
+    // holding the hear edge.
+    expect(aclCheck(db, 'topic:trollbox', 'pod1:publisher')).toBe(false);
+  });
+
+  // CONTROL: the exemption is for the `topic:` prefix ALONE. Any other colon id
+  // that names no agent is still remote and still needs its peering — without
+  // this, an exemption written as "ignore the peering check when the id has a
+  // colon" would pass every test above.
+  it('CONTROL: a non-topic colon id still requires its peering', () => {
+    expect(() => aclGrant(db, 'notatopic:x', 'local-a', 'system')).toThrow();
+    expect(aclCheck(db, 'notatopic:x', 'local-a')).toBe(false);
+  });
+});

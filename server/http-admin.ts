@@ -17,6 +17,7 @@ import {
   listAclByGrantedBy,
   listAclByGrantedByPrefix,
   getOrCreateTopic,
+  topicNameRefusal,
   listTopics,
   listAgents,
   Agent,
@@ -42,7 +43,7 @@ import {
 import { generateToken, hashToken, timingSafeEqual } from './auth.ts';
 import {
   PEER_ALIAS_RE, RESERVED_ALIAS, insertPeerKey, listPeerKeys, getLivePeerKeyForAlias,
-  getPeerKeyBySecret, revokePeerKey, getPeerByAlias, listPeers, upsertPeer, getPeerKeyById,
+  getPeerKeyBySecret, revokePeerKey, getPeerByAlias, listPeers, listPeerSubscriptions, upsertPeer, getPeerKeyById,
   type PeerKey, type Peer,
   insertOutboundPeer, getOutboundPeer, listOutboundPeers, updateOutboundPeer, endOutboundPeering, type OutboundPeer,
 } from './db.ts';
@@ -559,6 +560,16 @@ async function handleTopicPost(ctx: AdminCtx): Promise<void> {
     return;
   }
 
+  // F4: NEW names only — an existing topic is never rejected by its own name
+  // (the F0b rule). Consulted before getOrCreateTopic, which would otherwise
+  // create the row this refuses.
+  const nameRefusal = topicNameRefusal(db, name);
+  if (nameRefusal !== null) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: nameRefusal }));
+    return;
+  }
+
   if (getAgentById(db, created_by) === null) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'created_by agent not found' }));
@@ -632,6 +643,14 @@ async function handleAgentPost(ctx: AdminCtx): Promise<void> {
   if (id.includes(':')) {
     // ':' separates mesh from agent in a remote id. A local id containing one
     // would be indistinguishable from a remote address.
+    //
+    // F4 adds a SECOND reason and deliberately no second guard: `topic:` is the
+    // local topic-principal prefix, so an agent born in that range would be an
+    // ACL principal two different subsystems disagree about. This check already
+    // refuses every such id; a `topic:`-specific guard beside it would be a
+    // second rule for one question, which is how the two drift apart.
+    // Pre-existing `topic:*` ids are reported at boot (server.ts), never
+    // retroactively rejected.
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: "agent id must not contain ':'" }));
     return;
@@ -1493,12 +1512,17 @@ async function handlePeerKeyPost(ctx: AdminCtx): Promise<void> {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'alias must match ^[a-z0-9][a-z0-9-]{0,62}$' })); return;
   }
-  if (alias === RESERVED_ALIAS) {
+  // F4: `topic` joins `mesh` as a reserved alias, at BOTH doors — either one
+  // alone leaves the other as the way in. A peering called `topic` would make
+  // every LOCAL topic principal (`topic:trollbox`) read as a remote id, and
+  // revocation's prefix-range `deletePeeringEdges('topic', …)` would delete
+  // every topic grant on the mesh.
+  if (alias === RESERVED_ALIAS || alias === 'topic') {
     // 'mesh' names THIS mesh in every remote id. A peer holding it would make
     // its traffic indistinguishable from local traffic — refused at mint, the
     // only point where refusing is cheap.
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: `alias '${RESERVED_ALIAS}' is reserved` })); return;
+    res.end(JSON.stringify({ error: `alias '${alias}' is reserved` })); return;
   }
   if (getAgentById(db, alias) !== null) {
     // A peer alias and a local agent id share one id space at the point of
@@ -1611,6 +1635,31 @@ function publicPeerFields(row: Peer) {
     last_seen: row.last_seen,
     disabled: row.disabled === 1,
   };
+}
+
+/**
+ * F4 §5 — every subscription one peered mesh holds here.
+ *
+ * The operator-facing answer to "why is that pod not receiving?". It is the
+ * diagnostic the subscribe path deliberately withholds from the PEER: a peer
+ * learns only that its frame was refused, while the operator of THIS mesh can
+ * see exactly which of its agents are subscribed to what. That split is the
+ * design — uniform refusals outward, full visibility inward.
+ *
+ * 404 on an unregistered alias, which is not a disclosure: the caller holds the
+ * admin token and can list the peers anyway.
+ */
+function handlePeerSubscriptionsGet(ctx: AdminCtx): void {
+  const { res, db, params } = ctx;
+  // `idMatch` names its single capture `id`; the route reads
+  // /peers/:alias/subscriptions to a human, and `alias` is what it means.
+  const alias = params.id as string;
+  if (getPeerByAlias(db, alias) === null) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'no such peer' })); return;
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ alias, subscriptions: listPeerSubscriptions(db, alias) }));
 }
 
 /**
@@ -1886,9 +1935,14 @@ async function handleOutboundPeerPost(ctx: AdminCtx): Promise<void> {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'alias must match ^[a-z0-9][a-z0-9-]{0,62}$' })); return;
   }
-  if (alias === RESERVED_ALIAS) {
+  // F4: `topic` joins `mesh` as a reserved alias, at BOTH doors — either one
+  // alone leaves the other as the way in. A peering called `topic` would make
+  // every LOCAL topic principal (`topic:trollbox`) read as a remote id, and
+  // revocation's prefix-range `deletePeeringEdges('topic', …)` would delete
+  // every topic grant on the mesh.
+  if (alias === RESERVED_ALIAS || alias === 'topic') {
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: `alias '${RESERVED_ALIAS}' is reserved` })); return;
+    res.end(JSON.stringify({ error: `alias '${alias}' is reserved` })); return;
   }
 
   // An outbound alias must not PREFIX a legacy local id. `assertPeeringAllowed`
@@ -2070,6 +2124,9 @@ export const ROUTES: Route[] = [
   // #153: the inbound listing. `exact`, so it cannot swallow /peers/register —
   // and that route is POST regardless, so the two never contend.
   { method: 'GET',    match: exact('/peers'),                        handler: handlePeerGet },
+  // F4: after exact('/peers'), which cannot swallow it — an exact matcher and
+  // a two-segment pattern can never contend.
+  { method: 'GET',    match: idMatch(/^\/peers\/([^/]+)\/subscriptions$/), handler: handlePeerSubscriptionsGet },
   // The ONLY handler-authenticated route: a peer presents a key, which is
   // neither the admin token nor an agent token.
   { method: 'POST',   match: exact('/peers/register'),               handler: handlePeerRegister, auth: 'handler' },

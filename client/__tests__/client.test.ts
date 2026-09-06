@@ -353,3 +353,86 @@ describe('MeshClient', () => {
     expect(msg.text).toBe('time to ship');
   });
 });
+
+// F4 — `origin` on an inbound topic delivery.
+//
+// It says which mesh and agent a federated post came from, and it is DISPLAY
+// ONLY: the SDK surfaces it and attaches no meaning. `from` remains the
+// principal the message is attributed to (`orch:trollbox`); `origin` is the
+// speaker behind it (`pod1:alice`). A consumer that routed on it would be
+// trusting a string another mesh chose.
+describe('F4 Inbound.origin', () => {
+  // A local harness rather than the file's shared one: these two need the
+  // agentIndex to push a hand-built deliver frame, which is the only way to
+  // exercise a field the server sets on a path this suite cannot drive.
+  const startTestServer = async () => {
+    const db = openDb(':memory:');
+    const port = nextPort();
+    const handle = await startWsServer(port, db, 10_485_760, mkdtempSync(join(tmpdir(), 'f4-origin-')));
+    return { db, handle, port };
+  };
+
+  it('surfaces origin when the frame carries it, and null when it does not', async () => {
+    const { db, handle, port } = await startTestServer();
+    try {
+      registerAgent(db, { id: 'sub', token_hash: hashToken('tok'), hostname: 'h' });
+      const client = new MeshClient({ serverUrl: `ws://127.0.0.1:${port}`, agentId: 'sub', agentToken: 'tok' });
+      const seen: Inbound[] = [];
+      client.onMessage((m) => { seen.push(m); });
+      await client.connect();
+
+      const sock = handle.agentIndex.get('sub')!;
+      sock.send(JSON.stringify({
+        type: 'deliver', msg_id: 'm1', kind: 'topic', from: 'orch:trollbox', to: null,
+        topic: 'orch:trollbox', correlation_id: null, payload: 'hi',
+        content_type: 'text/plain', sent_at: Date.now(), origin: 'pod1:alice',
+      }));
+      sock.send(JSON.stringify({
+        type: 'deliver', msg_id: 'm2', kind: 'direct', from: 'other', to: 'sub',
+        topic: null, correlation_id: null, payload: 'hi',
+        content_type: 'text/plain', sent_at: Date.now(), origin: null,
+      }));
+      await new Promise(r => setTimeout(r, 200));
+
+      expect(seen.map(m => [m.msgId, m.origin])).toEqual([
+        ['m1', 'pod1:alice'],
+        ['m2', null],
+      ]);
+      // `from` is untouched: origin is beside it, never instead of it.
+      expect(seen[0]!.from).toBe('orch:trollbox');
+      client.close();
+    } finally {
+      await handle.shutdown().catch(() => {});
+      db.close();
+    }
+  }, 20_000);
+
+  it('a frame with no origin key at all surfaces null, not undefined', async () => {
+    const { db, handle, port } = await startTestServer();
+    try {
+      registerAgent(db, { id: 'sub', token_hash: hashToken('tok'), hostname: 'h' });
+      const client = new MeshClient({ serverUrl: `ws://127.0.0.1:${port}`, agentId: 'sub', agentToken: 'tok' });
+      const seen: Inbound[] = [];
+      client.onMessage((m) => { seen.push(m); });
+      await client.connect();
+
+      // Every pre-F4 sender omits the key entirely. `null` is the honest
+      // answer for "this did not cross a border"; `undefined` would make a
+      // consumer's `'origin' in m` check disagree with its `m.origin === null`
+      // check.
+      handle.agentIndex.get('sub')!.send(JSON.stringify({
+        type: 'deliver', msg_id: 'm3', kind: 'direct', from: 'other', to: 'sub',
+        topic: null, correlation_id: null, payload: 'hi',
+        content_type: 'text/plain', sent_at: Date.now(),
+      }));
+      await new Promise(r => setTimeout(r, 200));
+
+      expect(seen.length).toBe(1);
+      expect(seen[0]!.origin).toBe(null);
+      client.close();
+    } finally {
+      await handle.shutdown().catch(() => {});
+      db.close();
+    }
+  }, 20_000);
+});

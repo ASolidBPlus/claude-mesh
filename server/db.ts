@@ -50,6 +50,11 @@ export interface Message {
    *  PERMANENT remote refusal. A row carrying it is not pending and was not
    *  delivered; it records the outcome rather than pretending either. */
   failed_code: string | null;
+  /** F4: which mesh and agent a federated topic post came from, as a string to
+   *  SHOW. Never routed on, never an ACL principal, never a metric label — it
+   *  arrives from another mesh and is therefore attacker-supplied. null on
+   *  every path that did not cross a border. */
+  origin: string | null;
 }
 
 export interface Topic {
@@ -195,6 +200,75 @@ export function rebuildAclFkLess(db: Database): void {
   }
 }
 
+/**
+ * F4 — the SAME migration one table over, and for the same reason.
+ *
+ * `subscriptions.agent_id` carried `REFERENCES agents(id) ON DELETE CASCADE`.
+ * A remote subscriber is `pod1:alice`, which names no local agent, so the
+ * foreign key would reject exactly the row federation exists to write. Every
+ * database on disk still has that clause, and `CREATE TABLE IF NOT EXISTS`
+ * does nothing to a table that already exists.
+ *
+ * DROPS ONE FOREIGN KEY, KEEPS THE OTHER. `topic REFERENCES topics(name) ON
+ * DELETE CASCADE` stays: a subscription to a topic that no longer exists is
+ * unusable by anybody, and nothing about federation changes that. The early
+ * return is what makes the second boot a no-op, and it is written as "only the
+ * topic FK remains" rather than "no FKs remain" — the acl version's
+ * `length === 0` would loop forever here, rebuilding a table that is already
+ * correct on every single boot.
+ *
+ * Everything else is rebuildAclFkLess, deliberately: the transaction guard, the
+ * index capture and replay, the pragma outside / DDL inside split, the
+ * restore-on-both-paths finally, and the fatal-on-error. Those choices were
+ * each paid for once (see that function's comments for the measurements) and a
+ * second, subtly different copy is how the pair drifts.
+ */
+export function rebuildSubscriptionsFkLess(db: Database): void {
+  // Same reason as the acl rebuild: `PRAGMA foreign_keys = OFF` is a silent
+  // no-op inside a transaction, so a future tidy-up that wrapped the migration
+  // section would make the DROP/RENAME run under FK enforcement.
+  if (db.inTransaction) {
+    throw new Error('subscriptions rebuild must run outside a transaction: PRAGMA foreign_keys is ignored inside one');
+  }
+
+  try {
+    const fks = db.prepare('PRAGMA foreign_key_list(subscriptions)').all() as { table: string }[];
+    // Already in the target shape: exactly the topics FK and nothing else.
+    if (fks.length === 1 && fks[0]!.table === 'topics') return;
+
+    const indexDdl = (db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='subscriptions' AND sql IS NOT NULL"
+    ).all() as { sql: string }[]).map((r) => r.sql);
+
+    db.exec('PRAGMA foreign_keys = OFF');
+    try {
+      db.transaction(() => {
+        db.exec(`
+          CREATE TABLE subscriptions_new (
+            agent_id      TEXT NOT NULL,
+            topic         TEXT NOT NULL REFERENCES topics(name) ON DELETE CASCADE,
+            subscribed_at INTEGER NOT NULL,
+            PRIMARY KEY (agent_id, topic)
+          );
+        `);
+        db.exec('INSERT INTO subscriptions_new SELECT agent_id, topic, subscribed_at FROM subscriptions');
+        db.exec('DROP TABLE subscriptions');
+        db.exec('ALTER TABLE subscriptions_new RENAME TO subscriptions');
+        for (const ddl of indexDdl) db.exec(ddl);
+      })();
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON');
+    }
+
+    console.log(JSON.stringify({
+      evt: 'db.subscriptions_rebuilt_fkless', indexes_restored: indexDdl.length, at: Date.now(),
+    }));
+  } catch (err) {
+    process.stderr.write(`FATAL: subscriptions FK-less rebuild failed: ${err}\n`);
+    throw err;
+  }
+}
+
 export function openDb(path: string): Database {
   const db = new Database(path);
 
@@ -332,8 +406,22 @@ export function openDb(path: string): Database {
       metadata    TEXT NOT NULL DEFAULT '{}'
     );
 
+    -- F4: agent_id is FK-LESS, for the same reason acl is (see the acl DDL
+    -- above): a subscriber may be a REMOTE id like 'pod1:alice', which by
+    -- definition has no agents(id) row, and a foreign key would make the table
+    -- unable to express the thing F4 exists to express.
+    --
+    -- The referential guarantee MOVES rather than disappearing: deleteAgent
+    -- deletes an agent's subscriptions explicitly, where a reviewer of deletion
+    -- policy will find it, instead of a cascade doing it invisibly in DDL.
+    --
+    -- The TOPIC foreign key STAYS, with its cascade: a subscription to a topic
+    -- that no longer exists is unusable by anyone, local or remote, and nothing
+    -- about federation changes that. Written into the BASE table rather than
+    -- left to the rebuild (§16 B) — otherwise every fresh database would be
+    -- created FK-ful and immediately rebuilt on its first open.
     CREATE TABLE IF NOT EXISTS subscriptions (
-      agent_id     TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      agent_id     TEXT NOT NULL,
       topic        TEXT NOT NULL REFERENCES topics(name) ON DELETE CASCADE,
       subscribed_at INTEGER NOT NULL,
       PRIMARY KEY (agent_id, topic)
@@ -420,6 +508,11 @@ export function openDb(path: string): Database {
   // get tz=NULL and keep behaving exactly as before (UTC cron).
   try { db.exec('ALTER TABLE reminders ADD COLUMN tz TEXT'); } catch {}
 
+  // F4 migration: `origin` on messages — the display-only string naming which
+  // mesh and agent a federated topic post came from. Existing rows get NULL,
+  // which is the honest answer for every message that did not cross a border.
+  try { db.exec('ALTER TABLE messages ADD COLUMN origin TEXT'); } catch {}
+
   // #41 migration: first-class nullable `namespace` on agents (identity label;
   // no routing/ACL/enforcement — inert data). Existing rows get namespace=NULL.
   try { db.exec('ALTER TABLE agents ADD COLUMN namespace TEXT'); } catch {}
@@ -487,6 +580,7 @@ export function openDb(path: string): Database {
   } catch {}
 
   rebuildAclFkLess(db);
+  rebuildSubscriptionsFkLess(db);
 
   return db;
 }
@@ -785,6 +879,14 @@ export function deleteAgent(db: Database, id: string): string[] {
 
     db.prepare('DELETE FROM messages WHERE to_agent = ? AND delivered_at IS NULL').run(id);
 
+    // F4: the subscriptions cascade on agent_id is GONE (the column is FK-less
+    // so a remote id can be stored), so the deletion is explicit here — the
+    // same argument as the acl line below, one table over. Before the topics
+    // delete, because that one cascades to subscriptions by TOPIC and the two
+    // are different predicates: this removes what the agent subscribed TO, that
+    // removes who subscribed to what the agent CREATED.
+    db.prepare('DELETE FROM subscriptions WHERE agent_id = ?').run(id);
+
     db.prepare('DELETE FROM topics WHERE created_by = ?').run(id);
     // F0a: was an ON DELETE CASCADE on acl's foreign keys. Now explicit, because
     // the table is FK-less (see the acl DDL) — and because a cascade performed
@@ -850,16 +952,51 @@ function assertLocalEndpointExists(db: Database, endpoint: string): void {
  * reads nothing yet — `outbound_peers` is F2's — so it refuses, which is the
  * honest answer rather than a permissive default.
  */
+/**
+ * F4 — the LOCAL TOPIC PRINCIPAL prefix.
+ *
+ * `topic:trollbox` names a topic as an ACL principal, so a hub can express
+ * "this topic may be heard by pod1:sub" and "pod1:publisher may post to this
+ * topic" as ordinary acl edges rather than as a second grammar.
+ *
+ * It is deliberately in the SAME namespace shape as a remote id — one colon,
+ * a reserved prefix — which is why the alias `topic` is refused at both peering
+ * doors (`http-admin.ts` `handlePeerKeyPost`, `handleOutboundPeerPost`). The
+ * exemption below and that reservation are two halves of one decision: with the
+ * exemption alone, a peering called `topic` would make every topic principal
+ * read as remote and a revocation's prefix-range DELETE would take them all.
+ */
+export const TOPIC_PRINCIPAL_PREFIX = 'topic:';
+
+/**
+ * F4 — the ONE definition of "this endpoint names another mesh".
+ *
+ * Was a closure inside assertPeeringAllowed. Exported and named because F4 adds
+ * a second caller (the topic fan-out must skip remote subscribers) and two
+ * copies of a routing predicate is one predicate and one hole waiting to open —
+ * #79's argument, applied to a rule instead of to a credential compare.
+ *
+ * The AGENT LOOKUP is what distinguishes a remote id from a legacy local one:
+ * a colon alone is not decisive, because legacy colon ids are a preserved
+ * population (reported at boot, never rejected).
+ *
+ * A TOPIC PRINCIPAL IS NEITHER remote nor an agent. It is local by
+ * construction, and returning true for it would demand a peering aliased
+ * `topic`, which can never exist.
+ */
+export function isRemoteEndpoint(db: Database, endpoint: string): boolean {
+  if (endpoint.startsWith(TOPIC_PRINCIPAL_PREFIX)) return false;
+  return endpoint.includes(':') && getAgentById(db, endpoint) === null;
+}
+
 function assertPeeringAllowed(db: Database, from_agent: string, to_agent: string): void {
   const fail = (msg: string): never => {
     const err = new Error(msg) as Error & { code?: string };
     err.code = 'NO_PEERING';
     throw err;
   };
-  // The lookup is what distinguishes a remote id from a legacy local one.
-  const isRemote = (endpoint: string) => endpoint.includes(':') && getAgentById(db, endpoint) === null;
-  const fromRemote = isRemote(from_agent);
-  const toRemote = isRemote(to_agent);
+  const fromRemote = isRemoteEndpoint(db, from_agent);
+  const toRemote = isRemoteEndpoint(db, to_agent);
 
   if (fromRemote) {
     const alias = from_agent.slice(0, from_agent.indexOf(':'));
@@ -1156,6 +1293,14 @@ export function revokePeerKey(db: Database, id: string): boolean {
       .run(Date.now(), id).changes;
     if (changed === 0) return false;
     db.prepare('UPDATE peers SET disabled = 1 WHERE minted_by_key = ?').run(id);
+    // F4: and their subscriptions go too. Disabling the peer stops traffic;
+    // it does not stop a re-mint for the same alias inheriting the rows.
+    // Edge deletion on revoke is deliberately NOT moved here by F4 — that is a
+    // separate decision with its own history (#113).
+    for (const { alias } of db.prepare('SELECT alias FROM peers WHERE minted_by_key = ?')
+      .all(id) as { alias: string }[]) {
+      deleteRemoteSubscriptions(db, alias);
+    }
     return true;
   });
   return tx() as boolean;
@@ -1505,8 +1650,14 @@ export function upsertPeer(
     const isRotation = declared !== null && declared === existing.minted_by_key;
     if (!isRotation) {
       const removed = deletePeeringEdges(db, peer.alias, 'inbound');
+      // F4: subscriptions end with the peering for the same reason the edges
+      // do — a new key may be minted for the same alias, and a subscription
+      // that outlived its peering would silently belong to whoever next holds
+      // the name.
+      const removedSubscriptions = deleteRemoteSubscriptions(db, peer.alias);
       console.log(JSON.stringify({
         evt: 'peer.edges_ended_with_peering', alias: peer.alias, removed,
+        removed_subscriptions: removedSubscriptions,
         declared_rotates: declared, previous_key: existing.minted_by_key, at: now,
       }));
     }
@@ -1572,6 +1723,9 @@ export function insertMessage(
     content_type?: string;
     sent_at: number;
     expires_at?: number | null;
+    /** F4: display-only provenance. Defaults to null, so every existing caller
+     *  writes exactly what it wrote before. */
+    origin?: string | null;
   }
 ): Message {
   const content_type = msg.content_type ?? 'text/plain';
@@ -1579,11 +1733,12 @@ export function insertMessage(
   const topic = msg.topic ?? null;
   const correlation_id = msg.correlation_id ?? null;
   const expires_at = msg.expires_at ?? null;
+  const origin = msg.origin ?? null;
 
   db.prepare(`
-    INSERT INTO messages (id, kind, from_agent, to_agent, topic, correlation_id, payload, content_type, sent_at, expires_at, delivered_at, acked_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
-  `).run(msg.id, msg.kind, msg.from_agent, to_agent, topic, correlation_id, msg.payload, content_type, msg.sent_at, expires_at);
+    INSERT INTO messages (id, kind, from_agent, to_agent, topic, correlation_id, payload, content_type, sent_at, expires_at, delivered_at, acked_at, origin)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+  `).run(msg.id, msg.kind, msg.from_agent, to_agent, topic, correlation_id, msg.payload, content_type, msg.sent_at, expires_at, origin);
 
   return getMessage(db, msg.id) as Message;
 }
@@ -1783,24 +1938,150 @@ export function deleteTopic(db: Database, name: string): void {
 // 5.6 Subscriptions
 // ──────────────────────────────────────────────
 
-export function subscribe(db: Database, agent_id: string, topic: string): Subscription {
-  const now = Date.now();
-  db.prepare(`
-    INSERT OR IGNORE INTO subscriptions (agent_id, topic, subscribed_at)
-    VALUES (?, ?, ?)
-  `).run(agent_id, topic, now);
+/**
+ * F4 §7 — DID THIS CREATE A ROW? The single writer, and the boolean is the
+ * point.
+ *
+ * The SDK replays every subscription on reconnect (client.ts, the replay loop
+ * after auth), so without a "was anything created" answer a remote subscribe
+ * would enqueue a border row on every reconnect — telling the hub something it
+ * already knows and burning a token from the peering's rate bucket, which a
+ * flapping spoke would turn into rate-limited direct traffic.
+ */
+export function subscribeCreated(db: Database, agent_id: string, topic: string): boolean {
+  return db.prepare('INSERT OR IGNORE INTO subscriptions (agent_id, topic, subscribed_at) VALUES (?, ?, ?)')
+    .run(agent_id, topic, Date.now()).changes === 1;
+}
 
+/** F4 §7 — the twin of subscribeCreated: did this REMOVE a row? Teardown rows
+ *  are enqueued only when there was something to tear down. */
+export function unsubscribeRemoved(db: Database, agent_id: string, topic: string): boolean {
+  return db.prepare('DELETE FROM subscriptions WHERE agent_id = ? AND topic = ?')
+    .run(agent_id, topic).changes === 1;
+}
+
+export function subscribe(db: Database, agent_id: string, topic: string): Subscription {
+  subscribeCreated(db, agent_id, topic);
   return db.prepare('SELECT * FROM subscriptions WHERE agent_id = ? AND topic = ?')
     .get(agent_id, topic) as Subscription;
 }
 
 export function unsubscribe(db: Database, agent_id: string, topic: string): void {
-  db.prepare('DELETE FROM subscriptions WHERE agent_id = ? AND topic = ?').run(agent_id, topic);
+  unsubscribeRemoved(db, agent_id, topic);
+}
+
+/**
+ * F4 §7 — is this an existing topic on THIS mesh's `topics` table?
+ *
+ * Row existence only. Whether it is a HOME topic (ours to fan out) or a remote
+ * one we merely mirror is a different question, answered by the prefix test in
+ * `isHomeTopic` — a spoke really does hold a local `topics` row named
+ * `orch:trollbox`, so row existence cannot decide ownership.
+ */
+export function topicExists(db: Database, name: string): boolean {
+  return db.prepare('SELECT 1 FROM topics WHERE name = ?').get(name) !== null;
+}
+
+/**
+ * F4 §7 — may a NEW topic take this name?
+ *
+ * Returns a reason, or null to permit. Two rules, both about NEW names only:
+ *
+ *   ':' — the mesh/agent separator. A local topic `a:b` is indistinguishable
+ *         from a remote topic on a mesh aliased `a`, and the moment an outbound
+ *         peering `a` exists, `isHomeTopic` calls it foreign and stops fanning
+ *         it out locally. The topic would go quiet with nothing reporting why.
+ *   256 bytes — the same bound the wire applies to every other identifier, so a
+ *         name that cannot cross a border cannot be created either. Measured in
+ *         BYTES, not characters: a 200-character name of 2-byte codepoints is
+ *         400 bytes on the wire.
+ *
+ * PRE-EXISTING NAMES ARE NEVER REJECTED — the F0b rule that spared legacy colon
+ * agent ids, for the same reason: a live topic that can no longer be published
+ * to is a worse outcome than an ambiguous name, and only the operator can
+ * decide to rename it. They are surfaced by `findInvalidTopicNames` at boot.
+ */
+export function topicNameRefusal(db: Database, name: string): string | null {
+  if (topicExists(db, name)) return null;
+  if (name.includes(':')) return "topic name must not contain ':'";
+  if (Buffer.byteLength(name, 'utf8') > 256) return 'topic name must be at most 256 bytes';
+  return null;
+}
+
+/**
+ * F4 §7, §16 M — boot report: topic names that predate the rules above.
+ *
+ * A colon name is only ambiguous if its prefix names NO outbound peering; when
+ * it does, `orch:trollbox` is exactly what a mirrored remote topic is called
+ * and reporting it would be noise.
+ *
+ * The peering lookup deliberately has NO `enabled` filter (§16 M): pausing a
+ * peering is an operator action that must not turn that mesh's topics into boot
+ * warnings. A paused link is still a configured one.
+ */
+export function findInvalidTopicNames(db: Database): string[] {
+  return (db.prepare(`
+    SELECT name FROM topics
+    WHERE (name LIKE '%:%' AND substr(name, 1, instr(name, ':') - 1) NOT IN (SELECT alias FROM outbound_peers))
+       OR length(CAST(name AS BLOB)) > 256
+  `).all() as { name: string }[]).map(r => r.name);
+}
+
+/**
+ * F4 §7 — boot report: agent ids inside the reserved `topic:` range.
+ *
+ * `POST /agents` has refused any ':' since F0b, so such an id can only predate
+ * that rule — which is why this reports rather than guards. A prefix RANGE, not
+ * `LIKE 'topic%'`: the latter would also catch `topics-team`, an ordinary id
+ * that is none of this rule's business. (';' is ':' + 1.)
+ */
+export function findTopicPrefixAgents(db: Database): string[] {
+  return (db.prepare("SELECT id FROM agents WHERE id >= 'topic:' AND id < 'topic;' ORDER BY id")
+    .all() as { id: string }[]).map(r => r.id);
 }
 
 export function getTopicSubscribers(db: Database, topic: string): string[] {
   const rows = db.prepare('SELECT agent_id FROM subscriptions WHERE topic = ?').all(topic) as { agent_id: string }[];
   return rows.map(r => r.agent_id);
+}
+
+/**
+ * F4 §7 — the subscribers on ONE peered mesh for one topic.
+ *
+ * A PREFIX RANGE, not `LIKE 'alias:%'`: index-servable, and it cannot be
+ * confused by a '%' or '_' inside an alias. (';' is ':' + 1 — the same idiom as
+ * `deletePeeringEdges`.)
+ */
+export function listRemoteSubscribers(db: Database, alias: string, topic: string): string[] {
+  return (db.prepare(
+    'SELECT agent_id FROM subscriptions WHERE topic = ? AND agent_id >= ? AND agent_id < ? ORDER BY agent_id'
+  ).all(topic, `${alias}:`, `${alias};`) as { agent_id: string }[]).map(r => r.agent_id);
+}
+
+/**
+ * F4 §7 — every subscription a peered mesh holds here, for `GET
+ * /peers/:alias/subscriptions`. The operator-facing answer to "why is this pod
+ * not receiving?", which is otherwise only visible in the database.
+ */
+export function listPeerSubscriptions(
+  db: Database, alias: string,
+): { agent_id: string; topic: string; subscribed_at: number }[] {
+  return db.prepare(
+    `SELECT agent_id, topic, subscribed_at FROM subscriptions
+     WHERE agent_id >= ? AND agent_id < ? ORDER BY topic, agent_id`
+  ).all(`${alias}:`, `${alias};`) as { agent_id: string; topic: string; subscribed_at: number }[];
+}
+
+/**
+ * F4 §7 — remove every subscription a peered mesh holds here.
+ *
+ * Called where a peering ENDS, for the same reason `deletePeeringEdges` is: a
+ * new key may be minted for the same alias, and a subscription that outlived
+ * its peering would silently belong to whoever next holds the name.
+ */
+export function deleteRemoteSubscriptions(db: Database, alias: string): number {
+  return db.prepare('DELETE FROM subscriptions WHERE agent_id >= ? AND agent_id < ?')
+    .run(`${alias}:`, `${alias};`).changes;
 }
 
 export function getAgentSubscriptions(db: Database, agent_id: string): string[] {

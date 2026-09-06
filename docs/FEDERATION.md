@@ -124,6 +124,13 @@ Peerings are directional. For B→A as well, run steps 1–3 again with the role
 swapped: **A** mints a key, **B** registers, **B** configures the outbound link.
 The two directions are independent — revoking one does not touch the other.
 
+**To carry topics, name the peer the SAME alias in both tables.** `peers` and
+`outbound_peers` share no column, so on an inbound `topic-subscribe` from
+`pod1` the hub looks for an *outbound* peering also called `pod1` — that is the
+peering the topic would be delivered on — and refuses uniformly if there is
+none (`server/router.ts` `routeRelay`). A subscription it could never serve is
+worse than a refusal, because nothing reports it.
+
 ---
 
 ## 3. Sending across a border
@@ -146,6 +153,80 @@ curl -X POST "$SENDER/acl" -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 and the **receiving** mesh needs the mirror-image grant for the inbound
 direction (`inbound-alias:their-agent` → `local-agent`).
+
+### Hub and spoke: topics across a border
+
+One mesh **owns** a topic and is the ordering authority for it. Others
+subscribe to it and post into it. A post crosses at most **two** borders — into
+the owner, out to each subscribing mesh — and only through the owner.
+
+**(a) The kinds, and who grants what.** A peering carries the kinds its own
+admin listed on its own row, so a topic pair needs BOTH directions configured:
+
+| peering | kinds | carries |
+|---|---|---|
+| pod → orch | `direct`, `topic-subscribe`, `topic-publish` | subscribe/unsubscribe requests, and posts into orch's topics |
+| orch → pod | `direct`, `topic` | the deliveries |
+| pod ↔ pod | `direct` | ordinary messages only |
+
+`topic-unsubscribe` is **not grantable** and is accepted whenever the peering
+exists: a peer that may not stop subscribing is worse than one that may
+(`server/router.ts` `routeRelay`).
+
+**(b) Two grant classes per topic**, both ordinary ACL edges. The RIGHT TO POST
+and the RIGHT TO HEAR are separate, and a read-only topic is simply one where
+the owner withholds the first.
+
+```bash
+# on the SPOKE — its agent may post into the remote topic
+curl -X POST "$POD/acl" -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"from_agent":"alice","to_agent":"orch:trollbox"}'
+
+# on the HUB — that pod's agent may post into the topic
+curl -X POST "$ORCH/acl" -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"from_agent":"pod1:alice","to_agent":"topic:trollbox"}'
+
+# on the HUB — the topic may be heard by that pod's agent
+curl -X POST "$ORCH/acl" -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"from_agent":"topic:trollbox","to_agent":"pod1:sub"}'
+
+# on the SPOKE — the arriving topic may be heard by its agent
+curl -X POST "$POD/acl" -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"from_agent":"orch:trollbox","to_agent":"sub"}'
+```
+
+`topic:<name>` is a **local topic principal** — the topic as an ACL endpoint.
+`topic` is a reserved alias at both peering doors for that reason
+(`server/db.ts` `isRemoteEndpoint`).
+
+**(c) You will see your own posts come back.** One frame per peering cannot
+exclude the publisher, so an agent subscribed to a hub topic sees its own post
+arrive, exactly as a chat shows your own message. Suppressing it would mean
+routing on `origin`, which is forbidden — and the hub is the ordering
+authority, so the echo is the order being honest.
+
+**(d) One rate bucket per peering, shared by every kind, counted before the
+kind check.** A busy Troll Box therefore rate-limits that peering's *direct*
+traffic too; size `rate_per_min` for the topic volume. Per-kind buckets are out
+of scope.
+
+**While a spoke's outbound peering is PAUSED**, its `orch:` topics become local
+topics on that spoke and posts fan out LOCALLY instead of queueing for the
+border (`server/router.ts` `isHomeTopic`). Rows already queued still drain on
+re-enable. Accepted for v1 — a paused peering is a deliberate operator action,
+and this is what it costs.
+
+**(e) The arithmetic.** N pods cost the hub **2N** peering rows, plus
+**N(N−1)** pod↔pod direct rows if the pods also talk to each other. The worked
+example above is N=2.
+
+**(f) `origin` is display only.** It is set by the sending mesh's server, is
+never routed on and is never an ACL principal (`server/router.ts` `routeRelay`).
+Treat it as untrusted text: it says who the far mesh claims said something.
 
 ### What a refusal looks like
 
@@ -174,6 +255,7 @@ never queue. For a remote id, "online" means the peering socket is connected
 | call | shows |
 |---|---|
 | `GET /peers` | inbound peerings that have registered, **never their `token_hash`** — alias, the key that minted them, kinds, rate, `last_seen`, `disabled` (`server/http-admin.ts` `handlePeerGet`) |
+| `GET /peers/:alias/subscriptions` | what that peered mesh is subscribed to here — the answer to "why is that pod not receiving?" (`server/http-admin.ts` `handlePeerSubscriptionsGet`) |
 | `GET /peer-keys` | minted keys, **never the secrets** (`server/http-admin.ts` `handlePeerKeyGet`) |
 | `GET /outbound-peers` | configured outbound links, **never the tokens** (`server/http-admin.ts` `handleOutboundPeerGet`) |
 | `GET /agents` | the local roster, including four liveness readings — see below (`server/http-admin.ts` `handleAgentGet`) |
@@ -200,9 +282,13 @@ not "stuck".
   makes `mesh_peer_up == 0` a usable alert: a peering that is down looks
   different from one that was never configured. **This is the series to alert
   on.**
-- **`mesh_peer_relays_total{direction,outcome}`** — relayed messages;
+- **`mesh_peer_relays_total{direction,outcome,kind}`** — relayed messages;
   `outcome` is one of `delivered`, `refused`, `rate_limited`, `duplicate`,
-  `transient`.
+  `transient`, and `kind` is one of the five relay kinds or `unknown`
+  (`server/metrics.ts` `incPeerRelay`). **`("in","delivered")` means ACCEPTED AT
+  THE BORDER**, not delivered to anybody: a topic frame counts once here even
+  when the receiving mesh's ACL filtered every subscriber. What each subscriber
+  got is `mesh_topic_fanout_total`.
 - **`mesh_admin_auth_total{outcome}`** — admin authentications on this port,
   `success` and `failure` (`server/metrics.ts` `incAdminAuth`). **It counts
   uses, not users**: the admin token is shared, so a rising `success` says the
@@ -419,7 +505,10 @@ incidents, and anything you intend to undo.
 | not supported | why |
 |---|---|
 | **Multi-hop / transitive federation** | Your admin's decision covers *this* peer, not that peer's peers. A relayed `from`/`to` containing `:` is refused (`server/router.ts` `routeRelay`) |
-| **Topics across a border** | Federated pub/sub raises ownership and fan-out questions that are not answered; topics stay local |
+| **Transitive topics** | A post crosses at most two borders and only through the topic's home mesh; a received `topic` delivery is never re-originated (`server/router.ts` `routeRelay`) |
+| **Per-kind rate buckets** | One bucket per peering, shared by every kind — see §3 |
+| **Wildcard subscriptions** | A subscription names one topic |
+| **`DELETE /topics`** | A topic is removed with the agent that created it (`server/db.ts` `deleteAgent`) |
 | **Files across a border** | Direct messages only for v1 |
 | **Presence across a border** | You cannot see whether a remote agent is online — only whether the *peering* is connected |
 | **Reminders across a border** | Local scheduling only |

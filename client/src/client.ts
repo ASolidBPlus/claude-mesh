@@ -126,6 +126,10 @@ export interface Inbound {
   caption?: string | null;      // = caption
   replyToMsgId?: string | null; // = reply_to_msg_id
   groupId?: string | null;      // = group_id (multi-file grouping tag; null = ungrouped)
+  /** F4 — for a federated topic delivery, which mesh and agent really said it
+   *  (`pod1:alice`). `null` for everything that did not cross a border.
+   *  DISPLAY ONLY — the sending mesh chooses it. */
+  origin?: string | null;
 }
 
 export interface SendFileOpts {
@@ -1093,6 +1097,11 @@ export class MeshClient {
       payload: f.payload,
       contentType: f.content_type,
       sentAt: f.sent_at,
+      // `?? null`, not a passthrough: every pre-F4 sender omits the key, and
+      // `null` is the honest answer for "this did not cross a border".
+      // Leaving it `undefined` would make a consumer's `'origin' in m` check
+      // disagree with its `m.origin === null` check.
+      origin: f.origin ?? null,
     };
   }
 
