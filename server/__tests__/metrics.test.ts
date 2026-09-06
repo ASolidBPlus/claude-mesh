@@ -152,7 +152,7 @@ describe('metrics counters', () => {
   });
 
   // (removed) T11 observeRequestDuration histogram — the request_duration metric
-  // measured the removed request/response round-trip; deleted per Joel's strip.
+  // measured the removed request/response round-trip; deleted per the operator's strip.
 
   it('T12 histogram cumulative beyond top bucket', () => {
     observePayloadBytes(2_000_000);
@@ -194,7 +194,7 @@ describe('metrics gauges', () => {
   });
 
   // (removed) T16 pending_requests — the mesh_pending_requests gauge counted
-  // the removed request/response correlations; deleted per Joel's strip.
+  // the removed request/response correlations; deleted per the operator's strip.
 
   it('T17 reminders_pending', () => {
     registerAgent(db, { id: 'alice', token_hash: 'a'.repeat(64), hostname: 'h1' });
@@ -439,7 +439,7 @@ describe('metrics request/response E2E (real ws-server)', () => {
   });
 
   // (removed) T24 request+response round trip — exercised the removed native
-  // request/response primitive + its metrics; deleted per Joel's strip.
+  // request/response primitive + its metrics; deleted per the operator's strip.
 });
 
 describe('metrics HTTP endpoint', () => {

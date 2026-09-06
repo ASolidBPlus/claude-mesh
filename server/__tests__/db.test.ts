@@ -652,7 +652,7 @@ describe('getPendingTopicMessages', () => {
 });
 
 // (removed) getMessageByCorrelationId describe — the function backed only the
-// native request/response routing, removed per Joel's strip.
+// native request/response routing, removed per the operator's strip.
 
 // ──────────────────────────────────────────────
 // expireMessages

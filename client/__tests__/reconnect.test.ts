@@ -139,7 +139,7 @@ describe('MeshClient reconnect robustness', () => {
   // assertion (and ultimately the test timeout) would catch it.
   // (removed) 'in-flight request fails fast with CONNECTION_RESET on a forced
   // reconnect' — tested the removed native request/response primitive; deleted
-  // per Joel's strip. (The generic pending-map fail-fast/no-leak teardown is
+  // per the operator's strip. (The generic pending-map fail-fast/no-leak teardown is
   // still covered by Test 2a below for the surviving ack/remind/list waiters.)
 
   // ── Test 2a ──────────────────────────────────────────────────────────
@@ -147,7 +147,7 @@ describe('MeshClient reconnect robustness', () => {
   // reminderLists) with `code: 'CONNECTION_RESET'`, leaving no leaks. These
   // waiters have NO timeout of their own, so before this fix they would hang
   // until close(); here they must fail fast on the drop. (The pendingRequests
-  // map was removed with the native request/response strip — per Joel's strip.)
+  // map was removed with the native request/response strip — per the operator's strip.)
   it('forced drop rejects the pending maps with CONNECTION_RESET (no leaks)', async () => {
     const a = newClient('A', tokenA);
     await a.connect();
@@ -209,7 +209,7 @@ describe('MeshClient reconnect robustness', () => {
   // ── Test 2b ──────────────────────────────────────────────────────────
   // close() rejects and clears every pending map (acks, reminds, reminderLists)
   // with `client closed`, leaving no leaks. (pendingRequests was removed with
-  // the native request/response strip — per Joel's strip.)
+  // the native request/response strip — per the operator's strip.)
   it('close() rejects and clears all pending waiters with no leaks', async () => {
     const a = newClient('A', tokenA);
     await a.connect();

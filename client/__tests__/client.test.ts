@@ -134,7 +134,7 @@ describe('MeshClient', () => {
 
   // 5
   // (removed) 'request/response round-trip' + 'request timeout' — tested the
-  // removed native request/response primitive; deleted per Joel's strip.
+  // removed native request/response primitive; deleted per the operator's strip.
 
   // 7
   it('reconnect re-auths, re-subscribes, and resumes delivery', async () => {
@@ -239,7 +239,7 @@ describe('MeshClient', () => {
   });
 
   // (removed) 'request to a no-ACL agent rejects quickly with ACL_DENIED' —
-  // tested the removed native request primitive; deleted per Joel's strip.
+  // tested the removed native request primitive; deleted per the operator's strip.
   // (ACL fast-fail is still covered for directs by 'ACL-denied send rejects…'.)
 
   // ── reminders ────────────────────────────────────────────────

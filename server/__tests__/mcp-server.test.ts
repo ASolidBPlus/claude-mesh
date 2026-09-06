@@ -105,7 +105,7 @@ describe('startMcpServer', () => {
   });
 
   // (removed) 'CallTool mesh_request …' — the mesh_request tool tested the
-  // removed native request/response primitive; deleted per Joel's strip.
+  // removed native request/response primitive; deleted per the operator's strip.
 
   it('CallTool mesh_status with empty input returns isError true with INVALID_REQUEST', async () => {
     const result = await client.callTool({ name: 'mesh_status', arguments: {} });
