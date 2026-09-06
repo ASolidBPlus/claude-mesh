@@ -358,7 +358,7 @@ describe('tap — live gating end-to-end', () => {
     expect(OBS.frames.filter((f) => f.type === 'tap' && f.msg_id === 'pub1').length).toBe(1);
 
     // (removed) request + response tap assertions — the native request/response
-    // primitive was stripped per Joel's strip.
+    // primitive was stripped per the operator's strip.
 
     // file
     const data = Buffer.from('file-bytes-here').toString('base64');
@@ -516,7 +516,7 @@ describe('tap — MCP-path ingress is tapped via the shared observerIndex', () =
   });
 
   // (removed) '23. MCP-originated request is tapped' — the mesh_request MCP tool
-  // and native request routing were stripped per Joel's strip.
+  // and native request routing were stripped per the operator's strip.
 
   it('24. CRITICAL non-observer gets ZERO taps via the MCP path', async () => {
     makeAgent(db, 'A'); makeAgent(db, 'B'); makeAgent(db, 'NON'); makeAgent(db, 'OBS');

@@ -6,7 +6,7 @@ import { mkdtempSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
-// NOTE: two tests were removed here per Joel's request/response strip — "fires
+// NOTE: two tests were removed here per the operator's request/response strip — "fires
 // reject on expired pending requests" and "sends WS error frame on expired
 // pending requests with open socket". Both exercised cleanup's expired
 // pending-request sweep, which was part of the removed native request/response
