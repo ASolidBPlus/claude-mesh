@@ -222,6 +222,11 @@ fi
 # The one instance we have happened to overlap in ws-server.ts, but the missing door was in
 # client.ts, which #145 never touched: had ws-server.ts not coincidentally been shared, an
 # overlap filter would have reported NOTHING AT ALL. That is the filter failing, not a near miss.
+# WHERE CI STOPS. CI on the merge ref already catches "something merged broke what this PR
+# CALLS" — a compile or test failure. It cannot catch "something merged removed or poisoned
+# what can CALL this PR", because the absence of a driver is not a failure: nothing goes red
+# when a feature is merely unreachable. (The same question also catches a NEW driver
+# appearing, which is the security-relevant direction.)
 # DELIBERATELY KEPT. Cost: one local `git log --oneline --first-parent` per gate — no network,
 # no API call; this is not the slow part of the file. Benefit: the composed-pair defect has no
 # other vantage. The empty branch below prints on purpose: a check that prints nothing when
