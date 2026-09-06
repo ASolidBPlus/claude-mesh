@@ -45,8 +45,15 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
 
-  # Lets a run be started by hand on any ref — useful when a PR's runs were
-  # filtered away and the branch needs a green without an empty push.
+  # Runs the suite and the Docker build on any ref, by hand, for diagnosis.
+  # It publishes NOTHING (the ghcr gate below is `== 'push'`), and it is never
+  # merge evidence: a dispatch builds the BRANCH HEAD, not refs/pull/N/merge, so
+  # its provenance lines print the event and ref rather than parents and the
+  # merge gate has nothing to compare. Evidence for a PR comes from
+  # pull_request runs only.
+  #
+  # (This comment used to say it was for branches whose runs had been "filtered
+  # away" — the bug this same change removes. That reason no longer exists.)
   workflow_dispatch:
 
 concurrency:
