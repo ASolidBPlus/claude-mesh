@@ -146,10 +146,27 @@ describe('F3: observer cross_border scope', () => {
     const emitting = new Set<string>();
     let current = '';
     for (const line of src) {
-      const fn = line.match(/^(?:export )?function ([A-Za-z0-9_]+)\s*\(/);
+      // ALL THREE DECLARATION FORMS. The first version of this scan matched
+      // only `function name(`, so an `async function` or a `const x = () =>`
+      // route added AMONG the driven ones attributed its emitTap to the
+      // PREVIOUS matched name and the scan stayed green with a new undriven
+      // emitting route. Measured: placed where the preceding declaration is a
+      // DRIVEN name, such a route was completely silent at 11 pass, 0 fail.
+      //
+      // Nothing in this repo enforces declaration style — there is no linter
+      // config of any kind — so "we always write `export function`" is a habit,
+      // and a habit is not something a guard may assume.
+      const fn = line.match(/^(?:export\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z0-9_$]+)\s*[(<]/)
+             ?? line.match(/^(?:export\s+)?(?:const|let|var)\s+([A-Za-z0-9_$]+)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:function|\()/);
       if (fn !== null) current = fn[1]!;
       if (line.includes('emitTap(') && !line.trim().startsWith('*') && !line.trim().startsWith('//')) {
-        if (current !== '') emitting.add(current);
+        // An emitTap before ANY declaration match means the scan does not know
+        // whose call this is — silently skipping it is how a call site
+        // disappears from the set. Fail loudly instead.
+        if (current === '') {
+          throw new Error('SCAN: found an emitTap( call before any recognised declaration in router.ts — the scan cannot attribute it, so the drive list cannot be checked. Widen the declaration patterns rather than ignoring the call.');
+        }
+        emitting.add(current);
       }
     }
     expect(emitting.size).toBeGreaterThan(0);              // the scan found something
