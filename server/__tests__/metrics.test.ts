@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import { mkdtempSync } from 'fs';
@@ -20,6 +20,14 @@ import { routeDirect, routePublish, routeFile } from '../router.ts';
 import { startWsServer, WsServerHandle } from '../ws-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
 import { startReminderScheduler } from '../reminder-scheduler.ts';
+
+// Identity labels (from_agent / to_agent / agent) are opt-in since the
+// /metrics topology finding: the endpoint is unauthenticated, so those labels
+// enumerate the roster an ACL filter otherwise withholds. These tests assert
+// the LABELLED form, so they ask for it explicitly.
+beforeAll(() => { process.env.MESH_METRICS_IDENTITY_LABELS = '1'; });
+afterAll(() => { delete process.env.MESH_METRICS_IDENTITY_LABELS; });
+
 
 // ──────────────────────────────────────────────
 // Helpers

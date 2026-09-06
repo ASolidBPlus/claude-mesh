@@ -4,6 +4,7 @@ import * as http from 'http';
 import * as net from 'net';
 import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
 import { validateToken } from './auth.ts';
+import { PEER_PROTOCOL_VERSION } from './wire-version.ts';  // #131: via the tiny module, never cross-package from here
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
 import {
@@ -16,8 +17,13 @@ import { incMsgStatus, incReceived, incBytes } from './metrics.ts';
 
 /** F1a (§5.1): the only inbound peer protocol this mesh speaks. A version is a
  *  property of a LIVE CONNECTION, never of a stored row (D7) — which is why it
- *  is checked at auth and not persisted on `peers`. */
-export const PEER_PROTOCOL_VERSION = 1;
+ *  is checked at auth and not persisted on `peers`.
+ *
+ *  F2b: re-exported, not redefined. The definition is in the wire module
+ *  (client/src/protocol.ts) because all three readers must agree by
+ *  construction; keeping a copy here is exactly what let registration advertise
+ *  a version auth rejected. */
+export { PEER_PROTOCOL_VERSION };
 
 export interface WsServerHandle {
   wss: WebSocketServer;
@@ -434,7 +440,17 @@ export function startWsServer(
 
     // Create an HTTP server explicitly so we can track and destroy its sockets
     const httpServer = http.createServer();
-    const wss = new WebSocketServer({ server: httpServer });
+    // (c) Drop oversize frames at the CONNECTION level, before JSON.parse.
+    //
+    // The 1 MiB payload check in the router runs AFTER parsing, so a 100 MiB
+    // frame was already fully buffered and parsed before anything refused it —
+    // the cost is paid before the guard speaks. maxPayload makes the ws library
+    // fail the frame and close, so a hostile size never reaches the parser.
+    //
+    // Headroom above the payload cap because the frame carries envelope too
+    // (type, ids, content_type); the ROUTER's 1 MiB check is still the payload
+    // authority and is unchanged.
+    const wss = new WebSocketServer({ server: httpServer, maxPayload: 1_100_000 });
     const connections = new Set<WebSocket>();
     const sockets = new Set<net.Socket>();
     // Connection registry: ws -> state

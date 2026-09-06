@@ -1,8 +1,13 @@
 // @claude-mesh/client — shared wire-frame types.
 //
-// This module is the SINGLE SOURCE OF TRUTH for the JSON shapes that travel
-// over the mesh WebSocket. It is PURE TYPES: zero runtime code, zero imports
-// (no `ws`, no `bun:sqlite`). The server imports the inbound-to-server frames
+// This module is the SINGLE SOURCE OF TRUTH for the WIRE: the JSON shapes that
+// travel over the mesh WebSocket, AND the protocol version constant below.
+// Types plus that one runtime value; still zero imports (no `ws`, no
+// `bun:sqlite`).
+//
+// The header used to say PURE TYPES: zero runtime code. Changed in the SAME
+// commit that added the constant — otherwise the fix for a false claim ABOUT
+// this file would have left a false claim IN it. The server imports the inbound-to-server frames
 // from here via a relative path; the client uses the full set for its typed
 // parser. External consumers get them re-exported from the package root.
 
@@ -203,3 +208,38 @@ export type InboundFrame =
   | PresenceListFrame
   | RemindersListFrame
   | FileDeliverFrame;
+
+// ──────────────────────────────────────────────
+// Protocol version — ONE authority (#F2b item 7)
+// ──────────────────────────────────────────────
+
+/**
+ * The mesh-to-mesh peer protocol version.
+ *
+ * THIS IS THE ONLY DEFINITION. Three sites read it, and they answer three
+ * different questions that must give the same number:
+ *
+ *   - `server/ws-server.ts` — what this mesh ACCEPTS on a peer auth frame;
+ *   - `client/src/peer-client.ts` — what a peer ANNOUNCES when connecting;
+ *   - `server/http-admin.ts` — what REGISTRATION TELLS a new peer to send, in
+ *     the 201 body.
+ *
+ * The third is the consequential one and was the last to be found: bump the
+ * version with a literal left there and registration keeps advertising the old
+ * number, so every NEW peer is told to speak a version auth then rejects.
+ * Registration succeeds, authentication always fails, and the far mesh sees
+ * PROTOCOL_MISMATCH on its own fresh credential — the fault is entirely ours
+ * and every piece of evidence points at them.
+ *
+ * A MUTANT RE-INTRODUCING A LITERAL AT ANY OF THE THREE IS WHAT THIS EXISTS TO
+ * PREVENT. The enumeration test is scoped BY VALUE across server/ and client/,
+ * not by the sites anyone happened to name — grepping the identifier finds only
+ * the sites already doing the right thing, so it cannot find the ones that
+ * aren't. That is how the third site was missed the first time.
+ *
+ * It lives here rather than in either package because it is a property of the
+ * WIRE. This file is already the seam both sides read across:
+ * `peer-client.ts` imports it, and `server/router.ts` imports it by relative
+ * path — that predates this change.
+ */
+export const PEER_PROTOCOL_VERSION = 1;

@@ -1,4 +1,5 @@
 import { MeshClient } from './client.ts';
+import { PEER_PROTOCOL_VERSION } from './protocol.ts';
 import type { ErrorFrame } from './protocol.ts';
 
 /**
@@ -36,7 +37,7 @@ export class PeerClient extends MeshClient {
    * make "is this a peer" unanswerable.
    */
   protected override authExtras(): Record<string, unknown> {
-    return { protocol: 1 };
+    return { protocol: PEER_PROTOCOL_VERSION };
   }
 
   /**
@@ -64,6 +65,30 @@ export class PeerClient extends MeshClient {
    * agreed rate) or the SDK's own (ACK_TIMEOUT, CONNECTION_RESET). The caller
    * gets one failure channel rather than having to inspect two.
    */
+  /**
+   * #102: a peer connection has no topics.
+   *
+   * MeshClient re-subscribes stored topics on every reconnect. Inherited
+   * unchanged, a PeerClient that had ever subscribed would emit `subscribe`
+   * frames the receiving mesh's peer allowlist answers NOT_ALLOWED — on every
+   * reconnect, forever, reading as a mysterious error loop rather than as
+   * "you called the wrong method".
+   *
+   * Throwing LOCALLY, at the call site, converts that into a stack trace
+   * pointing at the mistake. Nothing is sent.
+   */
+  override subscribe(_topic: string): Promise<void> {
+    return Promise.reject(new Error(
+      'PeerClient cannot subscribe: a peer connection carries relays, not topics',
+    ));
+  }
+
+  override unsubscribe(_topic: string): Promise<void> {
+    return Promise.reject(new Error(
+      'PeerClient cannot unsubscribe: a peer connection carries relays, not topics',
+    ));
+  }
+
   relay(frame: RelayFrame): Promise<void> {
     return this.sendWithAck(frame.msg_id, frame);
   }

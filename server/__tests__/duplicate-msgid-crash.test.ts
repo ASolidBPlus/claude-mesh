@@ -32,7 +32,12 @@ function wait(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
 /** Read the sender's accepted-and-routed counter out of the metrics render. */
 function sentCountFor(db: Database, agentId: string): number {
-  const line = renderMetrics(db)
+  // Identity labels are opt-in (unauthenticated /metrics enumerates agent ids
+  // otherwise). This test needs the per-sender series, so it asks for it.
+  process.env.MESH_METRICS_IDENTITY_LABELS = '1';
+  const rendered = renderMetrics(db);
+  delete process.env.MESH_METRICS_IDENTITY_LABELS;
+  const line = rendered
     .split('\n')
     .find(l => l.startsWith(`mesh_messages_sent_total{from_agent="${agentId}"}`));
   return line === undefined ? 0 : Number(line.split(' ').pop());

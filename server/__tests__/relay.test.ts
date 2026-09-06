@@ -249,10 +249,15 @@ describe('F1b: metrics are labelled per ALIAS, never per remote agent', () => {
     routeRelay(db, new Map(), peer, relayFrame({ msg_id: 'ok-1' }));
     routeRelay(db, new Map(), peer, relayFrame({ msg_id: 'bad-1', to: 'ghost' }));
 
+    // Per-alias labels are OPT-IN since the /metrics topology finding: the
+    // aliases themselves are the disclosure on an unauthenticated endpoint.
+    process.env.MESH_METRICS_IDENTITY_LABELS = '1';
     const out = renderMetrics(db);
+    delete process.env.MESH_METRICS_IDENTITY_LABELS;
     expect(out).toContain('mesh_peer_relays_total{alias="othermesh",direction="in",outcome="delivered"} 1');
     expect(out).toContain('mesh_peer_relays_total{alias="othermesh",direction="in",outcome="refused"} 1');
-    // The remote agent id must not appear anywhere in the metrics output.
+    // The remote AGENT id must not appear even with labels on — cardinality we
+    // do not control, and a different disclosure from the alias.
     expect(out).not.toContain('their-agent');
     db.close();
   });

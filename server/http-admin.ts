@@ -41,6 +41,23 @@ import {
   getPeerKeyBySecret, revokePeerKey, getPeerByAlias, upsertPeer, getPeerKeyById, type PeerKey,
   insertOutboundPeer, getOutboundPeer, listOutboundPeers, updateOutboundPeer, endOutboundPeering, type OutboundPeer,
 } from './db.ts';
+// #131: read via ./wire-version.ts, never as a direct cross-package import
+// from the client wire module.
+//
+// This file is 81,312 B — over the 51,200 B transpiler-cache threshold — and it
+// was the ONLY importer that ever hit the intermittent link failure. It was
+// also the only one both cached AND crossing the package boundary. The
+// invariant, and the reason wire-version.ts exists, is written there.
+//
+// (Deliberately not naming the client path in prose here: a comment containing
+// the literal import string makes this file register as a cross-package
+// importer to any grep that does not strip comments, which is exactly the false
+// positive that turned up while verifying the invariant.)
+//
+// The constant still has exactly ONE definition. That, and the specifier every
+// reader uses, are pinned by border.test.ts, so the obvious tidy-up reds rather
+// than silently reinstating the edge.
+import { PEER_PROTOCOL_VERSION } from './wire-version.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
 import { renderMetrics } from './metrics.ts';
@@ -1527,7 +1544,10 @@ async function handlePeerRegister(ctx: AdminCtx): Promise<void> {
     token, // shown ONCE
     kinds: JSON.parse(peer.kinds) as string[],
     rate_per_min: peer.rate_per_min,
-    protocol: 1,
+    // The ONE constant. A literal here advertises a version auth may not
+    // accept — registration succeeds, authentication always fails, and it
+    // looks like a peer-side fault.
+    protocol: PEER_PROTOCOL_VERSION,
   }));
 }
 
@@ -1542,6 +1562,47 @@ async function handlePeerRegister(ctx: AdminCtx): Promise<void> {
 //
 // Every refusal below is therefore SPECIFIC on purpose. That is a decision, not
 // an omission.
+
+/**
+ * (d)+(g) THE OUTBOUND URL RULE — ONE predicate, both doors.
+ *
+ * POST and PATCH validated the URL with two COPIES of the same regex and
+ * nothing bound them. The likely future edit is a TIGHTENING, and a tightening
+ * that lands on one door leaves the other as the bypass — and the other is
+ * PATCH, the rotation path, which is exactly where an attacker who can already
+ * reach the admin API would look. Two copies of a security predicate is one
+ * predicate and one hole waiting to be opened.
+ *
+ * The rule: `wss://` anywhere; `ws://` ONLY for loopback. Plaintext to a remote
+ * host would put `outbound_peers.token` — a live credential (C7) — on the wire
+ * in cleartext on every reconnect, and the peer protocol has no other
+ * authentication to fall back on.
+ *
+ * Certificate verification is never disabled: the SDK uses `ws`'s default
+ * (rejectUnauthorized: true), and a source-scan test pins that
+ * `rejectUnauthorized` appears nowhere in client/ or border.ts — because the
+ * usual way this rule dies is one `{ rejectUnauthorized: false }` added to make
+ * a staging box work.
+ */
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
+export function validateOutboundPeerUrl(raw: unknown): { ok: true } | { ok: false; error: string } {
+  if (typeof raw !== 'string' || raw.length === 0) {
+    return { ok: false, error: 'url must be ws:// or wss://' };
+  }
+  let parsed: URL;
+  try { parsed = new URL(raw); } catch {
+    return { ok: false, error: 'url must be ws:// or wss://' };
+  }
+  if (parsed.protocol === 'wss:') return { ok: true };
+  if (parsed.protocol !== 'ws:') {
+    return { ok: false, error: 'url must be ws:// or wss://' };
+  }
+  if (!LOOPBACK_HOSTS.has(parsed.hostname)) {
+    return { ok: false, error: 'ws:// is permitted only for loopback; use wss://' };
+  }
+  return { ok: true };
+}
 
 /** Public shape of an outbound peering. NEVER includes `token` (C7): it is a
  *  live credential, and a read API that returned it would put it in every
@@ -1605,9 +1666,10 @@ async function handleOutboundPeerPost(ctx: AdminCtx): Promise<void> {
   }
 
   const url = body.url;
-  if (typeof url !== 'string' || !/^wss?:\/\//.test(url)) {
+  const urlCheck = validateOutboundPeerUrl(url);
+  if (!urlCheck.ok) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'url must be ws:// or wss://' })); return;
+    res.end(JSON.stringify({ error: urlCheck.error })); return;
   }
   const token = body.token;
   if (typeof token !== 'string' || token.length === 0) {
@@ -1642,7 +1704,10 @@ async function handleOutboundPeerPost(ctx: AdminCtx): Promise<void> {
   }
 
   const row = insertOutboundPeer(db, {
-    alias, url, token, assigned_alias,
+    // `url` is narrowed by validateOutboundPeerUrl above, which the compiler
+    // cannot see through a returned discriminated union — asserted, not cast
+    // past a real unknown.
+    alias, url: url as string, token, assigned_alias,
     kinds: JSON.stringify(kinds), rate_per_min, created_at: Date.now(),
   });
   // Event-driven, never polled: the handler that changed the state starts the
@@ -1705,11 +1770,14 @@ async function handleOutboundPeerPatch(ctx: AdminCtx): Promise<void> {
     patch.token = body.token;
   }
   if (body.url !== undefined) {
-    if (typeof body.url !== 'string' || !/^wss?:\/\//.test(body.url)) {
+    // The SAME predicate as POST — see validateOutboundPeerUrl. PATCH is the
+    // rotation path and would be the bypass if these ever diverged.
+    const check = validateOutboundPeerUrl(body.url);
+    if (!check.ok) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'url must be ws:// or wss://' })); return;
+      res.end(JSON.stringify({ error: check.error })); return;
     }
-    patch.url = body.url;
+    patch.url = body.url as string;
   }
   if (body.rate_per_min !== undefined) {
     if (typeof body.rate_per_min !== 'number' || !Number.isInteger(body.rate_per_min) || body.rate_per_min <= 0) {

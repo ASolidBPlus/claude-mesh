@@ -118,13 +118,72 @@ function renderHistogram(name: string, help: string, h: Histogram, lines: string
   lines.push(`${name}_count ${h.count}`);
 }
 
-/** Supplies the live peer aliases for mesh_peer_up. Set once at boot by
- *  server.ts from the WS handle's peerIndex; defaults to none so every existing
- *  caller of renderMetrics (and every test) is unchanged. */
-let peerUpAliases: () => Iterable<string> = () => [];
-export function setPeerUpSource(fn: () => Iterable<string>): void {
-  peerUpAliases = fn;
+/**
+ * Supplies mesh_peer_up's series: EVERY CONFIGURED PEER with its state, not
+ * only the connected ones (#108).
+ *
+ * The distinction is the whole point. A gauge emitted only when up produces a
+ * series that APPEARS on connect and VANISHES on disconnect — and you cannot
+ * alert on a series that is absent, because "no data" is indistinguishable from
+ * "never configured". The alert an operator wants is "this peering went to 0",
+ * which requires the 0 to exist.
+ *
+ * Set once at boot by server.ts; defaults to none so every existing caller of
+ * renderMetrics (and every test) is unchanged.
+ */
+/** Read at render time, not at import: a test (and an operator) can change it
+ *  without restarting, and there is no cached copy to disagree with the env. */
+/**
+ * Does this deployment accept that /metrics is internal-only?
+ *
+ * /metrics is UNAUTHENTICATED. Every label below that carries an AGENT ID or a
+ * PEER ALIAS is an enumeration of something the system otherwise withholds:
+ * `handleListPresence` is ACL-filtered so an agent cannot enumerate agents it
+ * has no edge to, and peer aliases are meaningful names that map this org's
+ * federation topology. A metrics label is not a lesser disclosure than an API
+ * response — it is the same information with no auth in front of it.
+ *
+ * It was first written as a PEER-alias flag. That was too narrow: the same
+ * reader enumerates LOCAL AGENT IDS from mesh_agent_up, mesh_messages_sent_total,
+ * mesh_messages_received_total and mesh_acl_denied_total. The label is a
+ * disclosure from the READER's position, not from the labelled party's.
+ *
+ * Off: aggregates only — still alertable, naming nobody.
+ * On:  identity labels, an explicit deployment decision.
+ */
+function identityLabelsEnabled(): boolean {
+  return process.env.MESH_METRICS_IDENTITY_LABELS === '1';
 }
+
+let peerUpSource: () => Iterable<{ alias: string; up: boolean }> = () => [];
+export function setPeerUpSource(fn: () => Iterable<{ alias: string; up: boolean }>): void {
+  peerUpSource = fn;
+}
+
+/**
+ * Labels whose values can never name a party (an agent id or a peer alias).
+ * Closed and exhaustive: everything NOT on this list must sit behind
+ * identityLabelsEnabled().
+ *
+ * It lives here, beside the emitters, rather than in the test that enforces it,
+ * so that the person adding a label meets it while adding the label. Each entry
+ * states its value domain, and an entry is only earned by a domain that is a
+ * fixed set of constants at the call sites:
+ *
+ *   direction   'in' | 'outbound'                              (router.ts, border.ts)
+ *   error_code  the ERR_* code constants                        (errors.ts)
+ *   kind        the message-kind constants                      (protocol.ts)
+ *   le          a histogram bucket boundary — a number
+ *   outcome     'delivered'|'refused'|'rate_limited'|'duplicate'|'transient'
+ *   state       'online'|'offline' / 'up'|'down'
+ *   status      'delivered'|'queued'|'dropped'|'expired'
+ *
+ * Adding an entry here to make a test pass is the failure this constant exists
+ * to prevent: if a label's values can name a party, it is gated, not listed.
+ */
+export const PARTY_FREE_LABELS: ReadonlySet<string> = new Set([
+  'direction', 'error_code', 'kind', 'le', 'outcome', 'state', 'status',
+]);
 
 export function renderMetrics(db: Database): string {
   const lines: string[] = [];
@@ -139,25 +198,49 @@ export function renderMetrics(db: Database): string {
     lines.push(`mesh_messages_total{kind="${escapeLabelValue(kind)}",status="${escapeLabelValue(status)}"} ${v}`);
   }
 
-  // mesh_messages_sent_total {from_agent}
-  lines.push('# HELP mesh_messages_sent_total Messages accepted and routed, by sender.');
-  lines.push('# TYPE mesh_messages_sent_total counter');
-  for (const [key, v] of sent) {
-    lines.push(`mesh_messages_sent_total{from_agent="${escapeLabelValue(key)}"} ${v}`);
+  // mesh_messages_sent_total — identity label, gated.
+  if (identityLabelsEnabled()) {
+    lines.push('# HELP mesh_messages_sent_total Messages accepted and routed, by sender.');
+    lines.push('# TYPE mesh_messages_sent_total counter');
+    for (const [key, v] of sent) {
+      lines.push(`mesh_messages_sent_total{from_agent="${escapeLabelValue(key)}"} ${v}`);
+    }
+  } else {
+    let total = 0;
+    for (const [, v] of sent) total += v;
+    lines.push('# HELP mesh_messages_sent_total Messages accepted and routed, by sender. (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)');
+    lines.push('# TYPE mesh_messages_sent_total counter');
+    lines.push(`mesh_messages_sent_total ${total}`);
   }
 
-  // mesh_messages_received_total {to_agent}
-  lines.push('# HELP mesh_messages_received_total Messages delivered, by recipient.');
-  lines.push('# TYPE mesh_messages_received_total counter');
-  for (const [key, v] of received) {
-    lines.push(`mesh_messages_received_total{to_agent="${escapeLabelValue(key)}"} ${v}`);
+  // mesh_messages_received_total — identity label, gated.
+  if (identityLabelsEnabled()) {
+    lines.push('# HELP mesh_messages_received_total Messages delivered, by recipient.');
+    lines.push('# TYPE mesh_messages_received_total counter');
+    for (const [key, v] of received) {
+      lines.push(`mesh_messages_received_total{to_agent="${escapeLabelValue(key)}"} ${v}`);
+    }
+  } else {
+    let total = 0;
+    for (const [, v] of received) total += v;
+    lines.push('# HELP mesh_messages_received_total Messages delivered, by recipient. (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)');
+    lines.push('# TYPE mesh_messages_received_total counter');
+    lines.push(`mesh_messages_received_total ${total}`);
   }
 
-  // mesh_acl_denied_total {from_agent}
-  lines.push('# HELP mesh_acl_denied_total ACL-denied send attempts, by sender.');
-  lines.push('# TYPE mesh_acl_denied_total counter');
-  for (const [key, v] of aclDenied) {
-    lines.push(`mesh_acl_denied_total{from_agent="${escapeLabelValue(key)}"} ${v}`);
+  // mesh_acl_denied_total — identity label, gated.
+  if (identityLabelsEnabled()) {
+    lines.push('# HELP mesh_acl_denied_total ACL-denied send attempts, by sender.');
+    lines.push('# TYPE mesh_acl_denied_total counter');
+    for (const [key, v] of aclDenied) {
+      lines.push(`mesh_acl_denied_total{from_agent="${escapeLabelValue(key)}"} ${v}`);
+    }
+  } else {
+    let total = 0;
+    for (const [, v] of aclDenied) total += v;
+    lines.push('# HELP mesh_acl_denied_total ACL-denied send attempts, by sender. (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)');
+    lines.push('# TYPE mesh_acl_denied_total counter');
+    lines.push(`mesh_acl_denied_total ${total}`);
   }
 
   // mesh_errors_total {error_code}
@@ -189,12 +272,22 @@ export function renderMetrics(db: Database): string {
   lines.push('# TYPE mesh_agents_online gauge');
   lines.push(`mesh_agents_online ${countAgentsOnline(db)}`);
 
-  // mesh_agent_up {agent}
-  lines.push('# HELP mesh_agent_up 1 if the agent is currently connected, else 0.');
-  lines.push('# TYPE mesh_agent_up gauge');
+  // mesh_agent_up {agent} — the widest identity label here: it lists EVERY
+  // registered agent id, which is precisely the roster handleListPresence
+  // ACL-filters. Gated.
   const agentRows = db.prepare('SELECT id, online FROM agents').all() as { id: string; online: number }[];
-  for (const row of agentRows) {
-    lines.push(`mesh_agent_up{agent="${escapeLabelValue(row.id)}"} ${row.online === 1 ? 1 : 0}`);
+  if (identityLabelsEnabled()) {
+    lines.push('# HELP mesh_agent_up 1 if the agent is currently connected, else 0.');
+    lines.push('# TYPE mesh_agent_up gauge');
+    for (const row of agentRows) {
+      lines.push(`mesh_agent_up{agent="${escapeLabelValue(row.id)}"} ${row.online === 1 ? 1 : 0}`);
+    }
+  } else {
+    const up = agentRows.filter(r => r.online === 1).length;
+    lines.push('# HELP mesh_agent_up_count Registered agents by connection state (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1).');
+    lines.push('# TYPE mesh_agent_up_count gauge');
+    lines.push(`mesh_agent_up_count{state="up"} ${up}`);
+    lines.push(`mesh_agent_up_count{state="down"} ${agentRows.length - up}`);
   }
 
   // mesh_topics
@@ -221,22 +314,63 @@ export function renderMetrics(db: Database): string {
   // Histograms
   renderHistogram('mesh_message_payload_bytes', 'Accepted message payload sizes in bytes.', payloadBytes, lines);
 
-  // mesh_peer_relays_total {alias,direction,outcome}
-  lines.push('# HELP mesh_peer_relays_total Relayed messages by peer alias, direction and outcome.');
-  lines.push('# TYPE mesh_peer_relays_total counter');
-  for (const [key, v] of peerRelays) {
-    const [alias, direction, outcome] = key.split('\0');
-    lines.push(`mesh_peer_relays_total{alias="${escapeLabelValue(alias ?? '')}",direction="${escapeLabelValue(direction ?? '')}",outcome="${escapeLabelValue(outcome ?? '')}"} ${v}`);
+  // PEER-ALIAS LABELS ARE OPT-IN (F2b probe finding 2).
+  //
+  // /metrics is unauthenticated. With per-alias series it enumerates the
+  // COMPLETE inter-org topology in both directions, with volumes and outcomes —
+  // and aliases are deliberately meaningful names (§9), so the labels ARE the
+  // disclosure. The exemption that made unauthenticated /metrics acceptable
+  // rests on "the admin port is internal-only", which is a DEPLOYMENT claim the
+  // code cannot enforce; before F2 it protected traffic counts, now it would
+  // protect who this org federates with.
+  //
+  // Default: aggregates, which keep the numbers useful and name nobody.
+  // MESH_METRICS_IDENTITY_LABELS=1: per-alias series, an explicit deployment
+  // decision that /metrics is genuinely internal-only.
+  if (identityLabelsEnabled()) {
+    lines.push('# HELP mesh_peer_relays_total Relayed messages by peer alias, direction and outcome.');
+    lines.push('# TYPE mesh_peer_relays_total counter');
+    for (const [key, v] of peerRelays) {
+      const [alias, direction, outcome] = key.split('\0');
+      lines.push(`mesh_peer_relays_total{alias="${escapeLabelValue(alias ?? '')}",direction="${escapeLabelValue(direction ?? '')}",outcome="${escapeLabelValue(outcome ?? '')}"} ${v}`);
+    }
+  } else {
+    // Aggregated over aliases: direction and outcome carry no topology.
+    const agg = new Map<string, number>();
+    for (const [key, v] of peerRelays) {
+      const [, direction, outcome] = key.split('\0');
+      const k = `${direction ?? ''}\0${outcome ?? ''}`;
+      agg.set(k, (agg.get(k) ?? 0) + v);
+    }
+    lines.push('# HELP mesh_peer_relays_total Relayed messages by direction and outcome (identity labels hidden; set MESH_METRICS_IDENTITY_LABELS=1 to label by party).');
+    lines.push('# TYPE mesh_peer_relays_total counter');
+    for (const [k, v] of agg) {
+      const [direction, outcome] = k.split('\0');
+      lines.push(`mesh_peer_relays_total{direction="${escapeLabelValue(direction ?? '')}",outcome="${escapeLabelValue(outcome ?? '')}"} ${v}`);
+    }
   }
 
-  // mesh_peer_up {alias} — 1 iff a socket is currently held for that alias.
-  // Read from the LIVE index, not from a stored column: peers has no `online`
-  // field and after #87 a durable liveness claim that outlives the process is
-  // exactly what must not be invented.
-  lines.push('# HELP mesh_peer_up Whether a peer mesh currently holds an authenticated socket.');
-  lines.push('# TYPE mesh_peer_up gauge');
-  for (const alias of peerUpAliases()) {
-    lines.push(`mesh_peer_up{alias="${escapeLabelValue(alias)}"} 1`);
+  // mesh_peer_up {alias} — 0 or 1 for EVERY configured peering, both
+  // directions (#108). State is read LIVE (the socket index, the forwarder's
+  // connection), never from a stored column: after #87, a durable liveness
+  // claim that outlives the process is exactly what must not be invented.
+  const peers = [...peerUpSource()];
+  if (identityLabelsEnabled()) {
+    lines.push('# HELP mesh_peer_up Whether a configured peering currently holds an authenticated socket.');
+    lines.push('# TYPE mesh_peer_up gauge');
+    for (const { alias, up } of peers) {
+      lines.push(`mesh_peer_up{alias="${escapeLabelValue(alias)}"} ${up ? 1 : 0}`);
+    }
+  } else {
+    // #108's ALERTABILITY SURVIVES the default: both series always exist, so
+    // "peerings went down" is still a value that moves rather than a series
+    // that vanishes. What is withheld is WHICH peering — the alert fires and
+    // the operator looks at a labelled instance or the logs.
+    const up = peers.filter(p => p.up).length;
+    lines.push('# HELP mesh_peer_up_count Configured peerings by connection state (identity labels hidden; set MESH_METRICS_IDENTITY_LABELS=1 to label by party).');
+    lines.push('# TYPE mesh_peer_up_count gauge');
+    lines.push(`mesh_peer_up_count{state="up"} ${up}`);
+    lines.push(`mesh_peer_up_count{state="down"} ${peers.length - up}`);
   }
 
   return lines.join('\n') + '\n';
