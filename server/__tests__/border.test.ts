@@ -8,7 +8,7 @@ import { routeDirect, routeRelay, MAX_TTL_MS } from '../router.ts';
 import { RELAY_DEDUPE_MS } from '../cleanup.ts';
 import { startBorder, forwarders, borderEvents, Forwarder } from '../border.ts';
 import { validateOutboundPeerUrl } from '../http-admin.ts';
-import { renderMetrics, setPeerUpSource, incPeerRelay, incSent, incReceived, incAclDenied, incError, incSysFanout, PARTY_FREE_LABELS } from '../metrics.ts';
+import { renderMetrics, setPeerUpSource, incPeerRelay, incSent, incReceived, incAclDenied, incError, incTopicFanout, PARTY_FREE_LABELS } from '../metrics.ts';
 import { Database } from 'bun:sqlite';
 import type { WebSocket } from 'ws';
 import { readFileSync, readdirSync, statSync, mkdtempSync } from 'fs';
@@ -311,7 +311,7 @@ describe('F2b: mesh_peer_up (#108) and the peer-label flag', () => {
   // reason attached, and it is the only thing standing behind the walk.
   it('the party-free allowlist itself is pinned — widening it disarms the walk', () => {
     expect([...PARTY_FREE_LABELS].sort()).toEqual([
-      'direction', 'error_code', 'kind', 'le', 'outcome', 'state', 'status', 'topic',
+      'direction', 'error_code', 'kind', 'le', 'outcome', 'state', 'status',
     ]);
   });
 
@@ -340,7 +340,7 @@ describe('F2b: mesh_peer_up (#108) and the peer-label flag', () => {
     incSent('a-one'); incReceived('a-one'); incAclDenied('a-one'); incError('ACL_DENIED');
     // #136's series. The walk's blind-spot arm reds on a declared-but-unexercised
     // metric, which is how this line came to exist rather than being remembered.
-    incSysFanout('sys.presence.turn', 'refused');
+    incTopicFanout('filtered');
 
     const rendered = renderMetrics(db).split('\n');
     const series = rendered.filter(l => l.length > 0 && !l.startsWith('#'));

@@ -9,7 +9,7 @@ type LabeledCounter = Map<string, number>;
 // Key encoding: label VALUES joined by NUL (\0) in a FIXED order. NUL cannot
 // appear in agent ids / kinds / statuses / error codes.
 const msgStatus: LabeledCounter   = new Map(); // key = `${kind}\0${status}`
-const sysFanout: LabeledCounter   = new Map(); // #136: key = `${topic}\0${outcome}` — sys.* topics ONLY
+const topicFanout: LabeledCounter = new Map(); // #136: key = outcome. NO topic label — see incTopicFanout.
 const sent: LabeledCounter        = new Map(); // key = from_agent
 const received: LabeledCounter    = new Map(); // key = to_agent
 const aclDenied: LabeledCounter   = new Map(); // key = from_agent
@@ -64,31 +64,31 @@ export function incPeerRelay(alias: string, direction: string, outcome: string):
 }
 
 /**
- * #136 — server-originated fan-out on a SYSTEM topic.
+ * #136 — per-subscriber outcomes of a TOPIC fan-out.
  *
- * Why this is not `incAclDenied`. `mesh_acl_denied_total`'s HELP says
- * "ACL-denied send attempts, by sender". A `sys.presence.turn` delivery refused
- * by a SUBSCRIBER's ACL is neither a send attempt nor by that sender — the
- * turning agent sent nothing. Counting it there produced ~5,800 refusals an
- * hour attributed to no client, which swamped the counter so completely that a
- * real refusal storm would have been invisible in it, and cost an hour of
- * attribution work across three agents during an incident.
+ * WHY THIS IS NOT `incAclDenied`. On a topic publish the sender does NOT choose
+ * the recipients: it names a topic, and the ACL filters the subscriber list.
+ * Counting each filtered subscriber as an "ACL-denied send attempt by sender"
+ * is a semantics error for EVERY topic — the sender attempted one publish, not
+ * N sends to N agents it never named.
  *
- * THE `topic` LABEL IS PARTY-FREE ONLY BECAUSE OF THE GUARD BELOW. Topic names
- * are NOT party-free in general: `routeSubscribe` calls `getOrCreateTopic` with
- * whatever an agent asks for, so an agent can create a topic named after a
- * person and an unguarded label would put that name in unauthenticated
- * `/metrics` — reopening exactly the hole #126 closed. Restricting the series
- * to `sys.` topics, which only this server creates, is what makes the label
- * safe, so the guard is load-bearing rather than defensive.
+ * It surfaced on `sys.presence.turn` because that topic is published ~2/s
+ * fleet-wide by the turn-status publisher, producing ~5,800 "denials" an hour
+ * attributed to no client and swamping the counter so completely that a real
+ * refusal storm would have been invisible in it. The topic was the messenger;
+ * the defect is the semantics.
+ *
+ * THE LABEL SET IS CLOSED BECAUSE THERE IS NO NAME LABEL. Topic names are
+ * agent-chosen — `routeSubscribe` calls `getOrCreateTopic` with whatever an
+ * agent asks for — so a `topic` label CANNOT be made party-free by any guard:
+ * a prefix check only decides which agent-chosen strings get in. An earlier
+ * revision of this series carried `{topic}` behind a `sys.` prefix check and
+ * was reachable — an agent publishing to `sys.<victim-id>` with one other
+ * subscriber put that id in the unauthenticated document. The fix is not a
+ * better guard on the name; it is having no name.
  */
-export const SYS_TOPIC_PREFIX = 'sys.';
-
-export function incSysFanout(topic: string, outcome: string): void {
-  try {
-    if (!topic.startsWith(SYS_TOPIC_PREFIX)) return;
-    bump(sysFanout, `${s(topic)}\0${s(outcome)}`);
-  } catch (_) { /* metrics must never affect delivery */ }
+export function incTopicFanout(outcome: 'delivered' | 'filtered'): void {
+  try { bump(topicFanout, s(outcome)); } catch (_) { /* metrics must never affect delivery */ }
 }
 
 export function incReminderFired(): void {
@@ -206,31 +206,21 @@ export function setPeerUpSource(fn: () => Iterable<{ alias: string; up: boolean 
  *   outcome     'delivered'|'refused'|'rate_limited'|'duplicate'|'transient'
  *   state       'online'|'offline' / 'up'|'down'
  *   status      'delivered'|'queued'|'dropped'|'expired'
- *   topic       ONLY the `sys.` topics this server creates — enforced by the
- *               guard in incSysFanout, NOT by the nature of topic names. Agents
- *               choose topic names freely, so an unrestricted topic label would
- *               carry whatever an agent called its topic.
- *
- * Adding an entry here to make a test pass is the failure this constant exists
- * to prevent: if a label's values can name a party, it is gated, not listed.
  */
 export const PARTY_FREE_LABELS: ReadonlySet<string> = new Set([
-  'direction', 'error_code', 'kind', 'le', 'outcome', 'state', 'status', 'topic',
+  'direction', 'error_code', 'kind', 'le', 'outcome', 'state', 'status',
 ]);
 
 export function renderMetrics(db: Database): string {
   const lines: string[] = [];
 
-  // #136: mesh_sys_fanout_total {topic,outcome} — server-originated system-topic
-  // fan-out, counted HERE and never in mesh_acl_denied_total, so that counter
-  // means what its HELP says.
-  lines.push('# HELP mesh_sys_fanout_total Server-originated system-topic fan-out by topic and outcome. Refusals here are NOT counted in mesh_acl_denied_total or mesh_errors_total, which are for agent send attempts.');
-  lines.push('# TYPE mesh_sys_fanout_total counter');
-  for (const [key, v] of sysFanout) {
-    const sep = key.indexOf('\0');
-    const topic = key.slice(0, sep);
-    const outcome = key.slice(sep + 1);
-    lines.push(`mesh_sys_fanout_total{topic="${escapeLabelValue(topic)}",outcome="${escapeLabelValue(outcome)}"} ${v}`);
+  // #136: mesh_topic_fanout_total {outcome} — per-subscriber outcomes of topic
+  // fan-out. NO topic label: names are agent-chosen, so the label set is closed
+  // only because there is no name in it.
+  lines.push('# HELP mesh_topic_fanout_total Per-subscriber outcomes of topic fan-out. ACL filtering here is NOT counted in mesh_acl_denied_total or mesh_errors_total, which count DIRECT sends where the sender chose the recipient.');
+  lines.push('# TYPE mesh_topic_fanout_total counter');
+  for (const [outcome, v] of topicFanout) {
+    lines.push(`mesh_topic_fanout_total{outcome="${escapeLabelValue(outcome)}"} ${v}`);
   }
 
   // mesh_messages_total {kind,status}
@@ -275,7 +265,7 @@ export function renderMetrics(db: Database): string {
 
   // mesh_acl_denied_total — identity label, gated.
   if (identityLabelsEnabled()) {
-    lines.push('# HELP mesh_acl_denied_total ACL-denied AGENT send attempts, by sender. Excludes server-originated system-topic fan-out, which is counted in mesh_sys_fanout_total (#136).');
+    lines.push('# HELP mesh_acl_denied_total ACL-denied DIRECT send attempts, by sender — sends where the sender chose the recipient. Topic fan-out filtering is counted in mesh_topic_fanout_total (#136).');
     lines.push('# TYPE mesh_acl_denied_total counter');
     for (const [key, v] of aclDenied) {
       lines.push(`mesh_acl_denied_total{from_agent="${escapeLabelValue(key)}"} ${v}`);
@@ -283,7 +273,7 @@ export function renderMetrics(db: Database): string {
   } else {
     let total = 0;
     for (const [, v] of aclDenied) total += v;
-    lines.push('# HELP mesh_acl_denied_total ACL-denied AGENT send attempts, by sender. Excludes server-originated system-topic fan-out, which is counted in mesh_sys_fanout_total (#136). (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)');
+    lines.push('# HELP mesh_acl_denied_total ACL-denied DIRECT send attempts, by sender — sends where the sender chose the recipient. Topic fan-out filtering is counted in mesh_topic_fanout_total (#136). (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)');
     lines.push('# TYPE mesh_acl_denied_total counter');
     lines.push(`mesh_acl_denied_total ${total}`);
   }
@@ -427,7 +417,7 @@ export function renderMetrics(db: Database): string {
 
 export function __resetMetricsForTest(): void {
   msgStatus.clear();
-  sysFanout.clear();
+  topicFanout.clear();
   sent.clear();
   received.clear();
   aclDenied.clear();
