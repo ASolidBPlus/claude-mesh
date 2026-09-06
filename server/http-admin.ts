@@ -43,7 +43,7 @@ import {
 import { generateToken, hashToken, timingSafeEqual } from './auth.ts';
 import {
   PEER_ALIAS_RE, RESERVED_ALIAS, insertPeerKey, listPeerKeys, getLivePeerKeyForAlias,
-  getPeerKeyBySecret, revokePeerKey, getPeerByAlias, listPeers, upsertPeer, getPeerKeyById,
+  getPeerKeyBySecret, revokePeerKey, getPeerByAlias, listPeers, listPeerSubscriptions, upsertPeer, getPeerKeyById,
   type PeerKey, type Peer,
   insertOutboundPeer, getOutboundPeer, listOutboundPeers, updateOutboundPeer, endOutboundPeering, type OutboundPeer,
 } from './db.ts';
@@ -1638,6 +1638,31 @@ function publicPeerFields(row: Peer) {
 }
 
 /**
+ * F4 §5 — every subscription one peered mesh holds here.
+ *
+ * The operator-facing answer to "why is that pod not receiving?". It is the
+ * diagnostic the subscribe path deliberately withholds from the PEER: a peer
+ * learns only that its frame was refused, while the operator of THIS mesh can
+ * see exactly which of its agents are subscribed to what. That split is the
+ * design — uniform refusals outward, full visibility inward.
+ *
+ * 404 on an unregistered alias, which is not a disclosure: the caller holds the
+ * admin token and can list the peers anyway.
+ */
+function handlePeerSubscriptionsGet(ctx: AdminCtx): void {
+  const { res, db, params } = ctx;
+  // `idMatch` names its single capture `id`; the route reads
+  // /peers/:alias/subscriptions to a human, and `alias` is what it means.
+  const alias = params.id as string;
+  if (getPeerByAlias(db, alias) === null) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'no such peer' })); return;
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ alias, subscriptions: listPeerSubscriptions(db, alias) }));
+}
+
+/**
  * #153 — the inbound counterpart to `GET /outbound-peers`.
  *
  * `listPeers` has existed in db.ts since F0b with no HTTP consumer, so an
@@ -2099,6 +2124,9 @@ export const ROUTES: Route[] = [
   // #153: the inbound listing. `exact`, so it cannot swallow /peers/register —
   // and that route is POST regardless, so the two never contend.
   { method: 'GET',    match: exact('/peers'),                        handler: handlePeerGet },
+  // F4: after exact('/peers'), which cannot swallow it — an exact matcher and
+  // a two-segment pattern can never contend.
+  { method: 'GET',    match: idMatch(/^\/peers\/([^/]+)\/subscriptions$/), handler: handlePeerSubscriptionsGet },
   // The ONLY handler-authenticated route: a peer presents a key, which is
   // neither the admin token nor an agent token.
   { method: 'POST',   match: exact('/peers/register'),               handler: handlePeerRegister, auth: 'handler' },
