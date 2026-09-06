@@ -17,6 +17,14 @@
 # error while fixing another keeps the total equal and passes. The ratchet
 # guards the trend, not each error. Driving a baseline to 0 and switching that
 # package to a strict `[ "$count" -eq 0 ]` is what closes that gap for good.
+#
+# THE IDENTITY FILES (`.github/typecheck-identities-*.txt`) are the list behind
+# the number: one line per diagnostic, `file:code:message` with a `#n` suffix
+# for repeats. LINE-INDEPENDENT BY DESIGN (#177) — a line number is a property
+# of everything above an error rather than of the error, so keying on one made
+# every count-preserving edit churn the file while nothing was looking at it.
+# They are read only when the count goes DOWN, to name what left; #80 is where
+# the SET becomes the gate, and that needs identities that survive a line shift.
 set -uo pipefail
 
 # ── The ratchet's own positive control ──────────────────────────────────────
@@ -60,9 +68,36 @@ for pkg in server client; do
   # NUMBER is the gate. A gate and its explanation must not be able to
   # describe different worlds.
   identity_file=".github/typecheck-identities-${pkg}.txt"
+  # AN IDENTITY IS LINE-INDEPENDENT: file : code : message (#177).
+  #
+  # It used to be file:LINE:code, and a line number is not a property of the
+  # error — it is a property of everything above it. F4 moved ~60 identities by
+  # shifting lines while the count held, so the file was never consulted and
+  # never refreshed; the first genuine fix then produced a vanished list of 61
+  # entries containing 2 real ones. A warning list that is routinely wrong gets
+  # skimmed, then ignored, which is the failure this script's own comment
+  # predicts.
+  #
+  # tsc has no enclosing-symbol field, but the MESSAGE names the symbol
+  # ("'touchAgent' is declared but its value is never read"), so the stable
+  # anchor is already in the input. Whitespace is collapsed because tsc wraps
+  # some messages.
+  #
+  # Measured twice: a ten-line shift at the top of db.ts churned 4 old
+  # identities and 0 new ones, and rebasing this branch over a merged PR that
+  # added a test file and edited two others churned 0 — the case the old scheme
+  # produced 61 entries for.
+  #
+  # DUPLICATES GET A #n SUFFIX so the identity file keeps ONE LINE PER
+  # DIAGNOSTIC — the count and the list must describe the same world, which is
+  # the invariant the single extraction below exists for. Dedup runs BEFORE the
+  # sort: appending "#2" after sorting can break the ordering comm depends on
+  # (a space sorts before '#', so "A extra" and "A#2" would swap).
   current_ids=$(echo "$output" \
-    | grep -oE '^[^(]+\([0-9]+,[0-9]+\): error TS[0-9]+' \
-    | sed -E 's/\(([0-9]+),[0-9]+\): error (TS[0-9]+)/:\1:\2/' \
+    | grep -oE '^[^(]+\([0-9]+,[0-9]+\): error TS[0-9]+: .*' \
+    | sed -E 's/\(([0-9]+),[0-9]+\): error (TS[0-9]+): /:\2:/' \
+    | sed -E 's/[[:space:]]+/ /g' \
+    | awk '{ c[$0]++; if (c[$0] > 1) print $0 "#" c[$0]; else print $0 }' \
     | LC_ALL=C sort)
   # LC_ALL=C throughout: `comm` requires both inputs in the SAME collation, and
   # the committed files were sorted in whoever's locale generated them while CI
@@ -124,7 +159,13 @@ for pkg in server client; do
     # baseline reports already-fixed errors as freshly vanished — and a warning
     # list that is routinely wrong gets skimmed, then ignored. Both files move
     # together or the next run lies.
-    echo "::notice::${pkg}: ${baseline} → ${count}. Do NOT lower the baseline until the disappeared list above is confirmed as real fixes; a suppressed or unchecked file looks identical to progress here. To accept: (cd ${pkg} && bunx tsc --noEmit 2>&1 | grep -oE '^[^(]+\\([0-9]+,[0-9]+\\): error TS[0-9]+' | sed -E 's/\\(([0-9]+),[0-9]+\\): error (TS[0-9]+)/:\\1:\\2/' | LC_ALL=C sort > ../${identity_file} && wc -l < ../${identity_file} > ../${baseline_file})"
+    #
+    # #177 removed the OTHER source of that staleness: identities used to carry
+    # a line number, so every count-preserving edit above an error rewrote its
+    # identity while this file was never consulted (it is read only on a DOWN).
+    # They are now file:code:message, so a line shift changes nothing and a
+    # vanished entry is a vanished ERROR.
+    echo "::notice::${pkg}: ${baseline} → ${count}. Do NOT lower the baseline until the disappeared list above is confirmed as real fixes; a suppressed or unchecked file looks identical to progress here. To accept: (cd ${pkg} && bunx tsc --noEmit 2>&1 | grep -oE '^[^(]+\\([0-9]+,[0-9]+\\): error TS[0-9]+: .*' | sed -E 's/\\(([0-9]+),[0-9]+\\): error (TS[0-9]+): /:\\2:/' | sed -E 's/[[:space:]]+/ /g' | awk '{ c[\$0]++; if (c[\$0] > 1) print \$0 \"#\" c[\$0]; else print \$0 }' | LC_ALL=C sort > ../${identity_file} && wc -l < ../${identity_file} > ../${baseline_file})"
   else
     echo "${pkg}: ${count} (baseline ${baseline}) ✅ held"
   fi
