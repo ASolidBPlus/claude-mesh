@@ -72,7 +72,7 @@ Route entry, placed after `exact('/peers')` (which cannot swallow it):
 ## 6. Refusal codes (exact, and where uniformity binds)
 Precedent: `routeDirect`'s remote branch (`router.ts:374-478`) — every cause answers `AGENT_NOT_FOUND` with `unknown agent: <what the caller supplied>`; `KIND_NOT_ALLOWED` is the ONE exception and sits **behind** the ACL check, justified by reachability (#123).
 
-| door | causes that MUST be byte-identical | code / message |
+| door | causes that MUST answer as a PURE FUNCTION OF THE INPUT (same input → same bytes regardless of cause) | code / message |
 |---|---|---|
 | `routeSubscribe` (local agent) | no outbound peering for the prefix (falls through to local, then the new-name ':' rule refuses) · peering lacks kind `topic-subscribe` · empty remainder · second ':' · name >256 bytes | `AGENT_NOT_FOUND`, `unknown topic: ${frame.topic}` |
 | `routePublish` remote branch | no peering · malformed address · **no RIGHT-TO-POST edge** `publisher → orch:trollbox` | `AGENT_NOT_FOUND`, `unknown topic: ${frame.topic}` |
@@ -259,3 +259,5 @@ L. **Paused-peering consequence, stated for the docs and pinned:** `hasOutboundP
 M. **Boot-report SQL precision:** `findInvalidTopicNames` must not flag `orch:trollbox`-style names whose prefix is an outbound alias in ANY state (enabled or disabled) — use `SELECT alias FROM outbound_peers` without an `enabled` filter, so a paused peering does not turn its topics into boot noise.
 
 Success-criteria additions: `bun test __tests__/duplicate-msgid-crash.test.ts __tests__/migration-chain.test.ts __tests__/peer-keys.test.ts __tests__/outbound-peers.test.ts __tests__/http-admin-topics.test.ts` green; `bash .github/scripts/typecheck-ratchet.sh` exits 0 with the baseline UNCHANGED at 116/37.
+N. **Uniformity is "pure function of the input", not "byte-identical across causes"** (builder finding, commit 5): the refusal message echoes what the caller supplied, so five different inputs cannot and must not produce identical bytes. Test shape: per cause, assert the answer depends only on the input; then drive ONE input through TWO causes (e.g. `orch:` as an empty remainder, then as an unpeered prefix after deleting the peering) and assert identical bytes — that comparison is the only one that can detect a cause leaking. §9's "asserted as a SET, byte for byte" is read this way.
+O. **Return-peering check must be pinned by the PAUSED case** (builder finding, commit 5): with no row, `JSON.parse(returnPeering.kinds)` throws and the kinds catch converts it into the same refusal, so deleting the explicit `null || enabled !== 1` check leaves every no-row case green. Keep the explicit check and pin it with a row that exists with `enabled = 0`.
