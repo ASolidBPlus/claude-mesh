@@ -50,6 +50,11 @@ export interface Message {
    *  PERMANENT remote refusal. A row carrying it is not pending and was not
    *  delivered; it records the outcome rather than pretending either. */
   failed_code: string | null;
+  /** F4: which mesh and agent a federated topic post came from, as a string to
+   *  SHOW. Never routed on, never an ACL principal, never a metric label — it
+   *  arrives from another mesh and is therefore attacker-supplied. null on
+   *  every path that did not cross a border. */
+  origin: string | null;
 }
 
 export interface Topic {
@@ -195,6 +200,75 @@ export function rebuildAclFkLess(db: Database): void {
   }
 }
 
+/**
+ * F4 — the SAME migration one table over, and for the same reason.
+ *
+ * `subscriptions.agent_id` carried `REFERENCES agents(id) ON DELETE CASCADE`.
+ * A remote subscriber is `pod1:alice`, which names no local agent, so the
+ * foreign key would reject exactly the row federation exists to write. Every
+ * database on disk still has that clause, and `CREATE TABLE IF NOT EXISTS`
+ * does nothing to a table that already exists.
+ *
+ * DROPS ONE FOREIGN KEY, KEEPS THE OTHER. `topic REFERENCES topics(name) ON
+ * DELETE CASCADE` stays: a subscription to a topic that no longer exists is
+ * unusable by anybody, and nothing about federation changes that. The early
+ * return is what makes the second boot a no-op, and it is written as "only the
+ * topic FK remains" rather than "no FKs remain" — the acl version's
+ * `length === 0` would loop forever here, rebuilding a table that is already
+ * correct on every single boot.
+ *
+ * Everything else is rebuildAclFkLess, deliberately: the transaction guard, the
+ * index capture and replay, the pragma outside / DDL inside split, the
+ * restore-on-both-paths finally, and the fatal-on-error. Those choices were
+ * each paid for once (see that function's comments for the measurements) and a
+ * second, subtly different copy is how the pair drifts.
+ */
+export function rebuildSubscriptionsFkLess(db: Database): void {
+  // Same reason as the acl rebuild: `PRAGMA foreign_keys = OFF` is a silent
+  // no-op inside a transaction, so a future tidy-up that wrapped the migration
+  // section would make the DROP/RENAME run under FK enforcement.
+  if (db.inTransaction) {
+    throw new Error('subscriptions rebuild must run outside a transaction: PRAGMA foreign_keys is ignored inside one');
+  }
+
+  try {
+    const fks = db.prepare('PRAGMA foreign_key_list(subscriptions)').all() as { table: string }[];
+    // Already in the target shape: exactly the topics FK and nothing else.
+    if (fks.length === 1 && fks[0]!.table === 'topics') return;
+
+    const indexDdl = (db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='subscriptions' AND sql IS NOT NULL"
+    ).all() as { sql: string }[]).map((r) => r.sql);
+
+    db.exec('PRAGMA foreign_keys = OFF');
+    try {
+      db.transaction(() => {
+        db.exec(`
+          CREATE TABLE subscriptions_new (
+            agent_id      TEXT NOT NULL,
+            topic         TEXT NOT NULL REFERENCES topics(name) ON DELETE CASCADE,
+            subscribed_at INTEGER NOT NULL,
+            PRIMARY KEY (agent_id, topic)
+          );
+        `);
+        db.exec('INSERT INTO subscriptions_new SELECT agent_id, topic, subscribed_at FROM subscriptions');
+        db.exec('DROP TABLE subscriptions');
+        db.exec('ALTER TABLE subscriptions_new RENAME TO subscriptions');
+        for (const ddl of indexDdl) db.exec(ddl);
+      })();
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON');
+    }
+
+    console.log(JSON.stringify({
+      evt: 'db.subscriptions_rebuilt_fkless', indexes_restored: indexDdl.length, at: Date.now(),
+    }));
+  } catch (err) {
+    process.stderr.write(`FATAL: subscriptions FK-less rebuild failed: ${err}\n`);
+    throw err;
+  }
+}
+
 export function openDb(path: string): Database {
   const db = new Database(path);
 
@@ -332,8 +406,22 @@ export function openDb(path: string): Database {
       metadata    TEXT NOT NULL DEFAULT '{}'
     );
 
+    -- F4: agent_id is FK-LESS, for the same reason acl is (see the acl DDL
+    -- above): a subscriber may be a REMOTE id like 'pod1:alice', which by
+    -- definition has no agents(id) row, and a foreign key would make the table
+    -- unable to express the thing F4 exists to express.
+    --
+    -- The referential guarantee MOVES rather than disappearing: deleteAgent
+    -- deletes an agent's subscriptions explicitly, where a reviewer of deletion
+    -- policy will find it, instead of a cascade doing it invisibly in DDL.
+    --
+    -- The TOPIC foreign key STAYS, with its cascade: a subscription to a topic
+    -- that no longer exists is unusable by anyone, local or remote, and nothing
+    -- about federation changes that. Written into the BASE table rather than
+    -- left to the rebuild (§16 B) — otherwise every fresh database would be
+    -- created FK-ful and immediately rebuilt on its first open.
     CREATE TABLE IF NOT EXISTS subscriptions (
-      agent_id     TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      agent_id     TEXT NOT NULL,
       topic        TEXT NOT NULL REFERENCES topics(name) ON DELETE CASCADE,
       subscribed_at INTEGER NOT NULL,
       PRIMARY KEY (agent_id, topic)
@@ -420,6 +508,11 @@ export function openDb(path: string): Database {
   // get tz=NULL and keep behaving exactly as before (UTC cron).
   try { db.exec('ALTER TABLE reminders ADD COLUMN tz TEXT'); } catch {}
 
+  // F4 migration: `origin` on messages — the display-only string naming which
+  // mesh and agent a federated topic post came from. Existing rows get NULL,
+  // which is the honest answer for every message that did not cross a border.
+  try { db.exec('ALTER TABLE messages ADD COLUMN origin TEXT'); } catch {}
+
   // #41 migration: first-class nullable `namespace` on agents (identity label;
   // no routing/ACL/enforcement — inert data). Existing rows get namespace=NULL.
   try { db.exec('ALTER TABLE agents ADD COLUMN namespace TEXT'); } catch {}
@@ -487,6 +580,7 @@ export function openDb(path: string): Database {
   } catch {}
 
   rebuildAclFkLess(db);
+  rebuildSubscriptionsFkLess(db);
 
   return db;
 }
@@ -784,6 +878,14 @@ export function deleteAgent(db: Database, id: string): string[] {
     ).all(id) as { file_path: string }[];
 
     db.prepare('DELETE FROM messages WHERE to_agent = ? AND delivered_at IS NULL').run(id);
+
+    // F4: the subscriptions cascade on agent_id is GONE (the column is FK-less
+    // so a remote id can be stored), so the deletion is explicit here — the
+    // same argument as the acl line below, one table over. Before the topics
+    // delete, because that one cascades to subscriptions by TOPIC and the two
+    // are different predicates: this removes what the agent subscribed TO, that
+    // removes who subscribed to what the agent CREATED.
+    db.prepare('DELETE FROM subscriptions WHERE agent_id = ?').run(id);
 
     db.prepare('DELETE FROM topics WHERE created_by = ?').run(id);
     // F0a: was an ON DELETE CASCADE on acl's foreign keys. Now explicit, because
@@ -1572,6 +1674,9 @@ export function insertMessage(
     content_type?: string;
     sent_at: number;
     expires_at?: number | null;
+    /** F4: display-only provenance. Defaults to null, so every existing caller
+     *  writes exactly what it wrote before. */
+    origin?: string | null;
   }
 ): Message {
   const content_type = msg.content_type ?? 'text/plain';
@@ -1579,11 +1684,12 @@ export function insertMessage(
   const topic = msg.topic ?? null;
   const correlation_id = msg.correlation_id ?? null;
   const expires_at = msg.expires_at ?? null;
+  const origin = msg.origin ?? null;
 
   db.prepare(`
-    INSERT INTO messages (id, kind, from_agent, to_agent, topic, correlation_id, payload, content_type, sent_at, expires_at, delivered_at, acked_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
-  `).run(msg.id, msg.kind, msg.from_agent, to_agent, topic, correlation_id, msg.payload, content_type, msg.sent_at, expires_at);
+    INSERT INTO messages (id, kind, from_agent, to_agent, topic, correlation_id, payload, content_type, sent_at, expires_at, delivered_at, acked_at, origin)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+  `).run(msg.id, msg.kind, msg.from_agent, to_agent, topic, correlation_id, msg.payload, content_type, msg.sent_at, expires_at, origin);
 
   return getMessage(db, msg.id) as Message;
 }

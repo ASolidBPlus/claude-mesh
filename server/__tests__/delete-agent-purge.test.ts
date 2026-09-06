@@ -318,6 +318,27 @@ describe('#91 deleteAgent purges the unusable, keeps the history', () => {
     expect(topicCount()).toBe(1);
   });
 
+  // F4 commit 1 — the subscriptions cascade is being REPLACED, not removed. The
+  // agent_id foreign key has to go so a remote subscriber id can be stored, and
+  // deleting an agent must still take its subscriptions with it. Explicit, for
+  // the same reason as the acl line above: a deletion policy belongs where
+  // somebody reviewing deletions will read it.
+  it('deleting an agent removes its subscriptions', () => {
+    getOrCreateTopic(db, 'news', 'other');
+    db.prepare('INSERT INTO subscriptions (topic, agent_id, subscribed_at) VALUES (?, ?, ?)')
+      .run('news', 'doomed', Date.now());
+    db.prepare('INSERT INTO subscriptions (topic, agent_id, subscribed_at) VALUES (?, ?, ?)')
+      .run('news', 'bystander', Date.now());
+    expect(subsFor('doomed')).toBe(1);            // POSITIVE CONTROL
+
+    deleteAgent(db, 'doomed');
+
+    expect(subsFor('doomed')).toBe(0);
+    // ...and only its own: the bystander's subscription to the SAME topic is
+    // untouched, so this is the agent_id predicate and not the topic cascade.
+    expect(subsFor('bystander')).toBe(1);
+  });
+
   // ── the decision stays in code ─────────────────────────────────────────────
 
   // NO FK CASCADE. Read from the LIVE schema rather than from the source text,

@@ -917,14 +917,41 @@ describe('Referential integrity (FK enforcement)', () => {
     expect(aclRelated(db, 'a', 'b')).toBe(true);
   });
 
-  it('inserting a subscription row with a non-existent agent_id throws a FK violation', () => {
+  // F4: this asserted the subscriptions.agent_id FOREIGN KEY, which is
+  // deliberately gone — a subscriber may be a REMOTE id (`pod1:alice`) that has
+  // no agents(id) row and never will. Same move as the acl pair above: the test
+  // is RE-POINTED at what now owns the guarantee rather than deleted, because
+  // an absence test whose world has been removed cannot fail (#89).
+  //
+  // What owns it now is deleteAgent, and it is a strictly weaker claim than an
+  // FK in one way and a stronger one in another: weaker because a raw INSERT of
+  // a nonexistent local id is no longer rejected, stronger because the deletion
+  // is visible in code a reviewer of deletion policy reads, rather than in DDL.
+  // The raw-INSERT case is what the next test pins.
+  it('deleteAgent removes an agent\'s subscriptions — the cascade, moved into code', () => {
+    const db = freshDb();
+    makeAgent(db, 'creator'); makeAgent(db, 'subber');
+    getOrCreateTopic(db, 'mytopic', 'creator');
+    subscribe(db, 'subber', 'mytopic');
+    expect(getTopicSubscribers(db, 'mytopic')).toEqual(['subber']);
+
+    deleteAgent(db, 'subber');
+
+    expect(getTopicSubscribers(db, 'mytopic')).toEqual([]);
+  });
+
+  // THE F4 POINT, and the mutant-catcher: restoring the agent_id foreign key
+  // would make every remote subscription unwritable, and every other test in
+  // this block would still pass.
+  it('a subscription row may name a REMOTE id that is not a local agent', () => {
     const db = freshDb();
     makeAgent(db, 'creator');
     getOrCreateTopic(db, 'mytopic', 'creator');
     expect(() => {
       db.prepare('INSERT INTO subscriptions (agent_id, topic, subscribed_at) VALUES (?, ?, ?)')
-        .run('ghost-agent', 'mytopic', Date.now());
-    }).toThrow();
+        .run('pod1:alice', 'mytopic', Date.now());
+    }).not.toThrow();
+    expect(getTopicSubscribers(db, 'mytopic')).toEqual(['pod1:alice']);
   });
 
   it('inserting a subscription row with a non-existent topic throws a FK violation', () => {
@@ -1161,5 +1188,65 @@ describe('queryMessages', () => {
     }
     const msgs = queryMessages(db, { limit: 9999 });
     expect(msgs).toHaveLength(5);
+  });
+});
+
+// F4 commit 1 (plan §4, §7) — `messages.origin`: the display-only string that
+// says which mesh and agent a federated topic post came from. Additive column,
+// null on every path that does not set it.
+describe('F4 messages.origin', () => {
+  it('round-trips through insertMessage, and defaults to null', () => {
+    const db = openDb(':memory:');
+    try {
+      registerAgent(db, { id: 'a', token_hash: hashToken('t'), hostname: 'h' });
+      insertMessage(db, {
+        id: 'm-with', kind: 'topic', from_agent: 'topic:trollbox', to_agent: 'a',
+        topic: 'trollbox', payload: 'hi', sent_at: Date.now(), origin: 'pod1:alice',
+      });
+      insertMessage(db, {
+        id: 'm-without', kind: 'direct', from_agent: 'a', to_agent: 'a',
+        payload: 'hi', sent_at: Date.now(),
+      });
+      expect(getMessage(db, 'm-with')!.origin).toBe('pod1:alice');
+      // The DEFAULT is the load-bearing half: every existing writer omits it,
+      // and a column that defaulted to anything else would rewrite their rows.
+      expect(getMessage(db, 'm-without')!.origin).toBe(null);
+    } finally { db.close(); }
+  });
+});
+
+// F4 commit 1 (§16 B, C11) — the rebuild drops ONE of subscriptions' two
+// foreign keys. This pins the one that stays: a topic's removal still takes its
+// subscriptions with it, including a remote subscriber's.
+describe('F4 subscriptions keep the topic foreign key', () => {
+  it('deleting a topic removes its subscriptions, local and remote alike', () => {
+    const db = openDb(':memory:');
+    try {
+      registerAgent(db, { id: 'creator', token_hash: hashToken('t'), hostname: 'h' });
+      getOrCreateTopic(db, 'news', 'creator');
+      db.prepare('INSERT INTO subscriptions (agent_id, topic, subscribed_at) VALUES (?,?,?)')
+        .run('creator', 'news', 1);
+      db.prepare('INSERT INTO subscriptions (agent_id, topic, subscribed_at) VALUES (?,?,?)')
+        .run('pod1:alice', 'news', 1);
+      expect(getTopicSubscribers(db, 'news').sort()).toEqual(['creator', 'pod1:alice']);
+
+      // Via deleteAgent, which is how a topic actually disappears: it deletes
+      // the topics the agent created, and the cascade follows.
+      deleteAgent(db, 'creator');
+
+      expect(getTopicSubscribers(db, 'news')).toEqual([]);
+    } finally { db.close(); }
+  });
+
+  it('a remote subscriber id is STORABLE — the agent_id foreign key is gone', () => {
+    const db = openDb(':memory:');
+    try {
+      registerAgent(db, { id: 'creator', token_hash: hashToken('t'), hostname: 'h' });
+      getOrCreateTopic(db, 'news', 'creator');
+      // `pod1:alice` names no local agent. Under the old DDL this threw.
+      expect(() => db.prepare('INSERT INTO subscriptions (agent_id, topic, subscribed_at) VALUES (?,?,?)')
+        .run('pod1:alice', 'news', 1)).not.toThrow();
+      expect(getTopicSubscribers(db, 'news')).toEqual(['pod1:alice']);
+    } finally { db.close(); }
   });
 });
