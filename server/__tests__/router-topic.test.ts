@@ -305,25 +305,28 @@ describe('routeUnsubscribe', () => {
     // Byte-identical, not merely both-truthy: a `message` added to one branch
     // is exactly how this class comes back, and only comparing the serialized
     // answers side by side catches it.
+    //
+    // WHAT DISCHARGES THE PER-GUARD OBLIGATION, since this is an ABSENCE test
+    // and an absence proves nothing on its own:
+    //   - that the assertion CAN fail: the mutant reinstating the existence
+    //     check reds THIS test (recorded in the PR; re-run it if you touch
+    //     routeUnsubscribe).
+    //   - that it is not vacuous: `unsubscribe removes subscription` below
+    //     proves routeUnsubscribe actually does the work whose refusal was
+    //     removed.
+    //
+    // A third test used to sit here, comparing the result against a
+    // hand-written copy of the old refusal object. It was deleted rather than
+    // repointed: a mutant reinstating the check with any DIFFERENT message
+    // would still have passed it, so it asserted only that `{ok:true}` differs
+    // from one specific historical string — which cannot fail, and read as
+    // coverage while the SET test was doing the work.
     expect(JSON.stringify(exists)).toBe(JSON.stringify(absent));
     expect(exists.ok).toBe(true);
     expect(absent.ok).toBe(true);
     expect(exists.error_code).toBeUndefined();
   });
 
-  // PER-GUARD. The property above is an ABSENCE, so it must be shown that the
-  // assertion can fail: a mutant reinstating the existence check has to produce
-  // a different byte. Without this the test passes just as well against a
-  // routeUnsubscribe that returns a constant.
-  it('#129 CONTROL: reinstating an existence check WOULD produce a different byte', () => {
-    registerAgent(db, { id: 'prober', token_hash: 's'.repeat(64), hostname: 'h1' });
-    getOrCreateTopic(db, 'real-topic', 'prober');
-
-    const real = routeUnsubscribe(db, 'prober', { type: 'unsubscribe', topic: 'real-topic' });
-    // What the deleted branch returned, reconstructed verbatim.
-    const oracle = { ok: false, error_code: 'TOPIC_NOT_FOUND', error_message: 'topic ghost-topic does not exist' };
-    expect(JSON.stringify(real)).not.toBe(JSON.stringify(oracle));
-  });
 
   // The refusal protected no state, so removing it must not have changed any:
   // an unsubscribe by a non-subscriber leaves the real subscriber alone.
