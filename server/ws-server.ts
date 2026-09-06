@@ -79,6 +79,467 @@ interface FrameCtx {
   filesDir: string;
 }
 
+/**
+ * #143 — what the auth frame needs from the connection scope. Every field is a
+ * LIVE reference (the maps are the server's own, not copies) and
+ * `broadcastStatus` is the closure defined in startWsServer — passing a
+ * snapshot of any of them would be the silent way to break this.
+ */
+interface AuthCtx {
+  ws: WebSocket;
+  state: ConnState;
+  db: Database;
+  frame: Record<string, unknown>;
+  parsed: unknown;
+  agentIndex: Map<string, WebSocket>;
+  peerIndex: Map<string, WebSocket>;
+  observerIndex: Map<string, WebSocket>;
+  presenceState: Map<string, PresenceState>;
+  broadcastStatus: (agentId: string, online: boolean, lastSeen: number, excludeWs: WebSocket | null) => void;
+  /** The peer arm clears the auth timer a SECOND time. The call site already
+   *  cleared it before dispatching here, so this is a no-op on an
+   *  already-cleared timer — but it is in the code being moved, so it moves,
+   *  and removing it is a behaviour question that does not belong in a
+   *  mechanical commit. Passed as a callback rather than dropped, so the move
+   *  stays verbatim and the redundancy stays VISIBLE instead of being quietly
+   *  resolved by the refactor. Found by the characterisation tests on the first
+   *  run of this extraction: `ReferenceError: authTimer is not defined`. */
+  clearAuthTimer: () => void;
+}
+
+/**
+ * #143 — THE AUTH FRAME, lifted out of the connection callback verbatim.
+ *
+ * It was 312 lines inside a 567-line closure, and the reasoning in it is
+ * load-bearing (C9 refusal folding, D11 ordering, #92 displacement), so it
+ * moves WITH its comments and without a word changed.
+ *
+ * WHAT THE MOVE CHANGES, and it is the point: the two `return`s that ended
+ * the peer and agent arms used to mean "stop handling this message", and
+ * each was the only thing standing between a completed auth and the
+ * post-auth dispatch. They now mean "leave this function", and the ONE
+ * `return` at the call site carries what both used to. One site instead of
+ * two is the safer shape — but only because the characterisation tests
+ * added before this cut pin what those returns do, from the outside.
+ *
+ * The pre-auth guard (`messageHandled`, `clearTimeout(authTimer)`) stays at
+ * the call site DELIBERATELY: it is about the socket's message stream, not
+ * about the auth frame, and moving it would put the timer's lifetime in a
+ * function that has no other reason to know about it.
+ */
+function handleAuthFrame(ctx: AuthCtx): void {
+  const { ws, state, db, frame, parsed, agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus, clearAuthTimer } = ctx;
+
+  if (typeof parsed !== 'object' || parsed === null || frame.type !== 'auth') {
+    try {
+      ws.send(JSON.stringify({ type: 'error', code: 'AUTH_REQUIRED', message: 'first frame must be auth' }));
+    } catch (_) { /* ignore */ }
+    ws.close(1008, 'auth required');
+    return;
+  }
+
+  // Auth frame handling
+  const agentId = frame.agent_id;
+  const token = frame.token;
+
+  if (typeof agentId !== 'string' || typeof token !== 'string') {
+    try {
+      ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'missing agent_id or token' }));
+    } catch (_) { /* ignore */ }
+    ws.close(1008, 'auth failed');
+    return;
+  }
+
+  // ── F1a (§5.1): PEER AUTH ──────────────────────────────────
+  //
+  // THE DISCRIMINATOR IS THE CREDENTIAL, NEVER THE CLIENT'S FIELD.
+  // A socket is a peer because its token authenticates against
+  // peers.token_hash, and an agent because it authenticates against
+  // agents.token_hash. `protocol` is validated only AFTER a peer
+  // credential has matched, and is never consulted to decide which
+  // table to try — otherwise a client could choose its own semantics
+  // by setting a field, which is the whole class of bug that "trust
+  // the credential, not the claim" exists to prevent.
+  //
+  // TABLES READ HERE: `peers` (this lookup) and `agents` (below).
+  // The union is total for an authenticating id because #98's three
+  // collision gates guarantee an alias and an agent id can never
+  // coincide — so the alias-keyed lookup IS the credential lookup,
+  // and there is no id for which both or neither could match.
+  const peerRow = getPeerByAlias(db, agentId);
+  if (peerRow !== null) {
+    // ONE refusal for every peer-reachable failure, and it is
+    // `unknown agent` — what a stranger already sees.
+    //
+    // Measured before choosing it. The three outcomes a prober can
+    // reach are: nonexistent alias, real alias + wrong token, and
+    // disabled alias + right token. Any message that differs between
+    // them is an oracle:
+    //   - a distinct DISABLED message tells a revoked peer that its
+    //     key was revoked rather than mistyped (this was the bug —
+    //     `invalid token` vs `unknown agent`, reproduced);
+    //   - making all three `invalid token` would instead separate a
+    //     real-alias-wrong-token from a nonexistent alias, trading a
+    //     revocation oracle for an ALIAS-EXISTENCE one.
+    // `unknown agent` is the only choice that adds no signal on
+    // either axis, because it is already the answer to "who?".
+    //
+    // Handled INSIDE this branch rather than falling through to the
+    // agent path. The fall-through produced the right string only
+    // because #98's collision gates make an alias-shaped agent id
+    // impossible — correct by a distant invariant is not the same as
+    // correct, and this is a refusal path where that distinction is
+    // the whole point.
+    // FOLDED PER C9: disabled and wrong-token are one refusal.
+    if (peerRow.disabled === 1 || !validateToken(token, peerRow.token_hash)) {
+      try {
+        ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
+      } catch (_) { /* ignore */ }
+      ws.close(1008, 'auth failed');
+      return;
+    }
+
+    // (b) protocol AFTER the credential matched — ORDERED PER C9.
+    // Cheap-checks-first is faster and tidier and would leak: a
+    // protocol answer before the credential tells an unauthenticated
+    // caller that the alias exists.
+    const claimed = (frame as { protocol?: unknown }).protocol;
+    if (claimed !== PEER_PROTOCOL_VERSION) {
+      console.warn(JSON.stringify({
+        evt: 'peer.protocol_mismatch', alias: agentId,
+        claimed: claimed ?? null, supported: PEER_PROTOCOL_VERSION, at: Date.now(),
+      }));
+      try {
+        ws.send(JSON.stringify({
+          type: 'error', code: 'PROTOCOL_MISMATCH',
+          message: `unsupported protocol; this mesh speaks ${PEER_PROTOCOL_VERSION}`,
+        }));
+      } catch (_) { /* ignore */ }
+      ws.close(1008, 'protocol mismatch');
+      return;
+    }
+
+    // (c) peer connection state. agentId stays NULL — a peer is not
+    // an agent, and every agent-shaped path keys off agentId.
+    state.authed = true;
+    state.peerAlias = agentId;
+    clearAuthTimer();
+
+    // NEWER WINS (D11). ORDER IS LOAD-BEARING: index the new socket
+    // FIRST, then close the old one.
+    //
+    // Measured, because the obvious order is wrong: closing first
+    // fires the old socket's close handler BEFORE the set, at which
+    // point the old socket is still the indexed one — so the close
+    // path's identity guard passes, deletes, and the set immediately
+    // re-adds. The guard becomes INERT, and a mutant removing it
+    // survives (it did). Indexing first means the guard is doing real
+    // work on the common path: the old socket sees that it is no
+    // longer indexed and leaves the new one alone.
+    //
+    // It is also the order that survives the case the guard exists
+    // for — a peer reconnecting because its old socket died, where
+    // the dead socket's close event can arrive AFTER the new one has
+    // authenticated and indexed.
+    //
+    // #105: NO BEHAVIOURAL TEST DISTINGUISHES THE TWO ORDERS.
+    // Measured — inverted order WITH the guard is 646/0, identical to
+    // what ships. THIS COMMENT IS THE CONTROL. The verification
+    // procedure is the 2x2 mutation, order x guard: only the cell
+    // with close-then-index AND no guard misbehaves, so neither
+    // single mutant catches a regression here. A refactor that
+    // restores close-then-index silently RE-INERTS the guard, with
+    // every test still green.
+    const existing = peerIndex.get(agentId);
+    peerIndex.set(agentId, ws);
+    if (existing !== undefined && existing !== ws) {
+      try {
+        existing.send(JSON.stringify({
+          type: 'error', code: 'PEER_REPLACED',
+          message: 'another socket authenticated for this alias',
+        }));
+      } catch (_) { /* ignore */ }
+      try { existing.close(1008, 'peer replaced'); } catch (_) { /* ignore */ }
+    }
+    touchPeer(db, agentId);
+
+    console.log(JSON.stringify({ evt: 'peer.connected', alias: agentId, at: Date.now() }));
+
+    // (e) peer auth_ok: no queue fields — a peer has no mailbox here.
+    try {
+      ws.send(JSON.stringify({ type: 'auth_ok', peer: agentId, protocol: PEER_PROTOCOL_VERSION }));
+    } catch (_) { /* ignore */ }
+
+    // EXPLICIT EARLY RETURN. The agent post-auth block below uses the
+    // LOCAL agentId variable and is not guarded by state.agentId, so
+    // falling through would run setOnline / agentIndex.set / pending
+    // drains / broadcastStatus for an id that names no agent.
+    return;
+  }
+
+  const agent = getAgentById(db, agentId);
+  if (agent === null) {
+    try {
+      ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
+    } catch (_) { /* ignore */ }
+    ws.close(1008, 'auth failed');
+    return;
+  }
+
+  // FOLDED PER C9 (#116). This said `invalid token` while an unknown
+  // id six lines above says `unknown agent` — two answers to ONE
+  // question ("may this caller in?"), which let an UNAUTHENTICATED
+  // network caller enumerate agent ids by reading the difference.
+  //
+  // #104 folded the PEER path for exactly this and the agent path was
+  // never folded, because the comparison that finds it is refusals
+  // side by side, and #104 only put the PEER refusals side by side.
+  //
+  // The frame's own-input refusal above ('missing agent_id or token')
+  // stays distinct: it answers a different question — what the caller
+  // SENT — and reveals nothing about what exists here.
+  if (!validateToken(token, agent.token_hash)) {
+    try {
+      ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
+    } catch (_) { /* ignore */ }
+    ws.close(1008, 'auth failed');
+    return;
+  }
+
+  const connectTime = Date.now();
+  setOnline(db, agentId, true);
+
+  state.authed = true;
+  state.agentId = agentId;
+
+  // #92 — NEWER WINS. A second successful auth for the same agent id
+  // DISPLACES the first socket.
+  //
+  // Before this, agentIndex.set silently overwrote the entry while
+  // the per-socket registry still held the first connection, authed,
+  // carrying the same agentId: two live sockets for one identity.
+  // Direct deliveries went to the newest via agentIndex, while the
+  // orphaned first socket stayed a presence-broadcast candidate and
+  // kept its authed state until it dropped on its own. Anything
+  // iterating the registry saw a ghost.
+  //
+  // Displacing rather than refusing the second auth is the friendlier
+  // half of the choice and matches what agentIndex already implied:
+  // an agent reconnecting over a half-open socket (#67) must be able
+  // to get back in, and refusing it would leave it locked out until
+  // the heartbeat reaped a connection it cannot see.
+  //
+  // ORDER: index first, then close. The close is what makes the old
+  // socket's own close handler run, and that handler deletes from
+  // agentIndex only if the entry is still ITS socket — so setting the
+  // new entry first is what stops the displaced socket's teardown
+  // evicting the live one. Same shape as the peer path's D11.
+  const displaced = agentIndex.get(agentId);
+  agentIndex.set(agentId, ws);
+  if (displaced !== undefined && displaced !== ws) {
+    try {
+      displaced.send(JSON.stringify({
+        type: 'error', code: 'DISPLACED',
+        message: 'displaced by a newer connection',
+      }));
+    } catch (_) { /* the socket may already be gone; displacement still stands */ }
+    // A stated code, so the old client knows it was replaced rather
+    // than dropped, and does not reconnect into a fight with itself.
+    try { displaced.close(1008, 'displaced by a newer connection'); } catch (_) { /* ignore */ }
+  }
+
+  const pending = getPendingMessages(db, agentId);
+  const queued = pending.length;
+
+  // Count pending files without delivering yet (for auth_ok payload)
+  const now = Date.now();
+  const pendingFileRows = db.prepare(`
+    SELECT COUNT(*) as cnt FROM files
+    WHERE to_agent = ?
+      AND delivered_at IS NULL
+      AND (expires_at IS NULL OR expires_at >= ?)
+  `).get(agentId, now) as { cnt: number };
+  const queued_files = pendingFileRows.cnt;
+
+  try {
+    ws.send(JSON.stringify({ type: 'auth_ok', agent_id: agentId, queued, queued_files }));
+  } catch (_) { /* ignore */ }
+  drainQueue(db, agentId, ws);
+  drainFileQueue(db, agentId, ws);
+
+  // Presence-debounce-aware online broadcast. Keys purely off
+  // presenceState (NOT the ws object): `close` removes the old ws from
+  // registry/agentIndex synchronously before any reconnect's auth runs
+  // (single-threaded event loop), so a flap-back is detected here.
+  const existing = presenceState.get(agentId);
+  if (existing && existing.pendingOfflineTimer !== null) {
+    // Flapped back inside the debounce window. Peers never saw offline
+    // (timer hadn't fired). Cancel the pending offline AND suppress the
+    // re-online broadcast — net zero churn. onlineBroadcast stays true.
+    clearTimeout(existing.pendingOfflineTimer);
+    existing.pendingOfflineTimer = null;
+  } else if (existing && existing.onlineBroadcast) {
+    // #152 — A DISPLACING AUTH IS NOT AN ARRIVAL.
+    //
+    // Reaching here means peers were told this agent is online and
+    // have not been told otherwise: no offline was broadcast (that
+    // deletes the state) and none is pending (that is the branch
+    // above). The only way to auth into that is over a socket that
+    // was already live for this id — a displacement — and the
+    // displaced socket's own close correctly broadcasts nothing
+    // (identity-guarded teardown, #92). Broadcasting online here put
+    // an ARRIVAL WITH NO DEPARTURE on the presence stream.
+    //
+    // Direction was always safe: never an unpaired departure, no
+    // reachable agent marked offline. The cost is to consumers that
+    // count transitions or infer session boundaries from the stream
+    // — mesh-chat's roster among them.
+    //
+    // KEYED ON PRESENCE, NOT ON THE SOCKET, and the reason needs no
+    // prediction about future code. This branch suppresses a
+    // broadcast because OBSERVERS ALREADY BELIEVE THIS AGENT IS
+    // ONLINE — and `onlineBroadcast` IS that fact, the variable whose
+    // meaning is the premise. The `displaced` local a few lines up is
+    // EVIDENCE FOR the fact, not the fact. A branch should test its
+    // own premise rather than a correlate; the day the two diverge,
+    // code keyed on the correlate is wrong for a reason invisible at
+    // the line.
+    //
+    // The two are equivalent today and that was checked rather than
+    // assumed, structurally as well as by test: agentIndex.delete has
+    // exactly one site, behind #92's identity guard, so no reachable
+    // state separates them. A corollary of keying on the premise is
+    // that a second path to a doubled socket is covered without being
+    // remembered — a corollary, not the reason.
+    //
+    // PRE-EXISTING, NOT #145's. This block is byte-identical to
+    // e3de095^ (verified). #145 changed how OFTEN it is reached, by
+    // making displacement the deliberate reconnect path; it also
+    // removed the spurious later departure that used to follow, which
+    // was the dangerous half and a different defect.
+  } else {
+    // Genuinely fresh / long-offline connect: broadcast online as today.
+    broadcastStatus(agentId, true, connectTime, ws);
+    presenceState.set(agentId, { pendingOfflineTimer: null, onlineBroadcast: true });
+  }
+
+  // SAFETY INVARIANT: observerIndex is the SOLE set the tap fan-out writes
+  // to. Membership is added here exactly once, ONLY iff isObserver(agentId)
+  // (admin-granted), and removed on disconnect/revoke. There is no other
+  // writer, so a non-observer connection can never receive a tap frame.
+  // Wrapped so an observer-lookup failure can never break auth or delivery.
+  try {
+    if (isObserver(db, agentId)) {
+      observerIndex.set(agentId, ws);
+    }
+  } catch (_) { /* tap must never affect auth or delivery */ }
+
+  return;
+}
+
+/**
+ * #143 — what a socket teardown needs from the connection scope. Same rule as
+ * AuthCtx: every field is a LIVE reference, never a snapshot.
+ */
+interface CloseCtx {
+  ws: WebSocket;
+  db: Database;
+  registry: Map<WebSocket, ConnState>;
+  connections: Set<WebSocket>;
+  agentIndex: Map<string, WebSocket>;
+  peerIndex: Map<string, WebSocket>;
+  observerIndex: Map<string, WebSocket>;
+  presenceState: Map<string, PresenceState>;
+  presenceDebounceMs: number;
+  broadcastStatus: (agentId: string, online: boolean, lastSeen: number, excludeWs: WebSocket | null) => void;
+  clearAuthTimer: () => void;
+}
+
+/**
+ * #143 — SOCKET TEARDOWN, lifted verbatim out of the connection callback.
+ *
+ * Both identity guards live here (#92 for agents, D11 for peers) and both are
+ * the difference between a reconnect and an outage, so this moves with its
+ * reasoning and nothing else.
+ *
+ * It has no early-return hazard of the kind the auth extraction had: every
+ * `return` in it already meant "this teardown is done", and there is no code
+ * after the handler to fall through to.
+ */
+function handleSocketClose(ctx: CloseCtx): void {
+  const { ws, db, registry, connections, agentIndex, peerIndex, observerIndex,
+          presenceState, presenceDebounceMs, broadcastStatus, clearAuthTimer } = ctx;
+  clearAuthTimer();
+  connections.delete(ws);
+  const connState = registry.get(ws);
+  registry.delete(ws);
+
+  // F1a: a peer socket branches FIRST and never touches agentIndex or
+  // setOnline — those are agent semantics and a peer has none.
+  //
+  // IDENTITY-GUARDED delete (#92's shape): evict only if the indexed
+  // socket IS this one. Without the guard a replaced socket's late
+  // close evicts the REPLACEMENT, leaving the alias unroutable while a
+  // healthy socket sits connected — the map and the world disagreeing
+  // with nothing reporting it.
+  if (connState?.peerAlias != null) {
+    const alias = connState.peerAlias;
+    if (peerIndex.get(alias) === ws) peerIndex.delete(alias);
+    console.log(JSON.stringify({ evt: 'peer.disconnected', alias, at: Date.now() }));
+    return;
+  }
+
+  if (connState && connState.authed && connState.agentId !== null) {
+    const agentId = connState.agentId;
+
+    // #92 — IDENTITY-GUARDED TEARDOWN, the other half of newer-wins.
+    //
+    // When a second auth displaces this socket, THIS handler runs for
+    // the displaced one while the agent is still very much online on
+    // the newer socket. Unguarded, it would delete the agentIndex entry
+    // that now points at the LIVE socket, mark the agent offline, and
+    // broadcast a presence departure — turning a successful reconnect
+    // into an outage. The peer path has carried this guard since D11;
+    // the agent path did not, which is why displacement could not be
+    // added without it.
+    //
+    // A late close from an already-replaced socket is the same case and
+    // is handled by the same test.
+    if (agentIndex.get(agentId) !== ws) {
+      try { registry.delete(ws); } catch (_) { /* never throw on close */ }
+      return;
+    }
+
+    setOnline(db, agentId, false);
+    agentIndex.delete(agentId);
+    try { observerIndex.delete(agentId); } catch (_) { /* never throw on close */ }
+
+    const disconnectTime = Date.now();
+    const ps = presenceState.get(agentId);
+    // Only schedule/emit offline if peers currently believe this agent
+    // is online. (ps undefined is not reachable in the normal flow, but
+    // the guard is conservatively safe.)
+    if (ps && ps.onlineBroadcast) {
+      if (presenceDebounceMs === 0) {
+        // Legacy / debounce-disabled: broadcast offline immediately.
+        broadcastStatus(agentId, false, disconnectTime, null);
+        presenceState.delete(agentId);
+      } else {
+        // Debounced: arm a timer. If the agent reconnects before it
+        // fires, the connect handler cancels it. If it fires, the agent
+        // is still gone → offline.
+        if (ps.pendingOfflineTimer !== null) clearTimeout(ps.pendingOfflineTimer);
+        ps.pendingOfflineTimer = setTimeout(() => {
+          // Reaching here means the connect handler did NOT cancel us →
+          // still offline.
+          broadcastStatus(agentId, false, Date.now(), null);
+          presenceState.delete(agentId);
+        }, presenceDebounceMs);
+      }
+    }
+  }
+}
+
 // Handlers are synchronous TODAY. The return type admits a promise anyway so
 // the dispatcher's guard is COLOUR-BLIND (#94): a guard whose coverage depends
 // on handlers staying sync is one `async` keyword away from being disabled,
@@ -611,11 +1072,23 @@ export function startWsServer(
         const state: ConnState = { ws, agentId: null, peerAlias: null, authed: false };
         registry.set(ws, state);
 
-        let authed = false;
+        // #143: NO local `authed` mirror. It used to sit here beside
+        // `state.authed`, set at both assignment sites together and read by
+        // different consumers — the pre-auth guard and the auth timer read the
+        // local, the presence fan-out and the close handler read the field.
+        // One fact with two homes is the shape this repo keeps finding drift
+        // in; here it also blocked the extraction below, because a captured
+        // mutable local cannot move into a named function without becoming a
+        // return value or a holder.
+        //
+        // Safe by CONSTRUCTION (exactly two assignment sites, both setting
+        // both) and confirmed by MEASUREMENT (instrumented at all three read
+        // sites, the two never diverged across 805 tests). The construction is
+        // the argument; the measurement only says nothing contradicted it.
         let messageHandled = false;
 
         const authTimer = setTimeout(() => {
-          if (!authed) {
+          if (!state.authed) {
             try {
               ws.send(JSON.stringify({ type: 'error', code: 'AUTH_TIMEOUT', message: 'no auth frame received within 5 seconds' }));
             } catch (_) { /* ignore */ }
@@ -628,7 +1101,7 @@ export function startWsServer(
           try {
             parsed = JSON.parse(data.toString());
           } catch (_) {
-            if (!authed) {
+            if (!state.authed) {
               if (messageHandled) return;
               messageHandled = true;
               clearTimeout(authTimer);
@@ -642,318 +1115,21 @@ export function startWsServer(
 
           const frame = parsed as Record<string, unknown>;
 
-          if (!authed) {
+          if (!state.authed) {
             // Pre-auth: only process first frame
             if (messageHandled) return;
             messageHandled = true;
             clearTimeout(authTimer);
 
-            if (typeof parsed !== 'object' || parsed === null || frame.type !== 'auth') {
-              try {
-                ws.send(JSON.stringify({ type: 'error', code: 'AUTH_REQUIRED', message: 'first frame must be auth' }));
-              } catch (_) { /* ignore */ }
-              ws.close(1008, 'auth required');
-              return;
-            }
-
-            // Auth frame handling
-            const agentId = frame.agent_id;
-            const token = frame.token;
-
-            if (typeof agentId !== 'string' || typeof token !== 'string') {
-              try {
-                ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'missing agent_id or token' }));
-              } catch (_) { /* ignore */ }
-              ws.close(1008, 'auth failed');
-              return;
-            }
-
-            // ── F1a (§5.1): PEER AUTH ──────────────────────────────────
-            //
-            // THE DISCRIMINATOR IS THE CREDENTIAL, NEVER THE CLIENT'S FIELD.
-            // A socket is a peer because its token authenticates against
-            // peers.token_hash, and an agent because it authenticates against
-            // agents.token_hash. `protocol` is validated only AFTER a peer
-            // credential has matched, and is never consulted to decide which
-            // table to try — otherwise a client could choose its own semantics
-            // by setting a field, which is the whole class of bug that "trust
-            // the credential, not the claim" exists to prevent.
-            //
-            // TABLES READ HERE: `peers` (this lookup) and `agents` (below).
-            // The union is total for an authenticating id because #98's three
-            // collision gates guarantee an alias and an agent id can never
-            // coincide — so the alias-keyed lookup IS the credential lookup,
-            // and there is no id for which both or neither could match.
-            const peerRow = getPeerByAlias(db, agentId);
-            if (peerRow !== null) {
-              // ONE refusal for every peer-reachable failure, and it is
-              // `unknown agent` — what a stranger already sees.
-              //
-              // Measured before choosing it. The three outcomes a prober can
-              // reach are: nonexistent alias, real alias + wrong token, and
-              // disabled alias + right token. Any message that differs between
-              // them is an oracle:
-              //   - a distinct DISABLED message tells a revoked peer that its
-              //     key was revoked rather than mistyped (this was the bug —
-              //     `invalid token` vs `unknown agent`, reproduced);
-              //   - making all three `invalid token` would instead separate a
-              //     real-alias-wrong-token from a nonexistent alias, trading a
-              //     revocation oracle for an ALIAS-EXISTENCE one.
-              // `unknown agent` is the only choice that adds no signal on
-              // either axis, because it is already the answer to "who?".
-              //
-              // Handled INSIDE this branch rather than falling through to the
-              // agent path. The fall-through produced the right string only
-              // because #98's collision gates make an alias-shaped agent id
-              // impossible — correct by a distant invariant is not the same as
-              // correct, and this is a refusal path where that distinction is
-              // the whole point.
-              // FOLDED PER C9: disabled and wrong-token are one refusal.
-              if (peerRow.disabled === 1 || !validateToken(token, peerRow.token_hash)) {
-                try {
-                  ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
-                } catch (_) { /* ignore */ }
-                ws.close(1008, 'auth failed');
-                return;
-              }
-
-              // (b) protocol AFTER the credential matched — ORDERED PER C9.
-              // Cheap-checks-first is faster and tidier and would leak: a
-              // protocol answer before the credential tells an unauthenticated
-              // caller that the alias exists.
-              const claimed = (frame as { protocol?: unknown }).protocol;
-              if (claimed !== PEER_PROTOCOL_VERSION) {
-                console.warn(JSON.stringify({
-                  evt: 'peer.protocol_mismatch', alias: agentId,
-                  claimed: claimed ?? null, supported: PEER_PROTOCOL_VERSION, at: Date.now(),
-                }));
-                try {
-                  ws.send(JSON.stringify({
-                    type: 'error', code: 'PROTOCOL_MISMATCH',
-                    message: `unsupported protocol; this mesh speaks ${PEER_PROTOCOL_VERSION}`,
-                  }));
-                } catch (_) { /* ignore */ }
-                ws.close(1008, 'protocol mismatch');
-                return;
-              }
-
-              // (c) peer connection state. agentId stays NULL — a peer is not
-              // an agent, and every agent-shaped path keys off agentId.
-              authed = true;
-              state.authed = true;
-              state.peerAlias = agentId;
-              clearTimeout(authTimer);
-
-              // NEWER WINS (D11). ORDER IS LOAD-BEARING: index the new socket
-              // FIRST, then close the old one.
-              //
-              // Measured, because the obvious order is wrong: closing first
-              // fires the old socket's close handler BEFORE the set, at which
-              // point the old socket is still the indexed one — so the close
-              // path's identity guard passes, deletes, and the set immediately
-              // re-adds. The guard becomes INERT, and a mutant removing it
-              // survives (it did). Indexing first means the guard is doing real
-              // work on the common path: the old socket sees that it is no
-              // longer indexed and leaves the new one alone.
-              //
-              // It is also the order that survives the case the guard exists
-              // for — a peer reconnecting because its old socket died, where
-              // the dead socket's close event can arrive AFTER the new one has
-              // authenticated and indexed.
-              //
-              // #105: NO BEHAVIOURAL TEST DISTINGUISHES THE TWO ORDERS.
-              // Measured — inverted order WITH the guard is 646/0, identical to
-              // what ships. THIS COMMENT IS THE CONTROL. The verification
-              // procedure is the 2x2 mutation, order x guard: only the cell
-              // with close-then-index AND no guard misbehaves, so neither
-              // single mutant catches a regression here. A refactor that
-              // restores close-then-index silently RE-INERTS the guard, with
-              // every test still green.
-              const existing = peerIndex.get(agentId);
-              peerIndex.set(agentId, ws);
-              if (existing !== undefined && existing !== ws) {
-                try {
-                  existing.send(JSON.stringify({
-                    type: 'error', code: 'PEER_REPLACED',
-                    message: 'another socket authenticated for this alias',
-                  }));
-                } catch (_) { /* ignore */ }
-                try { existing.close(1008, 'peer replaced'); } catch (_) { /* ignore */ }
-              }
-              touchPeer(db, agentId);
-
-              console.log(JSON.stringify({ evt: 'peer.connected', alias: agentId, at: Date.now() }));
-
-              // (e) peer auth_ok: no queue fields — a peer has no mailbox here.
-              try {
-                ws.send(JSON.stringify({ type: 'auth_ok', peer: agentId, protocol: PEER_PROTOCOL_VERSION }));
-              } catch (_) { /* ignore */ }
-
-              // EXPLICIT EARLY RETURN. The agent post-auth block below uses the
-              // LOCAL agentId variable and is not guarded by state.agentId, so
-              // falling through would run setOnline / agentIndex.set / pending
-              // drains / broadcastStatus for an id that names no agent.
-              return;
-            }
-
-            const agent = getAgentById(db, agentId);
-            if (agent === null) {
-              try {
-                ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
-              } catch (_) { /* ignore */ }
-              ws.close(1008, 'auth failed');
-              return;
-            }
-
-            // FOLDED PER C9 (#116). This said `invalid token` while an unknown
-            // id six lines above says `unknown agent` — two answers to ONE
-            // question ("may this caller in?"), which let an UNAUTHENTICATED
-            // network caller enumerate agent ids by reading the difference.
-            //
-            // #104 folded the PEER path for exactly this and the agent path was
-            // never folded, because the comparison that finds it is refusals
-            // side by side, and #104 only put the PEER refusals side by side.
-            //
-            // The frame's own-input refusal above ('missing agent_id or token')
-            // stays distinct: it answers a different question — what the caller
-            // SENT — and reveals nothing about what exists here.
-            if (!validateToken(token, agent.token_hash)) {
-              try {
-                ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
-              } catch (_) { /* ignore */ }
-              ws.close(1008, 'auth failed');
-              return;
-            }
-
-            const connectTime = Date.now();
-            setOnline(db, agentId, true);
-
-            authed = true;
-            state.authed = true;
-            state.agentId = agentId;
-
-            // #92 — NEWER WINS. A second successful auth for the same agent id
-            // DISPLACES the first socket.
-            //
-            // Before this, agentIndex.set silently overwrote the entry while
-            // the per-socket registry still held the first connection, authed,
-            // carrying the same agentId: two live sockets for one identity.
-            // Direct deliveries went to the newest via agentIndex, while the
-            // orphaned first socket stayed a presence-broadcast candidate and
-            // kept its authed state until it dropped on its own. Anything
-            // iterating the registry saw a ghost.
-            //
-            // Displacing rather than refusing the second auth is the friendlier
-            // half of the choice and matches what agentIndex already implied:
-            // an agent reconnecting over a half-open socket (#67) must be able
-            // to get back in, and refusing it would leave it locked out until
-            // the heartbeat reaped a connection it cannot see.
-            //
-            // ORDER: index first, then close. The close is what makes the old
-            // socket's own close handler run, and that handler deletes from
-            // agentIndex only if the entry is still ITS socket — so setting the
-            // new entry first is what stops the displaced socket's teardown
-            // evicting the live one. Same shape as the peer path's D11.
-            const displaced = agentIndex.get(agentId);
-            agentIndex.set(agentId, ws);
-            if (displaced !== undefined && displaced !== ws) {
-              try {
-                displaced.send(JSON.stringify({
-                  type: 'error', code: 'DISPLACED',
-                  message: 'displaced by a newer connection',
-                }));
-              } catch (_) { /* the socket may already be gone; displacement still stands */ }
-              // A stated code, so the old client knows it was replaced rather
-              // than dropped, and does not reconnect into a fight with itself.
-              try { displaced.close(1008, 'displaced by a newer connection'); } catch (_) { /* ignore */ }
-            }
-
-            const pending = getPendingMessages(db, agentId);
-            const queued = pending.length;
-
-            // Count pending files without delivering yet (for auth_ok payload)
-            const now = Date.now();
-            const pendingFileRows = db.prepare(`
-              SELECT COUNT(*) as cnt FROM files
-              WHERE to_agent = ?
-                AND delivered_at IS NULL
-                AND (expires_at IS NULL OR expires_at >= ?)
-            `).get(agentId, now) as { cnt: number };
-            const queued_files = pendingFileRows.cnt;
-
-            try {
-              ws.send(JSON.stringify({ type: 'auth_ok', agent_id: agentId, queued, queued_files }));
-            } catch (_) { /* ignore */ }
-            drainQueue(db, agentId, ws);
-            drainFileQueue(db, agentId, ws);
-
-            // Presence-debounce-aware online broadcast. Keys purely off
-            // presenceState (NOT the ws object): `close` removes the old ws from
-            // registry/agentIndex synchronously before any reconnect's auth runs
-            // (single-threaded event loop), so a flap-back is detected here.
-            const existing = presenceState.get(agentId);
-            if (existing && existing.pendingOfflineTimer !== null) {
-              // Flapped back inside the debounce window. Peers never saw offline
-              // (timer hadn't fired). Cancel the pending offline AND suppress the
-              // re-online broadcast — net zero churn. onlineBroadcast stays true.
-              clearTimeout(existing.pendingOfflineTimer);
-              existing.pendingOfflineTimer = null;
-            } else if (existing && existing.onlineBroadcast) {
-              // #152 — A DISPLACING AUTH IS NOT AN ARRIVAL.
-              //
-              // Reaching here means peers were told this agent is online and
-              // have not been told otherwise: no offline was broadcast (that
-              // deletes the state) and none is pending (that is the branch
-              // above). The only way to auth into that is over a socket that
-              // was already live for this id — a displacement — and the
-              // displaced socket's own close correctly broadcasts nothing
-              // (identity-guarded teardown, #92). Broadcasting online here put
-              // an ARRIVAL WITH NO DEPARTURE on the presence stream.
-              //
-              // Direction was always safe: never an unpaired departure, no
-              // reachable agent marked offline. The cost is to consumers that
-              // count transitions or infer session boundaries from the stream
-              // — mesh-chat's roster among them.
-              //
-              // KEYED ON PRESENCE, NOT ON THE SOCKET, and the reason needs no
-              // prediction about future code. This branch suppresses a
-              // broadcast because OBSERVERS ALREADY BELIEVE THIS AGENT IS
-              // ONLINE — and `onlineBroadcast` IS that fact, the variable whose
-              // meaning is the premise. The `displaced` local a few lines up is
-              // EVIDENCE FOR the fact, not the fact. A branch should test its
-              // own premise rather than a correlate; the day the two diverge,
-              // code keyed on the correlate is wrong for a reason invisible at
-              // the line.
-              //
-              // The two are equivalent today and that was checked rather than
-              // assumed, structurally as well as by test: agentIndex.delete has
-              // exactly one site, behind #92's identity guard, so no reachable
-              // state separates them. A corollary of keying on the premise is
-              // that a second path to a doubled socket is covered without being
-              // remembered — a corollary, not the reason.
-              //
-              // PRE-EXISTING, NOT #145's. This block is byte-identical to
-              // e3de095^ (verified). #145 changed how OFTEN it is reached, by
-              // making displacement the deliberate reconnect path; it also
-              // removed the spurious later departure that used to follow, which
-              // was the dangerous half and a different defect.
-            } else {
-              // Genuinely fresh / long-offline connect: broadcast online as today.
-              broadcastStatus(agentId, true, connectTime, ws);
-              presenceState.set(agentId, { pendingOfflineTimer: null, onlineBroadcast: true });
-            }
-
-            // SAFETY INVARIANT: observerIndex is the SOLE set the tap fan-out writes
-            // to. Membership is added here exactly once, ONLY iff isObserver(agentId)
-            // (admin-granted), and removed on disconnect/revoke. There is no other
-            // writer, so a non-observer connection can never receive a tap frame.
-            // Wrapped so an observer-lookup failure can never break auth or delivery.
-            try {
-              if (isObserver(db, agentId)) {
-                observerIndex.set(agentId, ws);
-              }
-            } catch (_) { /* tap must never affect auth or delivery */ }
-
+            // #143: the auth frame itself is handled by a named function. The
+            // `return` below is the one both arms used to carry individually —
+            // without it a completed auth falls through to the post-auth
+            // dispatch below, which is what auth-seam.test.ts pins.
+            handleAuthFrame({
+              ws, state, db, frame, parsed,
+              agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus,
+              clearAuthTimer: () => clearTimeout(authTimer),
+            });
             return;
           }
 
@@ -1091,75 +1267,11 @@ export function startWsServer(
         });
 
         ws.on('close', () => {
-          clearTimeout(authTimer);
-          connections.delete(ws);
-          const connState = registry.get(ws);
-          registry.delete(ws);
-
-          // F1a: a peer socket branches FIRST and never touches agentIndex or
-          // setOnline — those are agent semantics and a peer has none.
-          //
-          // IDENTITY-GUARDED delete (#92's shape): evict only if the indexed
-          // socket IS this one. Without the guard a replaced socket's late
-          // close evicts the REPLACEMENT, leaving the alias unroutable while a
-          // healthy socket sits connected — the map and the world disagreeing
-          // with nothing reporting it.
-          if (connState?.peerAlias != null) {
-            const alias = connState.peerAlias;
-            if (peerIndex.get(alias) === ws) peerIndex.delete(alias);
-            console.log(JSON.stringify({ evt: 'peer.disconnected', alias, at: Date.now() }));
-            return;
-          }
-
-          if (connState && connState.authed && connState.agentId !== null) {
-            const agentId = connState.agentId;
-
-            // #92 — IDENTITY-GUARDED TEARDOWN, the other half of newer-wins.
-            //
-            // When a second auth displaces this socket, THIS handler runs for
-            // the displaced one while the agent is still very much online on
-            // the newer socket. Unguarded, it would delete the agentIndex entry
-            // that now points at the LIVE socket, mark the agent offline, and
-            // broadcast a presence departure — turning a successful reconnect
-            // into an outage. The peer path has carried this guard since D11;
-            // the agent path did not, which is why displacement could not be
-            // added without it.
-            //
-            // A late close from an already-replaced socket is the same case and
-            // is handled by the same test.
-            if (agentIndex.get(agentId) !== ws) {
-              try { registry.delete(ws); } catch (_) { /* never throw on close */ }
-              return;
-            }
-
-            setOnline(db, agentId, false);
-            agentIndex.delete(agentId);
-            try { observerIndex.delete(agentId); } catch (_) { /* never throw on close */ }
-
-            const disconnectTime = Date.now();
-            const ps = presenceState.get(agentId);
-            // Only schedule/emit offline if peers currently believe this agent
-            // is online. (ps undefined is not reachable in the normal flow, but
-            // the guard is conservatively safe.)
-            if (ps && ps.onlineBroadcast) {
-              if (presenceDebounceMs === 0) {
-                // Legacy / debounce-disabled: broadcast offline immediately.
-                broadcastStatus(agentId, false, disconnectTime, null);
-                presenceState.delete(agentId);
-              } else {
-                // Debounced: arm a timer. If the agent reconnects before it
-                // fires, the connect handler cancels it. If it fires, the agent
-                // is still gone → offline.
-                if (ps.pendingOfflineTimer !== null) clearTimeout(ps.pendingOfflineTimer);
-                ps.pendingOfflineTimer = setTimeout(() => {
-                  // Reaching here means the connect handler did NOT cancel us →
-                  // still offline.
-                  broadcastStatus(agentId, false, Date.now(), null);
-                  presenceState.delete(agentId);
-                }, presenceDebounceMs);
-              }
-            }
-          }
+          handleSocketClose({
+            ws, db, registry, connections, agentIndex, peerIndex, observerIndex,
+            presenceState, presenceDebounceMs, broadcastStatus,
+            clearAuthTimer: () => clearTimeout(authTimer),
+          });
         });
       });
 
