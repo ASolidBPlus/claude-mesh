@@ -8,7 +8,7 @@ Where to go from here:
 
 - **Sending messages?** [Quickstart](#quickstart) → [the SDK](#41-with-the-sdk).
 - **Writing a client in another language?** [Frame protocol](#3-frame-protocol-reference).
-- **Running the bus?** [Admin API](#6-http-admin-api) · [Build / run](#8-build--run--deploy).
+- **Running the bus?** [Admin API](#7-http-admin-api) · [Build / run](#9-build--run--deploy).
 - **Extending the server?** [What it is](#1-what-it-is) — read the pure-bus rule first.
 
 ---
@@ -83,7 +83,7 @@ A consumer has three raw surfaces to build on:
 
 The [SDK](#41-with-the-sdk) implements everything in this section. Read it if you're writing a client in another language, or want to understand the wire.
 
-All frames are JSON with a `type` field. The client must send `auth` first (within 5 s) before any other frame is accepted. Default ports: WS `7384`, admin `7385` (the Docker image uses `7432`/`7433` — see [§8](#8-build--run--deploy)).
+All frames are JSON with a `type` field. The client must send `auth` first (within 5 s) before any other frame is accepted. Default ports: WS `7384`, admin `7385` (the Docker image uses `7432`/`7433` — see [§9](#9-build--run--deploy)).
 
 ### Handshake
 
@@ -312,7 +312,24 @@ A node needs an `id` + token (`POST /agents`) and at least one ACL entry (`POST 
 
 ---
 
-## 5. Observers and the tap
+## 5. Federation (cross-mesh peering)
+
+Two organisations can run separate meshes and let named agents talk across the
+boundary. Each mesh stays independent: peerings are **directional**, remote
+agents are addressed **`alias:agent`**, traffic is **one hop** and **direct
+messages only**, and an ordinary ACL grant is still required on both sides — a
+peering by itself grants nothing between agents.
+
+**Operators: see [`docs/FEDERATION.md`](docs/FEDERATION.md)** — the setup calls
+with example bodies and responses, what each failure looks like, what you can
+see while it runs, how to tear a peering down, and what is deliberately not
+supported. You do not need to read the design document to run a peering.
+
+`DESIGN_FEDERATION_V2.md` is the design and the reasoning behind it.
+
+---
+
+## 6. Observers and the tap
 
 The tap is the bus's live observability output: a real-time copy of every message flowing through the bus, delivered to authorized observer nodes.
 
@@ -334,7 +351,7 @@ Typical consumers: a live comms-map, an audit log, a scoring engine, a moderatio
 
 ---
 
-## 6. HTTP admin API
+## 7. HTTP admin API
 
 A second HTTP listener (admin port, default `7385`) handles administration. Every endpoint except `/metrics` requires `Authorization: Bearer <MESH_ADMIN_TOKEN>` — with two exceptions: `GET /messages` and `GET /files/:id` also accept an **agent's own bearer token**, node-scoped (see below). `/metrics` is intentionally unauthenticated — keep the admin port on an internal network and don't expose it publicly.
 
@@ -381,7 +398,7 @@ The server also exposes its operations as MCP tools over stdio — for an orches
 
 ---
 
-## 7. Observability
+## 8. Observability
 
 ### `/metrics` (Prometheus)
 Operational aggregates only — no per-conversation/analytic series (those are a consumer's job).
@@ -394,14 +411,14 @@ Counters are in-memory and reset on restart — graph them with `rate()`/`increa
 `mesh_messages_total{status="expired"}` counts messages that crossed their delivery TTL while still **undelivered** (their deliverability died) — not messages deleted from the store, which no longer happens at TTL. It's incremented once per message as it expires, windowed over each cleanup tick; because the counter is in-memory, expiries that cross the TTL boundary while the server is down are not counted (consistent with `rate()`/`increase()` graphing).
 
 ### The tap
-The live message stream — see [§5](#5-observers-and-the-tap). `/metrics` answers *how much / how healthy*, the tap answers *what's flowing now*, the message store answers *what happened*.
+The live message stream — see [§6](#6-observers-and-the-tap). `/metrics` answers *how much / how healthy*, the tap answers *what's flowing now*, the message store answers *what happened*.
 
 ### Durable scheduling (reminders / cron)
 Server-side scheduling that outlives your node: one-shot (`duration`/`due_at`) or recurring (`cron`), with DST-aware per-reminder timezones, surviving restarts and redeploys. Use it for heartbeats, periodic jobs, or deferred follow-ups without keeping an in-process timer alive.
 
 ---
 
-## 8. Build / run / deploy
+## 9. Build / run / deploy
 
 **Stack:** [Bun](https://bun.sh) runtime, `bun:sqlite` (no external DB), `ws` for WebSocket. No analytics dependencies — true to the pure-bus rule.
 
