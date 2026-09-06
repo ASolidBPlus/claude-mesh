@@ -211,7 +211,54 @@ export class MeshClient {
   private lastPongAt = 0;
 
   constructor(config: MeshClientConfig = {}) {
+    MeshClient.assertKnownKeys(config);
     this.config = config;
+    // Fail at CONSTRUCTION, not at connect: see assertKnownKeys for why the
+    // silent version of this was dangerous. Only serverUrl is checked here —
+    // it is the one whose fallback reaches the network. agentId/agentToken are
+    // still validated in resolveConfig, where a missing value cannot send you
+    // somewhere unintended.
+    const serverUrl = config.serverUrl ?? process.env.MESH_SERVER_URL;
+    if (serverUrl === undefined || serverUrl === '') {
+      throw new Error('MeshClient: serverUrl is required (config or MESH_SERVER_URL)');
+    }
+  }
+
+  /**
+   * Reject any config key this client does not implement.
+   *
+   * WHY THIS IS A THROW AND NOT A WARNING. Every field here has an environment
+   * fallback, so a MISSPELLED key is not inert — it is silently replaced by the
+   * environment. `new MeshClient({ url: 'ws://localhost:7400' })` ignores `url`,
+   * finds `serverUrl` undefined, falls back to `process.env.MESH_SERVER_URL`,
+   * and connects to whatever that names. In a container whose environment
+   * points at production, a throwaway script aimed at localhost reaches
+   * PRODUCTION instead, and nothing in the config, the logs, or the type system
+   * says so — `url` is not a type error on an object literal widened to
+   * MeshClientConfig at a call boundary.
+   *
+   * That is not hypothetical: a draft test connected to production exactly this
+   * way, and it is why an incident review had to ask every agent whether one of
+   * their scripts had done it. Silently ignoring an unknown key converts a typo
+   * into a connection to the wrong mesh.
+   *
+   * The environment fallback itself is KEPT — production plugins depend on it.
+   * What changes is that the fallback can no longer be reached by accident.
+   */
+  private static assertKnownKeys(config: MeshClientConfig): void {
+    const KNOWN = [
+      'serverUrl', 'agentId', 'agentToken', 'httpUrl',
+      'pingIntervalMs', 'pongDeadlineMs', 'ackTimeoutMs',
+    ];
+    const unknown = Object.keys(config).filter(k => !KNOWN.includes(k));
+    if (unknown.length > 0) {
+      throw new Error(
+        `MeshClient: unknown config key${unknown.length > 1 ? 's' : ''} ${unknown.map(k => `'${k}'`).join(', ')}. ` +
+        `Known keys: ${KNOWN.join(', ')}. ` +
+        `An unknown key is refused rather than ignored because every field falls back to the environment, ` +
+        `so a typo would silently connect to whatever MESH_SERVER_URL names.`,
+      );
+    }
   }
 
   // ──────────────────────────────────────────────
