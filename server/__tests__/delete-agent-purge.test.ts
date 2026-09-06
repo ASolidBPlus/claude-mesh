@@ -7,6 +7,7 @@ import * as net from 'net';
 import {
   openDb, registerAgent, deleteAgent, insertMessage, markDelivered,
   insertFile, markFileDelivered, getFile, queryMessages,
+  aclGrant, aclCheck, getOrCreateTopic,
 } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
@@ -62,6 +63,11 @@ describe('#91 deleteAgent purges the unusable, keeps the history', () => {
   });
 
   const ids = (rows: { id: string }[]) => rows.map(r => r.id).sort();
+  const aclRowsNaming = (id: string) =>
+    (db.prepare('SELECT COUNT(*) c FROM acl WHERE from_agent = ? OR to_agent = ?').get(id, id) as { c: number }).c;
+  const topicCount = () => (db.prepare('SELECT COUNT(*) c FROM topics').get() as { c: number }).c;
+  const subsFor = (id: string) =>
+    (db.prepare('SELECT COUNT(*) c FROM subscriptions WHERE agent_id = ?').get(id) as { c: number }).c;
   const allMessageIds = () => ids(db.prepare('SELECT id FROM messages').all() as { id: string }[]);
 
   // ── messages ───────────────────────────────────────────────────────────────
@@ -214,6 +220,102 @@ describe('#91 deleteAgent purges the unusable, keeps the history', () => {
     expect(purged).toEqual([path]);
     expect(getFile(db, 'f-orphan')).toBe(null);   // the row is gone…
     expect(existsSync(path)).toBe(true);          // …and the bytes are still here
+  });
+
+  // ── the two statements that were already here ──────────────────────────────
+  //
+  // SEAT 1's FINDING ON #159, and the diagnosis is the part worth keeping. My
+  // mutant set was drawn around what was NEW, not around the function: the acl
+  // and topics deletions appear in that diff as `+` lines (moved into the
+  // transaction and re-indented), so they were IN the diff and still invisible
+  // — the boundary was novelty. A moved line is a new line for coverage
+  // purposes. Both were unpinned: removing either left the file 11/0 green.
+
+  // The consequence is measured, not asserted from the comment. With the acl
+  // deletion removed: 2 rows naming the agent before, 2 after, and a
+  // re-registered id answers TRUE to aclCheck in both directions — it inherits
+  // its predecessor's grants, which is exactly what that line's own comment
+  // says it exists to prevent.
+  it('deletes every acl edge naming the agent, in both directions', () => {
+    aclGrant(db, 'doomed', 'other', 'system');      // doomed may send to other
+    aclGrant(db, 'other', 'doomed', 'system');      // and other to doomed
+    expect(aclRowsNaming('doomed')).toBe(2);        // POSITIVE CONTROL
+
+    deleteAgent(db, 'doomed');
+
+    expect(aclRowsNaming('doomed')).toBe(0);
+  });
+
+  // THE CONTROL FOR THE ABOVE, and the reason the edges must go rather than
+  // merely look untidy: an id can be registered again. Without this, "the rows
+  // are gone" is a housekeeping claim; with it, it is an access-control one.
+  it('CONTROL: an id registered again inherits none of its predecessor\'s grants', () => {
+    aclGrant(db, 'doomed', 'other', 'system');
+    aclGrant(db, 'other', 'doomed', 'system');
+    deleteAgent(db, 'doomed');
+
+    registerAgent(db, { id: 'doomed', token_hash: hashToken('a-new-holder'), hostname: 'h2' });
+
+    expect(aclCheck(db, 'doomed', 'other')).toBe(false);
+    expect(aclCheck(db, 'other', 'doomed')).toBe(false);
+    // ...and the grants are genuinely grantable, so `false` above is the
+    // absence of an edge and not a broken aclCheck.
+    aclGrant(db, 'doomed', 'other', 'system');
+    expect(aclCheck(db, 'doomed', 'other')).toBe(true);
+  });
+
+  // WHAT THE TOPICS DELETION ACTUALLY DOES, which is not what "cleanup"
+  // suggests. `topics.created_by REFERENCES agents(id)` carries NO ON DELETE
+  // clause, so the default is NO ACTION: with that line removed, deleting an
+  // agent that ever created a topic does not leave an orphan — it FAILS with
+  // SQLITE_CONSTRAINT_FOREIGNKEY (measured). The line is what makes the delete
+  // possible at all, so the property pinned here is that it SUCCEEDS.
+  it('an agent that created a topic can be deleted, and its topics go with it', () => {
+    getOrCreateTopic(db, 'doomed-topic', 'doomed');
+    expect(topicCount()).toBe(1);                   // POSITIVE CONTROL
+
+    expect(() => deleteAgent(db, 'doomed')).not.toThrow();
+
+    expect(topicCount()).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) c FROM agents WHERE id = 'doomed'").get()).toEqual({ c: 0 });
+  });
+
+  // A DELIBERATE COST, ON RECORD (seat 1). `subscriptions.topic REFERENCES
+  // topics(name) ON DELETE CASCADE`, so removing the agent's created topics
+  // takes every OTHER agent's subscriptions to those topics with them. That is
+  // pre-existing and unchanged, and it is the one place where "purge only what
+  // can never be used" overstates: a bystander's subscription was usable.
+  //
+  // Pinned rather than fixed, so the behaviour is a choice on the record
+  // instead of a surprise. The wider question — whether a topic should outlive
+  // its creator — is noted for the owner, not decided here.
+  it('a bystander\'s subscription to the agent\'s topic goes with the topic', () => {
+    getOrCreateTopic(db, 'doomed-topic', 'doomed');
+    db.prepare('INSERT INTO subscriptions (topic, agent_id, subscribed_at) VALUES (?, ?, ?)')
+      .run('doomed-topic', 'bystander', Date.now());
+    expect(subsFor('bystander')).toBe(1);           // POSITIVE CONTROL
+
+    deleteAgent(db, 'doomed');
+
+    // Gone — via the topics cascade, not via any statement in deleteAgent.
+    expect(subsFor('bystander')).toBe(0);
+    // The bystander itself is untouched: it is the SUBSCRIPTION that went, not
+    // the agent.
+    expect(db.prepare("SELECT COUNT(*) c FROM agents WHERE id = 'bystander'").get()).toEqual({ c: 1 });
+  });
+
+  // A subscription to somebody ELSE'S topic survives, which is what makes the
+  // test above a statement about the cascade rather than about deletion in
+  // general.
+  it('a subscription to an unrelated topic survives', () => {
+    getOrCreateTopic(db, 'other-topic', 'other');
+    db.prepare('INSERT INTO subscriptions (topic, agent_id, subscribed_at) VALUES (?, ?, ?)')
+      .run('other-topic', 'bystander', Date.now());
+
+    deleteAgent(db, 'doomed');
+
+    expect(subsFor('bystander')).toBe(1);
+    expect(topicCount()).toBe(1);
   });
 
   // ── the decision stays in code ─────────────────────────────────────────────
