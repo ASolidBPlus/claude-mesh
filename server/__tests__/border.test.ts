@@ -455,6 +455,12 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
   // (side-effect, `export *`, dynamic, require) and the double-quoted form that
   // was measured fail-open in the previous pin.
   //
+  // Two kinds of true negative, and they catch different failures. `import type`
+  // is absent because the TRANSPILER erases it. `./a-sibling.ts` and `'ws'` are
+  // absent because OUR FILTER excludes them — and without those two lines a
+  // classifier that dropped the filter and returned every import passed this
+  // test, since everything else here is cross-package.
+  //
   // The two commented-out imports — one line, one block — must also be absent.
   // That is the property which justified deleting this file's comment-stripping
   // code when the classifier moved to the transpiler; without it in the control,
@@ -470,7 +476,14 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
       `const e = require('../client/x-require.ts');`,
       `// import { F } from '../client/x-line-comment.ts';`,    // not code
       `/* import { G } from '../client/x-block-comment.ts'; */`, // not code either
-      `void [B, C, d, e];`,
+      // TRUE NEGATIVES FOR THE FILTER, distinct from the type import's true
+      // negative for the transpiler. Measured: without these, a classifier that
+      // dropped the '../client/' filter entirely and returned EVERY import still
+      // passed this test — because every other import here happens to be
+      // cross-package, so there was nothing for the filter to exclude.
+      `import { H } from './a-sibling.ts';`,                    // in-package relative
+      `import { WebSocket } from 'ws';`,                        // bare package
+      `void [B, C, d, e, H, WebSocket];`,
     ].join('\n');
 
     expect(crossPackageSpecifiers(synthetic).sort()).toEqual([
