@@ -16,11 +16,13 @@ import {
   getTopicSubscribers,
   isRemoteEndpoint,
   topicExists,
+  topicNameRefusal,
+  subscribeCreated,
+  unsubscribeRemoved,
   listEnabledOutboundPeers,
   listRemoteSubscribers,
   TOPIC_PRINCIPAL_PREFIX,
   subscribe as dbSubscribe,
-  unsubscribe as dbUnsubscribe,
   Message,
   insertFile,
   getFile,
@@ -625,6 +627,44 @@ export function routeRelay(
   const ttl = Math.min(rawTtl, MAX_TTL_MS);
   const content_type = typeof frame.content_type === 'string' ? frame.content_type : 'text/plain';
 
+  // ── The SUBSCRIBE arms: state changes from a mesh whose agents want, or no
+  // longer want, one of OUR topics.
+  //
+  // THE SAME-ALIAS RETURN RULE (A3). `peers` and `outbound_peers` share no
+  // column, so the only way to know where this topic would be DELIVERED is to
+  // look for an outbound peering under the same alias. Without one — or with
+  // one that cannot carry `topic` — a subscription would be recorded that can
+  // never be served, which is worse than a refusal because nothing reports it.
+  //
+  // NO `getOrCreateTopic`: a remote caller never creates a topic here. A
+  // subscribe to a name this mesh does not own is refused, or any peer could
+  // populate our topics table one guess at a time.
+  if (kind === 'topic-subscribe' || kind === 'topic-unsubscribe') {
+    db.prepare('INSERT INTO relays (peer_alias, remote_msg_id, seen_at) VALUES (?, ?, ?)')
+      .run(alias, msg_id, now);
+    const remoteSubscriber = `${alias}:${from}`;
+
+    if (kind === 'topic-unsubscribe') {
+      // Teardown asks nothing of the return peering or the topic: whatever the
+      // state is, less of it is always allowed.
+      unsubscribeRemoved(db, remoteSubscriber, topicName);
+      incPeerRelay(alias, 'in', 'delivered');
+      return { ok: true };
+    }
+
+    const returnPeering = getOutboundPeer(db, alias);
+    if (returnPeering === null || returnPeering.enabled !== 1) return refuse('no_return_peering');
+    let returnKinds: string[];
+    try { returnKinds = JSON.parse(returnPeering.kinds) as string[]; } catch { return refuse('no_return_peering'); }
+    if (!Array.isArray(returnKinds) || !returnKinds.includes('topic')) return refuse('no_return_peering');
+
+    if (!isHomeTopic(db, topicName)) return refuse('not_home_topic');
+
+    subscribeCreated(db, remoteSubscriber, topicName);
+    incPeerRelay(alias, 'in', 'delivered');
+    return { ok: true };
+  }
+
   // ── The TOPIC arm: a delivery from the mesh that OWNS the topic.
   //
   // The topic is stamped with our alias for them — `orch:trollbox` — which is
@@ -1019,11 +1059,79 @@ export function routePublish(
   return { ok: true, msg_id: frame.msg_id };
 }
 
+/**
+ * F4 §6, §7 — subscribe, local or across a border.
+ *
+ * ONE REFUSAL FOR EVERY CAUSE: `AGENT_NOT_FOUND` with `unknown topic: <what
+ * you asked for>`. There is deliberately no `KIND_NOT_ALLOWED` here, unlike
+ * the publish path — this door has NO ACL gate in front of it, so any
+ * authenticated agent could walk it, and a distinct code would hand them a
+ * free map of which aliases are peered and with which kinds. On the publish
+ * path the distinct code sits BEHIND an ACL check, which is what makes it
+ * affordable there (#123).
+ *
+ * The remote branch is tried FIRST, mirroring `routeDirect`: a prefix that
+ * names a live outbound peering means the caller is addressing another mesh.
+ * A prefix that names nothing falls through to the local path, where the
+ * new-name rule refuses it — so `ghost:trollbox` and `orch:` and `orch:a:b`
+ * all end at the same bytes by different routes.
+ */
 export function routeSubscribe(
   db: Database,
   agent_id: string,
   frame: SubscribeFrame
 ): RouterResult {
+  const refuse = (): RouterResult => {
+    incError('AGENT_NOT_FOUND');
+    return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown topic: ${frame.topic}` };
+  };
+
+  const colon = frame.topic.indexOf(':');
+  if (colon > 0 && hasOutboundPeer(db, frame.topic.slice(0, colon))) {
+    const alias = frame.topic.slice(0, colon);
+    const remote = frame.topic.slice(colon + 1);
+    // Bare and bounded: a second ':' would name a topic on a THIRD mesh, which
+    // is transitive federation nobody agreed to.
+    if (remote.length === 0 || remote.includes(':') || Buffer.byteLength(remote, 'utf8') > 256) return refuse();
+
+    const peering = getOutboundPeer(db, alias);
+    let kinds: string[];
+    try { kinds = JSON.parse(peering!.kinds) as string[]; } catch { return refuse(); }
+    if (!Array.isArray(kinds) || !kinds.includes('topic-subscribe')) return refuse();
+
+    // The local topics row carries the FULL remote name, and `created_by` is a
+    // local agent so the foreign key is satisfied. That row is what the
+    // subscription points at — and why home-ness is a PREFIX test rather than
+    // row existence.
+    getOrCreateTopic(db, frame.topic, agent_id);
+
+    // GATED ON A REAL STATE CHANGE. The SDK replays every subscription on
+    // reconnect, and a border row per replay would burn the peering's rate
+    // bucket to say nothing.
+    if (subscribeCreated(db, agent_id, frame.topic)) {
+      const now = Date.now();
+      insertMessage(db, {
+        id: crypto.randomUUID(),
+        kind: 'topic-subscribe',
+        from_agent: agent_id,          // bare; the hub stamps it with our alias
+        to_agent: `${alias}:`,
+        topic: remote,
+        payload: '',
+        sent_at: now,
+        // The DEDUPE window, not the message default: subscription state is not
+        // time-sensitive traffic and must survive a peering outage. A longer
+        // wait is diagnosed with GET /peers/:alias/subscriptions.
+        expires_at: now + MAX_TTL_MS,
+      });
+      borderEvents.emit('enqueued', alias);
+    }
+    return { ok: true };
+  }
+
+  // Local. A NEW name still has to be a permissible one.
+  const nameRefusal = topicNameRefusal(db, frame.topic);
+  if (nameRefusal !== null) return refuse();
+
   getOrCreateTopic(db, frame.topic, agent_id);
   dbSubscribe(db, agent_id, frame.topic);
   return { ok: true };
@@ -1056,7 +1164,28 @@ export function routeUnsubscribe(
   // unconditional DELETE scoped by agent_id, so the refusal never protected
   // any state — it only reported. Idempotent unsubscribe is also the honest
   // contract for a caller retrying after a lost ack.
-  dbUnsubscribe(db, agent_id, frame.topic);
+  //
+  // F4: teardown crosses the border when there WAS something to tear down. It
+  // is enqueued regardless of the peering's `kinds` — a peer that may not stop
+  // subscribing is worse than one that may, and the receiving side skips the
+  // kind check for this one frame for the same reason (§16 E).
+  const removed = unsubscribeRemoved(db, agent_id, frame.topic);
+  const colon = frame.topic.indexOf(':');
+  if (removed && colon > 0 && hasOutboundPeer(db, frame.topic.slice(0, colon))) {
+    const alias = frame.topic.slice(0, colon);
+    const now = Date.now();
+    insertMessage(db, {
+      id: crypto.randomUUID(),
+      kind: 'topic-unsubscribe',
+      from_agent: agent_id,
+      to_agent: `${alias}:`,
+      topic: frame.topic.slice(colon + 1),
+      payload: '',
+      sent_at: now,
+      expires_at: now + MAX_TTL_MS,
+    });
+    borderEvents.emit('enqueued', alias);
+  }
   return { ok: true };
 }
 

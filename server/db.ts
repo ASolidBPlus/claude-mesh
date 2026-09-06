@@ -1293,6 +1293,14 @@ export function revokePeerKey(db: Database, id: string): boolean {
       .run(Date.now(), id).changes;
     if (changed === 0) return false;
     db.prepare('UPDATE peers SET disabled = 1 WHERE minted_by_key = ?').run(id);
+    // F4: and their subscriptions go too. Disabling the peer stops traffic;
+    // it does not stop a re-mint for the same alias inheriting the rows.
+    // Edge deletion on revoke is deliberately NOT moved here by F4 — that is a
+    // separate decision with its own history (#113).
+    for (const { alias } of db.prepare('SELECT alias FROM peers WHERE minted_by_key = ?')
+      .all(id) as { alias: string }[]) {
+      deleteRemoteSubscriptions(db, alias);
+    }
     return true;
   });
   return tx() as boolean;
@@ -1642,8 +1650,14 @@ export function upsertPeer(
     const isRotation = declared !== null && declared === existing.minted_by_key;
     if (!isRotation) {
       const removed = deletePeeringEdges(db, peer.alias, 'inbound');
+      // F4: subscriptions end with the peering for the same reason the edges
+      // do — a new key may be minted for the same alias, and a subscription
+      // that outlived its peering would silently belong to whoever next holds
+      // the name.
+      const removedSubscriptions = deleteRemoteSubscriptions(db, peer.alias);
       console.log(JSON.stringify({
         evt: 'peer.edges_ended_with_peering', alias: peer.alias, removed,
+        removed_subscriptions: removedSubscriptions,
         declared_rotates: declared, previous_key: existing.minted_by_key, at: now,
       }));
     }
@@ -1924,19 +1938,36 @@ export function deleteTopic(db: Database, name: string): void {
 // 5.6 Subscriptions
 // ──────────────────────────────────────────────
 
-export function subscribe(db: Database, agent_id: string, topic: string): Subscription {
-  const now = Date.now();
-  db.prepare(`
-    INSERT OR IGNORE INTO subscriptions (agent_id, topic, subscribed_at)
-    VALUES (?, ?, ?)
-  `).run(agent_id, topic, now);
+/**
+ * F4 §7 — DID THIS CREATE A ROW? The single writer, and the boolean is the
+ * point.
+ *
+ * The SDK replays every subscription on reconnect (client.ts, the replay loop
+ * after auth), so without a "was anything created" answer a remote subscribe
+ * would enqueue a border row on every reconnect — telling the hub something it
+ * already knows and burning a token from the peering's rate bucket, which a
+ * flapping spoke would turn into rate-limited direct traffic.
+ */
+export function subscribeCreated(db: Database, agent_id: string, topic: string): boolean {
+  return db.prepare('INSERT OR IGNORE INTO subscriptions (agent_id, topic, subscribed_at) VALUES (?, ?, ?)')
+    .run(agent_id, topic, Date.now()).changes === 1;
+}
 
+/** F4 §7 — the twin of subscribeCreated: did this REMOVE a row? Teardown rows
+ *  are enqueued only when there was something to tear down. */
+export function unsubscribeRemoved(db: Database, agent_id: string, topic: string): boolean {
+  return db.prepare('DELETE FROM subscriptions WHERE agent_id = ? AND topic = ?')
+    .run(agent_id, topic).changes === 1;
+}
+
+export function subscribe(db: Database, agent_id: string, topic: string): Subscription {
+  subscribeCreated(db, agent_id, topic);
   return db.prepare('SELECT * FROM subscriptions WHERE agent_id = ? AND topic = ?')
     .get(agent_id, topic) as Subscription;
 }
 
 export function unsubscribe(db: Database, agent_id: string, topic: string): void {
-  db.prepare('DELETE FROM subscriptions WHERE agent_id = ? AND topic = ?').run(agent_id, topic);
+  unsubscribeRemoved(db, agent_id, topic);
 }
 
 /**

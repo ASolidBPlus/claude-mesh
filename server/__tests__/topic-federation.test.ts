@@ -2,10 +2,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import {
   openDb, registerAgent, aclGrant, getOrCreateTopic, subscribe, upsertPeer,
-  getTopicSubscribers, getPeerByAlias,
+  getTopicSubscribers, getPeerByAlias, insertPeerKey, revokePeerKey,
 } from '../db.ts';
 import { hashToken } from '../auth.ts';
-import { routePublish, routeRelay, resetRelayBuckets } from '../router.ts';
+import { routePublish, routeRelay, routeSubscribe, routeUnsubscribe, resetRelayBuckets } from '../router.ts';
+import { MAX_TTL_MS } from '../router.ts';
 import type { WebSocket } from 'ws';
 import { readFileSync } from 'fs';
 import { Forwarder } from '../border.ts';
@@ -394,5 +395,302 @@ describe('F4 Forwarder.send branches on the row kind', () => {
     expect(frame.kind).toBe('direct');
     expect(frame.to).toBe('bob');
     expect(frame.from).toBe('alice');
+  });
+});
+
+// ── commit 5: spoke → hub, subscribe and unsubscribe ─────────────────────────
+
+describe('F4 routeSubscribe: the remote branch and its uniform refusal', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    db = openDb(':memory:');
+    registerAgent(db, { id: 'alice', token_hash: hashToken('a'), hostname: 'h' });
+    db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                VALUES ('orch','wss://orch.example','tok','pod1','["topic","topic-subscribe"]',600,?)`).run(Date.now());
+    db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                VALUES ('nokind','wss://n.example','tok','pod1','["direct"]',600,?)`).run(Date.now());
+  });
+  afterEach(() => { db.close(); });
+
+  const sub = (topic: string) => routeSubscribe(db, 'alice', { type: 'subscribe', topic } as never);
+  const borderRows = () =>
+    db.prepare("SELECT * FROM messages WHERE kind = 'topic-subscribe'").all() as
+      { to_agent: string; from_agent: string; topic: string; expires_at: number }[];
+
+  it('subscribing to a remote topic enqueues ONE border row and creates the local topic', () => {
+    expect(sub('orch:trollbox').ok).toBe(true);
+
+    const rows = borderRows();
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.to_agent).toBe('orch:');       // the peering, not an agent
+    expect(rows[0]!.from_agent).toBe('alice');     // bare — the hub stamps it
+    expect(rows[0]!.topic).toBe('trollbox');       // bare — one hop
+
+    // The local topics row is what the subscription points at, and it carries
+    // the FULL remote name, which is why home-ness is a prefix test.
+    expect(getTopicSubscribers(db, 'orch:trollbox')).toEqual(['alice']);
+  });
+
+  // THE SDK REPLAYS EVERY SUBSCRIPTION ON RECONNECT (client.ts, the replay loop
+  // after auth). Without the `changes === 1` gate, every reconnect burns a
+  // token from the peering's rate bucket to tell the hub something it already
+  // knows — and a flapping spoke would rate-limit its own direct traffic.
+  it('a replayed subscribe enqueues NO second row', () => {
+    sub('orch:trollbox');
+    expect(borderRows().length).toBe(1);
+    sub('orch:trollbox');
+    sub('orch:trollbox');
+    expect(borderRows().length).toBe(1);
+  });
+
+  // §4: subscription state is not time-sensitive traffic. It must survive a
+  // peering outage, so it gets the dedupe window rather than the 5-minute
+  // default a message would take.
+  it('the border row expires on the DEDUPE window, not the message default', () => {
+    const before = Date.now();
+    sub('orch:trollbox');
+    const ttl = borderRows()[0]!.expires_at - before;
+    expect(ttl).toBeGreaterThan(300_000);          // not the message default
+    expect(ttl).toBeLessThanOrEqual(MAX_TTL_MS + 50);
+  });
+
+  // §6 — EVERY reachable refusal cause answers the SAME bytes. Asserted as a
+  // SET, byte for byte, because that is the property; asserting each cause
+  // separately would be the opposite of it. `routeSubscribe` emits no
+  // KIND_NOT_ALLOWED: it has no ACL gate in front of it, so a distinct code
+  // there would be a free topology oracle for any authenticated agent.
+  it('every refusal cause is byte-identical', () => {
+    const causes: [string, string][] = [
+      ['no peering for the prefix', 'ghost:trollbox'],
+      ['peering lacks topic-subscribe', 'nokind:trollbox'],
+      ['empty remainder', 'orch:'],
+      ['a second colon', 'orch:a:b'],
+      ['over 256 bytes', `orch:${'x'.repeat(300)}`],
+    ];
+    // THE PROPERTY IS THAT THE ANSWER IS A PURE FUNCTION OF THE INPUT, not that
+    // five different inputs produce identical bytes — they cannot, because the
+    // message echoes what the caller asked for, and echoing the caller's own
+    // string tells it nothing it did not already know. My first version
+    // asserted the impossible version and failed 5 ≠ 1; the distinction is the
+    // whole point of a uniform-refusal test, so it is written out rather than
+    // quietly narrowed.
+    for (const [label, topic] of causes) {
+      expect({ label, answer: sub(topic) }).toEqual({
+        label,
+        answer: { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown topic: ${topic}` },
+      });
+    }
+
+    // AND THE SAME INPUT, TWO DIFFERENT CAUSES, byte for byte. This is the
+    // comparison that can actually detect a cause leaking: `orch:` is an empty
+    // remainder while the peering exists, and an unpeered prefix once it is
+    // gone.
+    const withPeering = JSON.stringify(sub('orch:'));
+    db.prepare("DELETE FROM outbound_peers WHERE alias = 'orch'").run();
+    const withoutPeering = JSON.stringify(sub('orch:'));
+    expect(withoutPeering).toBe(withPeering);
+
+    // Nothing was written by any of them.
+    expect(borderRows().length).toBe(0);
+    expect(db.prepare('SELECT COUNT(*) c FROM subscriptions').get()).toEqual({ c: 0 });
+  });
+
+  it('CONTROL: an ordinary LOCAL subscribe still works and enqueues nothing', () => {
+    expect(sub('trollbox').ok).toBe(true);
+    expect(getTopicSubscribers(db, 'trollbox')).toEqual(['alice']);
+    expect(borderRows().length).toBe(0);
+  });
+
+  it('a NEW local topic name with a colon and no peering is refused', () => {
+    // Not a remote address (no such peering) and not a permissible local name.
+    expect(sub('ghost:x').ok).toBe(false);
+    expect(db.prepare('SELECT COUNT(*) c FROM topics').get()).toEqual({ c: 0 });
+  });
+});
+
+describe('F4 routeUnsubscribe: teardown is always allowed', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    db = openDb(':memory:');
+    registerAgent(db, { id: 'alice', token_hash: hashToken('a'), hostname: 'h' });
+    db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                VALUES ('orch','wss://orch.example','tok','pod1','["topic","topic-subscribe"]',600,?)`).run(Date.now());
+    routeSubscribe(db, 'alice', { type: 'subscribe', topic: 'orch:trollbox' } as never);
+  });
+  afterEach(() => { db.close(); });
+
+  const unsubRows = () =>
+    db.prepare("SELECT * FROM messages WHERE kind = 'topic-unsubscribe'").all() as { to_agent: string; topic: string }[];
+
+  it('enqueues one teardown row, and only when something was removed', () => {
+    expect(routeUnsubscribe(db, 'alice', { type: 'unsubscribe', topic: 'orch:trollbox' } as never).ok).toBe(true);
+    expect(unsubRows().length).toBe(1);
+    expect(unsubRows()[0]!.to_agent).toBe('orch:');
+
+    // Idempotent, and the second call removed nothing — so it enqueues nothing.
+    // A teardown row per retry would burn the peering's bucket on a no-op.
+    routeUnsubscribe(db, 'alice', { type: 'unsubscribe', topic: 'orch:trollbox' } as never);
+    expect(unsubRows().length).toBe(1);
+  });
+
+  // #129's contract is unchanged: unsubscribe NEVER refuses, for any cause.
+  it('never refuses, even for a topic that does not exist', () => {
+    expect(routeUnsubscribe(db, 'alice', { type: 'unsubscribe', topic: 'no:such' } as never).ok).toBe(true);
+    expect(routeUnsubscribe(db, 'alice', { type: 'unsubscribe', topic: 'nothing' } as never).ok).toBe(true);
+  });
+});
+
+// ── the hub side of subscribe/unsubscribe (routeRelay's arms) ────────────────
+describe('F4 routeRelay: topic-subscribe and topic-unsubscribe', () => {
+  let db: Database;
+
+  const setup = (opts: { returnPeering?: boolean; returnKinds?: string } = {}) => {
+    db = openDb(':memory:');
+    registerAgent(db, { id: 'hub-owner', token_hash: hashToken('h'), hostname: 'h' });
+    getOrCreateTopic(db, 'trollbox', 'hub-owner');
+    upsertPeer(db, {
+      alias: 'pod1', token_hash: hashToken('p'), minted_by_key: 'k',
+      kinds: '["topic-subscribe","topic-publish"]', rate_per_min: 600,
+    });
+    if (opts.returnPeering !== false) {
+      db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                  VALUES ('pod1','wss://pod1.example','tok','orch',?,600,?)`)
+        .run(opts.returnKinds ?? '["topic"]', Date.now());
+    }
+    return db;
+  };
+  afterEach(() => { db.close(); });
+
+  const relay = (over: Record<string, unknown> = {}) => routeRelay(
+    db, new Map(), getPeerByAlias(db, 'pod1')!,
+    { type: 'relay', msg_id: `m-${Math.random()}`, kind: 'topic-subscribe', from: 'alice', topic: 'trollbox', ...over } as never,
+  );
+
+  beforeEach(() => resetRelayBuckets());
+
+  it('records the remote subscriber, stamped with our alias for them', () => {
+    setup();
+    expect(relay().ok).toBe(true);
+    expect(getTopicSubscribers(db, 'trollbox')).toEqual(['pod1:alice']);
+  });
+
+  // THE SAME-ALIAS RETURN RULE (A3). `peers` and `outbound_peers` share no
+  // column, so the only way the hub can know where to send this topic BACK is
+  // to look for an outbound peering under the same alias. Without one, a
+  // subscription would be recorded that can never be served — so it is refused
+  // instead, uniformly.
+  it('refuses when there is no RETURN peering to deliver on', () => {
+    setup({ returnPeering: false });
+    const r = relay();
+    expect(r.ok).toBe(false);
+    expect(getTopicSubscribers(db, 'trollbox')).toEqual([]);
+  });
+
+  it('refuses when the return peering cannot carry topics', () => {
+    setup({ returnKinds: '["direct"]' });
+    expect(relay().ok).toBe(false);
+    expect(getTopicSubscribers(db, 'trollbox')).toEqual([]);
+  });
+
+  // THE `enabled` HALF, ISOLATED, and it exists because a mutant said the
+  // other half was not being tested by what I thought was testing it. Deleting
+  // the `returnPeering === null || enabled !== 1` check left every case above
+  // green: with no row, `JSON.parse(returnPeering.kinds)` throws a TypeError
+  // that the kinds `catch` turns into the SAME refusal. The explicit check
+  // stays — a refusal that depends on a TypeError being caught by a JSON
+  // handler is an accident, not a design — and this case pins the half that
+  // accident cannot cover, because here the row EXISTS and only `enabled` is 0.
+  it('refuses when the return peering is PAUSED', () => {
+    setup();
+    db.prepare("UPDATE outbound_peers SET enabled = 0 WHERE alias = 'pod1'").run();
+    expect(relay().ok).toBe(false);
+    expect(getTopicSubscribers(db, 'trollbox')).toEqual([]);
+  });
+
+  // Remote callers never CREATE topics: a subscribe to a name the hub does not
+  // own is refused rather than quietly conjuring a row, which would let any
+  // peer populate our topics table.
+  it('refuses a topic this mesh does not own, and creates nothing', () => {
+    setup();
+    expect(relay({ topic: 'nosuchtopic' }).ok).toBe(false);
+    expect(db.prepare('SELECT COUNT(*) c FROM topics').get()).toEqual({ c: 1 });
+  });
+
+  it('unsubscribe removes the remote subscriber and always succeeds', () => {
+    setup();
+    relay();
+    expect(getTopicSubscribers(db, 'trollbox')).toEqual(['pod1:alice']);
+
+    expect(relay({ kind: 'topic-unsubscribe' }).ok).toBe(true);
+    expect(getTopicSubscribers(db, 'trollbox')).toEqual([]);
+    // ...and again, for a subscription that is already gone.
+    expect(relay({ kind: 'topic-unsubscribe' }).ok).toBe(true);
+  });
+
+  // §16 E — teardown is permitted even when the peering does not grant the
+  // kind. A peer that may not stop subscribing is worse than one that may.
+  it('§16 E: unsubscribe is accepted although the peering does not grant that kind', () => {
+    setup();
+    relay();
+    // `topic-unsubscribe` is not in pod1's kinds — deliberately, it is not
+    // grantable at all.
+    expect(relay({ kind: 'topic-unsubscribe' }).ok).toBe(true);
+    expect(getTopicSubscribers(db, 'trollbox')).toEqual([]);
+  });
+
+  // ...but the malformed-column refusal still runs, so a broken row does not
+  // become permissive for this one kind.
+  it('§16 E: a malformed kinds column still refuses an unsubscribe', () => {
+    setup();
+    db.prepare("UPDATE peers SET kinds = 'not json' WHERE alias = 'pod1'").run();
+    expect(relay({ kind: 'topic-unsubscribe' }).ok).toBe(false);
+  });
+});
+
+// ── subscriptions end with the peering ───────────────────────────────────────
+describe('F4 remote subscriptions end with the peering', () => {
+  let db: Database;
+  beforeEach(() => {
+    db = openDb(':memory:');
+    registerAgent(db, { id: 'owner', token_hash: hashToken('o'), hostname: 'h' });
+    getOrCreateTopic(db, 'trollbox', 'owner');
+    insertPeerKey(db, {
+      id: 'key-1', key_hash: hashToken('k1'), alias: 'pod1',
+      kinds: '["topic-subscribe"]', rate_per_min: 600, created_at: Date.now(),
+    });
+    upsertPeer(db, {
+      alias: 'pod1', token_hash: hashToken('p'), minted_by_key: 'key-1',
+      kinds: '["topic-subscribe"]', rate_per_min: 600,
+    });
+    db.prepare('INSERT INTO subscriptions (agent_id, topic, subscribed_at) VALUES (?,?,?)')
+      .run('pod1:alice', 'trollbox', Date.now());
+    db.prepare('INSERT INTO subscriptions (agent_id, topic, subscribed_at) VALUES (?,?,?)')
+      .run('owner', 'trollbox', Date.now());
+  });
+  afterEach(() => { db.close(); });
+
+  it('a REBIND (a new key that does not declare a rotation) drops them', () => {
+    expect(getTopicSubscribers(db, 'trollbox').sort()).toEqual(['owner', 'pod1:alice']);
+    upsertPeer(db, {
+      alias: 'pod1', token_hash: hashToken('p2'), minted_by_key: 'key-2',
+      kinds: '["topic-subscribe"]', rate_per_min: 600,
+    });
+    // Gone: whoever now holds the name must subscribe again.
+    expect(getTopicSubscribers(db, 'trollbox')).toEqual(['owner']);
+  });
+
+  it('a ROTATION keeps them — the same peering, a new credential', () => {
+    upsertPeer(db, {
+      alias: 'pod1', token_hash: hashToken('p2'), minted_by_key: 'key-2',
+      kinds: '["topic-subscribe"]', rate_per_min: 600, rotates: 'key-1',
+    });
+    expect(getTopicSubscribers(db, 'trollbox').sort()).toEqual(['owner', 'pod1:alice']);
+  });
+
+  it('REVOKING the key drops them, and leaves the local subscriber alone', () => {
+    expect(revokePeerKey(db, 'key-1')).toBe(true);
+    expect(getTopicSubscribers(db, 'trollbox')).toEqual(['owner']);
   });
 });
