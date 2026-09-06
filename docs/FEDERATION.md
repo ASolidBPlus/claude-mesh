@@ -203,8 +203,30 @@ not "stuck".
 - **`mesh_peer_relays_total{direction,outcome}`** — relayed messages;
   `outcome` is one of `delivered`, `refused`, `rate_limited`, `duplicate`,
   `transient`.
+- **`mesh_admin_auth_total{outcome}`** — admin authentications on this port,
+  `success` and `failure` (`server/metrics.ts` `incAdminAuth`). **It counts
+  uses, not users**: the admin token is shared, so a rising `success` says the
+  credential was used, never by whom. No identity or source-address label —
+  this document is unauthenticated, and an address is an identity for that
+  purpose. The addresses are in the `admin.auth` log events instead.
 - **Aggregates** (`mesh_agents_online`, `mesh_agent_up_count{state}`,
   `mesh_peer_up_count{state}`) carry no identities and stay alertable.
+
+#### The admin audit log
+
+Every admin authentication writes one structured event, **success and failure**
+(`server/http-admin.ts` `recordAdminAuth`), and every mutation that succeeded
+writes an `admin.mutation` event naming the route and the object in its path.
+
+| field | read it as |
+|---|---|
+| `outcome`, `reason` | `reason` is `absent` or `invalid` and appears **only here** — the 401 body is identical for both, so a caller cannot use the difference (C9) |
+| `remote` | the socket's peer address. Unforgeable by the caller, but it is the **proxy's** address whenever one is in front |
+| `xff_untrusted` | `x-forwarded-for` verbatim. **A request header — anyone may send one saying anything.** Named so it has to be argued for rather than believed |
+
+**What this does not do: attribute.** While the admin token is shared between
+holders, an address narrows *which host*, never *which person*. This lands
+alongside retiring the shared token, not instead of it.
 
 #### `MESH_METRICS_IDENTITY_LABELS`
 
