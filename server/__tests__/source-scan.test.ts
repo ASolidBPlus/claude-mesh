@@ -195,6 +195,27 @@ function after() { forbidden(); }
     expect(() => bodyOf('const x = 1;', 'missing')).toThrow(/no definition/);
   });
 
+  // Seat 1's adversarial run on #173: a type parameter sits between the name
+  // and the paren, so `function\s+NAME\s*\(` misses it and the consumer is
+  // told "no definition" about a definition that is right there — loud, but
+  // naming the wrong cause. No repo function takes one today; this is
+  // prevention.
+  it('a definition with TYPE PARAMETERS is found', () => {
+    const src = 'export function shaped<T = {}>(a: T) {\n  marker(a);\n}\n';
+    expect(definitions(src, 'shaped')).toBe(1);
+    expect(isExported(src, 'shaped')).toBe(true);
+    expect(bodyOf(src, 'shaped')).toContain('marker(a)');
+  });
+
+  // ...and the limit of that allowance, stated rather than left to surprise:
+  // one FLAT `<…>` group. A nested generic stops the `[^>]*` early and the
+  // definition is missed — loudly, which is why it is acceptable and recorded.
+  it('KNOWN LIMIT: a NESTED generic parameter is not matched', () => {
+    const src = 'function deep<T extends Map<string, number>>(a: T) {\n  marker(a);\n}\n';
+    expect(definitions(src, 'deep')).toBe(0);
+    expect(() => bodyOf(src, 'deep')).toThrow(/no definition/);
+  });
+
   it('handles an exported async definition', () => {
     const body = bodyOf('export async function f(a) {\n  g();\n}\n', 'f');
     expect(body).toContain('g()');
