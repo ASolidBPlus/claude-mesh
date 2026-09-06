@@ -19,22 +19,19 @@
  * cross-package.
  *
  * Cross-package edges still exist and that is fine. What must not exist is a
- * file in BOTH sets. The edge set as THE TRANSPILER resolves it — copied from
- * the walker's printed output in border.test.ts, not hand-derived:
+ * file in BOTH sets. `router.ts` is not in the edge set at all: its wire-type
+ * import is `import type`, erased before any module edge exists. `ws-server.ts`
+ * and `http-admin.ts` are no longer cross-package importers — this change
+ * removed both.
  *
- *     server/border.ts        14,751 B   margin 36,449   ../client/src/peer-client.ts
- *     server/wire-version.ts  (this file, whose size the walker prints)
- *
- * `router.ts` is ABSENT from that set: its wire-type import is `import type`,
- * erased before any module edge exists. `ws-server.ts` and `http-admin.ts` are
- * no longer cross-package importers at all — this change removed both.
- *
- * The earlier version of this comment listed margins for `ws-server.ts` and
- * `router.ts`. Neither is in the set: one had already been removed by the very
- * change the comment described, the other was never a runtime edge. Numbers a
- * test prints should be COPIED from it, never re-derived by hand beside it —
- * and this file's own size is deliberately not written here, because any figure
- * for it is stale the moment this comment is edited.
+ * SIZES AND MARGINS: see the rows the #131 walker in `border.test.ts` prints on
+ * every run; the threshold constant lives there. None are repeated here, on
+ * purpose. Two earlier versions of this comment carried a hand-copied table and
+ * BOTH went stale within a generation — the first listed files that were not in
+ * the set at all, the second was one commit behind on two sizes. A number that a
+ * test prints on every run and a number written beside it can only agree by
+ * coincidence, and that is the duplicated-encoding defect this file's own review
+ * kept finding elsewhere. The fix is deletion, not a fresher copy.
  *
  * NOT a guarantee. wire-version.ts is a bare re-export barrel with no reason to
  * approach 51,200 B, but nothing STOPS it growing, and it is exactly where the
@@ -43,10 +40,10 @@
  * being a bare re-export barrel.
  *
  * An earlier version of this fix pointed `http-admin.ts` at `ws-server.ts`
- * instead. That was withdrawn: `ws-server.ts` is 46,780 B, inside the bisected
- * band and only ~0.7 KB above its lowest clean point, and it is the most edited
- * file in the repo — a margin that closes silently on some future commit with
- * nobody noticing.
+ * instead. That was withdrawn: `ws-server.ts` sits inside the bisected band with
+ * very little headroom, and it is the most edited file in the repo — a margin
+ * that closes silently on some future commit with nobody noticing. The walker
+ * prints its current size; do not restate it here.
  *
  * So: do not add code here. Not a helper, not a type, not a second re-export.
  * Anything that grows this file re-creates the condition it was made to remove.

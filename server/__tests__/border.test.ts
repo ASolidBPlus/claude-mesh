@@ -355,34 +355,52 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
   // 51,197 B -> 0 entries and 51,497 B -> 1. The failure only ever appeared at
   // an importer that was both cached and cross-package.
   //
+  // BOTH the reader set and each reader's specifier come from
+  // Bun.Transpiler, never from a regex over quotes. The earlier version matched
+  // `from '…'` single-quoted only, and nothing in this repo enforces quote style
+  // — no prettier, eslint, biome, dprint or .editorconfig, and no lint script.
+  // 78 single-quoted imports and zero double-quoted ones is a habit, not a rule.
+  // MEASURED: adding a new reader with double quotes left this test at 27 pass,
+  // 0 fail — the reader was simply invisible, which is fail-OPEN on one
+  // character. Membership is now decided by the transpiled output (so a mention
+  // in a comment is not a read, and a type-only use is correctly erased) and the
+  // specifier by scanImports.
+  //
+  // CAVEAT, so nobody "improves" this later: scanImports reports a
+  // value-syntax import whose binding happens to be used only as a type,
+  // because bun emits that edge. It is not a type-analysis oracle and must not
+  // be tuned toward one — the question here is which module edges exist, which
+  // is exactly what it answers.
+  //
   // This pins the SPECIFIER, not just the definition, because the natural
   // tidy-up — "why is this reading a wire constant from a barrel?" — silently
-  // reinstates the edge that was removed. Whoever makes that change should have
-  // to read this.
+  // reinstates the edge that was removed.
   //
   // Not a proof of mechanism: a removal of the only failing shape. #131 open.
   it('#131: every reader imports the constant from its pinned specifier', () => {
-    // NOTE: `export { PEER_PROTOCOL_VERSION };` in ws-server.ts has no `from`
-    // clause — it re-exports an already-imported binding and introduces no
-    // edge, so it is correctly absent from the list below.
     const root = join(import.meta.dir, '..', '..');
-    const files = [...sourceFiles(join(root, 'server')), ...sourceFiles(join(root, 'client', 'src'))];
+    const transpiler = new Bun.Transpiler({ loader: 'ts' });
+    const PROVIDER = /(?:protocol|wire-version|ws-server)\.ts$/;
 
     const readers: string[] = [];
-    for (const f of files) {
+    for (const f of [...sourceFiles(join(root, 'server')), ...sourceFiles(join(root, 'client', 'src'))]) {
       const src = readFileSync(f, 'utf8');
-      for (const m of src.matchAll(/(?:import|export)\s*\{[^}]*PEER_PROTOCOL_VERSION[^}]*\}\s*from\s*'([^']+)'/g)) {
-        readers.push(`${f.slice(root.length + 1)} <- ${m[1]}`);
-      }
+      let emitted: string;
+      try { emitted = transpiler.transformSync(src); } catch { emitted = ''; }
+      if (!/\bPEER_PROTOCOL_VERSION\b/.test(emitted)) continue;   // not a reader
+      const providers = transpiler.scanImports(src).filter(i => PROVIDER.test(i.path)).map(i => i.path);
+      readers.push(`${f.slice(root.length + 1)} <- ${providers.length > 0 ? providers.sort().join(', ') : '(defines it)'}`);
     }
 
-    // Re-exports count as readers too: wire-version.ts carries the edge, so a
-    // grep for `import {` alone would miss the one file that matters most.
+    console.log('#131 readers of PEER_PROTOCOL_VERSION, per Bun.Transpiler:');
+    for (const r of readers) console.log(`  ${r}`);
+
     expect(readers.sort()).toEqual([
       'client/src/peer-client.ts <- ./protocol.ts',            // in-package
-      'server/http-admin.ts <- ./wire-version.ts',             // 80,951 B — must not cross
-      'server/wire-version.ts <- ../client/src/protocol.ts',   // THE only server-side cross-package edge
-      'server/ws-server.ts <- ./wire-version.ts',              // 46,780 B — must not cross
+      'client/src/protocol.ts <- (defines it)',                // the one definition
+      'server/http-admin.ts <- ./wire-version.ts',             // cached; must not cross
+      'server/wire-version.ts <- ../client/src/protocol.ts',   // THE server-side cross-package edge
+      'server/ws-server.ts <- ./wire-version.ts',              // inside the band; must not cross
     ]);
   });
 
