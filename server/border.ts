@@ -93,8 +93,14 @@ const BACKOFF_MAX_MS = 60_000;
  *                  on fatal AUTH_FAILED. Recovery is an operator action.
  *   outbound_peers.enabled
  *                  PERMANENT BY DESIGN — endOutboundPeering sets 0 on fatal
- *                  AUTH_FAILED. Recoverable by PATCH {enabled:true}; that is a
- *                  decision, not a ratchet, and D13/§5.6 say why.
+ *                  AUTH_FAILED. Re-enabling is a decision, not a ratchet, and
+ *                  D13/§5.6 say why — but PATCH {enabled:true} ALONE DOES NOT
+ *                  RESTORE THE PEERING. endOutboundPeering also expires the
+ *                  queued messages for the alias and deletes its outbound ACL
+ *                  edges (db.ts), so recovery is PATCH **plus re-granting every
+ *                  edge**, and the queue is gone and not recoverable. An
+ *                  operator who re-enables and expects traffic to resume sees
+ *                  AGENT_NOT_FOUND, because the edges are missing.
  *   cap            readonly, derived at construction.
  */
 export class Forwarder {

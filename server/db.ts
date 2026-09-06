@@ -731,6 +731,28 @@ function assertPeeringAllowed(db: Database, from_agent: string, to_agent: string
   }
 }
 
+/**
+ * Grant an ACL edge.
+ *
+ * ENDPOINTS ARE NOT VALIDATED AGAINST THE REMOTE-ID GRAMMAR, BY DESIGN.
+ * `POST /acl {to_agent:"b:legacy:node"}` succeeds while routeDirect refuses to
+ * send there — untidy, and deliberately left that way.
+ *
+ * The reason is directly below: `assertLocalEndpointExists` returns early on
+ * ANY ':' because legacy colon ids are a PRESERVED POPULATION, reported at boot
+ * and never rejected, and `assertPeeringAllowed` records the reproduced case
+ * where treating ':' as decisive refused two ordinary local agents. Nothing
+ * bounds a legacy id to one colon — only NEW ids are refused a ':' at
+ * POST /agents — so a grammar check here could refuse a grant for a legitimate
+ * local agent. That is the defect these comments exist to prevent, traded for
+ * tidiness.
+ *
+ * THE SEND PATH IS THE DOOR. routeDirect answers a malformed remote id with the
+ * same uniform AGENT_NOT_FOUND as any other unroutable target, so nothing is
+ * reachable that would not be reachable anyway; the only cost is an operator
+ * who typed it wrong finding out later. docs/FEDERATION.md's troubleshooting
+ * list tells them to check that a remote id has exactly one ':'.
+ */
 export function aclGrant(
   db: Database,
   from_agent: string,

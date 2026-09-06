@@ -44,10 +44,13 @@ import {
 // #131: read via ./wire-version.ts, never as a direct cross-package import
 // from the client wire module.
 //
-// This file is 81,312 B — over the 51,200 B transpiler-cache threshold — and it
-// was the ONLY importer that ever hit the intermittent link failure. It was
-// also the only one both cached AND crossing the package boundary. The
-// invariant, and the reason wire-version.ts exists, is written there.
+// This file is over the 51,200 B transpiler-cache threshold — its current size
+// is printed by the #131 walker in border.test.ts, and is deliberately not
+// repeated here, because the figure that used to be written here went stale by
+// 300 B within a generation. This was the ONLY importer that ever hit the
+// intermittent link failure, and the only one both cached AND crossing the
+// package boundary. The invariant, and the reason wire-version.ts exists, is
+// written there.
 //
 // (Deliberately not naming the client path in prose here: a comment containing
 // the literal import string makes this file register as a cross-package
@@ -1749,6 +1752,21 @@ function handleOutboundPeerDelete(ctx: AdminCtx): void {
   res.end(JSON.stringify({ deleted: true, alias, expired_rows: expired, removed_edges: edges }));
 }
 
+/**
+ * PATCH an outbound peering. `{enabled:false}` is the PAUSE, and what pausing
+ * does is not what most operators expect it to do.
+ *
+ * WHILE PAUSED, NEW SENDS TO THE ALIAS ARE REFUSED with the uniform
+ * `AGENT_NOT_FOUND`: `hasOutboundPeer` is enabled-only, so a paused peering
+ * makes the remote id unknown to local senders. Only ALREADY-QUEUED messages
+ * wait; re-enabling drains them. So pausing is not buffering — an admin who
+ * pauses expecting new traffic to accumulate reads the refusal as a bug.
+ *
+ * What pausing DOES keep, and what makes it the reversible option: the queued
+ * rows and the ACL edges both survive, unlike a DELETE or a receiver-side
+ * revocation, either of which expires the queue and drops the edges.
+ * Documented for operators in docs/FEDERATION.md §5.
+ */
 async function handleOutboundPeerPatch(ctx: AdminCtx): Promise<void> {
   const { req, res, db, params, forwarders } = ctx;
   const alias = params.id as string;
