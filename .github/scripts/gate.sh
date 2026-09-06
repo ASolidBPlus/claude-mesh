@@ -92,7 +92,21 @@ if [ "${1:-}" = --selftest ]; then
   done
   [ "$(grep -c '^if \[ "\${1:-}" = --selftest' "$0")" = 1 ] || { echo "SELFTEST FAIL: more than one selftest block"; exit 1; }
   for mk in '# 1' '# 2' '# 3' '# 4' '# 6' '# 7'; do n=$(grep -c "^$mk\$\|^$mk " "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: marker '$mk' appears $n times"; exit 1; }; done
-  echo "structure: single definitions, one selftest, one of each check"
+  # '# 5' legitimately appears TWICE (the join's header explainer at its definition, and its
+  # invocation in the body) — asserted as exactly two, not omitted, so a doubled file (four)
+  # and a deleted explainer (one) both fail.
+  n=$(grep -c '^# 5 ' "$0"); [ "$n" = 2 ] || { echo "SELFTEST FAIL: marker '# 5' appears $n times (expected 2: definition explainer + invocation)"; exit 1; }
+  # sub-markers for the checks that have no numbered line of their own
+  for mk in '# 3a' '# 6b' '# 6c'; do n=$(grep -c "^$mk " "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: marker '$mk' appears $n times"; exit 1; }; done
+  # INVOCATION, not just definition: a predicate defined once and called zero times still
+  # "exists" (sec-reviewer's mutant on #151: the join_check call deleted, inventory quiet).
+  # Each predicate must be called from the gate body exactly once, at column 0.
+  for call in 'join_check "${runid' 'chk_parents "${#parents' 'chk_jobs "$jobs"' 'chk_verdict "$c"' 'kw_extract "$body"'; do
+    n=$(grep -cF -- "$call" "$0"); n=$((n-1)) # minus this loop's own literal
+    [ "$n" = 1 ] || { echo "SELFTEST FAIL: predicate call '$call' appears $n times in the body (expected 1)"; exit 1; }
+  done
+  n=$(grep -c '^  if is_amend "\$cb"; then' "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: is_amend invocation appears $n times"; exit 1; }
+  echo "structure: single definitions, one selftest, one of each check, every predicate invoked once"
   expect(){ # $1 must-fail|must-pass  $2 label; stdin = a check's output
     local out; out=$(cat)
     if [ "$1" = must-fail ]; then grep -q '^FAIL' <<<"$out" && echo "  ok   $2 (rejected)" || { echo "  BAD  $2: known-bad input PASSED"; fails=$((fails+1)); }
@@ -188,7 +202,7 @@ fi
 read -r runid rstatus rconc rcreated < <(gh api "repos/$R/actions/runs?head_sha=$HEAD&event=pull_request" --jq '.workflow_runs|sort_by(.created_at)|last|"\(.id) \(.status) \(.conclusion) \(.created_at)"')
 if [ "${rstatus:-}" = completed ] && [ "${rconc:-}" = success ]; then ok "CI run $runid success ($rcreated)"; else bad "CI run ${runid:-none}: ${rstatus:-none}/${rconc:-none} (cancelled/in_progress = re-run)"; fi
 jobs=$(gh api "repos/$R/actions/runs/${runid:-0}/jobs" --jq '.jobs[]|"\(.name):\(.conclusion)"' 2>/dev/null | tr '\n' ' ')
-grep -qvE 'success' <<<"$(tr ' ' '\n' <<<"$jobs" | grep . | cut -d: -f2)" && bad "jobs: $jobs" || ok "jobs: $jobs"
+chk_jobs "$jobs"
 # 5 the join (function defined above)
 join_check "${runid:-0}" "$p1" "$p2"
 # 6
