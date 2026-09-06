@@ -83,9 +83,15 @@ function requireAdmin(
   res: http.ServerResponse,
   adminToken: string
 ): boolean {
+  // #79: the same helper every other door uses. This compared the WHOLE header
+  // with `===` — a plain string comparison against a live credential, which is
+  // both the weakest of the three behaviours this repo had and the one a reader
+  // is most likely to copy, because it looks like ordinary code.
   const auth = req.headers['authorization'];
-  if (auth === `Bearer ${adminToken}`) {
-    return true;
+  if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
+    if (timingSafeEqual(auth.slice('Bearer '.length), adminToken)) {
+      return true;
+    }
   }
   res.writeHead(401, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'unauthorized' }));

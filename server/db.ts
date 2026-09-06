@@ -1,5 +1,6 @@
 import { Database } from 'bun:sqlite';
 import { safeFilename, safeContentType } from './file-hygiene.ts';
+import { hashToken, timingSafeEqual } from './auth.ts';
 
 // ──────────────────────────────────────────────
 // Types
@@ -1907,17 +1908,10 @@ export function listObservers(db: Database): Observer[] {
 // Internal helpers
 // ──────────────────────────────────────────────
 
-function hashToken(token: string): string {
-  const hasher = new Bun.CryptoHasher('sha256');
-  hasher.update(token);
-  return hasher.digest('hex');
-}
-
-function timingSafeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let result = 0;
-  for (let i = 0; i < a.length; i++) {
-    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return result === 0;
-}
+// #79: the private hashToken/timingSafeEqual copies that lived here are gone.
+//
+// They were BYTE-IDENTICAL to the exported pair in auth.ts, which is the whole
+// problem: a security primitive with two homes means a fix applied to one leaves
+// the other silently unchanged, and the copy nobody remembers is the one that
+// stays weak. This file's callers — getAgentByToken and getPeerKeyBySecret —
+// now use the same helper as every other door.
