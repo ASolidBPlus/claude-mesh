@@ -25,14 +25,23 @@ describe('#22 GET /healthz', () => {
   });
   afterEach(async () => { await handle.shutdown().catch(() => {}); db?.close(); });
 
-  it('200s with uptime_ms and db_ok, unauthenticated', async () => {
+  it('200s with db_ok, unauthenticated', async () => {
     const res = await fetch(`http://127.0.0.1:${port}/healthz`);
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('application/json');
-    const body = await res.json() as { uptime_ms: number; db_ok: boolean };
+    const body = await res.json() as { db_ok: boolean };
     expect(body.db_ok).toBe(true);
-    expect(typeof body.uptime_ms).toBe('number');
-    expect(body.uptime_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  // NOTHING THAT VARIES PER PROCESS may appear here. An earlier version
+  // returned uptime_ms — a restart fingerprint, readable by any peer that can
+  // reach this port, with no reachability argument to justify it on an endpoint
+  // that is unauthenticated by design. This pins the SHAPE, not just the
+  // absence of that one field, so the next convenience addition has to be a
+  // decision rather than a habit.
+  it('returns db_ok and nothing else', async () => {
+    const body = await (await fetch(`http://127.0.0.1:${port}/healthz`)).json() as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(['db_ok']);
   });
 
   it('sends NO credentials — the point is that an orchestrator has none', async () => {
@@ -42,12 +51,6 @@ describe('#22 GET /healthz', () => {
     expect(res.status).toBe(200);
   });
 
-  it('uptime_ms advances', async () => {
-    const a = await (await fetch(`http://127.0.0.1:${port}/healthz`)).json() as { uptime_ms: number };
-    await new Promise(r => setTimeout(r, 25));
-    const b = await (await fetch(`http://127.0.0.1:${port}/healthz`)).json() as { uptime_ms: number };
-    expect(b.uptime_ms).toBeGreaterThan(a.uptime_ms);
-  });
 
   // db_ok must be a REAL answer, not a constant. Closing the database is the
   // failure this endpoint exists to catch: process up, store gone. Without

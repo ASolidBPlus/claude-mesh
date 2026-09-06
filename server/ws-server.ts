@@ -457,7 +457,6 @@ export function startWsServer(
     // which is only a distinct question once there is a second instance to
     // shift traffic to (#23, parked). A /readyz that always agreed with
     // /healthz would be a promise the system cannot keep.
-    const startedAt = Date.now();
     const httpServer = http.createServer((req, res) => {
       if (req.method === 'GET' && (req.url === '/healthz' || req.url === '/healthz/')) {
         // db_ok is a real query, not a flag: an open handle to a corrupt or
@@ -466,7 +465,13 @@ export function startWsServer(
         // and the store is not".
         let db_ok = false;
         try { db.prepare('SELECT 1').get(); db_ok = true; } catch (_) { db_ok = false; }
-        const body = JSON.stringify({ uptime_ms: Date.now() - startedAt, db_ok });
+        // NOTHING THAT VARIES PER PROCESS. An earlier version returned
+        // uptime_ms, which is a restart fingerprint: any peer that can reach
+        // this port learns when the bus last restarted, and unlike the ACL or
+        // the tap there is no reachability argument for it — this endpoint is
+        // unauthenticated by design. Liveness needs the store check and nothing
+        // else, so the store check is all it returns.
+        const body = JSON.stringify({ db_ok });
         res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
         res.end(body);
         return;

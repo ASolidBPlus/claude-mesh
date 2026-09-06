@@ -356,11 +356,17 @@ Typical consumers: a live comms-map, an audit log, a scoring engine, a moderatio
 `GET /healthz` on the **WS port**, unauthenticated, `200` with:
 
 ```json
-{ "uptime_ms": 12345, "db_ok": true }
+{ "db_ok": true }
 ```
 
 Wire it to a k8s liveness probe, a load balancer, or Komodo. `db_ok` is a real
 query, not a flag — the failure it exists to catch is *process up, store gone*.
+
+**It returns nothing that varies per process.** An earlier version also returned
+uptime, which is a restart fingerprint readable by anyone who can reach the
+port — and this endpoint is unauthenticated by design, so there is no
+reachability argument to fall back on. Liveness needs the store check and
+nothing else.
 
 **Why the WS port and not the admin port:** `MESH_ADMIN_BIND` exists so an
 operator can restrict the admin listener, and a liveness endpoint that
