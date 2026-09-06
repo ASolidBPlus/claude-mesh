@@ -207,6 +207,33 @@ function after() { forbidden(); }
     expect(bodyOf(src, 'shaped')).toContain('marker(a)');
   });
 
+  // THE EDGE MY OWN FIXTURES MISSED (seat 1). `callSites` is
+  // `all − definitions`, so it DEPENDS on definitions — and when I taught
+  // definitions about type parameters I tested definitions, bodyOf and
+  // isExported, and never the one function downstream of the thing I changed.
+  // The assumption I encoded was "blast radius = diff". It is not: it is
+  // everything computed FROM what the diff touched, and a subtraction is the
+  // clearest possible case of that.
+  //
+  // The symptom was a count that could go NEGATIVE — measured before fixing:
+  //   generic def + generic call  defs=1 calls=-1
+  //   generic def + plain call    defs=1 calls= 0
+  //   generic def + no call       defs=1 calls=-1
+  //   plain def   + one call      defs=1 calls= 1   (the control)
+  it('a generic definition does not make callSites negative', () => {
+    const genericCall = 'export function f<T = {}>(a: T) {}\nf<number>(1);';
+    const plainCall = 'export function f<T = {}>(a: T) {}\nf(1);';
+    const noCall = 'export function f<T = {}>(a: T) {}';
+    const control = 'export function f(a) {}\nf(1);';
+
+    expect({
+      genericCall: callSites(genericCall, 'f'),
+      plainCall: callSites(plainCall, 'f'),
+      noCall: callSites(noCall, 'f'),
+      control: callSites(control, 'f'),
+    }).toEqual({ genericCall: 1, plainCall: 1, noCall: 0, control: 1 });
+  });
+
   // ...and the limit of that allowance, stated rather than left to surprise:
   // one FLAT `<…>` group. A nested generic stops the `[^>]*` early and the
   // definition is missed — loudly, which is why it is acceptable and recorded.

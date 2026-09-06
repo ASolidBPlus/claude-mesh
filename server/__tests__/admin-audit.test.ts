@@ -253,8 +253,19 @@ describe('#161 admin audit', () => {
       content_type: 'application/octet-stream', size_bytes: 5, file_path: present,
       sent_at: Date.now(), expires_at: null,
     });
-    // A row pointing at a blob that is already gone — an orphaned row, which is
-    // exactly what #85's ordering leaves behind after a crash.
+    // A row pointing at a blob that is already gone.
+    //
+    // THE PROVENANCE I FIRST WROTE HERE WAS BACKWARDS (seat 1). #85's ordering
+    // — delete the row, THEN unlink — leaves an orphan FILE and never a row
+    // pointing at missing bytes; that is its whole point, stated at both sites
+    // (`db.ts` `deleteExpiredFiles`, and the unlink loop in
+    // `handleAgentDelete`). So this state is the one the ordering PREVENTS, not
+    // the one it leaves.
+    //
+    // The fixture stays, because it is still the right discriminator: a row CAN
+    // outlive its blob by other routes — a hand-removed file, a restored
+    // database, a volume that lost its contents — and `unlinked` must count
+    // what the filesystem actually gave up rather than how many rows went.
     insertFile(db, {
       id: 'ghost', from_agent: 'a-one', to_agent: 'doomed2', filename: 'ghost.bin',
       content_type: 'application/octet-stream', size_bytes: 5,

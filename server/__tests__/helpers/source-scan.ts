@@ -160,7 +160,20 @@ export function definitions(src: string, name: string): number {
  * found by the helper's own test, which is the argument for the helper.
  */
 export function callSites(src: string, name: string): number {
-  const all = [...codeOnly(src).matchAll(new RegExp(`(?<![.\\w])${name}\\s*\\(`, 'g'))].length;
+  // THE TYPE-PARAMETER ALLOWANCE BELONGS HERE TOO, and its absence made this
+  // return NEGATIVE numbers (seat 1). `callSites = all − definitions`, so when
+  // `definitions` learned to match `function f<T>(…)` and this did not, a
+  // generic definition was subtracted from a total that never counted it: 1
+  // definition, 0 matches here, −1 calls.
+  //
+  // A count that can go negative is a defect on its face. It was latent — no
+  // function in this repo takes a type parameter — and it is fixed rather than
+  // documented, because the failure is silent in exactly the direction a
+  // single-call-site claim cares about.
+  //
+  // It also covers a generic CALL, `f<number>(1)`, which is the same syntax at
+  // the other end.
+  const all = [...codeOnly(src).matchAll(new RegExp(`(?<![.\\w])${name}\\s*(?:<[^>]*>)?\\s*\\(`, 'g'))].length;
   return all - definitions(src, name);
 }
 
