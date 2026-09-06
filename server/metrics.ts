@@ -10,6 +10,7 @@ type LabeledCounter = Map<string, number>;
 // appear in agent ids / kinds / statuses / error codes.
 const msgStatus: LabeledCounter   = new Map(); // key = `${kind}\0${status}`
 const topicFanout: LabeledCounter = new Map(); // #136: key = outcome. NO topic label — see incTopicFanout.
+const adminAuth: LabeledCounter   = new Map(); // #161: key = outcome. NO identity label — see incAdminAuth.
 const sent: LabeledCounter        = new Map(); // key = from_agent
 const received: LabeledCounter    = new Map(); // key = to_agent
 const aclDenied: LabeledCounter   = new Map(); // key = from_agent
@@ -99,6 +100,25 @@ export function incPeerRelay(alias: string, direction: string, outcome: string):
  */
 export function incTopicFanout(outcome: 'allowed' | 'filtered'): void {
   try { bump(topicFanout, s(outcome)); } catch (_) { /* metrics must never affect delivery */ }
+}
+
+/**
+ * #161 — admin authentication outcomes, with NO identity label of any kind.
+ *
+ * `/metrics` is unauthenticated on the admin port, so this document is an API
+ * response to whoever can reach that port. `outcome` is party-free by
+ * construction: two values, both fixed here, neither derived from anything a
+ * caller supplies. There is deliberately no source-address label — an address
+ * IS an identity for this purpose, it is unbounded (one series per client), and
+ * putting it in the unauthenticated document would hand a reader the very map
+ * of who talks to this admin port that the event exists to keep server-side.
+ *
+ * The reason for a failure (absent vs invalid credential) is likewise not a
+ * label: C9 keeps distinct causes indistinguishable on prober-reachable
+ * surfaces, and this document is one. The reason goes to the LOG, which is not.
+ */
+export function incAdminAuth(outcome: 'success' | 'failure'): void {
+  try { bump(adminAuth, s(outcome)); } catch (_) { /* metrics must never affect the request */ }
 }
 
 export function incReminderFired(): void {
@@ -231,6 +251,15 @@ export function renderMetrics(db: Database): string {
   lines.push('# TYPE mesh_topic_fanout_total counter');
   for (const [outcome, v] of topicFanout) {
     lines.push(`mesh_topic_fanout_total{outcome="${escapeLabelValue(outcome)}"} ${v}`);
+  }
+
+  // #161: mesh_admin_auth_total {outcome} — admin authentication outcomes.
+  // No identity label and no failure-reason label; see incAdminAuth for why
+  // both are absent rather than guarded.
+  lines.push('# HELP mesh_admin_auth_total Admin authentication outcomes on the admin API: success = the admin credential was accepted, failure = a request to an admin-authenticated route presented no usable credential. NOT an attribution — the credential is shared, so this counts uses, never users. No identity or source-address label: this document is unauthenticated on the admin port.');
+  lines.push('# TYPE mesh_admin_auth_total counter');
+  for (const [outcome, v] of adminAuth) {
+    lines.push(`mesh_admin_auth_total{outcome="${escapeLabelValue(outcome)}"} ${v}`);
   }
 
   // mesh_messages_total {kind,status}

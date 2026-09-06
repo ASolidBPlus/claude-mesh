@@ -68,7 +68,7 @@ import {
 import { PEER_PROTOCOL_VERSION } from './wire-version.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
-import { renderMetrics } from './metrics.ts';
+import { renderMetrics, incAdminAuth } from './metrics.ts';
 
 export interface HttpAdminHandle {
   server: http.Server;
@@ -101,6 +101,99 @@ function requireAdmin(
   res.writeHead(401, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'unauthorized' }));
   return false;
+}
+
+/**
+ * #161 — WHERE THE REQUEST CAME FROM, and how much that is worth.
+ *
+ * `remote` is the transport peer: the socket's own address, which cannot be
+ * forged by the caller but IS the proxy's address whenever one is in front.
+ *
+ * `xff_untrusted` is `x-forwarded-for` verbatim, under a name that says what it
+ * is. It is a REQUEST HEADER — anyone may send one, saying anything — so it is
+ * recorded because it is occasionally the only way to see past a proxy, and
+ * named so that nobody reads it as evidence. A field called `client_ip` would
+ * be believed; this one has to be argued for.
+ *
+ * Neither is an identity. The admin credential is shared, so an address
+ * narrows "which host" and never "which person" — the bound this whole feature
+ * ships with.
+ */
+function requestSource(req: http.IncomingMessage): Record<string, string | null> {
+  const xff = req.headers['x-forwarded-for'];
+  return {
+    remote: req.socket.remoteAddress ?? null,
+    // Truncated: a header is caller-controlled and unbounded, and an audit line
+    // is not a place to let a caller write arbitrarily much.
+    xff_untrusted: typeof xff === 'string' ? xff.slice(0, 256) : null,
+  };
+}
+
+/**
+ * WHY THE CREDENTIAL FAILED — for the LOG ONLY.
+ *
+ * C9 in its usual shape: distinct causes, one indistinguishable outcome on the
+ * prober-reachable surface. The 401 body and status are identical for both
+ * values here, and `mesh_admin_auth_total` carries no reason label because
+ * `/metrics` is unauthenticated on this port. A structured log on the server is
+ * not a surface an unauthenticated caller can read, which is what makes the
+ * distinction safe to keep exactly here and nowhere else.
+ *
+ * Returns a CLASS, never any part of what was presented — 'invalid' means a
+ * Bearer token was offered and did not match, and the bytes of that token are
+ * not this function's to hand on. #144's rule: token bytes never reach a log,
+ * a metric label, or a read API.
+ *
+ * NOT A TIMING CLAIM. `absent` short-circuits before any comparison, so the two
+ * paths differ in duration; that is true on main today and this function does
+ * not change it. The comparison itself is timing-safe (auth.ts timingSafeEqual);
+ * the presence check is not, and is not pretended to be.
+ */
+function credentialReason(req: http.IncomingMessage): 'absent' | 'invalid' {
+  const header = req.headers['authorization'];
+  return typeof header === 'string' && header.startsWith('Bearer ') ? 'invalid' : 'absent';
+}
+
+/**
+ * ONE structured event per admin-authentication decision, success AND failure.
+ *
+ * Success mattered as much as failure here and was the half most likely to be
+ * skipped: with only failures logged, a stolen token that works leaves exactly
+ * as little trace as it did before, and the question the operator has —
+ * "has anyone used the admin token?" — is answered by silence either way.
+ *
+ * THE PATH IS LOGGED WITHOUT ITS QUERY STRING. A path names the object; a query
+ * is caller-controlled, unbounded, and not needed to say what was reached. The
+ * path parameters in this API are object ids by construction (agent ids, key
+ * ids, aliases) — never credentials, which arrive in headers and bodies.
+ *
+ * WHAT IT IS NOT: attribution. The admin token is shared between holders, so
+ * this records that the credential was used and from where, never by whom. It
+ * lands ALONGSIDE the token shed, not instead of it.
+ */
+function recordAdminAuth(
+  req: http.IncomingMessage,
+  outcome: 'success' | 'failure',
+  reason: 'absent' | 'invalid' | null,
+  mode: NonNullable<Route['auth']> | 'admin',
+): void {
+  incAdminAuth(outcome);
+  let path = req.url ?? '';
+  const q = path.indexOf('?');
+  if (q >= 0) path = path.slice(0, q);
+  console.log(JSON.stringify({
+    evt: 'admin.auth',
+    outcome,
+    reason,                                   // null on success; server-side only
+    method: req.method ?? null,
+    path,
+    // A failure on an agentOrAdmin route may be a mistyped agent token rather
+    // than an admin attempt. Stated, so the event is not read as a count of
+    // admin attempts on those routes.
+    route_admits_agents: mode === 'agentOrAdmin',
+    ...requestSource(req),
+    at: Date.now(),
+  }));
 }
 
 // Result of authenticating a request on an agent-or-admin route.
@@ -287,6 +380,12 @@ async function handleAclPost(ctx: AdminCtx): Promise<void> {
     throw err; // anything else is a real fault — let the dispatcher guard log it
   }
 
+  // #161: the ACL is the most consequential thing the admin token confers, and
+  // it was one of the four routes that emitted nothing. Names the EDGE — never
+  // the credential that authorised it, which this handler never sees.
+  console.log(JSON.stringify({
+    evt: 'acl.granted', from_agent, to_agent, granted_by, at: Date.now(),
+  }));
   res.writeHead(201, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(row));
 }
@@ -329,6 +428,9 @@ async function handleAclDelete(ctx: AdminCtx): Promise<void> {
     return;
   }
 
+  console.log(JSON.stringify({
+    evt: 'acl.revoked', from_agent, to_agent, removed, at: Date.now(),
+  }));
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ok: true }));
 }
@@ -570,6 +672,12 @@ async function handleAgentPost(ctx: AdminCtx): Promise<void> {
   const token_hash = hashToken(rawToken);
   const agent = registerAgent(db, { id, token_hash, hostname, namespace });
 
+  // #161: names the agent created, and NOTHING about the token minted for it —
+  // not the token, not its hash, not its length. This response body is the one
+  // place the secret exists; the audit line beside it must not become a second.
+  console.log(JSON.stringify({
+    evt: 'agent.registered', agent_id: id, hostname, namespace, at: Date.now(),
+  }));
   res.writeHead(201, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ...formatAgent(agent), token: rawToken }));
 }
@@ -606,6 +714,10 @@ function handleAgentDelete(ctx: AdminCtx): void {
   }
   let purgedPaths: string[];
   try {
+    // #161 + #91: ONE agent.deleted event, emitted below after the unlink so it
+    // can carry the purge counts too. #161 added one here and #91 added one
+    // there; the fields merge rather than the events multiplying — two events
+    // with one name is how a log stops being countable.
     purgedPaths = deleteAgent(db, id);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1310,15 +1422,36 @@ export function resolveRouteAuth(
     // authentication and must refuse uniformly. The ctx says 'unauthenticated'
     // because that is the TRUTH here — the handler's own check is invisible to
     // the dispatcher, so nothing it hands the handler may act as a grant.
+    //
+    // #161: NOT recorded as an admin-auth outcome, because no admin credential
+    // was required or examined. The one route in this mode (/peers/register)
+    // logs its own refusals as `peer.register_refused`. Recording it here would
+    // report an admin authentication that did not happen.
     return { mode: 'unauthenticated' };
   }
   if (mode === 'agentOrAdmin') {
-    return resolveAuth(req, res, db, adminToken);
+    const result = resolveAuth(req, res, db, adminToken);
+    // Only an ADMIN outcome on this route is an admin authentication. An agent
+    // succeeding is not, and is not counted here.
+    if (result !== null && result.mode === 'admin') {
+      recordAdminAuth(req, 'success', null, mode);
+    } else if (result === null) {
+      // The credential was neither an admin token nor a live agent token. That
+      // MAY have been a failed admin attempt and there is no way to tell —
+      // said plainly in the event via `route_admits_agents`, so a reader does
+      // not mistake this for a count of admin attempts.
+      recordAdminAuth(req, 'failure', credentialReason(req), mode);
+    }
+    return result;
   }
   // 'admin' and the no-route case: unmatched paths still require the admin
   // token before the 404, so an unauthenticated caller cannot probe which
   // routes exist.
-  if (!requireAdmin(req, res, adminToken)) return null;
+  if (!requireAdmin(req, res, adminToken)) {
+    recordAdminAuth(req, 'failure', credentialReason(req), mode ?? 'admin');
+    return null;
+  }
+  recordAdminAuth(req, 'success', null, mode ?? 'admin');
   return { mode: 'admin' };
 }
 
@@ -2023,6 +2156,30 @@ export function startHttpAdmin(
         // 500 if the head isn't out yet, sever the socket if it is.
         try {
           await matched.handler({ req, res, db, url, params, agentIndex, observerIndex, peerIndex, forwarders, maxFileBytes, filesDir, auth });
+          // #161 — EVERY privileged mutation leaves a record, DERIVED rather
+          // than enumerated. 23 of 28 routes emitted nothing, and the fix for
+          // that cannot be a hand-maintained list of mutators: the next route
+          // added is exactly the one whose entry nobody remembers. This asks
+          // the route table instead — a non-GET that succeeded changed
+          // something — so a route added tomorrow is covered by existing code.
+          //
+          // The detail events (peer_key.minted, acl.granted, …) stay: this one
+          // says THAT a mutation happened and names the object in the path;
+          // those say WHAT changed, from inside the handler where the object is
+          // known. Neither reads the request body, which is where credentials
+          // arrive.
+          if (method !== 'GET' && res.statusCode >= 200 && res.statusCode < 300) {
+            console.log(JSON.stringify({
+              evt: 'admin.mutation',
+              method, path: pathname, status: res.statusCode,
+              // Path parameters only — object ids by construction. No query
+              // string and no body.
+              params,
+              actor: auth.mode,       // 'admin' | 'agent' | 'unauthenticated'
+              ...requestSource(req),
+              at: Date.now(),
+            }));
+          }
         } catch (err) {
           console.error(`[http-admin] handler crashed: ${method} ${pathname}:`, err);
           if (!res.headersSent) {
