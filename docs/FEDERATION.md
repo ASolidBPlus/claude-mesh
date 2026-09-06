@@ -252,10 +252,13 @@ into a statement your deployment either satisfies or does not, visible at boot.
 
 ### Break-glass: attributing a flood
 
-**The problem this solves.** With `MESH_METRICS_IDENTITY_LABELS` unset — the
-default, and the right default — `mesh_acl_denied_total` collapses to an
-aggregate. **The rate stays visible and the *who* goes dark**, which is exactly
-the attribution incident response needs.
+**The problem this solves, and its exact scope.** With
+`MESH_METRICS_IDENTITY_LABELS` unset — the default, and the right default —
+`mesh_acl_denied_total` collapses to an aggregate: the rate stays visible and
+the *who* goes dark. That is the attribution incident response needs, **for the
+class this counter covers, which is direct sends only.** For topic fan-out the
+*who* was never recorded at all, so there is nothing for the flag to reveal —
+see the table in step 2.
 
 **The procedure. It is a deploy action, not a code change:**
 
