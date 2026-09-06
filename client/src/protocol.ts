@@ -118,6 +118,12 @@ export interface DeliverFrame {
   payload: string;
   content_type: string;
   sent_at: number;
+  /** F4 — which mesh and agent a federated topic post came from, as a string to
+   *  SHOW. Absent on every path that did not cross a border, and `null` once
+   *  normalised. DISPLAY ONLY: it is chosen by the sending mesh, so a consumer
+   *  that routed or authorised on it would be trusting another mesh's string.
+   *  `from` remains the principal the message is attributed to. */
+  origin?: string | null;
 }
 
 export interface AckFrame {

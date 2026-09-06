@@ -987,3 +987,57 @@ describe('F4 guards the mutant sweep found unpinned', () => {
     expect(post().ok).toBe(true);
   });
 });
+
+// ── the echo, on the SPOKE side (M6, second reading) ─────────────────────────
+//
+// The hub-side echo — the posting pod's own peering is not skipped — is pinned
+// in the transit block. This is the other place suppression could be written:
+// the SPOKE dropping a delivery whose `origin` names one of ITS agents. The
+// mutant that does exactly that survived the whole suite until this test, and
+// it is the more tempting of the two, because it looks like "do not show
+// someone their own message" rather than like "route on origin".
+//
+// It IS routing on origin, which is forbidden — `origin` is a string the far
+// mesh chose. A peer could suppress any local agent's deliveries by forging it.
+describe('F4 the spoke does not suppress its own agents\' echoes', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    resetRelayBuckets();
+    db = openDb(':memory:');
+    registerAgent(db, { id: 'alice', token_hash: hashToken('a'), hostname: 'h' });
+    upsertPeer(db, {
+      alias: 'orch', token_hash: hashToken('o'), minted_by_key: 'k',
+      kinds: '["topic"]', rate_per_min: 600,
+    });
+    getOrCreateTopic(db, 'orch:trollbox', 'alice');
+    subscribe(db, 'alice', 'orch:trollbox');
+    aclGrant(db, 'orch:trollbox', 'alice', 'admin');
+  });
+  afterEach(() => { db.close(); });
+
+  it('a delivery whose origin names a LOCAL agent is still delivered to that agent', () => {
+    const sock = fakeSocket();
+    const r = routeRelay(db, new Map([['alice', sock]]), getPeerByAlias(db, 'orch')!, {
+      type: 'relay', msg_id: 'echo-1', kind: 'topic', from: 'trollbox', topic: 'trollbox',
+      origin: 'pod1:alice', payload: 'my own post', content_type: 'text/plain',
+    } as never);
+    expect(r.ok).toBe(true);
+
+    // alice posted it (as far as `origin` claims) and alice receives it.
+    expect(sock.sent.length).toBe(1);
+    expect(JSON.parse(sock.sent[0]!).payload).toBe('my own post');
+  });
+
+  // AND THE ATTACK THE SUPPRESSION WOULD CREATE, which is why the rule is not
+  // merely a preference: if a delivery were dropped because `origin` names a
+  // local agent, a peer could silence any agent it can name by forging it.
+  it('a FORGED origin naming a local agent cannot suppress that agent\'s delivery', () => {
+    const sock = fakeSocket();
+    routeRelay(db, new Map([['alice', sock]]), getPeerByAlias(db, 'orch')!, {
+      type: 'relay', msg_id: 'forged-1', kind: 'topic', from: 'trollbox', topic: 'trollbox',
+      origin: 'orch:alice', payload: 'you should still see this', content_type: 'text/plain',
+    } as never);
+    expect(sock.sent.length).toBe(1);
+  });
+});
