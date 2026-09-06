@@ -1041,3 +1041,93 @@ describe('F4 the spoke does not suppress its own agents\' echoes', () => {
     expect(sock.sent.length).toBe(1);
   });
 });
+
+// ── §16 L: what a PAUSED outbound peering does to its topics ─────────────────
+//
+// Documented (FEDERATION.md §3) and, until this test, unpinned. `hasOutboundPeer`
+// is enabled-only, so while a spoke's peering is PATCH-disabled `isHomeTopic`
+// calls `orch:trollbox` a HOME topic on that spoke: a post fans out LOCALLY
+// instead of queueing for the border.
+//
+// That is accepted for v1, and it is the kind of accepted behaviour that most
+// needs a test — an operator pausing a peering gets a topic that keeps working
+// locally and silently stops federating, and the only thing standing between
+// "documented decision" and "surprise" is a test that fails if it ever changes
+// by accident.
+//
+// WHICH GUARD ACTUALLY PRODUCES IT, because I got this wrong first: for a
+// PUBLISH the behaviour comes from `routePublish`'s remote-branch test
+// (`hasOutboundPeer`, which is enabled-only), NOT from `isHomeTopic` — the
+// local publish path never consults `isHomeTopic` at all. My first mutant
+// changed `isHomeTopic` and these tests stayed green, correctly. The mutant
+// that reds them makes `routePublish`'s branch enabled-insensitive, which is
+// the real §16 L mechanism. `isHomeTopic`'s own enabled-sensitivity governs
+// routeRelay's arms and is pinned there.
+describe('F4 §16 L: a paused peering makes its topics local again', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    resetRelayBuckets();
+    db = openDb(':memory:');
+    registerAgent(db, { id: 'poster', token_hash: hashToken('p'), hostname: 'h' });
+    registerAgent(db, { id: 'local-sub', token_hash: hashToken('s'), hostname: 'h' });
+    db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                VALUES ('orch','wss://orch.example','tok','pod1','["topic","topic-subscribe","topic-publish"]',600,?)`)
+      .run(Date.now());
+    // Both agents subscribe while the peering is UP, which is how the local
+    // topics row and the subscriptions come to exist at all.
+    routeSubscribe(db, 'local-sub', { type: 'subscribe', topic: 'orch:trollbox' } as never);
+    aclGrant(db, 'poster', 'local-sub', 'system');
+    aclGrant(db, 'poster', 'orch:trollbox', 'admin');       // the RIGHT TO POST, while up
+  });
+  afterEach(() => { db.close(); });
+
+  const pause = () => db.prepare("UPDATE outbound_peers SET enabled = 0 WHERE alias = 'orch'").run();
+  const resume = () => db.prepare("UPDATE outbound_peers SET enabled = 1 WHERE alias = 'orch'").run();
+  const publish = () => routePublish(db, new Map(), 'poster',
+    { type: 'publish', msg_id: `p-${Math.random()}`, topic: 'orch:trollbox', payload: 'hi' } as never);
+  const rowsTo = (to: string, kind: string) =>
+    (db.prepare('SELECT COUNT(*) c FROM messages WHERE to_agent = ? AND kind = ?').get(to, kind) as { c: number }).c;
+
+  it('while PAUSED, a post fans out locally and queues nothing for the border', () => {
+    pause();
+    expect(publish().ok).toBe(true);
+
+    // The local subscriber is served...
+    expect(rowsTo('local-sub', 'topic')).toBe(1);
+    // ...and nothing is queued for a peering that is not carrying anything.
+    expect(rowsTo('orch:', 'topic-publish')).toBe(0);
+    expect(rowsTo('orch:', 'topic')).toBe(0);
+  });
+
+  // THE CONTROL, and it is what makes the case above a statement about PAUSING
+  // rather than about this fixture: enabled, the same publish goes the other
+  // way entirely — to the border, and NOT to the local subscriber (C7: the
+  // echo returns from the hub).
+  it('CONTROL: enabled, the same post goes to the border and not to the local subscriber', () => {
+    expect(publish().ok).toBe(true);
+    expect(rowsTo('orch:', 'topic-publish')).toBe(1);
+    expect(rowsTo('local-sub', 'topic')).toBe(0);
+  });
+
+  it('a post queued while UP survives the pause and is still deliverable after resume', () => {
+    publish();                                   // queued for the border
+    expect(rowsTo('orch:', 'topic-publish')).toBe(1);
+
+    pause();
+    publish();                                   // this one goes local
+    resume();
+
+    // The queued row is untouched by the pause: still there, not expired, not
+    // failed. WHAT THIS DOES NOT SHOW is a forwarder delivering it — draining
+    // is border.ts's job and needs a live peer. What it pins is that pausing
+    // does not destroy or expire the backlog, which is the half an operator
+    // would be surprised by.
+    const queued = db.prepare(
+      `SELECT COUNT(*) c FROM messages
+       WHERE to_agent = 'orch:' AND kind = 'topic-publish'
+         AND delivered_at IS NULL AND failed_code IS NULL
+         AND (expires_at IS NULL OR expires_at > ?)`).get(Date.now()) as { c: number };
+    expect(queued).toEqual({ c: 1 });
+  });
+});
