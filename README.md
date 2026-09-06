@@ -175,10 +175,21 @@ The recipient downloads the bytes via `GET /files/<file_id>`. Max size is `MESH_
 
 ### Presence, reminders, keepalive
 - `→ ping` `{ "type": "ping", "ts": ... }` → `← pong` `{ "type": "pong", "ts": ..., "server_ts": ... }`. Use as a heartbeat.
-- `← agent_status` — arrives when an ACL-related peer goes online/offline: `{ "type": "agent_status", "agent_id": "bob", "online": true, "last_seen": ..., "last_alive": ... }`.
-- `→ list_presence` `{ "type": "list_presence", "msg_id": "p-1" }` → `← presence_list` `{ "type": "presence_list", "ref": "p-1", "agents": [{ "id": "bob", "online": true, "last_seen": ..., "last_alive": ... }] }` (ACL-filtered to you + your peers).
+- `← agent_status` — arrives when an ACL-related peer goes online/offline: `{ "type": "agent_status", "agent_id": "bob", "online": true, "last_seen": ..., "last_alive": ..., "last_responded": ... }`.
+- `→ list_presence` `{ "type": "list_presence", "msg_id": "p-1" }` → `← presence_list` `{ "type": "presence_list", "ref": "p-1", "agents": [{ "id": "bob", "online": true, "last_seen": ..., "last_alive": ..., "last_responded": ... }] }` (ACL-filtered to you + your peers).
 
-  **`last_seen` vs `last_alive`:** `last_seen` advances on TRAFFIC (the node sent or received something); `last_alive` advances when the node answers the keepalive `ping`. So an idle-but-healthy node advances `last_alive` only, and a node whose channel has died advances neither — which is what makes the two distinguishable from outside. `last_alive` is `null` for a node that has never pinged. Use `ping` as a heartbeat (every ~25 s) and treat a stale `last_alive` as a dead channel.
+  **The four readings, and what each actually claims.** They answer different questions and are deliberately not collapsed into one another:
+
+  - **`online`** = has a socket.
+  - **`last_seen`** = last acted — advances on TRAFFIC (the node sent or received something).
+  - **`last_alive`** = the transport answered — advances when the node answers the keepalive `ping`. `null` for a node that has never pinged.
+  - **`last_responded`** = the loop emitted something only the loop can emit. `null` until the emitter ships (spawner#346).
+
+  So an idle-but-healthy node advances `last_alive` only, and a node whose channel has died advances neither `last_seen` nor `last_alive` — which is what makes those two distinguishable from outside. Use `ping` as a heartbeat (every ~25 s) and treat a stale `last_alive` as a dead channel.
+
+  **`last_alive` does not mean the agent is working.** The keepalive is answered by the mesh *plugin*, a separate process with its own WebSocket client, which keeps ponging while the agent's loop is stuck — measured, an agent wedged for 55 minutes had a `last_alive` fresh to the second. `last_alive` is not wrong; it truthfully reports the transport. `last_responded` is the reading that answers "is the loop alive", and it exists so that question stops being answered by a field that never claimed to.
+
+  **`last_responded` is a CLAIM BY THE EMITTER**, like `turn_status`. The server cannot tell a loop-originated frame from one a timer produced — it sees a socket and bytes. Its job is to keep the claim distinguishable from the transport's, **not to authenticate it**.
 - `→ remind` — schedule a reminder the bus delivers back to you:
   ```json
   { "type": "remind", "msg_id": "rm-1", "text": "stand-up", "when": "0 9 * * 1",
