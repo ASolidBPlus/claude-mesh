@@ -620,12 +620,24 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
     // "never seen at all", and a green on either says nothing about the other.
     //
     // WHAT IT CAN AND CANNOT SEE: catches divergence between the two walks;
-    // blind to a defect in what they share. A mutant in EITHER walker alone is
-    // caught — disabling the recursion below reds it 17 vs 16. What moves both
-    // together is invisible, and the shared substrate is small and worth naming:
-    // the skip list (`node_modules`, `__tests__`), the `.ts` extension filter,
-    // and the readdirSync/statSync pair. Change any of those and this control
-    // agrees with itself while both walks are wrong.
+    // blind to a defect in what they share. What moves both together is
+    // invisible, and the shared substrate is small and worth naming: the skip
+    // list (`node_modules`, `__tests__`), the `.ts` extension filter, and the
+    // readdirSync/statSync pair. Change any of those and this control agrees
+    // with itself while both walks are wrong.
+    //
+    // THE MUTANT THAT DISCHARGES THIS WAS MEASURED UNDER A MODIFIED TREE, and
+    // saying so is the point. Disabling the recursion in either walker reds it
+    // 17 vs 16 ONLY with a synthetic nested file present. On the SHIPPED tree
+    // the recursion is unexercised — server/ is flat, its only subdirectories
+    // are node_modules and __tests__, and both walks skip both — so the same
+    // mutant changes nothing here: 1 pass, 0 fail. An earlier version of this
+    // comment stated the 17-vs-16 figures in the present tense, which reads as
+    // a property of the suite as it runs and is not one.
+    //
+    // What reopens it: the first real directory under server/. At that moment
+    // this control starts doing work, and so does the #131 walker's own
+    // recursion — which is why neither is deleted as dead.
     const independent: string[] = [];
     (function walk(dir: string): void {
       for (const name of readdirSync(dir)) {
