@@ -173,7 +173,7 @@ never queue. For a remote id, "online" means the peering socket is connected
 
 | call | shows |
 |---|---|
-| `GET /peers` | inbound peerings that have registered |
+| `GET /peers` | inbound peerings that have registered, **never their `token_hash`** — alias, the key that minted them, kinds, rate, `last_seen`, `disabled` (`server/http-admin.ts` `handlePeerGet`) |
 | `GET /peer-keys` | minted keys, **never the secrets** (`server/http-admin.ts` `handlePeerKeyGet`) |
 | `GET /outbound-peers` | configured outbound links, **never the tokens** |
 | `GET /agents` | the local roster, including four liveness readings — see below |
@@ -320,6 +320,18 @@ is understood as the current answer rather than the intended one.
 ## 5. Tearing down
 
 ### Revoke a key (receiver side)
+
+**First, see who actually holds a registration** — `GET /peers` lists them by
+alias with the `minted_by_key` you are about to revoke, so the revocation acts
+on a peering you have seen rather than one you remember:
+
+```bash
+curl "$RECEIVER/peers" -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+*(Docs correction, #153: §4 listed this route from the first version of this
+guide and it 404'd until now. It was the only row in that table with no
+`file.ts` + symbol citation beside it.)*
 
 ```bash
 curl -X DELETE "$RECEIVER/peer-keys/$KEY_ID" -H "Authorization: Bearer $ADMIN_TOKEN"

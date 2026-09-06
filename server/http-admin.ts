@@ -38,7 +38,8 @@ import {
 import { generateToken, hashToken, timingSafeEqual } from './auth.ts';
 import {
   PEER_ALIAS_RE, RESERVED_ALIAS, insertPeerKey, listPeerKeys, getLivePeerKeyForAlias,
-  getPeerKeyBySecret, revokePeerKey, getPeerByAlias, upsertPeer, getPeerKeyById, type PeerKey,
+  getPeerKeyBySecret, revokePeerKey, getPeerByAlias, listPeers, upsertPeer, getPeerKeyById,
+  type PeerKey, type Peer,
   insertOutboundPeer, getOutboundPeer, listOutboundPeers, updateOutboundPeer, endOutboundPeering, type OutboundPeer,
 } from './db.ts';
 // #131: read via ./wire-version.ts, never as a direct cross-package import
@@ -1432,6 +1433,59 @@ function handlePeerKeyGet(ctx: AdminCtx): void {
   res.end(JSON.stringify({ keys: listPeerKeys(db).map(k => publicPeerKeyFields(db, k)) }));
 }
 
+/** Public shape of a registered inbound peer. NEVER includes `token_hash`
+ *  (C7): it is the stored verifier for a live credential, and an admin read
+ *  that returned it would make every registered peer offline-crackable from
+ *  one GET — the same argument publicPeerKeyFields makes for `key_hash`.
+ *
+ *  `minted_by_key` IS included and is not a secret: it is the key's id, the
+ *  same value `GET /peer-keys` already lists, and it is what ties a registered
+ *  peer back to the key to revoke — which is the operator question this route
+ *  exists to answer.
+ *
+ *  NO socket-derived `connected` field, though `peerIndex` is in scope. That
+ *  is a second liveness reading placed beside a durable one, and #133 is the
+ *  record of what happens when two readings of "alive" sit on one row without
+ *  the difference being stated. This route lists the REGISTRY; if a live-socket
+ *  reading is wanted it should arrive named for what it is. */
+function publicPeerFields(row: Peer) {
+  return {
+    alias: row.alias,
+    minted_by_key: row.minted_by_key,
+    kinds: JSON.parse(row.kinds) as string[],
+    rate_per_min: row.rate_per_min,
+    registered_at: row.registered_at,
+    last_seen: row.last_seen,
+    disabled: row.disabled === 1,
+  };
+}
+
+/**
+ * #153 — the inbound counterpart to `GET /outbound-peers`.
+ *
+ * `listPeers` has existed in db.ts since F0b with no HTTP consumer, so an
+ * operator could mint keys and revoke them but could not enumerate who had
+ * actually registered, or was disabled, or what kinds and rate each holds —
+ * except by reading the boot log or opening the database.
+ *
+ * THE GUIDE ALREADY PROMISED THIS ROUTE. docs/FEDERATION.md §4 has listed
+ * `GET /peers` in its read-API table since 6db50f9, and it 404'd — verified
+ * against a live admin server before this was written. That row is the only
+ * one in the table with no `file.ts` + symbol citation next to it, which is
+ * exactly the tell: the rows derived from the code were true, the row derived
+ * from what the surface OUGHT to contain was not.
+ *
+ * Admin-authenticated, so listing is not a disclosure (C9): the caller already
+ * holds the admin token. The secret bytes are still withheld, because the
+ * threat here is not the operator but the copy of this response that ends up
+ * in a shell history, a ticket, or a log.
+ */
+function handlePeerGet(ctx: AdminCtx): void {
+  const { res, db } = ctx;
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ peers: listPeers(db).map(publicPeerFields) }));
+}
+
 /**
  * Close a peer's live socket, if it has one. F1a: the ACTION half of
  * revocation — the cleanup sweep is the STATE half and runs regardless, so a
@@ -1860,6 +1914,9 @@ export const ROUTES: Route[] = [
   { method: 'POST',   match: exact('/peer-keys'),                    handler: handlePeerKeyPost },
   { method: 'GET',    match: exact('/peer-keys'),                    handler: handlePeerKeyGet },
   { method: 'DELETE', match: idMatch(/^\/peer-keys\/([^/]+)$/),      handler: handlePeerKeyDelete },
+  // #153: the inbound listing. `exact`, so it cannot swallow /peers/register —
+  // and that route is POST regardless, so the two never contend.
+  { method: 'GET',    match: exact('/peers'),                        handler: handlePeerGet },
   // The ONLY handler-authenticated route: a peer presents a key, which is
   // neither the admin token nor an agent token.
   { method: 'POST',   match: exact('/peers/register'),               handler: handlePeerRegister, auth: 'handler' },
