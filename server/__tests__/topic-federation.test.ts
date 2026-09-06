@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import {
   openDb, registerAgent, aclGrant, getOrCreateTopic, subscribe, upsertPeer,
-  getTopicSubscribers, getPeerByAlias, insertPeerKey, revokePeerKey,
+  getTopicSubscribers, getPeerByAlias, insertPeerKey, revokePeerKey, aclCheck,
 } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { routePublish, routeRelay, routeSubscribe, routeUnsubscribe, resetRelayBuckets } from '../router.ts';
@@ -692,5 +692,298 @@ describe('F4 remote subscriptions end with the peering', () => {
   it('REVOKING the key drops them, and leaves the local subscriber alone', () => {
     expect(revokePeerKey(db, 'key-1')).toBe(true);
     expect(getTopicSubscribers(db, 'trollbox')).toEqual(['owner']);
+  });
+});
+
+// ── commit 6: spoke → hub post, and the transit invariant ────────────────────
+
+describe('F4 routePublish: the remote-topic branch', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    db = openDb(':memory:');
+    registerAgent(db, { id: 'alice', token_hash: hashToken('a'), hostname: 'h' });
+    registerAgent(db, { id: 'local-sub', token_hash: hashToken('l'), hostname: 'h' });
+    db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                VALUES ('orch','wss://orch.example','tok','pod1','["topic","topic-subscribe","topic-publish"]',600,?)`)
+      .run(Date.now());
+    db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                VALUES ('nopost','wss://n.example','tok','pod1','["topic","topic-subscribe"]',600,?)`)
+      .run(Date.now());
+    routeSubscribe(db, 'alice', { type: 'subscribe', topic: 'orch:trollbox' } as never);
+    routeSubscribe(db, 'local-sub', { type: 'subscribe', topic: 'orch:trollbox' } as never);
+    aclGrant(db, 'alice', 'orch:trollbox', 'admin');        // the RIGHT TO POST
+  });
+  afterEach(() => { db.close(); });
+
+  const publish = (topic: string, from = 'alice') =>
+    routePublish(db, new Map(), from, { type: 'publish', msg_id: 'p1', topic, payload: 'hi' } as never);
+  const posts = () =>
+    db.prepare("SELECT * FROM messages WHERE kind = 'topic-publish'").all() as
+      { to_agent: string; from_agent: string; topic: string; payload: string }[];
+
+  it('enqueues ONE post row for the border, bare from and bare topic', () => {
+    expect(publish('orch:trollbox').ok).toBe(true);
+    const rows = posts();
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.to_agent).toBe('orch:');
+    expect(rows[0]!.from_agent).toBe('alice');
+    expect(rows[0]!.topic).toBe('trollbox');
+  });
+
+  // C7 — THE ECHO. A remote publish does NOT fan out locally: local subscribers
+  // hear it when the hub's delivery comes back. The hub is the ordering
+  // authority, so a local shortcut would show this mesh's own agents a
+  // different order from every other mesh's.
+  it('does NOT fan out locally — the echo comes back from the hub', () => {
+    publish('orch:trollbox');
+    const local = db.prepare("SELECT COUNT(*) c FROM messages WHERE kind = 'topic'").get();
+    expect(local).toEqual({ c: 0 });
+  });
+
+  it('refuses without the RIGHT TO POST edge, uniformly', () => {
+    const r = publish('orch:trollbox', 'local-sub');       // no alice→topic edge
+    expect(r).toEqual({
+      ok: false, error_code: 'AGENT_NOT_FOUND', error_message: 'unknown topic: orch:trollbox',
+    });
+    expect(posts().length).toBe(0);
+  });
+
+  // The ONE non-uniform code on this path, and it sits BEHIND the ACL check —
+  // which is what makes it affordable: a caller that reaches it has already
+  // proven it holds an edge to this topic, so the reply reveals only the
+  // caller's OWN mesh configuration.
+  it('KIND_NOT_ALLOWED when the peering cannot carry a post — behind the ACL', () => {
+    routeSubscribe(db, 'alice', { type: 'subscribe', topic: 'nopost:games' } as never);
+    aclGrant(db, 'alice', 'nopost:games', 'admin');
+    const r = publish('nopost:games');
+    expect(r.ok).toBe(false);
+    expect((r as { error_code: string }).error_code).toBe('KIND_NOT_ALLOWED');
+
+    // ...and WITHOUT the edge, the same door answers the uniform refusal
+    // instead: the distinct code is never reachable before the ACL.
+    const r2 = publish('nopost:games', 'local-sub');
+    expect((r2 as { error_code: string }).error_code).toBe('AGENT_NOT_FOUND');
+  });
+});
+
+describe('F4 the hub re-originates a spoke post (transit)', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    resetRelayBuckets();
+    db = openDb(':memory:');
+    registerAgent(db, { id: 'owner', token_hash: hashToken('o'), hostname: 'h' });
+    registerAgent(db, { id: 'hub-sub', token_hash: hashToken('hs'), hostname: 'h' });
+    getOrCreateTopic(db, 'trollbox', 'owner');
+    getOrCreateTopic(db, 'games', 'owner');
+    for (const alias of ['pod1', 'pod2']) {
+      upsertPeer(db, {
+        alias, token_hash: hashToken(alias), minted_by_key: 'k',
+        kinds: '["topic-publish","topic-subscribe"]', rate_per_min: 600,
+      });
+      db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                  VALUES (?, ?, 'tok', 'orch', '["topic"]', 600, ?)`).run(alias, `wss://${alias}.example`, Date.now());
+    }
+    aclGrant(db, 'pod1:alice', 'topic:trollbox', 'admin');   // pod1:alice may post
+    subscribe(db, 'pod2:bob', 'trollbox');
+    aclGrant(db, 'topic:trollbox', 'pod2:bob', 'admin');     // pod2:bob may hear
+    subscribe(db, 'pod1:alice', 'trollbox');
+    aclGrant(db, 'topic:trollbox', 'pod1:alice', 'admin');   // and so may the poster
+  });
+  afterEach(() => { db.close(); });
+
+  const post = (over: Record<string, unknown> = {}) => routeRelay(
+    db, new Map(), getPeerByAlias(db, 'pod1')!,
+    {
+      type: 'relay', msg_id: `m-${Math.random()}`, kind: 'topic-publish',
+      from: 'alice', topic: 'trollbox', payload: 'hello', content_type: 'text/plain', ...over,
+    } as never,
+  );
+  const outTo = (alias: string) =>
+    db.prepare("SELECT * FROM messages WHERE to_agent = ? AND kind = 'topic'").all(`${alias}:`) as
+      { id: string; origin: string | null; expires_at: number; payload: string }[];
+
+  it('pod1 → orch → pod2, exactly once, with pod1 the origin', () => {
+    expect(post().ok).toBe(true);
+    expect(outTo('pod2').length).toBe(1);
+    expect(outTo('pod2')[0]!.origin).toBe('pod1:alice');
+    expect(outTo('pod2')[0]!.payload).toBe('hello');
+  });
+
+  // THE ECHO, from the hub's side: one frame per peering cannot exclude the
+  // publisher's own mesh, so pod1 gets the post back — exactly as a chat shows
+  // your own message. Suppressing it would mean routing on `origin`.
+  it('the posting pod receives the echo', () => {
+    post();
+    expect(outTo('pod1').length).toBe(1);
+    expect(outTo('pod1')[0]!.origin).toBe('pod1:alice');
+  });
+
+  // M7 — a FRESH id at the hub. Reusing the arriving msg_id would make the
+  // hub's retry indistinguishable from a redelivery on the far side.
+  it('the hub\'s outbound ids are fresh, and differ from the arriving msg_id', () => {
+    const arriving = 'arriving-id-1';
+    post({ msg_id: arriving });
+    const ids = [...outTo('pod1'), ...outTo('pod2')].map(r => r.id);
+    expect(ids.length).toBe(2);
+    for (const id of ids) expect(id).not.toBe(arriving);
+    expect(new Set(ids).size).toBe(2);
+    // ...and the arriving id is recorded in `relays`, which is where a remote
+    // namespace belongs.
+    expect(db.prepare('SELECT COUNT(*) c FROM relays WHERE remote_msg_id = ?').get(arriving)).toEqual({ c: 1 });
+  });
+
+  // M14 — the transited post's budget is THIS frame's, clamped. Deriving it
+  // from the 5-minute default would let a spoke's short-lived post outlive its
+  // sender's intent, or a long one be cut short.
+  it('expires_at comes from the arriving frame\'s ttl, never a default', () => {
+    const before = Date.now();
+    post({ ttl_ms: 60_000 });
+    const row = outTo('pod2')[0]!;
+    expect(row.expires_at - before).toBeLessThanOrEqual(60_050);
+    expect(row.expires_at - before).toBeGreaterThan(50_000);
+  });
+
+  it('a ttl beyond the dedupe window is clamped, not honoured', () => {
+    const before = Date.now();
+    post({ ttl_ms: MAX_TTL_MS * 10 });
+    expect(outTo('pod2')[0]!.expires_at - before).toBeLessThanOrEqual(MAX_TTL_MS + 50);
+  });
+
+  // M3 — the isHomeTopic guard. A post naming a topic this mesh does not own
+  // must produce nothing: without the guard the hub would relay on behalf of a
+  // third mesh, which is the transitive federation nobody agreed to.
+  it('M3 control: a post for a topic this mesh does not own yields no outbound row', () => {
+    // `pod2:games` is foreign here — the prefix names an outbound peering.
+    getOrCreateTopic(db, 'pod2:games', 'owner');
+    const r = post({ topic: 'pod2:games' });
+    expect(r.ok).toBe(false);            // bad_topic: a ':' in a relayed topic
+    expect(outTo('pod2').length).toBe(0);
+  });
+
+  it('M3 control: a post for a topic that does not exist at all yields nothing', () => {
+    expect(post({ topic: 'nosuchtopic' }).ok).toBe(false);
+    expect(outTo('pod1').length + outTo('pod2').length).toBe(0);
+  });
+
+  // M15 — THE HUB'S LOCAL FAN-OUT USES THE TOPIC PRINCIPAL, not the poster.
+  // A hub subscriber holds `topic:trollbox → hub-sub`; it holds nothing from
+  // `pod1:alice`, and it must still receive.
+  it('M15: a hub subscriber holding only the TOPIC edge receives the post', () => {
+    subscribe(db, 'hub-sub', 'trollbox');
+    aclGrant(db, 'topic:trollbox', 'hub-sub', 'admin');
+    expect(aclCheck(db, 'pod1:alice', 'hub-sub')).toBe(false);   // POSITIVE CONTROL
+
+    post();
+
+    const local = db.prepare("SELECT to_agent FROM messages WHERE kind='topic' AND to_agent = 'hub-sub'").all();
+    expect(local.length).toBe(1);
+  });
+
+  it('refuses a post from a peer with no RIGHT TO POST edge', () => {
+    upsertPeer(db, {
+      alias: 'pod2', token_hash: hashToken('pod2'), minted_by_key: 'k',
+      kinds: '["topic-publish"]', rate_per_min: 600,
+    });
+    const r = routeRelay(db, new Map(), getPeerByAlias(db, 'pod2')!, {
+      type: 'relay', msg_id: 'm-nopost', kind: 'topic-publish',
+      from: 'mallory', topic: 'trollbox', payload: 'x',
+    } as never);
+    expect(r.ok).toBe(false);
+    expect(outTo('pod1').length + outTo('pod2').length).toBe(0);
+  });
+});
+
+// ── the three cases the §11 mutant sweep asked for ───────────────────────────
+//
+// M3, M5 and M10 all SURVIVED the first sweep of this commit, and none of them
+// was a code defect: each was a guard with no test that could see it. M3 in
+// particular is the accidental-equivalence shape again — deleting the
+// `isHomeTopic` guard left my two "control" cases green because both of their
+// topics failed a LATER check for an unrelated reason.
+describe('F4 guards the mutant sweep found unpinned', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    resetRelayBuckets();
+    db = openDb(':memory:');
+    registerAgent(db, { id: 'owner', token_hash: hashToken('o'), hostname: 'h' });
+    getOrCreateTopic(db, 'trollbox', 'owner');
+    upsertPeer(db, {
+      alias: 'pod1', token_hash: hashToken('p'), minted_by_key: 'k',
+      kinds: '["topic-publish"]', rate_per_min: 600,
+    });
+    db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                VALUES ('pod1','wss://pod1.example','tok','orch','["topic"]',600,?)`).run(Date.now());
+    aclGrant(db, 'pod1:alice', 'topic:trollbox', 'admin');
+    subscribe(db, 'pod1:alice', 'trollbox');
+    aclGrant(db, 'topic:trollbox', 'pod1:alice', 'admin');
+  });
+  afterEach(() => { db.close(); });
+
+  const post = (over: Record<string, unknown> = {}) => routeRelay(
+    db, new Map(), getPeerByAlias(db, 'pod1')!,
+    {
+      type: 'relay', msg_id: `m-${Math.random()}`, kind: 'topic-publish',
+      from: 'alice', topic: 'trollbox', payload: 'hello', ...over,
+    } as never,
+  );
+
+  // M3, PROPERLY. The guard is only reachable when everything AFTER it would
+  // have passed: a topic that does not exist, WITH the post edge granted. My
+  // earlier controls used topics that also had no edge, so the refusal came
+  // from the ACL and the mutant survived.
+  it('M3: a post edge for a topic that does not exist is still refused, and writes nothing', () => {
+    aclGrant(db, 'pod1:alice', 'topic:ghosttopic', 'admin');
+    expect(aclCheck(db, 'pod1:alice', 'topic:ghosttopic')).toBe(true);   // POSITIVE CONTROL
+
+    expect(post({ topic: 'ghosttopic' }).ok).toBe(false);
+
+    expect(db.prepare("SELECT COUNT(*) c FROM messages").get()).toEqual({ c: 0 });
+    expect(db.prepare("SELECT COUNT(*) c FROM topics WHERE name = 'ghosttopic'").get()).toEqual({ c: 0 });
+  });
+
+  // M5. The re-originated row is FROM the topic principal — the hub owns the
+  // post now — with the real speaker recorded in `origin`, for display. Using
+  // the publisher as `from_agent` would make a remote id the sender of a local
+  // topic row, and every ACL downstream would read it.
+  it('M5: the re-originated row is FROM the topic principal, with origin beside it', () => {
+    // A LOCAL subscriber is required for this test to see anything. The
+    // OUTBOUND row's `from_agent` is computed inside the enqueue from the topic
+    // name, so it is immune to the ctx — which is why the first version of this
+    // test, asserting only the outbound row, left the mutant green. The row
+    // that carries `m.from_agent` is the locally fanned-out one.
+    registerAgent(db, { id: 'hub-sub', token_hash: hashToken('hs'), hostname: 'h' });
+    subscribe(db, 'hub-sub', 'trollbox');
+    aclGrant(db, 'topic:trollbox', 'hub-sub', 'admin');
+
+    post();
+
+    const local = db.prepare("SELECT from_agent, origin FROM messages WHERE to_agent = 'hub-sub'")
+      .get() as { from_agent: string; origin: string };
+    expect(local.from_agent).toBe('topic:trollbox');
+    expect(local.origin).toBe('pod1:alice');
+
+    const outbound = db.prepare("SELECT from_agent, origin FROM messages WHERE to_agent = 'pod1:' AND kind = 'topic'")
+      .get() as { from_agent: string; origin: string };
+    expect(outbound.from_agent).toBe('topic:trollbox');
+    expect(outbound.origin).toBe('pod1:alice');
+  });
+
+  // M10. ONE HOP: a ':' in a relayed `from` would mean this peer is relaying on
+  // behalf of a THIRD mesh — transitive federation nobody agreed to. Our
+  // admin's border decision covers this peer, not that peer's peers.
+  it('M10: a relayed `from` containing a colon is refused on every topic kind', () => {
+    for (const kind of ['topic-publish', 'topic-subscribe', 'topic-unsubscribe']) {
+      const r = post({ kind, from: 'pod9:mallory' });
+      expect({ kind, ok: r.ok }).toEqual({ kind, ok: false });
+    }
+    expect(db.prepare('SELECT COUNT(*) c FROM messages').get()).toEqual({ c: 0 });
+    expect(db.prepare("SELECT COUNT(*) c FROM subscriptions WHERE agent_id LIKE '%pod9%'").get()).toEqual({ c: 0 });
+  });
+
+  it('CONTROL: the same frames with a bare `from` are accepted', () => {
+    expect(post().ok).toBe(true);
   });
 });

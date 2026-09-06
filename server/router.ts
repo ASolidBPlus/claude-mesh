@@ -665,6 +665,49 @@ export function routeRelay(
     return { ok: true };
   }
 
+  // ── The POST arm: a spoke asking us, the OWNER, to publish.
+  //
+  // We re-originate: the post becomes ours, `from_agent` is the topic
+  // principal, and `origin` records who really said it — for display only. The
+  // hub is the ordering authority, which is why the poster's own mesh hears it
+  // as an echo of OUR delivery rather than of its own send.
+  if (kind === 'topic-publish') {
+    if (!isHomeTopic(db, topicName)) return refuse('not_home_topic');
+    // THE RIGHT TO POST, held by the remote publisher against our topic.
+    if (!aclCheck(db, `${alias}:${from}`, `${TOPIC_PRINCIPAL_PREFIX}${topicName}`)) return refuse('no_post_edge');
+
+    db.prepare('INSERT INTO relays (peer_alias, remote_msg_id, seen_at) VALUES (?, ?, ?)')
+      .run(alias, msg_id, now);
+
+    const principal = `${TOPIC_PRINCIPAL_PREFIX}${topicName}`;
+    fanOutHomeTopicPublish(db, agentIndex, {
+      topic: topicName,
+      from_agent: principal,
+      // THE TOPIC, not the poster: a subscriber's right to hear is a property
+      // of the topic. A hub subscriber holds `topic:x → me` and nothing from
+      // whoever posted on the far side.
+      aclPrincipal: principal,
+      origin: `${alias}:${from}`,
+      payload: payload as string,
+      content_type,
+      // THIS FRAME's budget, clamped — never a default. A spoke's short-lived
+      // post must not outlive its sender's intent on the way through.
+      sent_at: now,
+      expires_at: ttl === 0 ? null : now + ttl,
+      ephemeral: ttl === 0,
+      payloadBytes,
+    });
+
+    emitTap(observerIndex, {
+      type: 'tap', msg_id, kind: 'topic',
+      from: `${alias}:${from}`, to: null, topic: topicName, correlation_id: null,
+      sent_at: now, size: payloadBytes, payload: payload as string,
+    }, crossBorderAudience(db, observerIndex));
+
+    incPeerRelay(alias, 'in', 'delivered');
+    return { ok: true };
+  }
+
   // ── The TOPIC arm: a delivery from the mesh that OWNS the topic.
   //
   // The topic is stamped with our alias for them — `orch:trollbox` — which is
@@ -1003,11 +1046,82 @@ export function routePublish(
     return { ok: false, error_code: 'MESSAGE_TOO_LARGE', error_message: 'payload exceeds 1 MB limit' };
   }
 
+  // 1b. REMOTE TOPIC (§16 D). Placed before the local counters, and counting
+  //     inside the branch only AFTER every refusal has passed — mirroring
+  //     routeDirect, where a refused remote send counts nothing. A refusal is
+  //     not traffic.
+  const topicColon = frame.topic.indexOf(':');
+  if (topicColon > 0 && hasOutboundPeer(db, frame.topic.slice(0, topicColon))) {
+    const alias = frame.topic.slice(0, topicColon);
+    const remote = frame.topic.slice(topicColon + 1);
+    const refuseRemote = (): RouterResult => {
+      incError('AGENT_NOT_FOUND');
+      return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown topic: ${frame.topic}` };
+    };
+    if (remote.length === 0 || remote.includes(':') || Buffer.byteLength(remote, 'utf8') > 256) return refuseRemote();
+
+    // THE RIGHT TO POST, held by the publisher against the topic as an
+    // endpoint. The SENDING mesh decides whether this topic may leave.
+    if (!aclCheck(db, from_agent, frame.topic)) return refuseRemote();
+
+    // The one non-uniform code on this path, and it sits BEHIND the ACL —
+    // which is what makes it affordable: a caller that reaches it has already
+    // proven an edge to this topic, so the answer reveals only its OWN mesh's
+    // configuration and crosses no border (#123).
+    const peering = getOutboundPeer(db, alias);
+    let kinds: string[];
+    try { kinds = JSON.parse(peering!.kinds) as string[]; } catch { return refuseRemote(); }
+    if (!Array.isArray(kinds) || !kinds.includes('topic-publish')) {
+      incError('KIND_NOT_ALLOWED');
+      return { ok: false, error_code: 'KIND_NOT_ALLOWED', error_message: `kind not permitted to ${alias}` };
+    }
+
+    incSent(from_agent);
+    incBytes('in', payloadBytes);
+    observePayloadBytes(payloadBytes);
+
+    const nowRemote = Date.now();
+    const rawTtlPub = frame.ttl_ms === 0 ? 0 : (frame.ttl_ms ?? 300_000);
+    const ttlPub = Math.min(rawTtlPub, MAX_TTL_MS);
+    const postId = crypto.randomUUID();
+    insertMessage(db, {
+      id: postId,
+      kind: 'topic-publish',
+      from_agent,                       // bare; the hub stamps it with its alias for us
+      to_agent: `${alias}:`,
+      topic: remote,
+      payload: frame.payload,
+      content_type: frame.content_type ?? 'text/plain',
+      sent_at: nowRemote,
+      expires_at: ttlPub === 0 ? null : nowRemote + ttlPub,
+    });
+    incMsgStatus('topic', 'queued');
+
+    emitTap(observerIndex, {
+      type: 'tap', msg_id: postId, kind: 'topic',
+      from: from_agent, to: null, topic: frame.topic, correlation_id: null,
+      sent_at: nowRemote, size: payloadBytes, payload: frame.payload,
+    }, crossBorderAudience(db, observerIndex));
+
+    borderEvents.emit('enqueued', alias);
+
+    // NO LOCAL FAN-OUT (C7). Local subscribers hear this when the hub's
+    // delivery returns — the hub is the ordering authority, and a local
+    // shortcut would show this mesh's own agents a different order from every
+    // other mesh's.
+    return { ok: true, msg_id: frame.msg_id };
+  }
+
   incSent(from_agent);
   incBytes('in', payloadBytes);
   observePayloadBytes(payloadBytes);
 
-  // 2. Ensure topic exists
+  // 2. Ensure topic exists. A NEW name still has to be a permissible one.
+  const publishNameRefusal = topicNameRefusal(db, frame.topic);
+  if (publishNameRefusal !== null) {
+    incError('AGENT_NOT_FOUND');
+    return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown topic: ${frame.topic}` };
+  }
   getOrCreateTopic(db, frame.topic, from_agent);
 
   // 4. Compute expires_at
