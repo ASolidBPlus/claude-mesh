@@ -264,6 +264,23 @@ describe('F4 spoke: an arriving topic frame', () => {
     expect(JSON.parse(sock.sent[0]!).origin).toBe('orch:sub');
   });
 
+  // AN EMPTY ORIGIN IS ABSENT, NOT A VALUE (seat 2). `''` is a string, so it
+  // would have stamped to `orch:` — a bare alias with a trailing colon, naming
+  // nobody, which reads as a malformed remote id rather than as "no
+  // provenance". Collapsing it to null keeps one shape for "we do not know"
+  // instead of inventing a second.
+  it('an EMPTY origin is treated as absent, not stamped into a bare alias', () => {
+    const sock = fakeSocket();
+    routeRelay(db, new Map([['sub', sock]]), getPeerByAlias(db, 'orch')!,
+      topicFrame({ origin: '' }) as never);
+
+    const delivered = JSON.parse(sock.sent[0]!);
+    expect(delivered.origin).toBe(null);
+    expect(delivered.origin).not.toBe('orch:');
+    const row = db.prepare("SELECT origin FROM messages WHERE kind='topic'").get() as { origin: string | null };
+    expect(row.origin).toBe(null);
+  });
+
   // The bound is checked AFTER stamping, because the stamp is what goes on the
   // wire. A 252-byte origin under a 5-byte prefix is 257 stamped.
   it('an origin that only exceeds 256 bytes ONCE STAMPED is refused', () => {

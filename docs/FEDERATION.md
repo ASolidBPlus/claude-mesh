@@ -261,6 +261,11 @@ mesh it does not peer with. The stamp is applied by the server, so a peer cannot
 forge a replyable form — whatever it sends acquires our alias for it as a
 prefix. It is never routed on and never an ACL principal.
 
+**Only the first segment is ours.** Everything after it is what the delivering
+peer asserted — including whether the post was relayed at all: a peer can invent
+a middle segment for a mesh that does not exist, or omit one for a relay that
+did happen. Read `orch:…` as "orch handed us this", never as a path.
+
 ### What a refusal looks like
 
 | code | meaning |

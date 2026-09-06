@@ -592,7 +592,13 @@ export function routeRelay(
   // The 256-byte bound is checked AFTER stamping, because the stamp is what
   // goes on the wire and into the row.
   if (frame.origin !== undefined && typeof frame.origin !== 'string') return refuse('bad_origin');
-  const origin = typeof frame.origin === 'string' ? `${alias}:${frame.origin}` : null;
+  // An EMPTY origin is absent, not a value. Stamped, `''` would become `orch:`
+  // — a bare alias with a trailing colon, naming nobody, which reads as a
+  // malformed remote id rather than as "no provenance". The absent case is
+  // already `null` everywhere downstream, so this collapses one shape instead
+  // of inventing a second (seat 2).
+  const origin = typeof frame.origin === 'string' && frame.origin.length > 0
+    ? `${alias}:${frame.origin}` : null;
   if (origin !== null && Buffer.byteLength(origin, 'utf8') > 256) return refuse('bad_origin');
 
   // ONE HOP. `from`/`to` must be bare — a ':' would mean this peer is relaying
