@@ -1927,7 +1927,39 @@ export function startHttpAdmin(
 
     server.on('error', reject);
 
-    server.listen(port, () => {
+    // #127: MESH_ADMIN_BIND — the bind address for the ADMIN listener.
+    //
+    // Default is UNCHANGED: absent means listen(port) with no host, i.e. every
+    // interface, exactly as before. NOT a loopback default, deliberately —
+    // inside the container the spawner stack reaches this port over the Docker
+    // network, so a loopback default would make the mesh unreachable in
+    // production. This is a knob and a disclosure, not a new restriction.
+    //
+    // WHAT IT IS FOR. C9 exempts /metrics' per-cause counters on the premise
+    // that the admin port is internal-only. Until now the process did the
+    // OPPOSITE of what that premise needs — bound everything — and nothing in
+    // the system knew whether the network controls making it true were present.
+    // That made the premise an ASSUMPTION: checkable by nobody. With a bind
+    // address and a boot log naming it, it becomes CONFIGURATION: checkable by
+    // the deployer, at boot. C9 does not need the premise true everywhere; it
+    // needs it falsifiable somewhere.
+    const bindHost = process.env.MESH_ADMIN_BIND;
+    const onListening = () => {
+      const addr = server.address();
+      const bound = typeof addr === 'object' && addr !== null ? `${addr.address}:${addr.port}` : String(addr);
+      // Names the bind AND what is unauthenticated on it. A deployer reading
+      // 0.0.0.0 here is being told, at boot, that /metrics is reachable from
+      // wherever that resolves to — which is the whole point of the line.
+      console.log(JSON.stringify({
+        evt: 'admin.listening',
+        bind: bindHost ?? '(all interfaces)',
+        bound,
+        metrics_unauthenticated: true,
+        note: bindHost === undefined
+          ? 'admin port bound to ALL interfaces; /metrics is unauthenticated on it — set MESH_ADMIN_BIND to restrict, or accept this as the deployment decision'
+          : '/metrics is unauthenticated on this bind',
+        at: Date.now(),
+      }));
       const handle: HttpAdminHandle = {
         server,
         shutdown(): Promise<void> {
@@ -1940,6 +1972,10 @@ export function startHttpAdmin(
         },
       };
       resolve(handle);
-    });
+    };
+    // `host: undefined` is byte-identical to listen(port) — verified, both bind
+    // `::` — so the default path is unchanged by construction rather than by
+    // a branch that could drift from it.
+    server.listen({ port, host: bindHost }, onListening);
   });
 }
