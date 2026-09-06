@@ -232,13 +232,49 @@ curl -X POST "$MESH/observers" -H "Authorization: Bearer $ADMIN_TOKEN" \
 - A re-grant *overwrites*, so the same call narrows a scope as well as widening
   it.
 
-### `MESH_ADMIN_BIND` — **not yet implemented (#127)**
+### `MESH_ADMIN_BIND` — where the admin port listens
 
-Both listeners currently call `listen(port)` with no host, binding every
-interface. #127 will add a configurable admin bind address and a boot log naming
-both the bind and the unauthenticated `/metrics` on it. Until then, *the admin
-port being internal-only is an assumption your deployment has to enforce* — the
-process does nothing to check it.
+**Default is every interface, unchanged.** This is a knob and a disclosure, not
+a restriction: inside a container the spawner stack reaches both ports over the
+Docker network, so a loopback default would make the mesh unreachable.
+
+- `MESH_ADMIN_BIND=127.0.0.1` binds the admin listener to loopback only.
+- `MESH_WS_BIND` does the same for the agent/peer port. They are separate
+  variables because the ports have **different audiences**: the WS port must be
+  reachable by every agent and peering; the admin port need only be reachable
+  by operators and the spawner stack.
+
+**At boot the server logs where it bound and that `/metrics` is unauthenticated
+on it** (`evt: "admin.listening"`), including when you have set nothing — in
+which case it says so in as many words. That line is the point of the feature:
+it turns *"the admin port is internal-only"* from an assumption nobody can check
+into a statement your deployment either satisfies or does not, visible at boot.
+
+### Break-glass: attributing a flood
+
+**The problem this solves.** With `MESH_METRICS_IDENTITY_LABELS` unset — the
+default, and the right default — `mesh_acl_denied_total` collapses to an
+aggregate. **The rate stays visible and the *who* goes dark**, which is exactly
+the attribution incident response needs.
+
+**The procedure. It is a deploy action, not a code change:**
+
+1. Set `MESH_METRICS_IDENTITY_LABELS=1` on the bus and restart it.
+2. Scrape `/metrics` and read the identity-labelled series —
+   `mesh_acl_denied_total{from_agent}` names the sources.
+3. **Unset it and restart again.** Do not leave it on: while set, `/metrics`
+   hands the complete registered agent roster to any reader of an
+   unauthenticated endpoint.
+
+Treat the window as a deliberate, time-boxed exposure with a named end. If you
+find yourself leaving it on "for now", the honest alternative is to restrict the
+admin port with `MESH_ADMIN_BIND` and accept the exposure permanently — that is
+at least a decision someone made.
+
+**An attribution path that needs no flag** exists in principle: bucket refusals
+by *source socket*, since each plugin host holds one distinguishable connection
+to the bus. That is not built; it is recorded here so the break-glass procedure
+is understood as the current answer rather than the intended one.
 
 ---
 

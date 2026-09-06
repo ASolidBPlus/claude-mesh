@@ -504,7 +504,16 @@ export function startWsServer(
     httpServer.on('error', reject);
     wss.on('error', reject);
 
-    httpServer.listen(port, () => {
+    // #127, symmetry: MESH_WS_BIND for the agent/peer listener. Same default —
+    // absent means every interface, unchanged (`host: undefined` binds `::`
+    // exactly as listen(port) does, verified, so the default is unchanged by
+    // construction rather than by a branch).
+    //
+    // Named separately from MESH_ADMIN_BIND on purpose: the two ports have
+    // DIFFERENT audiences. The WS port must be reachable by every agent and
+    // every peering; the admin port need only be reachable by operators and the
+    // spawner stack. One variable for both would force the more permissive.
+    httpServer.listen({ port, host: process.env.MESH_WS_BIND }, () => {
       wss.on('connection', (ws: WebSocket) => {
         connections.add(ws);
 
