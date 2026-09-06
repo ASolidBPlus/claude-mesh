@@ -18,10 +18,23 @@
  * files are `http-admin.ts` and `db.ts`, and `db.ts` imports nothing
  * cross-package.
  *
- * Cross-package importers still exist and that is fine — `router.ts` and
- * `border.ts` both are, and both are far below the threshold. What must not
- * exist is a file in BOTH sets. Today's margins: `ws-server.ts` 4,420 B,
- * `router.ts` 18,412 B, `border.ts` 36,449 B.
+ * Cross-package edges still exist and that is fine. What must not exist is a
+ * file in BOTH sets. The edge set as THE TRANSPILER resolves it — copied from
+ * the walker's printed output in border.test.ts, not hand-derived:
+ *
+ *     server/border.ts        14,751 B   margin 36,449   ../client/src/peer-client.ts
+ *     server/wire-version.ts  (this file, whose size the walker prints)
+ *
+ * `router.ts` is ABSENT from that set: its wire-type import is `import type`,
+ * erased before any module edge exists. `ws-server.ts` and `http-admin.ts` are
+ * no longer cross-package importers at all — this change removed both.
+ *
+ * The earlier version of this comment listed margins for `ws-server.ts` and
+ * `router.ts`. Neither is in the set: one had already been removed by the very
+ * change the comment described, the other was never a runtime edge. Numbers a
+ * test prints should be COPIED from it, never re-derived by hand beside it —
+ * and this file's own size is deliberately not written here, because any figure
+ * for it is stale the moment this comment is edited.
  *
  * NOT a guarantee. wire-version.ts is a bare re-export barrel with no reason to
  * approach 51,200 B, but nothing STOPS it growing, and it is exactly where the

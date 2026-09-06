@@ -389,42 +389,43 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
   // #131 ENFORCED, not merely described. The comments above state the invariant
   // and comments do not fail. This is the assertion.
   //
-  // RUNTIME imports only: `import type` is erased before anything is executed,
-  // so it cannot participate in a link failure. router.ts imports its wire
-  // types with `import type` and is therefore NOT a runtime cross-package edge,
-  // despite naming the same module — which is exactly the kind of distinction a
-  // grep for the path would get wrong.
+  // THE EDGE SET COMES FROM THE TRANSPILER, NOT FROM A REGEX — and the reason is
+  // the whole finding. Classifying imports by hand means deciding which ones are
+  // erased, and a value edge misclassified as erased returns CLEAN on exactly
+  // the state this guard exists to catch: it fails OPEN. Four separate
+  // hand-parsed derivations of this same set were attempted across the lane and
+  // every one of them was wrong at least once, including two of mine.
+  //
+  // `Bun.Transpiler.scanImports` is the component whose behaviour the invariant
+  // is ABOUT, so it cannot disagree with the transpiler. It also covers the four
+  // forms a `from`-anchored regex silently misses — side-effect import,
+  // `export * from`, dynamic `import()`, `require()` — none of which exist in
+  // server/ today, which is precisely why a regex would have kept looking right.
+  // Comments need no stripping: the transpiler does not see them.
+  //
+  // Positive-controlled on a synthetic file carrying all six forms: `import type`
+  // absent (erased), `import { type B, C }` present (C is a value), side-effect
+  // present, `export *` present, dynamic present, commented-out absent.
   it('#131: no server file with a runtime cross-package import reaches the cache threshold', () => {
     const THRESHOLD = 51_200;   // fine-bisected: 51,197 -> 0 cache entries, 51,497 -> 1
     const root = join(import.meta.dir, '..', '..');
+    const transpiler = new Bun.Transpiler({ loader: 'ts' });
 
     const rows: { file: string; size: number; specs: string[] }[] = [];
     for (const f of sourceFiles(join(root, 'server'))) {
-      const src = readFileSync(f, 'utf8')
-        .replace(/\/\*[\s\S]*?\*\//g, '')     // block comments: a path in prose is not an edge
-        .replace(/\/\/.*$/gm, '');             // line comments, same reason
-      // For each cross-package `from '...'`, walk BACK to the keyword that owns
-      // it and ask whether that statement is type-only. Matching forward from
-      // the keyword does NOT work: a lazy `[\s\S]*?` runs past the end of one
-      // import statement into the next one's `from`, which made this walker
-      // report router.ts — an `import type` — as a runtime edge. The printed
-      // rows are what caught it; the verdict was green either way.
-      const specs: string[] = [];
-      for (const m of src.matchAll(/from\s*'(\.\.\/client\/[^']+)'/g)) {
-        const before = src.slice(0, m.index!);
-        const kw = Math.max(before.lastIndexOf('import'), before.lastIndexOf('export'));
-        if (kw === -1) continue;
-        // Type-only if `type` is the very next token after the keyword. Note the
-        // limit: an inline `import { type A, B }` counts as runtime here, which
-        // is the safe direction — it over-reports rather than missing an edge.
-        if (!/^(?:import|export)\s+type\b/.test(src.slice(kw))) specs.push(m[1]!);
-      }
+      const specs = transpiler
+        .scanImports(readFileSync(f, 'utf8'))
+        .filter(i => i.path.startsWith('../client/'))
+        .map(i => `${i.path} (${i.kind})`);
       if (specs.length > 0) rows.push({ file: f.slice(root.length + 1), size: statSync(f).size, specs });
     }
 
-    // Print what the walk found, not just its verdict: a green here is worth
-    // exactly the set it examined.
-    console.log('#131 runtime cross-package edges in server/:');
+    // Print the rows, not just the verdict. This is load-bearing: the previous
+    // hand-parsed version of this walker reported router.ts — an erased
+    // `import type` — as a runtime edge, and the verdict was GREEN both before
+    // and after that bug, because router.ts is far below the threshold either
+    // way. Only the printed rows could show the detector was wrong.
+    console.log('#131 runtime cross-package edges in server/, per Bun.Transpiler:');
     for (const r of rows) console.log(`  ${r.file} — ${r.size} B (margin ${THRESHOLD - r.size}) — ${r.specs.join(', ')}`);
 
     expect(rows.length).toBeGreaterThan(0);          // the walk found something
