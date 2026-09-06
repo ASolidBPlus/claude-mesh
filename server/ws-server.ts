@@ -1229,6 +1229,42 @@ export function startWsServer(
 
           const handler = typeof frameType === 'string' ? POST_AUTH_HANDLERS[frameType] : undefined;
           if (handler !== undefined) {
+            // #171 — THE ACT-PATH WRITER for `last_seen`, which had none.
+            //
+            // `touchAgent` is the only writer that means "acted", and since #67
+            // took its call off the keepalive path it had no production caller
+            // at all: the field's remaining writer was `setOnline`, so
+            // "last acted" was a CONNECT STAMP and every consumer reading it as
+            // activity showed the fleet idle since its last reconnect.
+            //
+            // ONE SITE, HERE, rather than five inside the handlers, because
+            // this is the one place every agent-originated frame passes through
+            // and a per-handler copy is a list that goes stale the next time a
+            // frame type is added.
+            //
+            // BEFORE the handler, so a REFUSED act counts: the field is "last
+            // acted", not "last succeeded", and an agent whose sends are all
+            // being refused is an agent doing something. An operator asking
+            // "is this thing alive and trying" needs that answer.
+            //
+            // TWO EXCLUSIONS, and both are the same argument one level apart:
+            //   ping       — the transport, answered by the mesh PLUGIN while
+            //                the agent's loop may be stuck (#67). This is the
+            //                exclusion that removal was for.
+            //   loop_alive — the LOOP's proof of life, emitted every turn
+            //                whether the agent did anything or not (#133).
+            //                Counting it would make "last acted" mean "the loop
+            //                is running" for every agent carrying the emitter —
+            //                a second copy of `last_responded` under a name
+            //                that promises something else, which is the exact
+            //                conflation #133 exists to prevent.
+            //
+            // The issue asked for `ping` alone; `loop_alive` shipped between
+            // its filing and this fix, and including it would have undone #133
+            // by accident.
+            if (frameType !== 'ping' && frameType !== 'loop_alive' && state.agentId !== null) {
+              touchAgent(db, state.agentId);
+            }
             // #94 CLASS FIX, the same guard #68 gave the HTTP dispatcher. A
             // handler throw here used to reach the process with no
             // uncaughtException handler installed anywhere in server/ — so ANY
