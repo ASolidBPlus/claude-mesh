@@ -75,8 +75,11 @@ function importSpecifiers(src: string): string[] {
 // depth is handled, and the inference is reasonable and wrong.
 //
 // Measured before the fix: a nested `server/sub/deep.ts` importing
-// `'../../client/src/peer-client.ts'` at 51,678 B passed all three guards —
-// 3 pass, 0 fail — and never appeared in the printed rows.
+// `'../../client/src/peer-client.ts'`, sized as a probe just over the
+// threshold, passed all three guards — 3 pass, 0 fail — and never appeared in
+// the printed rows. (The probe pair is recorded in #131; no size is repeated
+// here, so the only figures in prose are the threshold and its bisection
+// points.)
 //
 // Third defect in this filter stage, all three the same shape: the
 // classification step was cheap to write and wrong at the edges.
@@ -90,6 +93,12 @@ const SERVER_ROOT = join(REPO_ROOT, 'server');
  * the importing file's directory: without it the same specifier names different
  * targets at different depths, which is the assumption that made the previous
  * prefix-matching version fail open.
+ *
+ * NAME IT ACCURATELY: this tests "the resolved path escapes `server/` AT ALL",
+ * not "escapes to `client/`". A `'../design/x.ts'` trips a guard whose name says
+ * client. That is deliberate and it is the safe direction — a guard that fails
+ * open when it under-reports should over-report — but a reader who assumes the
+ * narrower meaning will be surprised, so it is said here rather than inferred.
  *
  * Two properties of this test worth knowing before changing it. Bare package
  * specifiers ('ws') resolve inside the root and are correctly in-package. And a
@@ -567,6 +576,15 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
     const nestedDir = join(REPO_ROOT, 'server', 'a', 'b');
     expect(crossPackageEdges(forms('../../../client'), nestedDir).sort()).toEqual(EXPECTED);
 
+    // FOUR LEVELS DOWN, and this case is the one that distinguishes "resolved"
+    // from "widened until the cases we happened to write pass". Two depths can
+    // both be satisfied by a filter that special-cases two depths; a third,
+    // deeper one cannot be, short of actually resolving. The repo's controls
+    // stopped at two levels, which is exactly the coverage a depth-1 prefix
+    // would also have survived.
+    const deepDir = join(REPO_ROOT, 'server', 'a', 'b', 'c');
+    expect(crossPackageEdges(forms('../../../../client'), deepDir).sort()).toEqual(EXPECTED);
+
     // A relative specifier that resolves OUTSIDE client/ from that same nested
     // directory must not be counted — the prefix version had no way to ask.
     expect(crossPackageEdges(`import { Z } from '../../server/x.ts'; void Z;`, nestedDir)).toEqual([]);
@@ -600,6 +618,26 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
     // probe was walked, and its edge was filtered out — which is exactly why
     // both are needed: one covers "seen but misclassified", the other covers
     // "never seen at all", and a green on either says nothing about the other.
+    //
+    // WHAT IT CAN AND CANNOT SEE: catches divergence between the two walks;
+    // blind to a defect in what they share. What moves both together is
+    // invisible, and the shared substrate is small and worth naming: the skip
+    // list (`node_modules`, `__tests__`), the `.ts` extension filter, and the
+    // readdirSync/statSync pair. Change any of those and this control agrees
+    // with itself while both walks are wrong.
+    //
+    // THE MUTANT THAT DISCHARGES THIS WAS MEASURED UNDER A MODIFIED TREE, and
+    // saying so is the point. Disabling the recursion in either walker reds it
+    // 17 vs 16 ONLY with a synthetic nested file present. On the SHIPPED tree
+    // the recursion is unexercised — server/ is flat, its only subdirectories
+    // are node_modules and __tests__, and both walks skip both — so the same
+    // mutant changes nothing here: 1 pass, 0 fail. An earlier version of this
+    // comment stated the 17-vs-16 figures in the present tense, which reads as
+    // a property of the suite as it runs and is not one.
+    //
+    // What reopens it: the first real directory under server/. At that moment
+    // this control starts doing work, and so does the #131 walker's own
+    // recursion — which is why neither is deleted as dead.
     const independent: string[] = [];
     (function walk(dir: string): void {
       for (const name of readdirSync(dir)) {
