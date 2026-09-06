@@ -4,7 +4,7 @@ import * as http from 'http';
 import * as net from 'net';
 import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
 import { validateToken } from './auth.ts';
-import { PEER_PROTOCOL_VERSION } from '../client/src/protocol.ts';
+import { PEER_PROTOCOL_VERSION } from './wire-version.ts';  // #131: via the tiny module, never cross-package from here
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
 import {

@@ -345,6 +345,46 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
     expect(defs[0]).toContain(join('client', 'src', 'protocol.ts'));
     expect(literals).toEqual([]);
   });
+
+  // #131. The definition stays in the wire module; what changed is WHERE
+  // http-admin reads it from. It is the only importer that ever hit the
+  // intermittent link failure, and the only one both over the on-disk
+  // transpiler-cache threshold (>=50 KB; bisected 45-60 KB) AND crossing the
+  // package boundary — ws-server.ts (46 KB, uncached) and peer-client.ts (same
+  // package) never failed. Reading it from './ws-server.ts', which re-exports
+  // it, removes that edge.
+  //
+  // This pins the SPECIFIER, not just the definition, because the natural
+  // tidy-up — "why is http-admin importing a wire constant from the ws server?"
+  // — silently reinstates exactly the edge that was removed. Whoever makes that
+  // change should have to read this.
+  //
+  // Not a proof of mechanism: a removal of the measured asymmetry
+  // (cached AND cross-package). #131 stays open.
+  it('#131: every reader imports the constant from its pinned specifier', () => {
+    // NOTE: `export { PEER_PROTOCOL_VERSION };` in ws-server.ts has no `from`
+    // clause — it re-exports an already-imported binding and introduces no
+    // edge, so it is correctly absent from the list below.
+    const root = join(import.meta.dir, '..', '..');
+    const files = [...sourceFiles(join(root, 'server')), ...sourceFiles(join(root, 'client', 'src'))];
+
+    const readers: string[] = [];
+    for (const f of files) {
+      const src = readFileSync(f, 'utf8');
+      for (const m of src.matchAll(/(?:import|export)\s*\{[^}]*PEER_PROTOCOL_VERSION[^}]*\}\s*from\s*'([^']+)'/g)) {
+        readers.push(`${f.slice(root.length + 1)} <- ${m[1]}`);
+      }
+    }
+
+    // Re-exports count as readers too: wire-version.ts carries the edge, so a
+    // grep for `import {` alone would miss the one file that matters most.
+    expect(readers.sort()).toEqual([
+      'client/src/peer-client.ts <- ./protocol.ts',            // in-package
+      'server/http-admin.ts <- ./wire-version.ts',             // 80,951 B — must not cross
+      'server/wire-version.ts <- ../client/src/protocol.ts',   // THE only server-side cross-package edge
+      'server/ws-server.ts <- ./wire-version.ts',              // 46,780 B — inside the band, must not cross
+    ]);
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════════════

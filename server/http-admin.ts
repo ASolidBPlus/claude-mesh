@@ -41,7 +41,23 @@ import {
   getPeerKeyBySecret, revokePeerKey, getPeerByAlias, upsertPeer, getPeerKeyById, type PeerKey,
   insertOutboundPeer, getOutboundPeer, listOutboundPeers, updateOutboundPeer, endOutboundPeering, type OutboundPeer,
 } from './db.ts';
-import { PEER_PROTOCOL_VERSION } from '../client/src/protocol.ts';
+// #131: read via ./wire-version.ts, never as a direct cross-package import
+// from the client wire module.
+//
+// This file is 81,312 B — over the 51,200 B transpiler-cache threshold — and it
+// was the ONLY importer that ever hit the intermittent link failure. It was
+// also the only one both cached AND crossing the package boundary. The
+// invariant, and the reason wire-version.ts exists, is written there.
+//
+// (Deliberately not naming the client path in prose here: a comment containing
+// the literal import string makes this file register as a cross-package
+// importer to any grep that does not strip comments, which is exactly the false
+// positive that turned up while verifying the invariant.)
+//
+// The constant still has exactly ONE definition. That, and the specifier every
+// reader uses, are pinned by border.test.ts, so the obvious tidy-up reds rather
+// than silently reinstating the edge.
+import { PEER_PROTOCOL_VERSION } from './wire-version.ts';
 import { parseDuration } from './duration.ts';
 import { cronValidate, cronNext, tzValidate, cronNextTz, isBareIso, bareIsoToUtc } from './cron.ts';
 import { renderMetrics } from './metrics.ts';
