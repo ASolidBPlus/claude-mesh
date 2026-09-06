@@ -165,38 +165,93 @@ describe('#11: the single query returns exactly the old per-peer answer', () => 
   });
 });
 
-describe('#11: the self-edge diagonal — the one intended behaviour delta', () => {
-  // registry is keyed by SOCKET, so an agent holding a second live connection
-  // appears in it twice. Before #11, an agent with a self-edge row in acl had
-  // aclRelated(A, A) === true, so its own status frame went to its other
-  // socket. listAclPeers excludes self, so it no longer does.
+describe('#11 / #92: the self-edge diagonal, and why its world is gone', () => {
+  // WHAT THIS TEST USED TO BE, and why it could not survive #92.
   //
-  // Pinned rather than merely stated: replacing a pairwise predicate with set
-  // membership is exact only OFF the diagonal, and this is the diagonal.
-  it('an agent with a self-edge and two sockets does not receive its own status', async () => {
+  // It constructed a two-sockets-one-identity world by authenticating the same
+  // agent twice, then asserted the first socket received no self-status. That
+  // world was a QUIRK: agentIndex.set overwrote the entry while the per-socket
+  // registry still held the first connection, authed. #92 removed it — a second
+  // auth now displaces the first socket.
+  //
+  // The old test would still PASS after that change, and that is exactly the
+  // problem: it would pass because there is no second socket left to not
+  // receive the frame, not because self-exclusion works. An absence test whose
+  // world has been deleted can no longer fail.
+  //
+  // So the property moved to where it can still be discriminated:
+  // self-exclusion is pinned at the HELPER level by "excludes self even when a
+  // self-edge exists" above — listAclPeers(db, 'solo') is empty with the
+  // diagonal row present — which is the behaviour #11 actually changed, and it
+  // holds regardless of how many sockets exist.
+  //
+  // What is asserted HERE instead is #92's own property: the thing that makes
+  // the two-socket world unreachable.
+  it('#92: a second auth for the same id displaces the first socket', async () => {
     const db = openDb(':memory:');
     const port = nextPort();
-    const filesDir = mkdtempSync(join(tmpdir(), 'mesh-11-self-'));
+    const filesDir = mkdtempSync(join(tmpdir(), 'mesh-92-'));
     const handle: WsServerHandle = await startWsServer(port, db, 10_485_760, filesDir);
     registerAgent(db, { id: 'twin', token_hash: hashToken('tok-twin'), hostname: 'h' });
-    aclGrant(db, 'twin', 'twin', 'system'); // the diagonal row
+    aclGrant(db, 'twin', 'twin', 'system'); // the diagonal row is still present
 
     const first = await authConnect(port, 'twin', 'tok-twin');
-    const seen: unknown[] = [];
-    first.on('message', (d) => {
-      const m = JSON.parse(d.toString());
-      if (m.type === 'agent_status') seen.push(m);
+    const firstFrames: unknown[] = [];
+    const closed: { code: number | null; reason: string } = { code: null, reason: '' };
+    first.on('message', (d) => { firstFrames.push(JSON.parse(d.toString())); });
+    first.on('close', (...args: unknown[]) => {
+      closed.code = args[0] as number;
+      closed.reason = String(args[1] ?? '');
     });
     await wait(50);
+    firstFrames.length = 0;                       // ignore anything before displacement
 
-    // Second socket for the SAME agent: its connect fires a presence broadcast
-    // with the new socket excluded, so the first socket is the only candidate.
     const second = await authConnect(port, 'twin', 'tok-twin');
-    await wait(120);
+    await wait(150);
 
-    expect(seen).toEqual([]);
+    // The displaced socket is TOLD why, with a stated code, so the old client
+    // knows it was replaced rather than dropped and does not reconnect into a
+    // fight with itself.
+    expect(closed.code).toBe(1008);
+    expect(closed.reason).toContain('displaced');
+    expect(firstFrames.some((f) => (f as { code?: string }).code === 'DISPLACED')).toBe(true);
 
-    try { first.close(); second.close(); } catch { /* ignore */ }
+    // ...and no frame arrives after the close.
+    const afterClose = firstFrames.length;
+    await wait(100);
+    expect(firstFrames.length).toBe(afterClose);
+
+    // The survivor is still indexed: displacement must not evict the LIVE
+    // socket's entry along with the dead one's, which is what the
+    // identity-guarded teardown exists to prevent.
+    expect(handle.agentIndex.get('twin')).toBeDefined();
+    expect(second.readyState).toBe(1);
+
+    try { second.close(); } catch { /* ignore */ }
+    await handle.shutdown().catch(() => {});
+    db.close();
+  }, 20_000);
+
+  // POSITIVE CONTROL for the displacement. Without it, a server that closed
+  // every second connection would pass the test above and look correct.
+  it('#92 CONTROL: two DIFFERENT ids keep two sockets', async () => {
+    const db = openDb(':memory:');
+    const port = nextPort();
+    const filesDir = mkdtempSync(join(tmpdir(), 'mesh-92-ctl-'));
+    const handle: WsServerHandle = await startWsServer(port, db, 10_485_760, filesDir);
+    registerAgent(db, { id: 'alpha', token_hash: hashToken('tok-a'), hostname: 'h' });
+    registerAgent(db, { id: 'beta', token_hash: hashToken('tok-b'), hostname: 'h' });
+
+    const a = await authConnect(port, 'alpha', 'tok-a');
+    const b = await authConnect(port, 'beta', 'tok-b');
+    await wait(150);
+
+    expect(a.readyState).toBe(1);
+    expect(b.readyState).toBe(1);
+    expect(handle.agentIndex.get('alpha')).toBeDefined();
+    expect(handle.agentIndex.get('beta')).toBeDefined();
+
+    try { a.close(); b.close(); } catch { /* ignore */ }
     await handle.shutdown().catch(() => {});
     db.close();
   }, 20_000);

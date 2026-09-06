@@ -731,7 +731,42 @@ export function startWsServer(
             authed = true;
             state.authed = true;
             state.agentId = agentId;
+
+            // #92 — NEWER WINS. A second successful auth for the same agent id
+            // DISPLACES the first socket.
+            //
+            // Before this, agentIndex.set silently overwrote the entry while
+            // the per-socket registry still held the first connection, authed,
+            // carrying the same agentId: two live sockets for one identity.
+            // Direct deliveries went to the newest via agentIndex, while the
+            // orphaned first socket stayed a presence-broadcast candidate and
+            // kept its authed state until it dropped on its own. Anything
+            // iterating the registry saw a ghost.
+            //
+            // Displacing rather than refusing the second auth is the friendlier
+            // half of the choice and matches what agentIndex already implied:
+            // an agent reconnecting over a half-open socket (#67) must be able
+            // to get back in, and refusing it would leave it locked out until
+            // the heartbeat reaped a connection it cannot see.
+            //
+            // ORDER: index first, then close. The close is what makes the old
+            // socket's own close handler run, and that handler deletes from
+            // agentIndex only if the entry is still ITS socket — so setting the
+            // new entry first is what stops the displaced socket's teardown
+            // evicting the live one. Same shape as the peer path's D11.
+            const displaced = agentIndex.get(agentId);
             agentIndex.set(agentId, ws);
+            if (displaced !== undefined && displaced !== ws) {
+              try {
+                displaced.send(JSON.stringify({
+                  type: 'error', code: 'DISPLACED',
+                  message: 'displaced by a newer connection',
+                }));
+              } catch (_) { /* the socket may already be gone; displacement still stands */ }
+              // A stated code, so the old client knows it was replaced rather
+              // than dropped, and does not reconnect into a fight with itself.
+              try { displaced.close(1008, 'displaced by a newer connection'); } catch (_) { /* ignore */ }
+            }
 
             const pending = getPendingMessages(db, agentId);
             const queued = pending.length;
@@ -939,6 +974,25 @@ export function startWsServer(
 
           if (connState && connState.authed && connState.agentId !== null) {
             const agentId = connState.agentId;
+
+            // #92 — IDENTITY-GUARDED TEARDOWN, the other half of newer-wins.
+            //
+            // When a second auth displaces this socket, THIS handler runs for
+            // the displaced one while the agent is still very much online on
+            // the newer socket. Unguarded, it would delete the agentIndex entry
+            // that now points at the LIVE socket, mark the agent offline, and
+            // broadcast a presence departure — turning a successful reconnect
+            // into an outage. The peer path has carried this guard since D11;
+            // the agent path did not, which is why displacement could not be
+            // added without it.
+            //
+            // A late close from an already-replaced socket is the same case and
+            // is handled by the same test.
+            if (agentIndex.get(agentId) !== ws) {
+              try { registry.delete(ws); } catch (_) { /* never throw on close */ }
+              return;
+            }
+
             setOnline(db, agentId, false);
             agentIndex.delete(agentId);
             try { observerIndex.delete(agentId); } catch (_) { /* never throw on close */ }
