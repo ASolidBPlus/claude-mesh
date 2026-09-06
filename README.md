@@ -83,7 +83,7 @@ A consumer has three raw surfaces to build on:
 
 The [SDK](#41-with-the-sdk) implements everything in this section. Read it if you're writing a client in another language, or want to understand the wire.
 
-All frames are JSON with a `type` field. The client must send `auth` first (within 5 s) before any other frame is accepted. Default ports: WS `7384`, admin `7385` (the Docker image uses `7432`/`7433` — see [§8](#9-build--run--deploy)).
+All frames are JSON with a `type` field. The client must send `auth` first (within 5 s) before any other frame is accepted. Default ports: WS `7384`, admin `7385` (the Docker image uses `7432`/`7433` — see [§9](#9-build--run--deploy)).
 
 ### Handshake
 
@@ -411,7 +411,7 @@ Counters are in-memory and reset on restart — graph them with `rate()`/`increa
 `mesh_messages_total{status="expired"}` counts messages that crossed their delivery TTL while still **undelivered** (their deliverability died) — not messages deleted from the store, which no longer happens at TTL. It's incremented once per message as it expires, windowed over each cleanup tick; because the counter is in-memory, expiries that cross the TTL boundary while the server is down are not counted (consistent with `rate()`/`increase()` graphing).
 
 ### The tap
-The live message stream — see [§5](#6-observers-and-the-tap). `/metrics` answers *how much / how healthy*, the tap answers *what's flowing now*, the message store answers *what happened*.
+The live message stream — see [§6](#6-observers-and-the-tap). `/metrics` answers *how much / how healthy*, the tap answers *what's flowing now*, the message store answers *what happened*.
 
 ### Durable scheduling (reminders / cron)
 Server-side scheduling that outlives your node: one-shot (`duration`/`due_at`) or recurring (`cron`), with DST-aware per-reminder timezones, surviving restarts and redeploys. Use it for heartbeats, periodic jobs, or deferred follow-ups without keeping an in-process timer alive.

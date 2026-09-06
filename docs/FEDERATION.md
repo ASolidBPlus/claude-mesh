@@ -295,7 +295,12 @@ ACL edges must be re-granted. If you only need the link to stop, use
 `PATCH /outbound-peers/:alias` with `{"enabled": false}` stops the link while
 keeping its configuration — **and, unlike a delete or a revocation, it keeps the
 queued messages and the ACL edges.** This is the reversible option: `{"enabled":
-true}` restores the link with nothing else to redo. Prefer it for maintenance,
+true}` restores the link with nothing else to redo.
+
+**While disabled, NEW sends to that alias are refused with `AGENT_NOT_FOUND`**
+(a paused peering makes the remote id unknown to local senders); only
+already-queued messages wait, and re-enabling drains them. So pausing is not
+buffering — expect senders to see refusals for the duration. Prefer it for maintenance,
 incidents, and anything you intend to undo.
 
 ---
