@@ -611,11 +611,23 @@ export function startWsServer(
         const state: ConnState = { ws, agentId: null, peerAlias: null, authed: false };
         registry.set(ws, state);
 
-        let authed = false;
+        // #143: NO local `authed` mirror. It used to sit here beside
+        // `state.authed`, set at both assignment sites together and read by
+        // different consumers — the pre-auth guard and the auth timer read the
+        // local, the presence fan-out and the close handler read the field.
+        // One fact with two homes is the shape this repo keeps finding drift
+        // in; here it also blocked the extraction below, because a captured
+        // mutable local cannot move into a named function without becoming a
+        // return value or a holder.
+        //
+        // Safe by CONSTRUCTION (exactly two assignment sites, both setting
+        // both) and confirmed by MEASUREMENT (instrumented at all three read
+        // sites, the two never diverged across 805 tests). The construction is
+        // the argument; the measurement only says nothing contradicted it.
         let messageHandled = false;
 
         const authTimer = setTimeout(() => {
-          if (!authed) {
+          if (!state.authed) {
             try {
               ws.send(JSON.stringify({ type: 'error', code: 'AUTH_TIMEOUT', message: 'no auth frame received within 5 seconds' }));
             } catch (_) { /* ignore */ }
@@ -628,7 +640,7 @@ export function startWsServer(
           try {
             parsed = JSON.parse(data.toString());
           } catch (_) {
-            if (!authed) {
+            if (!state.authed) {
               if (messageHandled) return;
               messageHandled = true;
               clearTimeout(authTimer);
@@ -642,7 +654,7 @@ export function startWsServer(
 
           const frame = parsed as Record<string, unknown>;
 
-          if (!authed) {
+          if (!state.authed) {
             // Pre-auth: only process first frame
             if (messageHandled) return;
             messageHandled = true;
@@ -739,7 +751,6 @@ export function startWsServer(
 
               // (c) peer connection state. agentId stays NULL — a peer is not
               // an agent, and every agent-shaped path keys off agentId.
-              authed = true;
               state.authed = true;
               state.peerAlias = agentId;
               clearTimeout(authTimer);
@@ -828,7 +839,6 @@ export function startWsServer(
             const connectTime = Date.now();
             setOnline(db, agentId, true);
 
-            authed = true;
             state.authed = true;
             state.agentId = agentId;
 
