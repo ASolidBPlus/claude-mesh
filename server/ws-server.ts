@@ -898,6 +898,45 @@ export function startWsServer(
               // re-online broadcast — net zero churn. onlineBroadcast stays true.
               clearTimeout(existing.pendingOfflineTimer);
               existing.pendingOfflineTimer = null;
+            } else if (existing && existing.onlineBroadcast) {
+              // #152 — A DISPLACING AUTH IS NOT AN ARRIVAL.
+              //
+              // Reaching here means peers were told this agent is online and
+              // have not been told otherwise: no offline was broadcast (that
+              // deletes the state) and none is pending (that is the branch
+              // above). The only way to auth into that is over a socket that
+              // was already live for this id — a displacement — and the
+              // displaced socket's own close correctly broadcasts nothing
+              // (identity-guarded teardown, #92). Broadcasting online here put
+              // an ARRIVAL WITH NO DEPARTURE on the presence stream.
+              //
+              // Direction was always safe: never an unpaired departure, no
+              // reachable agent marked offline. The cost is to consumers that
+              // count transitions or infer session boundaries from the stream
+              // — mesh-chat's roster among them.
+              //
+              // KEYED ON PRESENCE, NOT ON THE SOCKET, and the reason needs no
+              // prediction about future code. This branch suppresses a
+              // broadcast because OBSERVERS ALREADY BELIEVE THIS AGENT IS
+              // ONLINE — and `onlineBroadcast` IS that fact, the variable whose
+              // meaning is the premise. The `displaced` local a few lines up is
+              // EVIDENCE FOR the fact, not the fact. A branch should test its
+              // own premise rather than a correlate; the day the two diverge,
+              // code keyed on the correlate is wrong for a reason invisible at
+              // the line.
+              //
+              // The two are equivalent today and that was checked rather than
+              // assumed, structurally as well as by test: agentIndex.delete has
+              // exactly one site, behind #92's identity guard, so no reachable
+              // state separates them. A corollary of keying on the premise is
+              // that a second path to a doubled socket is covered without being
+              // remembered — a corollary, not the reason.
+              //
+              // PRE-EXISTING, NOT #145's. This block is byte-identical to
+              // e3de095^ (verified). #145 changed how OFTEN it is reached, by
+              // making displacement the deliberate reconnect path; it also
+              // removed the spurious later departure that used to follow, which
+              // was the dangerous half and a different defect.
             } else {
               // Genuinely fresh / long-offline connect: broadcast online as today.
               broadcastStatus(agentId, true, connectTime, ws);
