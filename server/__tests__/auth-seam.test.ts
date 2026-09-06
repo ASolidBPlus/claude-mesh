@@ -254,7 +254,12 @@ describe('#143 auth seam, characterised before the cut', () => {
   // noted. What remains outside it is genuinely dynamic dispatch — a call
   // reached through a computed property or a value that never names the
   // function in source. That residual is accepted while the function is
-  // module-private, which the definition count pins.
+  // module-private — which the export assertion pins, not the definition count.
+  //
+  // Together the four assertions close every route in: an unexported single
+  // definition (nothing outside the file can reach it), no mention that is not
+  // a call (nothing inside can capture it), exactly one call, and that call
+  // preceded in-block by the clear.
   it('handleAuthFrame has ONE call site, and that site clears the auth timer', async () => {
     const src = await Bun.file(join(import.meta.dir, '../ws-server.ts')).text();
     const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
@@ -274,6 +279,13 @@ describe('#143 auth seam, characterised before the cut', () => {
     // This is the check the previous comment DESCRIBED as an accepted residual.
     // It was one line to close, so describing it was the wrong trade.
     expect([...code.matchAll(/\bhandleAuthFrame\b(?!\s*\()/g)].length).toBe(0);
+
+    // AND THE DEFINITION IS NOT EXPORTED (seat 2, round three). The count above
+    // matches `export function handleAuthFrame(` exactly once too, so adding
+    // `export` left this green while opening a route in from any other file —
+    // and the comment below claimed the count pinned module-privacy. It did
+    // not. Measured: 11/0 under the export mutant before this line.
+    expect(code).not.toMatch(/export\s+(async\s+)?function\s+handleAuthFrame\b/);
 
     // ...and the call is preceded, in the same block, by the clear. Sliced
     // backwards from the call to the enclosing `if (!state.authed) {`, so this
