@@ -1,16 +1,24 @@
 name: CI
 
 # The repository's single CI workflow, and the ONLY place the test suite and
-# the typecheck ratchet run — on pull requests and on every push to main.
+# the typecheck ratchet run — on EVERY pull request regardless of its base
+# branch, and on every push to main. (Stacked PRs test head-merged-into-parent;
+# a base filter would silently exempt them.)
 # Jobs:
 #   test      — bun test, server and client
 #   typecheck — the error-count ratchet (.github/scripts/typecheck-ratchet.sh);
 #               fails when the count goes UP, lists what disappeared when it goes down
 #   docker    — build the server image; publish to GitHub Container Registry
-#               (ghcr.io/<owner>/claude-mesh) on pushes to main and on version tags.
-#               Pull requests build but do NOT push — validates the Dockerfile.
+#               (ghcr.io/<owner>/claude-mesh) on pushes to main and on version
+#               tags, and NEVER from dispatch or pull_request runs. Those build
+#               but do not push — validating the Dockerfile without publishing.
 #
 # "docker ✅" alone does NOT mean the tests ran — check the test/typecheck jobs.
+#
+# COST OF `edited`: every title or body edit now triggers a full run, and
+# cancel-in-progress will cancel an in-flight synchronize run when it does —
+# leaving a CANCELLED check. Cancelled is a THIRD state: re-run it, never read
+# it as a pass.
 # No secrets to configure: GHCR auth uses the built-in GITHUB_TOKEN.
 # Note: production (spawner-mesh) currently git-pulls the source rather than
 # pulling this image, so the published image is for external `docker run`
@@ -20,8 +28,33 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  # EVERY pull request, regardless of base branch. The `branches: [main]` filter
+  # that used to be here silently disabled CI for stacked PRs: it filters on the
+  # BASE, so retargeting a PR onto another PR's branch stopped its runs
+  # entirely. Stacked PRs are exactly the ones that most need testing, because
+  # what CI checks is head-merged-into-parent — the tree that will actually land.
+  #
+  # `edited` is in the list so that RETARGETING a PR fires a run at all, rather
+  # than leaving a green earned against a different parent standing in for it.
+  #
+  # It does NOT guarantee the run tests the tree that lands: refs/pull/N/merge is
+  # rebuilt asynchronously, so a run starting before the rebuild tests the OLD
+  # merge. What makes that safe is not the trigger but the provenance lines each
+  # job prints — the merge gate compares those parents against the PR's base and
+  # head at merge time.
   pull_request:
-    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+  # Runs the suite and the Docker build on any ref, by hand, for diagnosis.
+  # It publishes NOTHING (the ghcr gate below is `== 'push'`), and it is never
+  # merge evidence: a dispatch builds the BRANCH HEAD, not refs/pull/N/merge, so
+  # its provenance lines print the event and ref rather than parents and the
+  # merge gate has nothing to compare. Evidence for a PR comes from
+  # pull_request runs only.
+  #
+  # (This comment used to say it was for branches whose runs had been "filtered
+  # away" — the bug this same change removes. That reason no longer exists.)
+  workflow_dispatch:
 
 concurrency:
   group: docker-${{ github.ref }}
@@ -32,6 +65,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: What tree is this run building?
+        # A run's checks are attached to a PR by a LIVE JOIN, so the base it
+        # appears under is rendered at read time and can differ from the base it
+        # actually built. refs/pull/N/merge is also recomputed asynchronously
+        # after a base change, so a run that starts before the rebuild tests the
+        # OLD merge while reporting as a check on the new base. Printing the
+        # parents makes that visible in the log instead of arguable:
+        #   HEAD^1 = the BASE side — answers "head-into-main or head-into-parent?"
+        #   HEAD^2 = the HEAD side.
+        # READS THE COMMIT OBJECT, not the graph, and that is not a style
+        # choice. actions/checkout defaults to fetch-depth 1, and a shallow
+        # clone GRAFTS THE PARENTS AWAY — so `git rev-parse HEAD^1` fails on
+        # the merge ref even though the commit object carries both parent
+        # hashes. The first version of this step used rev-parse, was proved
+        # against a synthetic merge in a FULL clone, and then printed "not a
+        # merge commit" for both parents on the first real merge ref it saw.
+        # `git cat-file -p HEAD` reads the object and works shallow.
+        #
+        # Printed for pull_request only: the parents exist only when the
+        # checkout IS the merge ref. push and workflow_dispatch print the event
+        # and ref instead.
+        # This step must never be why a job fails — least of all the manual
+        # dispatch run it exists for.
+        run: |
+          echo "HEAD             $(git rev-parse HEAD)"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PARENTS=$(git cat-file -p HEAD | awk '/^parent /{print $2}')
+            P1=$(echo "$PARENTS" | sed -n 1p)
+            P2=$(echo "$PARENTS" | sed -n 2p)
+            echo "base (parent 1)  ${P1:-none}"
+            if [ -n "$P2" ]; then
+              echo "head (parent 2)  $P2"
+            else
+              echo "head (parent 2)  single parent, not a merge"
+            fi
+          else
+            echo "event            ${{ github.event_name }}   ref ${{ github.ref }}"
+          fi
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -55,6 +126,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: What tree is this run building?
+        # A run's checks are attached to a PR by a LIVE JOIN, so the base it
+        # appears under is rendered at read time and can differ from the base it
+        # actually built. refs/pull/N/merge is also recomputed asynchronously
+        # after a base change, so a run that starts before the rebuild tests the
+        # OLD merge while reporting as a check on the new base. Printing the
+        # parents makes that visible in the log instead of arguable:
+        #   HEAD^1 = the BASE side — answers "head-into-main or head-into-parent?"
+        #   HEAD^2 = the HEAD side.
+        # READS THE COMMIT OBJECT, not the graph, and that is not a style
+        # choice. actions/checkout defaults to fetch-depth 1, and a shallow
+        # clone GRAFTS THE PARENTS AWAY — so `git rev-parse HEAD^1` fails on
+        # the merge ref even though the commit object carries both parent
+        # hashes. The first version of this step used rev-parse, was proved
+        # against a synthetic merge in a FULL clone, and then printed "not a
+        # merge commit" for both parents on the first real merge ref it saw.
+        # `git cat-file -p HEAD` reads the object and works shallow.
+        #
+        # Printed for pull_request only: the parents exist only when the
+        # checkout IS the merge ref. push and workflow_dispatch print the event
+        # and ref instead.
+        # This step must never be why a job fails — least of all the manual
+        # dispatch run it exists for.
+        run: |
+          echo "HEAD             $(git rev-parse HEAD)"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PARENTS=$(git cat-file -p HEAD | awk '/^parent /{print $2}')
+            P1=$(echo "$PARENTS" | sed -n 1p)
+            P2=$(echo "$PARENTS" | sed -n 2p)
+            echo "base (parent 1)  ${P1:-none}"
+            if [ -n "$P2" ]; then
+              echo "head (parent 2)  $P2"
+            else
+              echo "head (parent 2)  single parent, not a merge"
+            fi
+          else
+            echo "event            ${{ github.event_name }}   ref ${{ github.ref }}"
+          fi
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -75,6 +184,44 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      - name: What tree is this run building?
+        # A run's checks are attached to a PR by a LIVE JOIN, so the base it
+        # appears under is rendered at read time and can differ from the base it
+        # actually built. refs/pull/N/merge is also recomputed asynchronously
+        # after a base change, so a run that starts before the rebuild tests the
+        # OLD merge while reporting as a check on the new base. Printing the
+        # parents makes that visible in the log instead of arguable:
+        #   HEAD^1 = the BASE side — answers "head-into-main or head-into-parent?"
+        #   HEAD^2 = the HEAD side.
+        # READS THE COMMIT OBJECT, not the graph, and that is not a style
+        # choice. actions/checkout defaults to fetch-depth 1, and a shallow
+        # clone GRAFTS THE PARENTS AWAY — so `git rev-parse HEAD^1` fails on
+        # the merge ref even though the commit object carries both parent
+        # hashes. The first version of this step used rev-parse, was proved
+        # against a synthetic merge in a FULL clone, and then printed "not a
+        # merge commit" for both parents on the first real merge ref it saw.
+        # `git cat-file -p HEAD` reads the object and works shallow.
+        #
+        # Printed for pull_request only: the parents exist only when the
+        # checkout IS the merge ref. push and workflow_dispatch print the event
+        # and ref instead.
+        # This step must never be why a job fails — least of all the manual
+        # dispatch run it exists for.
+        run: |
+          echo "HEAD             $(git rev-parse HEAD)"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PARENTS=$(git cat-file -p HEAD | awk '/^parent /{print $2}')
+            P1=$(echo "$PARENTS" | sed -n 1p)
+            P2=$(echo "$PARENTS" | sed -n 2p)
+            echo "base (parent 1)  ${P1:-none}"
+            if [ -n "$P2" ]; then
+              echo "head (parent 2)  $P2"
+            else
+              echo "head (parent 2)  single parent, not a merge"
+            fi
+          else
+            echo "event            ${{ github.event_name }}   ref ${{ github.ref }}"
+          fi
 
       - name: Image metadata (tags + labels)
         id: meta
@@ -92,7 +239,22 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        # GATED ON THE EVENT WE MEAN, not on the absence of one we don't.
+        #
+        # This was `!= 'pull_request'`, which was correct while push and
+        # pull_request were the only events. Adding workflow_dispatch broke it
+        # silently: a dispatch is not a pull_request, so the button added to get
+        # a green on a filtered branch would have LOGGED IN AND PUBLISHED
+        # branch-ref and sha tags from whatever ref it was dispatched on —
+        # unreviewed branch code becoming a named tag in the org registry.
+        #
+        # A denial-listed condition admits every event added later. That is the
+        # same shape as a hand-maintained allowlist of config keys: the list is
+        # written once and the world keeps growing. `== 'push'` names the set we
+        # intend, which is exactly the `push:` trigger above — branches [main]
+        # and tags v* — and nothing else. dispatch and pull_request runs BUILD
+        # (validating the Dockerfile) and never publish.
+        if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -103,7 +265,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
+          # Same gate as the login above, and for the same reason.
+          push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
