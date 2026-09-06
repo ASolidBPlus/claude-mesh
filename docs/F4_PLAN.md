@@ -206,7 +206,7 @@ bash .github/scripts/typecheck-ratchet.sh                  # requires `bun insta
 | M5 | use `frame.origin` as `from_agent` or as the ACL principal | the origin-forgery case |
 | M6 | suppress the echo by comparing `origin` to a local agent id | the echo case |
 | M7 | reuse the incoming `msg_id` for the hub's outbound rows | "the hub's outbound row id differs from the arriving msg_id, and pod2's `relays` row records the hub's id" |
-| M8 | drop the `topic` FK as well as `agent_id` in the rebuild | "deleting the topic's creator removes the remote subscription rows" |
+| M8 | drop the `topic` FK as well as `agent_id` in the rebuild | "deleting the topic's creator removes the remote subscription rows" — reds in `migration-chain.test.ts` (a fresh db never rebuilds under §16 B, so `db.test.ts` cannot see it) |
 | M9 | enqueue the `topic-subscribe` row unconditionally | "a replayed subscribe enqueues no second row" |
 | M10 | allow a ':' in a relayed `from` for topic kinds | `from_not_one_hop` |
 | M11 | label `mesh_peer_relays_total` with the raw frame `kind` | "an unknown kind renders `kind=\"unknown\"`" |
@@ -238,7 +238,7 @@ Per-kind rate buckets · transitive topics (A subscribing through B to C) · wil
 - Do **not** add `Co-Authored-By` trailers. Commit as the configured git user, on a branch, never directly on `main`.
 
 ## 15. Two planner notes (why the plan is shaped this way)
-1. `enqueueOutboundTopicRows` serves two publish paths (a hub agent publishing a home topic, and a re-originated `topic-publish`), so C5's "exactly one call site" is preserved by routing BOTH through `fanOutHomeTopicPublish` — the single call site lives there, and the C5 mutant (moving it into code shared with the `topic` delivery arm) still reds the `pod3:*` control.
+1. `enqueueOutboundTopicRows` serves two publish paths (a hub agent publishing a home topic, and a re-originated `topic-publish`), so C5's "exactly one call site" is preserved by routing BOTH through `fanOutHomeTopicPublish` — the single call site lives there, and the C5 mutant (moving it into code shared with the `topic` delivery arm) reds the STRUCTURAL single-call-site case; the `pod3:*` behavioural control stays green under this mutant (evaluator measured) — the structural case is the pin.
 2. `emitTap` stays out of the extracted helpers because `observer-cross-border.test.ts` scans `router.ts` for the set of function names containing an `emitTap(` call and asserts equality with its DRIVEN list; that is why `enqueueOutboundTopicRows` returns `{alias,id}[]` instead of emitting taps.
 
 
@@ -261,3 +261,4 @@ M. **Boot-report SQL precision:** `findInvalidTopicNames` must not flag `orch:tr
 Success-criteria additions: `bun test __tests__/duplicate-msgid-crash.test.ts __tests__/migration-chain.test.ts __tests__/peer-keys.test.ts __tests__/outbound-peers.test.ts __tests__/http-admin-topics.test.ts` green; `bash .github/scripts/typecheck-ratchet.sh` exits 0 with the baseline UNCHANGED at 116/37.
 N. **Uniformity is "pure function of the input", not "byte-identical across causes"** (builder finding, commit 5): the refusal message echoes what the caller supplied, so five different inputs cannot and must not produce identical bytes. Test shape: per cause, assert the answer depends only on the input; then drive ONE input through TWO causes (e.g. `orch:` as an empty remainder, then as an unpeered prefix after deleting the peering) and assert identical bytes — that comparison is the only one that can detect a cause leaking. §9's "asserted as a SET, byte for byte" is read this way.
 O. **Return-peering check must be pinned by the PAUSED case** (builder finding, commit 5): with no row, `JSON.parse(returnPeering.kinds)` throws and the kinds catch converts it into the same refusal, so deleting the explicit `null || enabled !== 1` check leaves every no-row case green. Keep the explicit check and pin it with a row that exists with `enabled = 0`.
+P. **Evaluator corrections at #172 (17:30Z):** M2 is killed by the structural case, not the `pod3:*` control; M8 reds in `migration-chain.test.ts`. §16 L needs its test (added post-eval).
