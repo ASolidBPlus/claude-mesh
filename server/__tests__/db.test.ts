@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach } from 'bun:test';
 import { Database } from 'bun:sqlite';
+// #79: the ONE hashToken, not a test-local replica. This file used to define
+// its own copy — a duplicate of a security primitive, which is the defect #79
+// removed from db.ts and left here only because that scan excludes __tests__.
+// A copy that agrees today is a copy that diverges on the first fix, and the
+// one nobody re-checks is the one in the test.
+import { hashToken } from '../auth.ts';
 import {
   openDb,
   registerAgent,
@@ -53,12 +59,7 @@ function makeAgent(db: Database, id: string, token = 'secret-' + id) {
   return registerAgent(db, { id, token_hash: hash, hostname: 'host-' + id });
 }
 
-// Replicate the hashing logic from db.ts for test use
-function hashToken(token: string): string {
-  const hasher = new Bun.CryptoHasher('sha256');
-  hasher.update(token);
-  return hasher.digest('hex');
-}
+
 
 // ──────────────────────────────────────────────
 // openDb
