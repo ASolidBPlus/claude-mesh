@@ -62,7 +62,14 @@ describe('MESH_WS_BIND', () => {
   // and bound everything anyway.
   it('set to loopback: loopback connects, the external address does not', async () => {
     const external = externalIPv4();
-    if (external === null) return;              // single-interface host: nothing to prove
+    if (external === null) {
+      // VISIBLE skip. `return` here made this test GREEN having proven nothing
+      // on a single-interface host, and the explanation was a source comment no
+      // runner prints — a pass that means "not checked" is the shape this suite
+      // spends its effort catching elsewhere.
+      console.log('SKIP: no non-loopback IPv4 on this host — the bind restriction cannot be exercised');
+      return;
+    }
 
     process.env.MESH_WS_BIND = '127.0.0.1';
     handle = await start();
@@ -75,9 +82,18 @@ describe('MESH_WS_BIND', () => {
   // POSITIVE CONTROL for the test above: unset, the SAME external address DOES
   // connect. Without it, "the external address does not connect" could equally
   // mean the address is wrong, the firewall blocks it, or the server is broken.
+  // LOAD-BEARING, not decoration. A spurious timeout in canConnect returns
+  // false, which would quietly SATISFY the bind test's expectation that the
+  // external address is refused — a broken network and a working restriction
+  // look identical from that assertion alone. Only this control, showing the
+  // same address connecting when the variable is unset, tells them apart.
+  // Do not trim it.
   it('CONTROL: unset, the same external address connects', async () => {
     const external = externalIPv4();
-    if (external === null) return;
+    if (external === null) {
+      console.log('SKIP: no non-loopback IPv4 on this host — the control cannot be exercised');
+      return;
+    }
 
     delete process.env.MESH_WS_BIND;
     handle = await start();
