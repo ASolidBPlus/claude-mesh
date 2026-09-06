@@ -200,9 +200,13 @@ not "stuck".
   makes `mesh_peer_up == 0` a usable alert: a peering that is down looks
   different from one that was never configured. **This is the series to alert
   on.**
-- **`mesh_peer_relays_total{direction,outcome}`** — relayed messages;
+- **`mesh_peer_relays_total{direction,outcome,kind}`** — relayed messages;
   `outcome` is one of `delivered`, `refused`, `rate_limited`, `duplicate`,
-  `transient`.
+  `transient`, and `kind` is one of the five relay kinds or `unknown`
+  (`server/metrics.ts` `incPeerRelay`). **`("in","delivered")` means ACCEPTED AT
+  THE BORDER**, not delivered to anybody: a topic frame counts once here even
+  when the receiving mesh's ACL filtered every subscriber. What each subscriber
+  got is `mesh_topic_fanout_total`.
 - **`mesh_admin_auth_total{outcome}`** — admin authentications on this port,
   `success` and `failure` (`server/metrics.ts` `incAdminAuth`). **It counts
   uses, not users**: the admin token is shared, so a rising `success` says the

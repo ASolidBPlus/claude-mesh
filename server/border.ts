@@ -275,7 +275,7 @@ export class Forwarder {
     this.inFlight.delete(row.id);
     // delivered_at is set ONLY on the peer's ack — never on send.
     markDelivered(this.db, row.id);
-    incPeerRelay(this.row.alias, 'outbound', 'delivered');
+    incPeerRelay(this.row.alias, 'outbound', 'delivered', row.kind);
     // (a) BOTH pacing states reset HERE and nowhere else — on a relay ACK,
     // never on connect. A far side that accepts the socket and then drops
     // or refuses everything would otherwise reset them on every reconnect,
@@ -299,7 +299,7 @@ export class Forwarder {
       // PERMANENT. The far side will refuse this message every time — no
       // amount of retrying changes a border decision.
       markMessageFailed(this.db, row.id, code, Date.now());
-      incPeerRelay(this.row.alias, 'outbound', 'refused');
+      incPeerRelay(this.row.alias, 'outbound', 'refused', row.kind);
       // Tell the originating agent if it is still here (D5). Best-effort: a
       // sender that has gone offline learns nothing, which is why failed_code
       // is on the row rather than only in a frame.
@@ -318,14 +318,14 @@ export class Forwarder {
       // configured rate — see the ack path. Halving alone would be a one-way
       // ratchet the far side controls.
       this.refillPerMin = Math.max(1, Math.floor(this.refillPerMin / 2));
-      incPeerRelay(this.row.alias, 'outbound', 'rate_limited');
+      incPeerRelay(this.row.alias, 'outbound', 'rate_limited', row.kind);
       this.scheduleRetry();
       return;
     }
 
     // ACK_TIMEOUT / CONNECTION_RESET / anything else: TRANSIENT. The row stays
     // pending and leaves in-flight, so the next drain picks it up.
-    incPeerRelay(this.row.alias, 'outbound', 'transient');
+    incPeerRelay(this.row.alias, 'outbound', 'transient', row.kind);
     this.scheduleRetry();
   }
 }

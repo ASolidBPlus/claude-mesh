@@ -517,8 +517,16 @@ export function routeRelay(
 ): { ok: true } | { ok: false; code: 'RELAY_REFUSED' | 'RATE_LIMITED'; ref?: string } {
   const alias = peer.alias;
   const ref = typeof frame.msg_id === 'string' && frame.msg_id.length > 0 ? frame.msg_id : undefined;
+  // F4 — THE METRIC LABEL IS CLAMPED HERE, at the only place that can tell a
+  // validated kind from a peer's string. `frame.kind` arrives on the wire, so
+  // labelling it raw would let a stranger mint unbounded series in an
+  // unauthenticated document (#136's cardinality failure, one metric over).
+  // Anything outside the closed set renders as `unknown`.
+  const RELAY_KINDS = ['direct', 'topic', 'topic-subscribe', 'topic-unsubscribe', 'topic-publish'];
+  const metricKind = typeof frame.kind === 'string' && RELAY_KINDS.includes(frame.kind)
+    ? frame.kind : 'unknown';
   const refuse = (reason: string) => {
-    incPeerRelay(alias, 'in', 'refused');
+    incPeerRelay(alias, 'in', 'refused', metricKind);
     console.log(JSON.stringify({ evt: 'peer.relay_refused', alias, reason, at: Date.now() }));
     return { ok: false as const, code: 'RELAY_REFUSED' as const, ...(ref !== undefined ? { ref } : {}) };
   };
@@ -593,7 +601,7 @@ export function routeRelay(
 
   const now = Date.now();
   if (!withinRate(alias, peer.rate_per_min, now)) {
-    incPeerRelay(alias, 'in', 'rate_limited');
+    incPeerRelay(alias, 'in', 'rate_limited', metricKind);
     return { ok: false, code: 'RATE_LIMITED', ...(ref !== undefined ? { ref } : {}) };
   }
 
@@ -614,7 +622,7 @@ export function routeRelay(
   // message BY DESIGN — a dedupe ledger that grew forever is the alternative.
   const seen = db.prepare('SELECT 1 FROM relays WHERE peer_alias = ? AND remote_msg_id = ?').get(alias, msg_id);
   if (seen !== null) {
-    incPeerRelay(alias, 'in', 'duplicate');
+    incPeerRelay(alias, 'in', 'duplicate', metricKind);
     return { ok: true };
   }
 
@@ -648,7 +656,7 @@ export function routeRelay(
       // Teardown asks nothing of the return peering or the topic: whatever the
       // state is, less of it is always allowed.
       unsubscribeRemoved(db, remoteSubscriber, topicName);
-      incPeerRelay(alias, 'in', 'delivered');
+      incPeerRelay(alias, 'in', 'delivered', metricKind);
       return { ok: true };
     }
 
@@ -661,7 +669,7 @@ export function routeRelay(
     if (!isHomeTopic(db, topicName)) return refuse('not_home_topic');
 
     subscribeCreated(db, remoteSubscriber, topicName);
-    incPeerRelay(alias, 'in', 'delivered');
+    incPeerRelay(alias, 'in', 'delivered', metricKind);
     return { ok: true };
   }
 
@@ -704,7 +712,7 @@ export function routeRelay(
       sent_at: now, size: payloadBytes, payload: payload as string,
     }, crossBorderAudience(db, observerIndex));
 
-    incPeerRelay(alias, 'in', 'delivered');
+    incPeerRelay(alias, 'in', 'delivered', metricKind);
     return { ok: true };
   }
 
@@ -751,7 +759,7 @@ export function routeRelay(
     // filtered every subscriber: the peering did its job, and what this mesh
     // then chose to do with the frame is its own ACL's business, counted by
     // mesh_topic_fanout_total.
-    incPeerRelay(alias, 'in', 'delivered');
+    incPeerRelay(alias, 'in', 'delivered', metricKind);
     return { ok: true };
   }
 
@@ -784,7 +792,7 @@ export function routeRelay(
     sent_at: now, size: payloadBytes, payload: payload as string,
   }, crossBorderAudience(db, observerIndex));
 
-  incPeerRelay(alias, 'in', 'delivered');
+  incPeerRelay(alias, 'in', 'delivered', metricKind);
   return { ok: true };
 }
 

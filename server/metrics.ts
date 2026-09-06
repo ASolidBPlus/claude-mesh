@@ -60,8 +60,26 @@ export function escapeLabelValue(v: string): string {
  * in our metrics store — cardinality we do not control. The alias is OURS: we
  * issued it, and there is exactly one per peering.
  */
-export function incPeerRelay(alias: string, direction: string, outcome: string): void {
-  try { bump(peerRelays, `${s(alias)}\0${s(direction)}\0${s(outcome)}`); } catch (_) { /* metrics must never affect delivery */ }
+/**
+ * F4 — `kind` is the fourth label, and it is DEFAULTED rather than required.
+ *
+ * A required parameter would add two type errors at the border tests' existing
+ * three-argument calls and fail the ratchet; those calls stay as they are and
+ * render `kind="unknown"`, which is the honest answer for a call site that does
+ * not know.
+ *
+ * PARTY-FREE BY CONSTRUCTION, which is why it appears in the aggregated arm
+ * where `alias` may not: five fixed relay kinds, and the emitter clamps to that
+ * set. The clamp is not optional — `kind` arrives on the wire from a peer, so
+ * an unclamped label would let a stranger mint unbounded series in an
+ * unauthenticated document. That is #136's cardinality failure one metric over,
+ * and the reason the clamp lives at the emitter rather than here: this function
+ * cannot tell a validated kind from an attacker's string.
+ */
+export function incPeerRelay(alias: string, direction: string, outcome: string, kind = 'unknown'): void {
+  try {
+    bump(peerRelays, `${s(alias)}\0${s(direction)}\0${s(outcome)}\0${s(kind)}`);
+  } catch (_) { /* metrics must never affect delivery */ }
 }
 
 /**
@@ -402,25 +420,27 @@ export function renderMetrics(db: Database): string {
   // MESH_METRICS_IDENTITY_LABELS=1: per-alias series, an explicit deployment
   // decision that /metrics is genuinely internal-only.
   if (identityLabelsEnabled()) {
-    lines.push('# HELP mesh_peer_relays_total Relayed messages by peer alias, direction and outcome.');
+    lines.push('# HELP mesh_peer_relays_total Relayed messages by peer alias, direction, outcome and relay kind.');
     lines.push('# TYPE mesh_peer_relays_total counter');
     for (const [key, v] of peerRelays) {
-      const [alias, direction, outcome] = key.split('\0');
-      lines.push(`mesh_peer_relays_total{alias="${escapeLabelValue(alias ?? '')}",direction="${escapeLabelValue(direction ?? '')}",outcome="${escapeLabelValue(outcome ?? '')}"} ${v}`);
+      const [alias, direction, outcome, kind] = key.split('\0');
+      lines.push(`mesh_peer_relays_total{alias="${escapeLabelValue(alias ?? '')}",direction="${escapeLabelValue(direction ?? '')}",outcome="${escapeLabelValue(outcome ?? '')}",kind="${escapeLabelValue(kind ?? '')}"} ${v}`);
     }
   } else {
     // Aggregated over aliases: direction and outcome carry no topology.
     const agg = new Map<string, number>();
     for (const [key, v] of peerRelays) {
-      const [, direction, outcome] = key.split('\0');
-      const k = `${direction ?? ''}\0${outcome ?? ''}`;
+      const [, direction, outcome, kind] = key.split('\0');
+      // `kind` SURVIVES the aggregation: it names no party, so hiding it would
+      // cost the answer without protecting anything.
+      const k = `${direction ?? ''}\0${outcome ?? ''}\0${kind ?? ''}`;
       agg.set(k, (agg.get(k) ?? 0) + v);
     }
-    lines.push('# HELP mesh_peer_relays_total Relayed messages by direction and outcome (identity labels hidden; set MESH_METRICS_IDENTITY_LABELS=1 to label by party).');
+    lines.push('# HELP mesh_peer_relays_total Relayed messages by direction, outcome and relay kind (identity labels hidden; set MESH_METRICS_IDENTITY_LABELS=1 to label by party). ("in","delivered") means ACCEPTED AT THE BORDER — a topic frame counts once here even when the local fan-out filtered every subscriber.');
     lines.push('# TYPE mesh_peer_relays_total counter');
     for (const [k, v] of agg) {
-      const [direction, outcome] = k.split('\0');
-      lines.push(`mesh_peer_relays_total{direction="${escapeLabelValue(direction ?? '')}",outcome="${escapeLabelValue(outcome ?? '')}"} ${v}`);
+      const [direction, outcome, kind] = k.split('\0');
+      lines.push(`mesh_peer_relays_total{direction="${escapeLabelValue(direction ?? '')}",outcome="${escapeLabelValue(outcome ?? '')}",kind="${escapeLabelValue(kind ?? '')}"} ${v}`);
     }
   }
 
