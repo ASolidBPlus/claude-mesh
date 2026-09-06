@@ -8,7 +8,7 @@ Where to go from here:
 
 - **Sending messages?** [Quickstart](#quickstart) → [the SDK](#41-with-the-sdk).
 - **Writing a client in another language?** [Frame protocol](#3-frame-protocol-reference).
-- **Running the bus?** [Admin API](#7-http-admin-api) · [Build / run](#9-build--run--deploy).
+- **Running the bus?** [Admin API](#8-http-admin-api) · [Build / run](#10-build--run--deploy).
 - **Extending the server?** [What it is](#1-what-it-is) — read the pure-bus rule first.
 
 ---
@@ -83,7 +83,7 @@ A consumer has three raw surfaces to build on:
 
 The [SDK](#41-with-the-sdk) implements everything in this section. Read it if you're writing a client in another language, or want to understand the wire.
 
-All frames are JSON with a `type` field. The client must send `auth` first (within 5 s) before any other frame is accepted. Default ports: WS `7384`, admin `7385` (the Docker image uses `7432`/`7433` — see [§9](#9-build--run--deploy)).
+All frames are JSON with a `type` field. The client must send `auth` first (within 5 s) before any other frame is accepted. Default ports: WS `7384`, admin `7385` (the Docker image uses `7432`/`7433` — see [§10](#10-build--run--deploy)).
 
 ### Handshake
 
@@ -351,7 +351,37 @@ Typical consumers: a live comms-map, an audit log, a scoring engine, a moderatio
 
 ---
 
-## 7. HTTP admin API
+## 7. Liveness
+
+`GET /healthz` on the **WS port**, unauthenticated, `200` with:
+
+```json
+{ "db_ok": true }
+```
+
+Wire it to a k8s liveness probe, a load balancer, or Komodo. `db_ok` is a real
+query, not a flag — the failure it exists to catch is *process up, store gone*.
+
+**It returns nothing that varies per process.** An earlier version also returned
+uptime, which is a restart fingerprint readable by anyone who can reach the
+port — and this endpoint is unauthenticated by design, so there is no
+reachability argument to fall back on. Liveness needs the store check and
+nothing else.
+
+**Why the WS port and not the admin port:** `MESH_ADMIN_BIND` exists so an
+operator can restrict the admin listener, and a liveness endpoint that
+disappears when someone takes that option would report the bus dead exactly when
+it was hardened. The WS port must be reachable by every agent and peering, so it
+is the one an orchestrator can always reach.
+
+**No `/readyz`.** Readiness means "ready to take traffic", which is only a
+distinct question once there is a second instance to shift traffic to. A
+`/readyz` that always agreed with `/healthz` would be a promise the system
+cannot keep.
+
+---
+
+## 8. HTTP admin API
 
 A second HTTP listener (admin port, default `7385`) handles administration. Every endpoint except `/metrics` requires `Authorization: Bearer <MESH_ADMIN_TOKEN>` — with two exceptions: `GET /messages` and `GET /files/:id` also accept an **agent's own bearer token**, node-scoped (see below). `/metrics` is intentionally unauthenticated — keep the admin port on an internal network and don't expose it publicly.
 
@@ -398,7 +428,7 @@ The server also exposes its operations as MCP tools over stdio — for an orches
 
 ---
 
-## 8. Observability
+## 9. Observability
 
 ### `/metrics` (Prometheus)
 Operational aggregates only — no per-conversation/analytic series (those are a consumer's job).
@@ -418,7 +448,7 @@ Server-side scheduling that outlives your node: one-shot (`duration`/`due_at`) o
 
 ---
 
-## 9. Build / run / deploy
+## 10. Build / run / deploy
 
 **Stack:** [Bun](https://bun.sh) runtime, `bun:sqlite` (no external DB), `ws` for WebSocket. No analytics dependencies — true to the pure-bus rule.
 

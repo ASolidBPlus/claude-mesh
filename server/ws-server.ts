@@ -439,7 +439,49 @@ export function startWsServer(
     }
 
     // Create an HTTP server explicitly so we can track and destroy its sockets
-    const httpServer = http.createServer();
+    // #22 — unauthenticated liveness, on the WS listener rather than the admin
+    // port. THE CHOICE OF LISTENER IS THE DESIGN DECISION, so it is written
+    // down: #127 exists so an operator CAN restrict the admin port
+    // (MESH_ADMIN_BIND), and a liveness endpoint that disappears when someone
+    // takes that option is worse than none — the orchestrator would report the
+    // bus dead exactly when it was hardened. The WS port must be reachable by
+    // every agent and peering, so it is the one an orchestrator can always
+    // reach. (spawner-v2 reads the boot log and admin API today; this does not
+    // remove that path, it adds one that survives a restricted admin bind.)
+    //
+    // Before this, a plain GET here HUNG: http.createServer() had no request
+    // handler, so Node never answered and the caller timed out. Nothing can
+    // have depended on that, which is why adding a handler is safe.
+    //
+    // NO READINESS VARIANT. /readyz would have to mean "ready to take traffic",
+    // which is only a distinct question once there is a second instance to
+    // shift traffic to (#23, parked). A /readyz that always agreed with
+    // /healthz would be a promise the system cannot keep.
+    const httpServer = http.createServer((req, res) => {
+      if (req.method === 'GET' && (req.url === '/healthz' || req.url === '/healthz/')) {
+        // db_ok is a real query, not a flag: an open handle to a corrupt or
+        // closed database would answer `true` to anything cheaper, and the
+        // failure this endpoint exists to catch is exactly "the process is up
+        // and the store is not".
+        let db_ok = false;
+        try { db.prepare('SELECT 1').get(); db_ok = true; } catch (_) { db_ok = false; }
+        // NOTHING THAT VARIES PER PROCESS. An earlier version returned
+        // uptime_ms, which is a restart fingerprint: any peer that can reach
+        // this port learns when the bus last restarted, and unlike the ACL or
+        // the tap there is no reachability argument for it — this endpoint is
+        // unauthenticated by design. Liveness needs the store check and nothing
+        // else, so the store check is all it returns.
+        const body = JSON.stringify({ db_ok });
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+        res.end(body);
+        return;
+      }
+      // Everything else keeps the previous shape as closely as anything can:
+      // a plain 404 rather than a hang. An unroutable request now gets an
+      // answer, which is strictly better for a caller and reveals nothing.
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found' }));
+    });
     // (c) Drop oversize frames at the CONNECTION level, before JSON.parse.
     //
     // The 1 MiB payload check in the router runs AFTER parsing, so a 100 MiB
