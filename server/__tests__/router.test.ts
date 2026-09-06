@@ -233,6 +233,10 @@ describe('buildDeliverFrame', () => {
       payload: 'hello',
       content_type: 'text/plain',
       sent_at: 1743659280000,
+      // F4 §16 C: `origin` is a REQUIRED field, so every builder of a deliver
+      // frame states its provenance — null here, because a direct message has
+      // none.
+      origin: null,
     };
 
     const result = buildDeliverFrame(sample);

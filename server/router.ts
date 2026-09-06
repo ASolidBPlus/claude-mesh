@@ -14,6 +14,7 @@ import {
   getPendingMessages,
   getOrCreateTopic,
   getTopicSubscribers,
+  isRemoteEndpoint,
   subscribe as dbSubscribe,
   unsubscribe as dbUnsubscribe,
   Message,
@@ -57,6 +58,12 @@ export function buildDeliverFrame(msg: {
   payload: string;
   content_type: string;
   sent_at: number;
+  /** F4 §16 C — REQUIRED, not optional. Every call site states what the
+   *  provenance is, including the ones where it is `null`, because an optional
+   *  field would let a new delivery path forget it and ship a topic frame with
+   *  no origin that looks exactly like a local one. The callers that pass a
+   *  whole `Message` get it from the row for free. */
+  origin: string | null;
 }): string {
   return JSON.stringify({
     type: 'deliver',
@@ -69,6 +76,7 @@ export function buildDeliverFrame(msg: {
     payload: msg.payload,
     content_type: msg.content_type,
     sent_at: msg.sent_at,
+    origin: msg.origin,
   });
 }
 
@@ -114,6 +122,7 @@ export function deliverOrQueue(
       id: msg.id, kind: 'direct', from_agent: msg.from_agent, to_agent: msg.to_agent,
       topic: null, correlation_id: null, payload: msg.payload,
       content_type: msg.content_type, sent_at: msg.sent_at,
+      origin: null,   // a direct message has no cross-mesh provenance
     }));
     if (!msg.ephemeral) markDelivered(db, msg.id);
     incMsgStatus('direct', 'delivered');
@@ -213,6 +222,147 @@ export interface RelayFrameIn {
  * distinguishable because it is the one refusal the peer can act on.
  */
 const NO_OBSERVERS: ReadonlySet<string> = new Set();
+
+/**
+ * F4 §7 — the LOCAL half of a topic fan-out, extracted from `routePublish` so
+ * that both publish paths and the inbound border arm share exactly one copy.
+ *
+ * Three callers will exist and they differ only in their inputs: a local
+ * publish (`aclPrincipal` = the publisher), a hub re-originating a spoke's post
+ * (`aclPrincipal` = the topic principal), and a spoke delivering an arriving
+ * `topic` frame (`aclPrincipal` = the stamped remote topic). Everything they do
+ * to a subscriber is identical, and a second copy is how the ACL principal
+ * silently becomes the wrong one on one of the three.
+ *
+ * REMOTE SUBSCRIBERS ARE SKIPPED (A2). `subscriptions.agent_id` may now name
+ * `pod1:alice`, and this mesh cannot deliver to it: a `messages` row addressed
+ * to a bare remote id matches no drain range and is read by nobody, so it would
+ * sit in the queue until it expired. Remote subscribers are served by the
+ * border rows instead. The filter is `isRemoteEndpoint`, an AGENT LOOKUP rather
+ * than a colon test, so a legacy local id containing ':' still receives.
+ *
+ * CONTAINS NO `emitTap` AND NO BORDER ENQUEUE, deliberately. `observer-cross-
+ * border.test.ts` scans this file for the set of function names containing an
+ * `emitTap(` call and asserts equality with its driven list, and the border
+ * enqueue has exactly one call site by contract (§15); putting either here
+ * would break a guarantee that is checked structurally rather than by
+ * behaviour.
+ */
+export function fanOutTopicLocal(
+  db: Database,
+  agentIndex: Map<string, WebSocket>,
+  m: {
+    topic: string;
+    from_agent: string;
+    origin: string | null;
+    payload: string;
+    content_type: string;
+    sent_at: number;
+    expires_at: number | null;
+    ephemeral: boolean;
+    /** The principal the per-subscriber ACL is evaluated FROM. Not always
+     *  `from_agent`: on a hub it is the topic principal, so a subscriber's
+     *  right to hear is a property of the topic rather than of whoever posted. */
+    aclPrincipal: string;
+    payloadBytes: number;
+  },
+): void {
+  const subscribers = getTopicSubscribers(db, m.topic)
+    .filter(id => id !== m.from_agent)
+    .filter(id => !isRemoteEndpoint(db, id));
+
+  for (const subscriber_id of subscribers) {
+
+    // 5a. ACL check.
+    //
+    // THE GATE STAYS. Removing it for system topics was one of the options on
+    // #136 and it is wrong: routeSubscribe calls getOrCreateTopic with no ACL
+    // check, so ANY authenticated agent can subscribe to sys.presence.turn.
+    // Ungating the fan-out would hand every subscriber the activity of the
+    // entire roster — the same enumeration #125, #128 and #129 exist to close.
+    //
+    // WHAT CHANGES IS THE COUNTING, and it is not about system topics at all.
+    // On a topic publish the sender does NOT choose the recipients: it names a
+    // topic, and the ACL filters the subscriber list. Counting each filtered
+    // subscriber as an "ACL-denied send attempt by sender" is a semantics error
+    // for EVERY topic — the sender attempted one publish, not N sends to N
+    // agents it never named. sys.presence.turn only made it visible, by being
+    // published ~2/s fleet-wide.
+    //
+    // mesh_acl_denied_total and mesh_errors_total{ACL_DENIED} are therefore for
+    // DIRECT sends, where the sender did choose the recipient. Fan-out outcomes
+    // go to mesh_topic_fanout_total, which carries no topic label because topic
+    // names are agent-chosen.
+    if (!aclCheck(db, m.aclPrincipal, subscriber_id)) {
+      incTopicFanout('filtered');
+      continue;
+    }
+    // 'allowed', not 'delivered': this is where the ACL decision is made, and
+    // the online/offline branch below has not run yet. mesh_messages_total is
+    // the authority on delivery.
+    incTopicFanout('allowed');
+
+    // 5b. Unique msg_id per subscriber copy
+    const msgId = crypto.randomUUID();
+
+    // 5c. Online
+    const recipientWs = agentIndex.get(subscriber_id);
+    if (recipientWs !== undefined) {
+      // ttl_ms=0 = EPHEMERAL: deliver live, persist nothing (see routeDirect).
+      // Beat/heartbeat topics (e.g. turn-status) use this so they never
+      // accumulate as scrollback history and starve real-message reads.
+      if (!m.ephemeral) {
+        insertMessage(db, {
+          id: msgId,
+          kind: 'topic',
+          from_agent: m.from_agent,
+          to_agent: subscriber_id,
+          topic: m.topic,
+          payload: m.payload,
+          content_type: m.content_type,
+          sent_at: m.sent_at,
+          expires_at: m.expires_at,
+          origin: m.origin,
+        });
+      }
+      recipientWs.send(buildDeliverFrame({
+        id: msgId,
+        kind: 'topic',
+        from_agent: m.from_agent,
+        to_agent: null,
+        topic: m.topic,
+        correlation_id: null,
+        payload: m.payload,
+        content_type: m.content_type,
+        sent_at: m.sent_at,
+        origin: m.origin,
+      }));
+      if (!m.ephemeral) markDelivered(db, msgId);
+      incMsgStatus('topic', 'delivered');
+      incReceived(subscriber_id);
+      incBytes('out', m.payloadBytes);
+    } else {
+      // 5d. Offline
+      if (m.ephemeral) {
+        incMsgStatus('topic', 'dropped');
+        continue;
+      }
+      insertMessage(db, {
+        id: msgId,
+        kind: 'topic',
+        from_agent: m.from_agent,
+        to_agent: subscriber_id,
+        topic: m.topic,
+        payload: m.payload,
+        content_type: m.content_type,
+        sent_at: m.sent_at,
+        expires_at: m.expires_at,
+        origin: m.origin,
+      });
+      incMsgStatus('topic', 'queued');
+    }
+  }
+}
 
 /**
  * The audience for a frame that crosses a border (F3).
@@ -599,9 +749,6 @@ export function routePublish(
   // 2. Ensure topic exists
   getOrCreateTopic(db, frame.topic, from_agent);
 
-  // 3. Get subscribers, remove publisher
-  const subscribers = getTopicSubscribers(db, frame.topic).filter(id => id !== from_agent);
-
   // 4. Compute expires_at
   let ttl: number;
   if (frame.ttl_ms === 0) {
@@ -614,96 +761,19 @@ export function routePublish(
   const content_type = frame.content_type ?? 'text/plain';
   const sent_at = Date.now();
 
-  // 5. Fan out to each subscriber
-  for (const subscriber_id of subscribers) {
-    // 5a. ACL check.
-    //
-    // THE GATE STAYS. Removing it for system topics was one of the options on
-    // #136 and it is wrong: routeSubscribe calls getOrCreateTopic with no ACL
-    // check, so ANY authenticated agent can subscribe to sys.presence.turn.
-    // Ungating the fan-out would hand every subscriber the activity of the
-    // entire roster — the same enumeration #125, #128 and #129 exist to close.
-    //
-    // WHAT CHANGES IS THE COUNTING, and it is not about system topics at all.
-    // On a topic publish the sender does NOT choose the recipients: it names a
-    // topic, and the ACL filters the subscriber list. Counting each filtered
-    // subscriber as an "ACL-denied send attempt by sender" is a semantics error
-    // for EVERY topic — the sender attempted one publish, not N sends to N
-    // agents it never named. sys.presence.turn only made it visible, by being
-    // published ~2/s fleet-wide.
-    //
-    // mesh_acl_denied_total and mesh_errors_total{ACL_DENIED} are therefore for
-    // DIRECT sends, where the sender did choose the recipient. Fan-out outcomes
-    // go to mesh_topic_fanout_total, which carries no topic label because topic
-    // names are agent-chosen.
-    if (!aclCheck(db, from_agent, subscriber_id)) {
-      incTopicFanout('filtered');
-      continue;
-    }
-    // 'allowed', not 'delivered': this is where the ACL decision is made, and
-    // the online/offline branch below has not run yet. mesh_messages_total is
-    // the authority on delivery.
-    incTopicFanout('allowed');
-
-    // 5b. Unique msg_id per subscriber copy
-    const msgId = crypto.randomUUID();
-
-    // 5c. Online
-    const recipientWs = agentIndex.get(subscriber_id);
-    if (recipientWs !== undefined) {
-      // ttl_ms=0 = EPHEMERAL: deliver live, persist nothing (see routeDirect).
-      // Beat/heartbeat topics (e.g. turn-status) use this so they never
-      // accumulate as scrollback history and starve real-message reads.
-      const ephemeral = ttl === 0;
-      if (!ephemeral) {
-        insertMessage(db, {
-          id: msgId,
-          kind: 'topic',
-          from_agent,
-          to_agent: subscriber_id,
-          topic: frame.topic,
-          payload: frame.payload,
-          content_type,
-          sent_at,
-          expires_at,
-        });
-      }
-      recipientWs.send(buildDeliverFrame({
-        id: msgId,
-        kind: 'topic',
-        from_agent,
-        to_agent: null,
-        topic: frame.topic,
-        correlation_id: null,
-        payload: frame.payload,
-        content_type,
-        sent_at,
-      }));
-      if (!ephemeral) markDelivered(db, msgId);
-      incMsgStatus('topic', 'delivered');
-      incReceived(subscriber_id);
-      incBytes('out', payloadBytes);
-    } else {
-      // 5d. Offline
-      if (ttl === 0) {
-        incMsgStatus('topic', 'dropped');
-        continue;
-      }
-      insertMessage(db, {
-        id: msgId,
-        kind: 'topic',
-        from_agent,
-        to_agent: subscriber_id,
-        topic: frame.topic,
-        payload: frame.payload,
-        content_type,
-        sent_at,
-        expires_at,
-      });
-      incMsgStatus('topic', 'queued');
-    }
-  }
-
+  // 5. Fan out to the local subscribers.
+  fanOutTopicLocal(db, agentIndex, {
+    topic: frame.topic,
+    from_agent,
+    origin: null,           // a locally-published post has no remote provenance
+    aclPrincipal: from_agent,
+    payload: frame.payload,
+    content_type,
+    sent_at,
+    expires_at,
+    ephemeral: ttl === 0,
+    payloadBytes,
+  });
   emitTap(observerIndex, {
     type: 'tap', msg_id: frame.msg_id, kind: 'topic',
     from: from_agent, to: null, topic: frame.topic, correlation_id: null,
