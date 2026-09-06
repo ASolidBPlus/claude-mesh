@@ -101,6 +101,24 @@ if [ "${1:-}" = --selftest ]; then
   # INVOCATION, not just definition: a predicate defined once and called zero times still
   # "exists" (sec-reviewer's mutant on #151: the join_check call deleted, inventory quiet).
   # Each predicate must be called from the gate body exactly once, at column 0.
+  #
+  # COVERAGE, stated so the gaps are chosen rather than discovered. Three
+  # mechanisms guard this file, and EVERY predicate is covered by at least one:
+  #
+  #   invocation assertions (this list)  join_check, chk_parents, chk_jobs,
+  #                                      chk_verdict, kw_extract, is_amend
+  #   behavioural inventory (expect)     all eight, the six above included
+  #   set -u                             any unset variable, everywhere
+  #
+  # seat_of and read_merge_ref are absent from this list deliberately, not by
+  # oversight: seat_of is called from INSIDE other predicates rather than the
+  # body, and read_merge_ref is called at column 0 but takes no argument, so the
+  # "name followed by its first argument" pattern this loop matches cannot
+  # express it. Both are covered behaviourally.
+  #
+  # Adding a predicate means adding a line here OR a case in the inventory. With
+  # neither, deleting its call is silent — which is exactly the mutant this
+  # block exists to catch.
   for call in 'join_check "${runid' 'chk_parents "${#parents' 'chk_jobs "$jobs"' 'chk_verdict "$c"' 'kw_extract "$body"'; do
     n=$(grep -cF -- "$call" "$0"); n=$((n-1)) # minus this loop's own literal
     [ "$n" = 1 ] || { echo "SELFTEST FAIL: predicate call '$call' appears $n times in the body (expected 1)"; exit 1; }
