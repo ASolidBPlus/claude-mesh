@@ -9,6 +9,7 @@ import { routePublish, routeRelay, routeSubscribe, routeUnsubscribe, resetRelayB
 import { MAX_TTL_MS } from '../router.ts';
 import type { WebSocket } from 'ws';
 import { readFileSync } from 'fs';
+import { definitions, callSites, nonCallMentions, bodyOf } from './helpers/source-scan.ts';
 import { Forwarder } from '../border.ts';
 import { join } from 'path';
 
@@ -331,50 +332,33 @@ describe('F4 spoke: an arriving topic frame', () => {
 // control) can only see the case it drives, and a loop needs two peerings and a
 // delivery to appear at all.
 describe('F4 the enqueue has exactly one call site', () => {
-  const source = () => {
-    const src = readFileSync(join(import.meta.dir, '../router.ts'), 'utf8');
-    // Comments are stripped: this function is DISCUSSED in several of them, and
-    // a scan that counted prose would be measuring how much was written about
-    // the rule rather than whether the code follows it.
-    return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
-  };
+  // The scanner is shared and PINNED (#173, server/__tests__/helpers/
+  // source-scan.ts). The hand-rolled version this replaces stripped comments
+  // with a regex that would eat a line containing a `//` inside a string, and
+  // sliced a function body to the next column-0 `function` — which truncates
+  // inside a template literal, making every absence check below pass because
+  // the text was never read.
+  const source = () => readFileSync(join(import.meta.dir, '../router.ts'), 'utf8');
+  const NAME = 'enqueueOutboundTopicRows';
 
   it('one definition, one call, and no mention that is neither', () => {
-    const code = source();
-    const defs = [...code.matchAll(/export\s+function\s+enqueueOutboundTopicRows\s*\(/g)];
-    const calls = [...code.matchAll(/\benqueueOutboundTopicRows\s*\(/g)];
-    expect(defs.length).toBe(1);
-    expect(calls.length - defs.length).toBe(1);
-
+    const src = source();
+    expect(definitions(src, NAME)).toBe(1);
+    expect(callSites(src, NAME)).toBe(1);
     // No MENTION that is not a call — the alias route (`const e =
     // enqueueOutboundTopicRows; … e(m)`) adds a caller the count above cannot
     // see. Learned on #170, where exactly that hole survived three rounds.
-    expect([...code.matchAll(/\benqueueOutboundTopicRows\b(?!\s*\()/g)].length).toBe(0);
+    expect(nonCallMentions(src, NAME)).toBe(0);
   });
 
   it('the ONE call is inside fanOutHomeTopicPublish, not the local fan-out or the topic arm', () => {
-    const code = source();
-    const bodyOf = (name: string): string => {
-      const start = code.indexOf(`function ${name}(`);
-      expect(start).toBeGreaterThan(-1);
-      // To the next top-level `function`/`export function`, which is where this
-      // one ends — good enough for a single-file scan and stated as such.
-      const next = code.slice(start + 1).search(/\n(?:export\s+)?function\s/);
-      const body = code.slice(start, next === -1 ? undefined : start + 1 + next);
-      // A TRUNCATED SLICE MUST BE LOUD (seat 1). The `not.toContain` assertions
-      // below are absence checks, and an absence check on a slice that stopped
-      // early passes for the worst possible reason — the text simply was not
-      // read. A function's last line is its closing brace, so a slice that does
-      // not end at one did not reach the end of the function.
-      expect({ name, endsAtBrace: body.trimEnd().endsWith('}') }).toEqual({ name, endsAtBrace: true });
-      return body;
-    };
-
-    expect(bodyOf('fanOutHomeTopicPublish')).toContain('enqueueOutboundTopicRows(');
+    const src = source();
+    expect(bodyOf(src, 'fanOutHomeTopicPublish')).toContain(`${NAME}(`);
     // The two bodies that must NOT enqueue, named individually so a failure
-    // says which one broke.
-    expect(bodyOf('fanOutTopicLocal')).not.toContain('enqueueOutboundTopicRows(');
-    expect(bodyOf('routeRelay')).not.toContain('enqueueOutboundTopicRows(');
+    // says which one broke. `bodyOf` brace-matches and THROWS on an unbalanced
+    // body, so a truncated slice cannot answer these quietly.
+    expect(bodyOf(src, 'fanOutTopicLocal')).not.toContain(`${NAME}(`);
+    expect(bodyOf(src, 'routeRelay')).not.toContain(`${NAME}(`);
   });
 });
 

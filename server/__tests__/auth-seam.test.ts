@@ -9,6 +9,7 @@ import {
 } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { startWsServer, WsServerHandle, PEER_PROTOCOL_VERSION, handleSocketClose } from '../ws-server.ts';
+import { codeOnly, definitions, callSites, nonCallMentions, isExported } from './helpers/source-scan.ts';
 
 // #143 — CHARACTERISATION TESTS FOR THE AUTH SEAM. Written BEFORE the cut, and
 // this is the whole reason they exist: a mechanical split is judged by "every
@@ -262,30 +263,27 @@ describe('#143 auth seam, characterised before the cut', () => {
   // preceded in-block by the clear.
   it('handleAuthFrame has ONE call site, and that site clears the auth timer', async () => {
     const src = await Bun.file(join(import.meta.dir, '../ws-server.ts')).text();
-    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    // The scanner is shared and PINNED (#173). What used to be four
+    // hand-rolled regexes here — three of which took three review rounds to
+    // get right — is four named questions, and the answers are checked in
+    // source-scan.test.ts rather than assumed at each call site.
+    const code = codeOnly(src);
+    const NAME = 'handleAuthFrame';
 
-    // The definition is `function handleAuthFrame(`; a call is any other
-    // occurrence followed by `(`.
-    const occurrences = [...code.matchAll(/\bhandleAuthFrame\s*\(/g)];
-    const definitions = [...code.matchAll(/function\s+handleAuthFrame\s*\(/g)];
-    expect(definitions.length).toBe(1);
-    expect(occurrences.length - definitions.length).toBe(1);
+    expect(definitions(src, NAME)).toBe(1);
+    expect(callSites(src, NAME)).toBe(1);
 
-    // AND NO MENTION THAT IS NOT A CALL (seat 2). Counting `handleAuthFrame(`
+    // NO MENTION THAT IS NOT A CALL (seat 2). Counting `handleAuthFrame(`
     // leaves an alias — `const h = handleAuthFrame; … h(ctx)` — invisible: it
     // adds a caller that never clears the timer, and the count above stays at
     // one. Measured green under that mutant before this line existed.
-    //
-    // This is the check the previous comment DESCRIBED as an accepted residual.
-    // It was one line to close, so describing it was the wrong trade.
-    expect([...code.matchAll(/\bhandleAuthFrame\b(?!\s*\()/g)].length).toBe(0);
+    expect(nonCallMentions(src, NAME)).toBe(0);
 
-    // AND THE DEFINITION IS NOT EXPORTED (seat 2, round three). The count above
-    // matches `export function handleAuthFrame(` exactly once too, so adding
-    // `export` left this green while opening a route in from any other file —
-    // and the comment below claimed the count pinned module-privacy. It did
-    // not. Measured: 11/0 under the export mutant before this line.
-    expect(code).not.toMatch(/export\s+(async\s+)?function\s+handleAuthFrame\b/);
+    // AND THE DEFINITION IS NOT EXPORTED (seat 2, round three). The definition
+    // count matches `export function handleAuthFrame(` too, so adding `export`
+    // left this green while opening a route in from any other file — and the
+    // comment then claimed the count pinned module-privacy. It did not.
+    expect(isExported(src, NAME)).toBe(false);
 
     // ...and the call is preceded, in the same block, by the clear. Sliced
     // backwards from the call to the enclosing `if (!state.authed) {`, so this
