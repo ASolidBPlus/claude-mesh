@@ -153,12 +153,19 @@ export interface AgentStatusFrame {
       Distinct from last_seen on purpose — an idle-healthy node advances
       last_alive but not last_seen. */
   last_alive?: number | null;
+  /** #133: the LOOP's proof-of-life, optional exactly as last_alive is. */
+  last_responded?: number | null;
 }
 
 export interface PresenceListFrame {
   type: 'presence_list';
   ref?: string;
-  agents: { id: string; online: boolean; last_seen: number; last_alive?: number | null }[];
+  // #133: `last_responded` is optional exactly as `last_alive` is — the server
+  // widened the wire first and the emitter ships separately (spawner#346), so a
+  // client built against an older bus sees the key absent and one built against
+  // a newer bus sees it null until something writes it. Both are the same
+  // "unknown", which is why one optional field covers both.
+  agents: { id: string; online: boolean; last_seen: number; last_alive?: number | null; last_responded?: number | null }[];
 }
 
 export interface RemindersListFrame {

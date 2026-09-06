@@ -86,8 +86,22 @@ export interface PresenceEntry {
   lastSeen: number;
   /** Last proof-of-life (unix ms): stamped when the node answers the keepalive
       ping, so it advances for an idle-but-healthy node too. `null` = never seen
-      alive. Use this, not lastSeen, to tell "quiet" from "channel is dead". */
+      alive. Use this, not lastSeen, to tell "quiet" from "channel is dead".
+
+      It does NOT mean the agent is working: the keepalive is answered by the
+      mesh plugin, a separate process, which keeps ponging while the agent's
+      loop is stuck. For that question use lastResponded. */
   lastAlive: number | null;
+  /** #133. Last time the agent's LOOP emitted something only the loop can emit
+      — the reading that answers "is this agent actually working", which
+      lastAlive never claimed to.
+
+      `null` until the emitter ships (spawner#346), and absent from a bus that
+      predates the field; both mean "unknown", which is why it is optional. It
+      is a CLAIM BY THE EMITTER, like turn_status: the server keeps it
+      distinguishable from the transport's proof-of-life, it does not
+      authenticate it. */
+  lastResponded?: number | null;
 }
 
 /**
@@ -930,6 +944,7 @@ export class MeshClient {
       online: frame.online,
       lastSeen: frame.last_seen,
       lastAlive: frame.last_alive ?? null,
+      lastResponded: frame.last_responded ?? null,
     } as PresenceEntry);
   }
 
@@ -944,6 +959,7 @@ export class MeshClient {
         online: a.online,
         lastSeen: a.last_seen,
         lastAlive: a.last_alive ?? null,
+        lastResponded: a.last_responded ?? null,
       }))
     );
   }

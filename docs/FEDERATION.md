@@ -176,6 +176,19 @@ never queue. For a remote id, "online" means the peering socket is connected
 | `GET /peers` | inbound peerings that have registered |
 | `GET /peer-keys` | minted keys, **never the secrets** (`server/http-admin.ts` `handlePeerKeyGet`) |
 | `GET /outbound-peers` | configured outbound links, **never the tokens** |
+| `GET /agents` | the local roster, including four liveness readings — see below |
+
+**The roster's four liveness readings answer different questions**, and the
+difference matters when you are deciding whether an agent is stuck:
+`online` = has a socket · `last_seen` = last acted · `last_alive` = the
+transport answered the keepalive · `last_responded` = the agent's LOOP emitted
+something only the loop can emit.
+
+**`last_alive` does not mean the agent is working.** The keepalive is answered
+by the mesh plugin, a separate process, which keeps ponging while the agent's
+loop is stuck. `last_responded` is the reading for that question, and it is
+`null` until the emitter ships (spawner#346) — a null there means "unknown",
+not "stuck".
 
 ### Metrics
 
