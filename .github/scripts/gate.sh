@@ -220,7 +220,12 @@ fi
 # DELIBERATELY UNFILTERED. Do not narrow this list by file overlap: overlap is a proxy for a
 # relation it does not capture ("what can DRIVE this code", not "what files does it share").
 # The one instance we have happened to overlap in ws-server.ts, but the missing door was in
-# client.ts, which #145 never touched — an overlap filter would have caught it by luck.
+# client.ts, which #145 never touched: had ws-server.ts not coincidentally been shared, an
+# overlap filter would have reported NOTHING AT ALL. That is the filter failing, not a near miss.
+# DELIBERATELY KEPT. Cost: one local `git log --oneline --first-parent` per gate — no network,
+# no API call; this is not the slow part of the file. Benefit: the composed-pair defect has no
+# other vantage. The empty branch below prints on purpose: a check that prints nothing when
+# there is nothing to say is indistinguishable from a check that is not running.
 since=$(git log --oneline --first-parent "$(git merge-base "$HEAD" "$maintip")..$maintip" 2>/dev/null)
 if [ -n "$since" ]; then
   note "merged since this head's merge-base with main ($(wc -l <<<"$since") commits) — ask: does any of these change what this PR can be DRIVEN BY, or make a workaround it relies on harmful?"
