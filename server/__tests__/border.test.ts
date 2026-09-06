@@ -61,14 +61,25 @@ function importSpecifiers(src: string): string[] {
 
 // The repo layout, computed once. Everything below is expressed by RESOLVING
 // specifiers against the importing file's directory rather than by matching a
-// prefix string, because a prefix encodes an assumption about DEPTH: server/ is
-// flat today, `sourceFiles()` recurses, and a nested `server/sub/deep.ts`
-// reaching `'../../client/src/peer-client.ts'` is a real cross-package edge
-// that `startsWith('../client/')` does not match. Measured before this change:
-// such a file at 51,678 B passed all three guards, 3 pass 0 fail, and never
-// appeared in the printed rows — failing open in exactly the direction these
-// guards exist to catch. Third defect in this filter stage, all three the same
-// shape: the classification step was cheap to write and wrong at the edges.
+// prefix string, because a prefix encodes an assumption about DEPTH — and the
+// recursion in `sourceFiles()` encodes the opposite one.
+//
+// NOT REACHABLE TODAY. The recursion has never executed in either walked root:
+// client/src has no subdirectories, and server/'s only one is __tests__, which
+// is skipped. The recursion assumes nesting; the filter assumed depth 1. They
+// coexisted only because nothing has ever been nested.
+//
+// That recursion was an UNEXECUTED PROMISE — visible support that half-worked:
+// it collected the nested file and the filter then discarded its edge. That is
+// worse than absent support, because a reader who sees the recursion infers
+// depth is handled, and the inference is reasonable and wrong.
+//
+// Measured before the fix: a nested `server/sub/deep.ts` importing
+// `'../../client/src/peer-client.ts'` at 51,678 B passed all three guards —
+// 3 pass, 0 fail — and never appeared in the printed rows.
+//
+// Third defect in this filter stage, all three the same shape: the
+// classification step was cheap to write and wrong at the edges.
 const REPO_ROOT = join(import.meta.dir, '..', '..');
 const SERVER_ROOT = join(REPO_ROOT, 'server');
 
@@ -566,7 +577,9 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
     const root = join(import.meta.dir, '..', '..');
 
     const rows: { file: string; size: number; specs: string[] }[] = [];
+    let visited = 0;
     for (const f of sourceFiles(join(root, 'server'))) {
+      visited++;
       const specs = crossPackageEdges(readFileSync(f, 'utf8'), dirname(f));
       if (specs.length > 0) rows.push({ file: f.slice(root.length + 1), size: statSync(f).size, specs });
     }
@@ -580,6 +593,23 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
     for (const r of rows) console.log(`  ${r.file} — ${r.size} B (margin ${THRESHOLD - r.size}) — ${r.specs.join(', ')}`);
 
     expect(rows.length).toBeGreaterThan(0);          // the walk found something
+
+    // POPULATION CONTROL, and it is a different repair from the filter fix
+    // above. That one made a walked file's edge visible; this one makes an
+    // UNWALKED file loud. It would NOT have caught seat 2's finding — their
+    // probe was walked, and its edge was filtered out — which is exactly why
+    // both are needed: one covers "seen but misclassified", the other covers
+    // "never seen at all", and a green on either says nothing about the other.
+    const independent: string[] = [];
+    (function walk(dir: string): void {
+      for (const name of readdirSync(dir)) {
+        if (name === 'node_modules' || name === '__tests__') continue;
+        const full = join(dir, name);
+        if (statSync(full).isDirectory()) walk(full);
+        else if (name.endsWith('.ts')) independent.push(full);
+      }
+    })(SERVER_ROOT);
+    expect(visited).toBe(independent.length);
 
     const over = rows.filter(r => r.size >= THRESHOLD);
     expect(over.map(r => `${r.file} is ${r.size} B, at or over the ${THRESHOLD} B cache threshold with a runtime cross-package import (#131 reopens)`)).toEqual([]);
