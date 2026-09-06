@@ -223,19 +223,71 @@ describe('F4 spoke: an arriving topic frame', () => {
     expect(rows.map(r2 => r2.to_agent)).toEqual(['sub']);
   });
 
-  it('carries origin through to the row and the deliver frame, and changes nothing else', () => {
+  // ORIGIN IS STAMPED WITH THE ALIAS IT ARRIVED THROUGH, exactly as `from` is.
+  // Raw, the string is ambiguous here: `alice` would read as a LOCAL agent and
+  // `pod1:alice` names a mesh whose alias is pod1's business, not ours.
+  it('stamps origin with the delivering alias, and changes nothing else', () => {
     const sock = fakeSocket();
     routeRelay(db, new Map([['sub', sock]]), getPeerByAlias(db, 'orch')!,
       topicFrame({ origin: 'pod1:alice' }) as never);
 
     const delivered = JSON.parse(sock.sent[0]!);
-    expect(delivered.origin).toBe('pod1:alice');
+    // Two colons: the post came to us through orch, from pod1's alice. It is
+    // DELIBERATELY unroutable — we do not peer with pod1 and must not offer a
+    // path back to it.
+    expect(delivered.origin).toBe('orch:pod1:alice');
     // ...and it is NOT the sender: `from` is still the stamped topic.
     expect(delivered.from).toBe('orch:trollbox');
     const row = db.prepare("SELECT from_agent, origin FROM messages WHERE kind='topic'").get() as
       { from_agent: string; origin: string };
-    expect(row.origin).toBe('pod1:alice');
+    expect(row.origin).toBe('orch:pod1:alice');
     expect(row.from_agent).toBe('orch:trollbox');
+  });
+
+  // The hub's OWN publisher arrives bare and becomes a real remote id — the
+  // form a reader can actually make sense of.
+  it('a bare origin becomes a remote id under our alias for them', () => {
+    const sock = fakeSocket();
+    routeRelay(db, new Map([['sub', sock]]), getPeerByAlias(db, 'orch')!,
+      topicFrame({ origin: 'hub-pub' }) as never);
+    expect(JSON.parse(sock.sent[0]!).origin).toBe('orch:hub-pub');
+  });
+
+  // A PEER CANNOT FORGE A REPLYABLE FORM. Whatever it sends acquires our alias
+  // as a prefix, and the alias is ours to choose — so an origin claiming to be
+  // a local agent arrives as `orch:sub`, which names the peer's namespace and
+  // not ours.
+  it('a forged local-looking origin is stamped into the peer\'s namespace', () => {
+    const sock = fakeSocket();
+    routeRelay(db, new Map([['sub', sock]]), getPeerByAlias(db, 'orch')!,
+      topicFrame({ origin: 'sub' }) as never);
+    expect(JSON.parse(sock.sent[0]!).origin).toBe('orch:sub');
+  });
+
+  // AN EMPTY ORIGIN IS ABSENT, NOT A VALUE (seat 2). `''` is a string, so it
+  // would have stamped to `orch:` — a bare alias with a trailing colon, naming
+  // nobody, which reads as a malformed remote id rather than as "no
+  // provenance". Collapsing it to null keeps one shape for "we do not know"
+  // instead of inventing a second.
+  it('an EMPTY origin is treated as absent, not stamped into a bare alias', () => {
+    const sock = fakeSocket();
+    routeRelay(db, new Map([['sub', sock]]), getPeerByAlias(db, 'orch')!,
+      topicFrame({ origin: '' }) as never);
+
+    const delivered = JSON.parse(sock.sent[0]!);
+    expect(delivered.origin).toBe(null);
+    expect(delivered.origin).not.toBe('orch:');
+    const row = db.prepare("SELECT origin FROM messages WHERE kind='topic'").get() as { origin: string | null };
+    expect(row.origin).toBe(null);
+  });
+
+  // The bound is checked AFTER stamping, because the stamp is what goes on the
+  // wire. A 252-byte origin under a 5-byte prefix is 257 stamped.
+  it('an origin that only exceeds 256 bytes ONCE STAMPED is refused', () => {
+    expect(routeRelay(db, new Map(), getPeerByAlias(db, 'orch')!,
+      topicFrame({ msg_id: 'u', origin: 'x'.repeat(250) }) as never).ok).toBe(true);
+    expect(routeRelay(db, new Map(), getPeerByAlias(db, 'orch')!,
+      topicFrame({ msg_id: 'o', origin: 'x'.repeat(252) }) as never).ok).toBe(false);
   });
 
   // ORIGIN IS NOT AN ACL PRINCIPAL. A peer that forges an origin naming a local
@@ -243,7 +295,7 @@ describe('F4 spoke: an arriving topic frame', () => {
   it('a forged origin changes no ACL outcome', () => {
     const sock = fakeSocket();
     routeRelay(db, new Map([['nosub', sock]]), getPeerByAlias(db, 'orch')!,
-      topicFrame({ origin: 'orch:trollbox' }) as never);
+      topicFrame({ origin: 'orch:trollbox' }) as never);   // arrives stamped as orch:orch:trollbox
 
     expect(sock.sent).toEqual([]);
     const rows = db.prepare("SELECT to_agent FROM messages WHERE kind='topic'").all() as { to_agent: string }[];
@@ -308,7 +360,14 @@ describe('F4 the enqueue has exactly one call site', () => {
       // To the next top-level `function`/`export function`, which is where this
       // one ends — good enough for a single-file scan and stated as such.
       const next = code.slice(start + 1).search(/\n(?:export\s+)?function\s/);
-      return code.slice(start, next === -1 ? undefined : start + 1 + next);
+      const body = code.slice(start, next === -1 ? undefined : start + 1 + next);
+      // A TRUNCATED SLICE MUST BE LOUD (seat 1). The `not.toContain` assertions
+      // below are absence checks, and an absence check on a slice that stopped
+      // early passes for the worst possible reason — the text simply was not
+      // read. A function's last line is its closing brace, so a slice that does
+      // not end at one did not reach the end of the function.
+      expect({ name, endsAtBrace: body.trimEnd().endsWith('}') }).toEqual({ name, endsAtBrace: true });
+      return body;
     };
 
     expect(bodyOf('fanOutHomeTopicPublish')).toContain('enqueueOutboundTopicRows(');
@@ -1129,5 +1188,68 @@ describe('F4 §16 L: a paused peering makes its topics local again', () => {
          AND delivered_at IS NULL AND failed_code IS NULL
          AND (expires_at IS NULL OR expires_at > ?)`).get(Date.now()) as { c: number };
     expect(queued).toEqual({ c: 1 });
+  });
+});
+
+// ── P16: a PAUSED hub→spoke peering gets NO row ─────────────────────────────
+//
+// The plan said posts QUEUE for a paused peering and drain on resume. They do
+// not, and the code is right: `enqueueOutboundTopicRows` iterates
+// `listEnabledOutboundPeers`, so a disabled peering is never considered and the
+// post is DROPPED for that spoke.
+//
+// Which is the correct behaviour for a topic, and worth stating rather than
+// merely correcting: a queued post would arrive minutes or hours late into a
+// live conversation, and the dedupe window would expire most of it anyway.
+// Pausing a topic peering means that mesh misses what it missed.
+//
+// §16 L's "rows already queued still drain" is about `topic-publish` rows a
+// SPOKE queued before its own peering paused — a different direction and a
+// different row kind. The two are easy to conflate, which is why both are
+// pinned.
+describe('F4 P16: a paused hub→spoke peering drops, it does not queue', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    resetRelayBuckets();
+    db = openDb(':memory:');
+    registerAgent(db, { id: 'hub-pub', token_hash: hashToken('p'), hostname: 'h' });
+    getOrCreateTopic(db, 'trollbox', 'hub-pub');
+    for (const alias of ['pod1', 'pod2']) {
+      db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                  VALUES (?, ?, 'tok', 'orch', '["topic"]', 600, ?)`).run(alias, `wss://${alias}.example`, Date.now());
+      subscribe(db, `${alias}:sub`, 'trollbox');
+      aclGrant(db, 'topic:trollbox', `${alias}:sub`, 'admin');
+    }
+  });
+  afterEach(() => { db.close(); });
+
+  const rowsTo = (alias: string) =>
+    (db.prepare("SELECT COUNT(*) c FROM messages WHERE to_agent = ? AND kind = 'topic'").get(`${alias}:`) as { c: number }).c;
+  const publish = () => routePublish(db, new Map(), 'hub-pub',
+    { type: 'publish', topic: 'trollbox', payload: 'hi' } as never);
+
+  it('no row is written for a peering that is paused', () => {
+    db.prepare("UPDATE outbound_peers SET enabled = 0 WHERE alias = 'pod2'").run();
+    publish();
+
+    expect(rowsTo('pod1')).toBe(1);
+    // Not queued for later: dropped. pod2 misses what it missed.
+    expect(rowsTo('pod2')).toBe(0);
+  });
+
+  it('CONTROL: enabled, the same publish writes one row for each', () => {
+    publish();
+    expect(rowsTo('pod1')).toBe(1);
+    expect(rowsTo('pod2')).toBe(1);
+  });
+
+  it('resuming does not retroactively produce the missed post', () => {
+    db.prepare("UPDATE outbound_peers SET enabled = 0 WHERE alias = 'pod2'").run();
+    publish();
+    db.prepare("UPDATE outbound_peers SET enabled = 1 WHERE alias = 'pod2'").run();
+
+    // Nothing appears on resume — there was never a row to drain.
+    expect(rowsTo('pod2')).toBe(0);
   });
 });
