@@ -14,6 +14,14 @@ import { join } from 'path';
 // A line number is a property of everything ABOVE an error, not of the error.
 // `file:code:message` is, and the message names the symbol.
 //
+// IT IS A TRADE, NOT A STRICT IMPROVEMENT (seat 2 on #181). The two schemes
+// are stable against different things: the old one survives a RENAME and not a
+// line shift; this one survives a line shift and not a rename — aliasing one
+// unused import churns two entries here and none under the old scheme, with
+// the count unchanged either way. Line shifts are constant and renames are
+// rare, so the trade is worth making, and the script's DOWN branch says which
+// causes a vanished entry can have.
+//
 // THIS FILE IS THE ONLY THING THAT LOOKS AT THEM ON A NORMAL RUN. Without it,
 // the format could revert and nobody would find out until the next DOWN — the
 // same silence #177 exists to remove, one level up.

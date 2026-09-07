@@ -160,11 +160,21 @@ for pkg in server client; do
     # list that is routinely wrong gets skimmed, then ignored. Both files move
     # together or the next run lies.
     #
-    # #177 removed the OTHER source of that staleness: identities used to carry
-    # a line number, so every count-preserving edit above an error rewrote its
-    # identity while this file was never consulted (it is read only on a DOWN).
-    # They are now file:code:message, so a line shift changes nothing and a
-    # vanished entry is a vanished ERROR.
+    # #177 removed the LOUDEST source of that staleness: identities used to
+    # carry a line number, so every count-preserving edit above an error rewrote
+    # its identity while this file was never consulted (it is read only on a
+    # DOWN). They are now file:code:message, and a line shift changes nothing.
+    #
+    # IT IS A TRADE, NOT A STRICT IMPROVEMENT, and the confirmation above is
+    # still required. The two schemes are stable against different things:
+    # file:line:code survives a RENAME and not a line shift; file:code:message
+    # survives a line shift and not a rename. Measured on this tree — ten blank
+    # lines atop db.ts churn 4 old identities and 0 new; aliasing one unused
+    # import churns 0 old and 2 new, with the count unchanged either way.
+    #
+    # So a vanished entry is a FIX, a RENAME, or a file that stopped being
+    # checked. Confirm which — that last one is what this branch exists to
+    # catch, and it looks identical to progress from here.
     echo "::notice::${pkg}: ${baseline} → ${count}. Do NOT lower the baseline until the disappeared list above is confirmed as real fixes; a suppressed or unchecked file looks identical to progress here. To accept: (cd ${pkg} && bunx tsc --noEmit 2>&1 | grep -oE '^[^(]+\\([0-9]+,[0-9]+\\): error TS[0-9]+: .*' | sed -E 's/\\(([0-9]+),[0-9]+\\): error (TS[0-9]+): /:\\2:/' | sed -E 's/[[:space:]]+/ /g' | awk '{ c[\$0]++; if (c[\$0] > 1) print \$0 \"#\" c[\$0]; else print \$0 }' | LC_ALL=C sort > ../${identity_file} && wc -l < ../${identity_file} > ../${baseline_file})"
   else
     echo "${pkg}: ${count} (baseline ${baseline}) ✅ held"
