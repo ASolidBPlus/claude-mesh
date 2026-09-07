@@ -187,7 +187,19 @@ export function callSites(src: string, name: string): number {
 export function nonCallMentions(src: string, name: string): number {
   // Same `.` exclusion as callSites: `obj.target` is a property, not a capture
   // of the free function.
-  return [...codeOnly(src).matchAll(new RegExp(`(?<![.\\w])${name}\\b(?!\\s*\\()`, 'g'))].length;
+  //
+  // AND THE SAME TYPE-PARAMETER ALLOWANCE, for the third time — found by
+  // extending the sum invariant to the generic fixtures (#182). Without it
+  // `function shaped<T>(…)` is followed by `<`, not `(`, so the lookahead
+  // passes and the DEFINITION is also counted as a non-call mention: a phantom
+  // capture reported for every generic function, and the alias check that
+  // exists to find real captures would cry wolf on all of them.
+  //
+  // Three places needed this expression and I fixed two, twice. The sum
+  // invariant — every mention is a definition, a call, or neither, and the
+  // three account for all of them — is what makes a miscategorisation visible
+  // when no single count looks wrong.
+  return [...codeOnly(src).matchAll(new RegExp(`(?<![.\\w])${name}\\b(?!\\s*(?:<[^>]*>)?\\s*\\()`, 'g'))].length;
 }
 
 /** Is the definition exported? A single unexported definition is what makes

@@ -205,6 +205,13 @@ function after() { forbidden(); }
     expect(definitions(src, 'shaped')).toBe(1);
     expect(isExported(src, 'shaped')).toBe(true);
     expect(bodyOf(src, 'shaped')).toContain('marker(a)');
+    // THE SUM INVARIANT REACHES THIS FIXTURE (#182). It lived on ONE plain
+    // fixture, so the generic cases exercised `definitions`, `bodyOf` and
+    // `isExported` and never the one function computed FROM them — which is
+    // precisely how the negative-count regression got through. Every mention of
+    // the name is a definition, a call, or neither, and the three must account
+    // for all of them.
+    expect(definitions(src, 'shaped') + callSites(src, 'shaped') + nonCallMentions(src, 'shaped')).toBe(1);
   });
 
   // THE EDGE MY OWN FIXTURES MISSED (seat 1). `callSites` is
@@ -241,6 +248,12 @@ function after() { forbidden(); }
     const src = 'function deep<T extends Map<string, number>>(a: T) {\n  marker(a);\n}\n';
     expect(definitions(src, 'deep')).toBe(0);
     expect(() => bodyOf(src, 'deep')).toThrow(/no definition/);
+    // The sum invariant here too, and it says something about the limit rather
+    // than merely repeating it: the definition is not RECOGNISED, so it counts
+    // as a non-call mention. The total is still one — the scanner miscategorises
+    // it and does not lose it, which is why the failure is loud ("no definition
+    // of deep") rather than a silently wrong count.
+    expect(definitions(src, 'deep') + callSites(src, 'deep') + nonCallMentions(src, 'deep')).toBe(1);
   });
 
   it('handles an exported async definition', () => {

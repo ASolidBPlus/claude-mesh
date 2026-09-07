@@ -158,10 +158,22 @@ describe('#166 the page\'s stated forms, run through the shipped predicates', ()
     const section = page.slice(page.indexOf('## GO-WITH-AMENDMENTS and discharge'), page.indexOf('## What the gate also reads'));
     // Derived from the code, not from memory: the discharge check's own
     // conjunction is seat, head, and no anchored NO-GO.
-    const check = gate.slice(gate.indexOf('db=$(gh api'), gate.indexOf('else bad "verdict $c is GO-WITH-AMENDMENTS'));
-    expect(check).toContain('[ "$ds" = "$s" ]');
-    expect(check).toContain('grep -q "$HEAD"');
+    //
+    // Read from `discharge_ok`'s BODY, since #182 lifted the conjunction out of
+    // the gate's main body into a named predicate — which is what lets the
+    // behavioural case below run it instead of reconstructing it. Sliced by the
+    // column-0 close, the same rule the source scanner uses on TypeScript.
+    const fnStart = gate.indexOf('discharge_ok(){');
+    expect(fnStart).toBeGreaterThan(-1);
+    const check = gate.slice(fnStart, gate.indexOf('\n}', fnStart) + 2);
+    expect(check).toContain('[ "$ds" = "$2" ]');
+    expect(check).toContain('grep -q "$3"');
     expect(check).toContain('Verdict:\\**\\s*NO-GO');
+    // ...and all three are joined by AND. Seat 1's `&&` → `||` mutant is what
+    // this line exists for; it is asserted on the SHAPE as well as driven
+    // behaviourally below, because the two fail differently and a reader of a
+    // failure should be told which.
+    expect(check.match(/&&/g)?.length).toBe(2);
 
     expect(section).toMatch(/same seat/i);
     expect(section).toMatch(/full head SHA/i);
@@ -174,10 +186,15 @@ describe('#166 the page\'s stated forms, run through the shipped predicates', ()
     const noSha = 'sec-reviewer — discharge\nbinds ' + SHORT;
     const reproducedNoGo = 'sec-reviewer — discharge\n> Verdict: NO-GO — the earlier round\nbinds ' + HEAD;
 
+    // RUNS THE SHIPPED PREDICATE (#182). This used to be a hand-written
+    // RECONSTRUCTION of the gate's inline conjunction — the one blind spot an
+    // oracle that sources functions has, and one invisible from inside its own
+    // design: seat 1's `&&` → `||` mutant on the gate left this file 16/0.
+    // `discharge_ok` now lives above the selftest guard, so it arrives with
+    // `seat_of` and the rest.
     const discharge = (body: string) => withPredicates(
       `D=$(cat <<'EOF'\n${body}\nEOF\n)\n` +
-      `ds=$(seat_of "$D")\n` +
-      `[ "$ds" = 1 ] && grep -q "${HEAD}" <<<"$D" && ! grep -qP "^[\\s*_\\x60>-]*Verdict:\\**\\s*NO-GO" <<<"$D" && echo DISCHARGED || echo REFUSED`,
+      `discharge_ok "$D" 1 "${HEAD}" && echo DISCHARGED || echo REFUSED`,
     ).trim();
 
     expect({ ok: discharge(ok), wrongSeat: discharge(wrongSeat), noSha: discharge(noSha), reproducedNoGo: discharge(reproducedNoGo) })
