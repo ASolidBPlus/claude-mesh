@@ -261,6 +261,26 @@ mesh it does not peer with. The stamp is applied by the server, so a peer cannot
 forge a replyable form — whatever it sends acquires our alias for it as a
 prefix. It is never routed on and never an ACL principal.
 
+**`origin` is an IDENTIFIER, and its characters are checked** (#184). The
+component a peer supplies must match `[A-Za-z0-9._@:-]+`; anything else refuses
+the frame with the same uniform `RELAY_REFUSED` as any other malformed field.
+Length alone was not enough once a consumer began rendering `origin` into a
+language model's prompt: a single newline inside a 75-byte origin forges a
+`[from …]` line, which is the tag such a prompt is trained to read as the reply
+address. The rule is an ALLOWLIST because a blacklist of `\n` and `\r` would
+still admit U+0085, U+2028/U+2029, a tab, or a right-to-left override. It is
+applied in `stampOrigin` (`server/router.ts`), the one place a peer-supplied
+origin is made — both the `topic` arm's `origin` and the `topic-publish` arm's
+poster id go through it.
+
+A consumer still owes its own flattening: this grammar is the producer's
+promise, and a client may be talking to a mesh that predates it.
+
+A LOCAL publisher's origin (`routePublish`, `origin: from_agent`) is not
+checked here. It is an agent id an admin chose at `POST /agents`, not a peer's
+string, and it is the same value the frame already carries as `from` — the
+grammar that would constrain it belongs at the registration door.
+
 **Only the first segment is ours.** Everything after it is what the delivering
 peer asserted — including whether the post was relayed at all: a peer can invent
 a middle segment for a mesh that does not exist, or omit one for a relay that
