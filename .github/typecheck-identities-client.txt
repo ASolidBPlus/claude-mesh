@@ -1,36 +1,36 @@
-../server/cron.ts:100:TS2345
-../server/cron.ts:101:TS2345
-../server/cron.ts:231:TS2345
-../server/cron.ts:312:TS2345
-../server/cron.ts:97:TS2345
-../server/cron.ts:98:TS2345
-../server/cron.ts:99:TS2345
-../server/db.ts:1829:TS2345
-../server/db.ts:783:TS2345
-../server/duration.ts:21:TS2538
-../server/http-admin.ts:1253:TS2345
-../server/http-admin.ts:1367:TS2345
-../server/http-admin.ts:1375:TS2345
-../server/http-admin.ts:1381:TS2345
-../server/http-admin.ts:37:TS6133
-../server/http-admin.ts:3:TS6133
-../server/http-admin.ts:40:TS6133
-../server/http-admin.ts:523:TS2345
-../server/http-admin.ts:527:TS2345
-../server/http-admin.ts:715:TS2345
-../server/http-admin.ts:728:TS2345
-../server/http-admin.ts:740:TS2345
-../server/http-admin.ts:881:TS2379
-../server/http-admin.ts:941:TS2345
-../server/metrics.ts:189:TS2532
-../server/metrics.ts:35:TS2532
-../server/metrics.ts:35:TS2532
-../server/router.ts:26:TS6133
-../server/router.ts:28:TS6133
-../server/ws-server.ts:16:TS6192
-__tests__/file-grouping.test.ts:60:TS2769
-__tests__/file-grouping.test.ts:80:TS2769
-__tests__/presence-ttl.test.ts:61:TS18048
-__tests__/presence-ttl.test.ts:62:TS18048
-__tests__/presence-ttl.test.ts:63:TS18048
-__tests__/reconnect.test.ts:159:TS2379
+../server/cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+../server/cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#2
+../server/cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#3
+../server/cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#4
+../server/cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#5
+../server/cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#6
+../server/cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#7
+../server/db.ts:TS2345:Argument of type 'unknown[]' is not assignable to parameter of type 'SQLQueryBindings[] | [null] | [string] | [number] | [bigint] | [false] | [true] | [Uint8Array<ArrayBufferLike>] | [Uint8ClampedArray<ArrayBufferLike>] | ... 10 more ... | [...]'.
+../server/db.ts:TS2345:Argument of type 'unknown[]' is not assignable to parameter of type 'SQLQueryBindings[] | [null] | [string] | [number] | [bigint] | [false] | [true] | [Uint8Array<ArrayBufferLike>] | [Uint8ClampedArray<ArrayBufferLike>] | ... 10 more ... | [...]'.#2
+../server/duration.ts:TS2538:Type 'undefined' cannot be used as an index type.
+../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#10
+../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#2
+../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#3
+../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#4
+../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#5
+../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#6
+../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#7
+../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#8
+../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#9
+../server/http-admin.ts:TS2379:Argument of type '{ agent: string | undefined; topic: string | undefined; since: number | undefined; limit: number | undefined; before: { sentAt: number; id: string; } | undefined; kinds: string[] | undefined; }' is not assignable to parameter of type '{ agent?: string; topic?: string; since?: number; limit?: number; before?: { sentAt: number; id: string; }; kinds?: string[]; }' with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' to the types of the target's properties.
+../server/http-admin.ts:TS6133:'Reminder' is declared but its value is never read.
+../server/http-admin.ts:TS6133:'isObserver' is declared but its value is never read.
+../server/http-admin.ts:TS6133:'net' is declared but its value is never read.
+../server/metrics.ts:TS2532:Object is possibly 'undefined'.
+../server/metrics.ts:TS2532:Object is possibly 'undefined'.#2
+../server/metrics.ts:TS2532:Object is possibly 'undefined'.#3
+../server/router.ts:TS6133:'Message' is declared but its value is never read.
+../server/router.ts:TS6133:'getFile' is declared but its value is never read.
+../server/ws-server.ts:TS6192:All imports in import declaration are unused.
+__tests__/file-grouping.test.ts:TS2769:No overload matches this call.
+__tests__/file-grouping.test.ts:TS2769:No overload matches this call.#2
+__tests__/presence-ttl.test.ts:TS18048:'byId.A' is possibly 'undefined'.
+__tests__/presence-ttl.test.ts:TS18048:'byId.B' is possibly 'undefined'.
+__tests__/presence-ttl.test.ts:TS18048:'byId.B' is possibly 'undefined'.#2
+__tests__/reconnect.test.ts:TS2379:Argument of type '{ label: string; outcome: string; code: string | undefined; }' is not assignable to parameter of type '{ label: string; outcome: string; code?: string; }' with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' to the types of the target's properties.
