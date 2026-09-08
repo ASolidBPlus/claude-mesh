@@ -206,6 +206,18 @@ if [ "${1:-}" = --selftest ]; then
   # would satisfy - produced ZERO `BAD` lines. Measured on this file. A rule is
   # only tested by an input that distinguishes it from its weaker form.
   V7=$(printf '**`sec-reviewer` - verdict**\nVerdict: GO - binds %s' "${H:0:7}"); expect must-fail "GO binding a SHORT sha" "$(chk_verdict t "$V7" $H "")"
+  # #188 - THE FIXTURES ABOVE ARE INVENTED FORMS. These two are the first lines
+  # the seats ACTUALLY post, copied from live verdict comments, and they differ:
+  # seat 1 wraps its id in backticks inside bold and continues the sentence,
+  # seat 2 posts BARE - no bold, no backticks. `seat_of` is therefore a
+  # TWO-CONSUMER parser, and the invented fixtures cannot see that: tightened to
+  # require a backtick it would keep every case above green while every seat 2
+  # verdict silently became unattributable, which reads as a fix and is a
+  # regression neither seat can see from its own side.
+  R1=$(printf '**`sec-reviewer` - security review verdict.** Posted by the fleet'"'"'s security reviewer; we share a GitHub account\nVerdict: GO - binds %s' $H)
+  R2=$(printf 'sec-reviewer-2 - security review verdict\nVerdict: GO - binds %s' $H)
+  expect must-pass "seat 1 REAL posted first line" "$(chk_verdict t "$R1" $H 1)"
+  expect must-pass "seat 2 REAL posted first line" "$(chk_verdict t "$R2" $H 2)"
   is_amend "Verdict: GO-WITH-AMENDMENTS — binds $H" && echo "  ok   amendments verdict detected" || { echo "  BAD  amendments verdict missed"; fails=$((fails+1)); }
   is_amend "Verdict: GO. Supersedes my GO-WITH-AMENDMENTS at $X" && { echo "  BAD  a mention of a superseded amendments verdict read as one"; fails=$((fails+1)); } || echo "  ok   mention of amendments is not a verdict"
   # discharge_ok: one known-good and one per condition, because three conditions
