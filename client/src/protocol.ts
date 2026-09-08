@@ -122,7 +122,12 @@ export interface DeliverFrame {
    *  SHOW. Absent on every path that did not cross a border, and `null` once
    *  normalised. DISPLAY ONLY: it is chosen by the sending mesh, so a consumer
    *  that routed or authorised on it would be trusting another mesh's string.
-   *  `from` remains the principal the message is attributed to. */
+   *  `from` remains the principal the message is attributed to.
+ *
+ *  A SERVER FROM #184 ON constrains the peer-supplied part to
+ *  `[A-Za-z0-9._@:-]`, so it can hold no line break. A consumer that renders
+ *  this into a language model's prompt must STILL flatten it: the grammar is
+ *  the producer's promise, and this client may be talking to an older mesh. */
   origin?: string | null;
 }
 
