@@ -342,6 +342,38 @@ describe('#187 relayed `from` cannot forge a tag', () => {
       .map(r => r.agent_id)).toEqual(['farmesh:their-agent']);
   });
 
+  // THE ALLOWLIST'S OWN ARGUMENT, TESTED — driven through the MINTING arm,
+  // which is the only one that can see it (seat 2 on #189).
+  //
+  // The claim in `db.ts` is that a `[\r\n]` blacklist is not enough because it
+  // still admits U+0085, U+2028/U+2029, a tab and an RTL override — two of
+  // which survive a consumer's `/\s+/g` flatten. That claim was PROSE here: the
+  // table above runs through the DIRECT arm, where a forged principal has no
+  // ACL edge and is refused for the ACL's reason, so a blacklist passed the
+  // whole file. Measured, then closed.
+  //
+  // Here the same table decides whether a ROW IS MINTED, and nothing else can
+  // answer for it.
+  it('the whole hostile table is refused AT THE MINT, not only the line breaks', () => {
+    db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                VALUES ('farmesh','wss://f.example','tok','us','["topic"]',600,?)`).run(Date.now());
+    getOrCreateTopic(db, 'trollbox', 'local-a');
+
+    const sub = (from: string) => routeRelay(
+      db, new Map(), getPeerByAlias(db, 'farmesh')!,
+      { type: 'relay', msg_id: `s-${Math.random()}`, kind: 'topic-subscribe',
+        from, topic: 'trollbox' } as never,
+    );
+
+    const chars = HOSTILE.filter(([n]) => n !== 'COLON');   // COLON is one_hop's kill
+    const outcomes = chars.map(([name, code]) => [name, sub(`a${ch(code)}b`).ok]);
+    expect(outcomes).toEqual(chars.map(([name]) => [name, false]));
+    expect(db.prepare('SELECT COUNT(*) c FROM subscriptions').get()).toEqual({ c: 0 });
+
+    // POSITIVE CONTROL on the same arm, so "refused" is not the fixture.
+    expect(sub('their-agent').ok).toBe(true);
+  });
+
   // THE GRANDFATHER, and the reason this can land on a live mesh: a principal
   // this mesh ALREADY knows keeps arriving, whatever its characters.
   it('a principal that already holds an ACL edge is admitted', () => {

@@ -280,6 +280,7 @@ A LOCAL publisher's origin (`routePublish`, `origin: from_agent`) is not
 checked here. It is an agent id an admin chose at `POST /agents`, not a peer's
 string, and it is the same value the frame already carries as `from` — the
 grammar that would constrain it belongs at the registration door.
+
 **(g) `from` and topic names are IDENTIFIERS too** (#187), and this half is the
 stronger one: `from` is stamped into `from_agent`, which a consumer renders
 *inside* the `[from …]` tag — so a break in an id forges that tag directly, with
