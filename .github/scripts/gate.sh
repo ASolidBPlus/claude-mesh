@@ -76,7 +76,7 @@ chk_verdict(){ # $1 label $2 body $3 head $4 required seat or ""
   elif [ -z "$4" ] || [ "$s" = "$4" ]; then ok "verdict $1 from seat $s"
   else bad "verdict $1 from seat $s, SEAT=$4 required"; fi
   if grep -q "$3" <<<"$2" && grep -qP '^[\s*_\x60>-]*Verdict:\**\s*GO\b' <<<"$2" && ! grep -qP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2"; then
-    ok "verdict $1 binds ${3:0:7} GO"
+    ok "verdict $1 binds $3 GO"
   else bad "verdict $1: head=$(grep -c "$3" <<<"$2") GO=$(grep -cP '^[\s*_\x60>-]*Verdict:\**\s*GO\b' <<<"$2") NOGO=$(grep -cP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2")"; fi
 }
 is_amend(){ grep -qiP '^[\s*_\x60>-]*Verdict:\**\s*GO[- ]WITH[- ]AMENDMENT' <<<"$1"; } # the VALUE is the amendments form; a mention later on the line is not
@@ -100,6 +100,17 @@ discharge_ok(){ # $1 discharge body  $2 the amending seat  $3 head sha
   local ds; ds=$(seat_of "$1")
   [ "$ds" = "$2" ] && grep -q "$3" <<<"$1" && ! grep -qP "^[\s*_\x60>-]*Verdict:\**\s*NO-GO" <<<"$1"
 }
+# #188 - ZERO VERDICTS IS NOT A PASS. `gate.sh <pr> <sha>` with no verdict ids
+# ran to completion silently: the `for c in "${VERDICTS[@]}"` loop simply had
+# nothing to iterate, so with CI green the output was indistinguishable from
+# every verdict having passed. Measured on a live PR before the fix - GATE PASS
+# with no verdict supplied.
+#
+# A PREDICATE rather than an inline test, because this file's rule is that every
+# outcome check lives above the guard where --selftest can drive it.
+chk_arity(){ # $1 how many verdict ids were supplied
+  [ "$1" -ge 1 ] && ok "verdicts supplied: $1" || bad "no verdict supplied - with CI green, zero verdicts reads exactly like every verdict passing"
+}
 kw_extract(){ # GitHub's grammar: keyword, optional colon, any whitespace, #N (case-insensitive)
   grep -oiP '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b:?\s*#[0-9]+' <<<"$1" | sort -u | tr '\n' ' '
 }
@@ -109,7 +120,7 @@ if [ "${1:-}" = --selftest ]; then
   # shape directly: every function defined once, one selftest guard, one of each check marker
   # (an append-instead-of-replace edit once doubled the file; the selftest passed on the first
   # third and never saw the rest — build-triage, #151)
-  for fn in join_check chk_parents chk_jobs chk_verdict is_amend discharge_ok kw_extract seat_of read_merge_ref; do
+  for fn in join_check chk_parents chk_jobs chk_verdict chk_arity is_amend discharge_ok kw_extract seat_of read_merge_ref; do
     n=$(grep -c "^$fn()" "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: $fn defined $n times"; exit 1; }
   done
   [ "$(grep -c '^if \[ "\${1:-}" = --selftest' "$0")" = 1 ] || { echo "SELFTEST FAIL: more than one selftest block"; exit 1; }
@@ -128,12 +139,13 @@ if [ "${1:-}" = --selftest ]; then
   # mechanisms guard this file, and EVERY predicate is covered by at least one:
   #
   #   invocation assertions (this list)  join_check, chk_parents, chk_jobs,
-  #                                      chk_verdict, kw_extract; is_amend and
+  #                                      chk_verdict, chk_arity, kw_extract;
+  #                                      is_amend and
   #                                      discharge_ok by their own greps below,
   #                                      whose call shapes this loop's
   #                                      "name + first argument" pattern cannot
   #                                      express
-  #   behavioural inventory (expect)     all nine, the ones above included
+  #   behavioural inventory (expect)     all ten, the ones above included
   #   set -u                             any unset variable, everywhere
   #
   # seat_of and read_merge_ref are absent from this list deliberately, not by
@@ -145,36 +157,67 @@ if [ "${1:-}" = --selftest ]; then
   # Adding a predicate means adding a line here OR a case in the inventory. With
   # neither, deleting its call is silent — which is exactly the mutant this
   # block exists to catch.
-  for call in 'join_check "${runid' 'chk_parents "${#parents' 'chk_jobs "$jobs"' 'chk_verdict "$c"' 'kw_extract "$body"'; do
+  for call in 'join_check "${runid' 'chk_parents "${#parents' 'chk_jobs "$jobs"' 'chk_verdict "$c"' 'chk_arity "${#VERDICTS' 'kw_extract "$body"'; do
     n=$(grep -cF -- "$call" "$0"); n=$((n-1)) # minus this loop's own literal
     [ "$n" = 1 ] || { echo "SELFTEST FAIL: predicate call '$call' appears $n times in the body (expected 1)"; exit 1; }
   done
   n=$(grep -c '^  if is_amend "\$cb"; then' "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: is_amend invocation appears $n times"; exit 1; }
   n=$(grep -c '^      discharge_ok "\$db" "\$s" "\$HEAD"' "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: discharge_ok invocation appears $n times"; exit 1; }
   echo "structure: single definitions, one selftest, one of each check, every predicate invoked once"
-  expect(){ # $1 must-fail|must-pass  $2 label; stdin = a check's output
-    local out; out=$(cat)
+  expect(){ # $1 must-fail|must-pass  $2 label  $3 the check's OUTPUT
+    # #188 - THE OUTPUT ARRIVES AS AN ARGUMENT, never on stdin. Piping a check
+    # into this function ran it in a SUBSHELL, so `fails=$((fails+1))`
+    # incremented a copy that was then discarded: a mutant printed `BAD ...`
+    # and the selftest still exited 0 and reported SELFTEST PASS. Measured on
+    # this file before the fix - chk_jobs stubbed to always pass printed two
+    # BAD lines and exited 0.
+    #
+    # The mechanism whose whole purpose is catching checks that pass while
+    # proving nothing was itself passing while proving nothing, and neither
+    # reading it nor running it showed that: stdout said BAD, exit status said
+    # 0. Only re-implementing it did.
+    local out=$3
     if [ "$1" = must-fail ]; then grep -q '^FAIL' <<<"$out" && echo "  ok   $2 (rejected)" || { echo "  BAD  $2: known-bad input PASSED"; fails=$((fails+1)); }
     else grep -q '^FAIL' <<<"$out" && { echo "  BAD  $2: known-good input FAILED"; fails=$((fails+1)); } || echo "  ok   $2 (accepted)"; fi
   }
   T=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; H=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; X=cccccccccccccccccccccccccccccccccccccccc
   echo "behavioural inventory (each check driven with known-bad and known-good input):"
-  chk_parents 2 $T $H $T $H true  | expect must-pass "parents fresh + mergeable"
-  chk_parents 2 $X $H $T $H true  | expect must-fail "parent 1 stale"
-  chk_parents 2 $T $X $T $H true  | expect must-fail "parent 2 stale"
-  chk_parents 1 $T "" $T $H true  | expect must-fail "one parent"
-  chk_parents 2 $T $H $T $H false | expect must-fail "mergeable=false on a fresh ref"
+  expect must-pass "parents fresh + mergeable" "$(chk_parents 2 $T $H $T $H true)"
+  expect must-fail "parent 1 stale" "$(chk_parents 2 $X $H $T $H true)"
+  expect must-fail "parent 2 stale" "$(chk_parents 2 $T $X $T $H true)"
+  expect must-fail "one parent" "$(chk_parents 1 $T "" $T $H true)"
+  expect must-fail "mergeable=false on a fresh ref" "$(chk_parents 2 $T $H $T $H false)"
   chk_parents 2 $X $H $T $H true  | grep -q 'stale tree' && echo "  ok   mergeable ignored on a stale ref" || { echo "  BAD  mergeable read on a stale ref"; fails=$((fails+1)); }
-  chk_jobs "test:success typecheck:success docker:success" | expect must-pass "all jobs success"
-  chk_jobs "test:success typecheck:cancelled docker:success" | expect must-fail "a cancelled job"
-  chk_jobs "" | expect must-fail "no jobs"
-  V1=$(printf '**`sec-reviewer` — verdict**\n**Verdict: GO** binds %s' $H); chk_verdict t "$V1" $H ""  | expect must-pass "seat 1 GO binding the head"
-  V2=$(printf '**`sec-reviewer-2` — verdict**\nVerdict: GO — binds %s' $H); chk_verdict t "$V2" $H 2 | expect must-pass "seat 2 GO with SEAT=2"
-  chk_verdict t "$V2" $H 1 | expect must-fail "seat 2 verdict when SEAT=1 required"
-  V3=$(printf '**`sec-reviewer` — verdict**\nVerdict: GO — binds %s' $X); chk_verdict t "$V3" $H "" | expect must-fail "GO binding a different head"
-  V4=$(printf '**`sec-reviewer` — verdict**\nVerdict: NO-GO — binds %s' $H); chk_verdict t "$V4" $H "" | expect must-fail "NO-GO"
-  V5=$(printf 'Some random comment\nVerdict: GO — binds %s' $H); chk_verdict t "$V5" $H "" | expect must-fail "unattributable first line"
-  V6=$(printf '**`sec-reviewer` — verdict**\nwe saw no NO-GO; the Verdict: GO line is missing; binds %s' $H); chk_verdict t "$V6" $H "" | expect must-fail "GO mentioned mid-line only"
+  expect must-pass "all jobs success" "$(chk_jobs "test:success typecheck:success docker:success")"
+  expect must-fail "a cancelled job" "$(chk_jobs "test:success typecheck:cancelled docker:success")"
+  expect must-fail "no jobs" "$(chk_jobs "")"
+  expect must-pass "one verdict supplied" "$(chk_arity 1)"
+  expect must-fail "no verdict supplied" "$(chk_arity 0)"
+  V1=$(printf '**`sec-reviewer` — verdict**\n**Verdict: GO** binds %s' $H); expect must-pass "seat 1 GO binding the head" "$(chk_verdict t "$V1" $H "")"
+  V2=$(printf '**`sec-reviewer-2` — verdict**\nVerdict: GO — binds %s' $H); expect must-pass "seat 2 GO with SEAT=2" "$(chk_verdict t "$V2" $H 2)"
+  expect must-fail "seat 2 verdict when SEAT=1 required" "$(chk_verdict t "$V2" $H 1)"
+  V3=$(printf '**`sec-reviewer` — verdict**\nVerdict: GO — binds %s' $X); expect must-fail "GO binding a different head" "$(chk_verdict t "$V3" $H "")"
+  V4=$(printf '**`sec-reviewer` — verdict**\nVerdict: NO-GO — binds %s' $H); expect must-fail "NO-GO" "$(chk_verdict t "$V4" $H "")"
+  V5=$(printf 'Some random comment\nVerdict: GO — binds %s' $H); expect must-fail "unattributable first line" "$(chk_verdict t "$V5" $H "")"
+  V6=$(printf '**`sec-reviewer` — verdict**\nwe saw no NO-GO; the Verdict: GO line is missing; binds %s' $H); expect must-fail "GO mentioned mid-line only" "$(chk_verdict t "$V6" $H "")"
+  # #188 - THE HEADLINE PROPERTY, and nothing exercised it: every fixture above
+  # supplies a FULL 40-hex sha, so `grep -q "$3"` mutated to `grep -q
+  # "${3:0:7}"` - a SEVEN-CHARACTER bind, which any comment quoting a short sha
+  # would satisfy - produced ZERO `BAD` lines. Measured on this file. A rule is
+  # only tested by an input that distinguishes it from its weaker form.
+  V7=$(printf '**`sec-reviewer` - verdict**\nVerdict: GO - binds %s' "${H:0:7}"); expect must-fail "GO binding a SHORT sha" "$(chk_verdict t "$V7" $H "")"
+  # #188 - THE FIXTURES ABOVE ARE INVENTED FORMS. These two are the first lines
+  # the seats ACTUALLY post, copied from live verdict comments, and they differ:
+  # seat 1 wraps its id in backticks inside bold and continues the sentence,
+  # seat 2 posts BARE - no bold, no backticks. `seat_of` is therefore a
+  # TWO-CONSUMER parser, and the invented fixtures cannot see that: tightened to
+  # require a backtick it would keep every case above green while every seat 2
+  # verdict silently became unattributable, which reads as a fix and is a
+  # regression neither seat can see from its own side.
+  R1=$(printf '**`sec-reviewer` - security review verdict.** Posted by the fleet'"'"'s security reviewer; we share a GitHub account\nVerdict: GO - binds %s' $H)
+  R2=$(printf 'sec-reviewer-2 - security review verdict\nVerdict: GO - binds %s' $H)
+  expect must-pass "seat 1 REAL posted first line" "$(chk_verdict t "$R1" $H 1)"
+  expect must-pass "seat 2 REAL posted first line" "$(chk_verdict t "$R2" $H 2)"
   is_amend "Verdict: GO-WITH-AMENDMENTS — binds $H" && echo "  ok   amendments verdict detected" || { echo "  BAD  amendments verdict missed"; fails=$((fails+1)); }
   is_amend "Verdict: GO. Supersedes my GO-WITH-AMENDMENTS at $X" && { echo "  BAD  a mention of a superseded amendments verdict read as one"; fails=$((fails+1)); } || echo "  ok   mention of amendments is not a verdict"
   # discharge_ok: one known-good and one per condition, because three conditions
@@ -186,6 +229,10 @@ if [ "${1:-}" = --selftest ]; then
   discharge_ok "$D_OK"   1 $H && echo "  ok   discharge accepted (seat, sha, no NO-GO)" || { echo "  BAD  a valid discharge was refused"; fails=$((fails+1)); }
   discharge_ok "$D_SEAT" 1 $H && { echo "  BAD  a discharge by another seat was accepted"; fails=$((fails+1)); } || echo "  ok   discharge by another seat refused"
   discharge_ok "$D_SHA"  1 $H && { echo "  BAD  a discharge naming another head was accepted"; fails=$((fails+1)); } || echo "  ok   discharge not binding the head refused"
+  # The same short-sha gap one predicate over: `discharge_ok` binds with the
+  # same `grep -q "$3"`, so it needs the same distinguishing input (#188).
+  D_SHORT=$(printf '**`sec-reviewer` - discharge**\ndeferred; binds %s' "${H:0:7}")
+  discharge_ok "$D_SHORT" 1 $H && { echo "  BAD  a discharge binding a SHORT sha was accepted"; fails=$((fails+1)); } || echo "  ok   discharge binding a short sha refused"
   discharge_ok "$D_NOGO" 1 $H && { echo "  BAD  a discharge reproducing a NO-GO was accepted"; fails=$((fails+1)); } || echo "  ok   discharge reproducing a NO-GO refused"
   for kw in "Closes #12" "Closes: #12" "closes:#12" "Closes  #12" "Fixed: #7" "resolves #9"; do [ -n "$(kw_extract "$kw")" ] && echo "  ok   keyword form '$kw'" || { echo "  BAD  keyword form '$kw' missed"; fails=$((fails+1)); }; done
   [ -z "$(kw_extract "see #12 and the loop closed itself")" ] && echo "  ok   non-keyword '#12' ignored" || { echo "  BAD  non-keyword matched"; fails=$((fails+1)); }
@@ -214,8 +261,8 @@ fi
 
 # 1
 ref=$(git ls-remote origin "refs/heads/$branch" | cut -f1)
-[ "$ref" = "$HEAD" ] && ok "branch ref $branch = ${HEAD:0:7}" || bad "branch ref ${ref:0:7} != expected ${HEAD:0:7}"
-[ "$headsha" = "$HEAD" ] && ok "PR head = ${HEAD:0:7}" || bad "PR head is ${headsha:0:7}"
+[ "$ref" = "$HEAD" ] && ok "branch ref $branch = $HEAD" || bad "branch ref $ref != expected $HEAD"
+[ "$headsha" = "$HEAD" ] && ok "PR head = $HEAD" || bad "PR head is $headsha, expected $HEAD"
 # 2
 [ "$state" = open ] && ok "state open" || bad "state $state"
 [ "$base" = main ] && ok "base main" || bad "base is $base (retarget first)"
@@ -288,6 +335,7 @@ chk_jobs "$jobs"
 # 5 the join (function defined above)
 join_check "${runid:-0}" "$p1" "$p2"
 # 6
+chk_arity "${#VERDICTS[@]}"
 for c in "${VERDICTS[@]}"; do
   cb=$(gh api "repos/$R/issues/comments/$c" --jq .body) || { bad "verdict $c unreadable"; continue; }
   s=$(seat_of "$cb")
@@ -297,8 +345,8 @@ for c in "${VERDICTS[@]}"; do
       db=$(gh api "repos/$R/issues/comments/$DISCHARGED" --jq .body 2>/dev/null) || db=""
       ds=$(seat_of "$db")
       discharge_ok "$db" "$s" "$HEAD" \
-        && ok "verdict $c GO-WITH-AMENDMENTS discharged by $DISCHARGED (seat $ds, binds ${HEAD:0:7})" \
-        || bad "verdict $c GO-WITH-AMENDMENTS: discharge $DISCHARGED not by seat $s (seat $ds), does not bind ${HEAD:0:7}, or reproduces a NO-GO"
+        && ok "verdict $c GO-WITH-AMENDMENTS discharged by $DISCHARGED (seat $ds, binds $HEAD)" \
+        || bad "verdict $c GO-WITH-AMENDMENTS: discharge $DISCHARGED not by seat $s (seat $ds), does not bind $HEAD, or reproduces a NO-GO"
     else bad "verdict $c is GO-WITH-AMENDMENTS at this head and no DISCHARGED comment cited"; fi
   fi
 done
@@ -331,5 +379,11 @@ note "closing keywords: ${kw:-none}"
 for n in $(grep -oE '#[0-9]+' <<<"$kw" | tr -d '#'); do
   gh api "repos/$R/pulls/$n" >/dev/null 2>&1 && bad "closing keyword names PR #$n" || ok "closes issue #$n"
 done
-[ $fail = 0 ] && echo "GATE  PASS #$N @ ${HEAD:0:7}" || echo "GATE  FAIL #$N @ ${HEAD:0:7}"
+# #188 — THE BIND IS PRINTED IN FULL, here and at every line that names the
+# head this run is bound to (branch ref, PR head, verdict, discharge). A short
+# sha is what the gate REFUSES in a verdict; printing one in the gate's own
+# conclusion asks a reader to accept a weaker form of the field under dispute.
+# The parent/join lines stay short: those compare two shas the gate derived
+# itself and are diagnostics, not the bind.
+[ $fail = 0 ] && echo "GATE  PASS #$N @ $HEAD" || echo "GATE  FAIL #$N @ $HEAD"
 exit $fail
