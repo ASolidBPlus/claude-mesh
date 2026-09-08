@@ -80,6 +80,26 @@ chk_verdict(){ # $1 label $2 body $3 head $4 required seat or ""
   else bad "verdict $1: head=$(grep -c "$3" <<<"$2") GO=$(grep -cP '^[\s*_\x60>-]*Verdict:\**\s*GO\b' <<<"$2") NOGO=$(grep -cP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2")"; fi
 }
 is_amend(){ grep -qiP '^[\s*_\x60>-]*Verdict:\**\s*GO[- ]WITH[- ]AMENDMENT' <<<"$1"; } # the VALUE is the amendments form; a mention later on the line is not
+
+# THE DISCHARGE RULE, and it lives up here for a reason (#182). It was INLINE in
+# the body below the selftest guard, which put it outside the two things that
+# check this file: the selftest's behavioural inventory, and the verdict page's
+# oracle — which sources the FUNCTIONS above the guard and so could only hold a
+# hand-written reconstruction of it. Seat 1's mutant proved the cost: `&&` → `||`
+# in the old inline conjunction, 16 pass / 0 fail.
+#
+# An oracle that sources functions has exactly one blind spot — inline logic —
+# and it is invisible from inside the oracle's own design.
+#
+# THREE CONDITIONS, all required: the discharge comes from the SAME seat that
+# gave the amendments verdict, it names the head, and it does not itself carry
+# an anchored NO-GO — so a discharge that reproduces the verdict it discharges
+# is refused. That last one is the writer rule ("never reproduce a verdict
+# line") with teeth rather than a separate rule to remember.
+discharge_ok(){ # $1 discharge body  $2 the amending seat  $3 head sha
+  local ds; ds=$(seat_of "$1")
+  [ "$ds" = "$2" ] && grep -q "$3" <<<"$1" && ! grep -qP "^[\s*_\x60>-]*Verdict:\**\s*NO-GO" <<<"$1"
+}
 kw_extract(){ # GitHub's grammar: keyword, optional colon, any whitespace, #N (case-insensitive)
   grep -oiP '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b:?\s*#[0-9]+' <<<"$1" | sort -u | tr '\n' ' '
 }
@@ -89,7 +109,7 @@ if [ "${1:-}" = --selftest ]; then
   # shape directly: every function defined once, one selftest guard, one of each check marker
   # (an append-instead-of-replace edit once doubled the file; the selftest passed on the first
   # third and never saw the rest — build-triage, #151)
-  for fn in join_check chk_parents chk_jobs chk_verdict is_amend kw_extract seat_of read_merge_ref; do
+  for fn in join_check chk_parents chk_jobs chk_verdict is_amend discharge_ok kw_extract seat_of read_merge_ref; do
     n=$(grep -c "^$fn()" "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: $fn defined $n times"; exit 1; }
   done
   [ "$(grep -c '^if \[ "\${1:-}" = --selftest' "$0")" = 1 ] || { echo "SELFTEST FAIL: more than one selftest block"; exit 1; }
@@ -108,8 +128,12 @@ if [ "${1:-}" = --selftest ]; then
   # mechanisms guard this file, and EVERY predicate is covered by at least one:
   #
   #   invocation assertions (this list)  join_check, chk_parents, chk_jobs,
-  #                                      chk_verdict, kw_extract, is_amend
-  #   behavioural inventory (expect)     all eight, the six above included
+  #                                      chk_verdict, kw_extract; is_amend and
+  #                                      discharge_ok by their own greps below,
+  #                                      whose call shapes this loop's
+  #                                      "name + first argument" pattern cannot
+  #                                      express
+  #   behavioural inventory (expect)     all nine, the ones above included
   #   set -u                             any unset variable, everywhere
   #
   # seat_of and read_merge_ref are absent from this list deliberately, not by
@@ -126,6 +150,7 @@ if [ "${1:-}" = --selftest ]; then
     [ "$n" = 1 ] || { echo "SELFTEST FAIL: predicate call '$call' appears $n times in the body (expected 1)"; exit 1; }
   done
   n=$(grep -c '^  if is_amend "\$cb"; then' "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: is_amend invocation appears $n times"; exit 1; }
+  n=$(grep -c '^      discharge_ok "\$db" "\$s" "\$HEAD"' "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: discharge_ok invocation appears $n times"; exit 1; }
   echo "structure: single definitions, one selftest, one of each check, every predicate invoked once"
   expect(){ # $1 must-fail|must-pass  $2 label; stdin = a check's output
     local out; out=$(cat)
@@ -152,6 +177,16 @@ if [ "${1:-}" = --selftest ]; then
   V6=$(printf '**`sec-reviewer` — verdict**\nwe saw no NO-GO; the Verdict: GO line is missing; binds %s' $H); chk_verdict t "$V6" $H "" | expect must-fail "GO mentioned mid-line only"
   is_amend "Verdict: GO-WITH-AMENDMENTS — binds $H" && echo "  ok   amendments verdict detected" || { echo "  BAD  amendments verdict missed"; fails=$((fails+1)); }
   is_amend "Verdict: GO. Supersedes my GO-WITH-AMENDMENTS at $X" && { echo "  BAD  a mention of a superseded amendments verdict read as one"; fails=$((fails+1)); } || echo "  ok   mention of amendments is not a verdict"
+  # discharge_ok: one known-good and one per condition, because three conditions
+  # that a test has only seen satisfied together are ONE condition to that test.
+  D_OK=$(printf '**`sec-reviewer` — discharge**\ndeferred; binds %s' $H)
+  D_SEAT=$(printf '**`sec-reviewer-2` — discharge**\ndeferred; binds %s' $H)
+  D_SHA=$(printf '**`sec-reviewer` — discharge**\ndeferred; binds %s' $X)
+  D_NOGO=$(printf '**`sec-reviewer` — discharge**\n> Verdict: NO-GO — the earlier round\nbinds %s' $H)
+  discharge_ok "$D_OK"   1 $H && echo "  ok   discharge accepted (seat, sha, no NO-GO)" || { echo "  BAD  a valid discharge was refused"; fails=$((fails+1)); }
+  discharge_ok "$D_SEAT" 1 $H && { echo "  BAD  a discharge by another seat was accepted"; fails=$((fails+1)); } || echo "  ok   discharge by another seat refused"
+  discharge_ok "$D_SHA"  1 $H && { echo "  BAD  a discharge naming another head was accepted"; fails=$((fails+1)); } || echo "  ok   discharge not binding the head refused"
+  discharge_ok "$D_NOGO" 1 $H && { echo "  BAD  a discharge reproducing a NO-GO was accepted"; fails=$((fails+1)); } || echo "  ok   discharge reproducing a NO-GO refused"
   for kw in "Closes #12" "Closes: #12" "closes:#12" "Closes  #12" "Fixed: #7" "resolves #9"; do [ -n "$(kw_extract "$kw")" ] && echo "  ok   keyword form '$kw'" || { echo "  BAD  keyword form '$kw' missed"; fails=$((fails+1)); }; done
   [ -z "$(kw_extract "see #12 and the loop closed itself")" ] && echo "  ok   non-keyword '#12' ignored" || { echo "  BAD  non-keyword matched"; fails=$((fails+1)); }
   # join fixtures: guard on the resource the test CONSUMES (run logs), not run metadata
@@ -261,9 +296,9 @@ for c in "${VERDICTS[@]}"; do
     if [ -n "${DISCHARGED:-}" ]; then
       db=$(gh api "repos/$R/issues/comments/$DISCHARGED" --jq .body 2>/dev/null) || db=""
       ds=$(seat_of "$db")
-      [ "$ds" = "$s" ] && grep -q "$HEAD" <<<"$db" && ! grep -qP "^[\s*_\x60>-]*Verdict:\**\s*NO-GO" <<<"$db" \
+      discharge_ok "$db" "$s" "$HEAD" \
         && ok "verdict $c GO-WITH-AMENDMENTS discharged by $DISCHARGED (seat $ds, binds ${HEAD:0:7})" \
-        || bad "verdict $c GO-WITH-AMENDMENTS: discharge $DISCHARGED not by seat $s (seat $ds) or does not bind ${HEAD:0:7}"
+        || bad "verdict $c GO-WITH-AMENDMENTS: discharge $DISCHARGED not by seat $s (seat $ds), does not bind ${HEAD:0:7}, or reproduces a NO-GO"
     else bad "verdict $c is GO-WITH-AMENDMENTS at this head and no DISCHARGED comment cited"; fi
   fi
 done
