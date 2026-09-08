@@ -42,7 +42,12 @@ seat_of(){ # anchored on the first line; seat 2 first
 # checkout's is present, the PARSER is broken; both absent = run predates the step.
 join_check(){ # $1 run id, $2 expected base, $3 expected head -> prints, returns 0/1
   local run=$1 eb=$2 eh=$3 log njobs nb nh nco cob coh
-  log=$(gh run view "$run" --log 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+  # -R "$R" because `gh run view` INFERS THE REPO FROM THE CALLER'S DIRECTORY
+  # otherwise. Every other call in this file goes through `gh api "repos/$R/…"`
+  # and is therefore location-independent; these two were not, so run from
+  # anywhere but a checkout of this repo the gate reported its fixtures as
+  # unreadable — an environment fault that is really an argument fault.
+  log=$(gh run view "$run" -R "$R" --log 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
   njobs=$(grep -cP '^\S+\t.*\t[0-9T:.Z-]+ base \(parent 1\)  [0-9a-f]{40}' <<<"$log")
   nb=$(grep -cP "^\S+\t.*\t[0-9T:.Z-]+ base \(parent 1\)  $eb\$" <<<"$log")
   nh=$(grep -cP "^\S+\t.*\t[0-9T:.Z-]+ head \(parent 2\)  $eh\$" <<<"$log")
@@ -124,6 +129,23 @@ if [ "${1:-}" = --selftest ]; then
     n=$(grep -c "^$fn()" "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: $fn defined $n times"; exit 1; }
   done
   [ "$(grep -c '^if \[ "\${1:-}" = --selftest' "$0")" = 1 ] || { echo "SELFTEST FAIL: more than one selftest block"; exit 1; }
+  # EVERY `gh run view` CARRIES -R. Without it the command infers the repo from
+  # the caller's directory, so the gate's answer would depend on where it was
+  # invoked — and the failure surfaced as "FIXTURES UNAVAILABLE", which reads as
+  # an expired log or a token problem rather than a missing argument. The
+  # pattern is written `vie[w]` so this line does not match itself.
+  # COMMENTS ARE EXCLUDED, and that is the honest rule rather than a trick: the
+  # property is that no CODE line reads a run log without -R. Spelling the
+  # literal around (`vie[w]`) keeps the PATTERN from matching itself; excluding
+  # `^N:\s*#` keeps the prose about the rule — including the paragraph above —
+  # from being read as a violation of it. Both are needed: I had each in turn,
+  # and each alone reported this block.
+  offenders=$(grep -n 'gh run vie[w]' "$0" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -v -- '-R "$R"')
+  if [ -n "$offenders" ]; then
+    echo "SELFTEST FAIL: a run-log read without -R \"\$R\" — its answer would depend on the caller's directory"
+    echo "$offenders"
+    exit 1
+  fi
   for mk in '# 1' '# 2' '# 3' '# 4' '# 6' '# 7'; do n=$(grep -c "^$mk\$\|^$mk " "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: marker '$mk' appears $n times"; exit 1; }; done
   # '# 5' legitimately appears TWICE (the join's header explainer at its definition, and its
   # invocation in the body) — asserted as exactly two, not omitted, so a doubled file (four)
@@ -238,7 +260,7 @@ if [ "${1:-}" = --selftest ]; then
   [ -z "$(kw_extract "see #12 and the loop closed itself")" ] && echo "  ok   non-keyword '#12' ignored" || { echo "  BAD  non-keyword matched"; fails=$((fails+1)); }
   # join fixtures: guard on the resource the test CONSUMES (run logs), not run metadata
   for f in 34026343625 34025812806; do
-    [ "$(gh run view "$f" --log 2>/dev/null | wc -l)" -gt 0 ] || { echo "SELFTEST FIXTURES UNAVAILABLE (run $f has no readable log: expired, or this token cannot read logs) — not a gate fault; re-pin two current runs or use a token with Actions read"; exit 2; }
+    [ "$(gh run view "$f" -R "$R" --log 2>/dev/null | wc -l)" -gt 0 ] || { echo "SELFTEST FIXTURES UNAVAILABLE (run $f has no readable log: expired, or this token cannot read logs) — not a gate fault; re-pin two current runs or use a token with Actions read"; exit 2; }
   done
   echo "positive: run 34026343625 must PASS for (c12e6dd, 6258a5c)"
   join_check 34026343625 c12e6ddd4192b4ebe3762be37d3bb82fd2ce70dc "$(gh api repos/$R/actions/runs/34026343625 --jq .head_sha)"; r1=$?
