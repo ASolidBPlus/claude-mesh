@@ -509,7 +509,8 @@ function crossBorderAudience(db: Database, observerIndex: Map<string, WebSocket>
 }
 
 /**
- * #184 — THE GRAMMAR OF AN `origin`, and the ONE place an origin is made.
+ * #184 — THE GRAMMAR OF AN `origin`, and the ONE place a PEER-SUPPLIED origin
+ * is made.
  *
  * `origin` was bounded (256 bytes once stamped) and otherwise carried
  * verbatim. That was safe while the only consumer was a server rendering it
@@ -639,8 +640,10 @@ export function routeRelay(
   // acquires our alias for it as a prefix, and the alias is ours to choose.
   //
   // The stamp, the CHARACTER GRAMMAR (#184) and the byte bound all live in
-  // `stampOrigin`, which is the only place an origin is made — so the POST arm
-  // below inherits all three rather than remembering them.
+  // `stampOrigin`, which is the only place a PEER-SUPPLIED origin is made — so
+  // the POST arm below inherits all three rather than remembering them.
+  // (`routePublish` builds `origin: from_agent` for the hub's OWN post outside
+  // this door: a local admin-chosen id, which is #187's class, not this one's.)
   const stamped = stampOrigin(alias, frame.origin);
   if (!stamped.ok) return refuse(stamped.reason);
   const origin = stamped.origin;
