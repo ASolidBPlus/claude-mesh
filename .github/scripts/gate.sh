@@ -76,7 +76,7 @@ chk_verdict(){ # $1 label $2 body $3 head $4 required seat or ""
   elif [ -z "$4" ] || [ "$s" = "$4" ]; then ok "verdict $1 from seat $s"
   else bad "verdict $1 from seat $s, SEAT=$4 required"; fi
   if grep -q "$3" <<<"$2" && grep -qP '^[\s*_\x60>-]*Verdict:\**\s*GO\b' <<<"$2" && ! grep -qP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2"; then
-    ok "verdict $1 binds ${3:0:7} GO"
+    ok "verdict $1 binds $3 GO"
   else bad "verdict $1: head=$(grep -c "$3" <<<"$2") GO=$(grep -cP '^[\s*_\x60>-]*Verdict:\**\s*GO\b' <<<"$2") NOGO=$(grep -cP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2")"; fi
 }
 is_amend(){ grep -qiP '^[\s*_\x60>-]*Verdict:\**\s*GO[- ]WITH[- ]AMENDMENT' <<<"$1"; } # the VALUE is the amendments form; a mention later on the line is not
@@ -249,8 +249,8 @@ fi
 
 # 1
 ref=$(git ls-remote origin "refs/heads/$branch" | cut -f1)
-[ "$ref" = "$HEAD" ] && ok "branch ref $branch = ${HEAD:0:7}" || bad "branch ref ${ref:0:7} != expected ${HEAD:0:7}"
-[ "$headsha" = "$HEAD" ] && ok "PR head = ${HEAD:0:7}" || bad "PR head is ${headsha:0:7}"
+[ "$ref" = "$HEAD" ] && ok "branch ref $branch = $HEAD" || bad "branch ref $ref != expected $HEAD"
+[ "$headsha" = "$HEAD" ] && ok "PR head = $HEAD" || bad "PR head is $headsha, expected $HEAD"
 # 2
 [ "$state" = open ] && ok "state open" || bad "state $state"
 [ "$base" = main ] && ok "base main" || bad "base is $base (retarget first)"
@@ -333,8 +333,8 @@ for c in "${VERDICTS[@]}"; do
       db=$(gh api "repos/$R/issues/comments/$DISCHARGED" --jq .body 2>/dev/null) || db=""
       ds=$(seat_of "$db")
       discharge_ok "$db" "$s" "$HEAD" \
-        && ok "verdict $c GO-WITH-AMENDMENTS discharged by $DISCHARGED (seat $ds, binds ${HEAD:0:7})" \
-        || bad "verdict $c GO-WITH-AMENDMENTS: discharge $DISCHARGED not by seat $s (seat $ds), does not bind ${HEAD:0:7}, or reproduces a NO-GO"
+        && ok "verdict $c GO-WITH-AMENDMENTS discharged by $DISCHARGED (seat $ds, binds $HEAD)" \
+        || bad "verdict $c GO-WITH-AMENDMENTS: discharge $DISCHARGED not by seat $s (seat $ds), does not bind $HEAD, or reproduces a NO-GO"
     else bad "verdict $c is GO-WITH-AMENDMENTS at this head and no DISCHARGED comment cited"; fi
   fi
 done
@@ -367,5 +367,11 @@ note "closing keywords: ${kw:-none}"
 for n in $(grep -oE '#[0-9]+' <<<"$kw" | tr -d '#'); do
   gh api "repos/$R/pulls/$n" >/dev/null 2>&1 && bad "closing keyword names PR #$n" || ok "closes issue #$n"
 done
-[ $fail = 0 ] && echo "GATE  PASS #$N @ ${HEAD:0:7}" || echo "GATE  FAIL #$N @ ${HEAD:0:7}"
+# #188 — THE BIND IS PRINTED IN FULL, here and at every line that names the
+# head this run is bound to (branch ref, PR head, verdict, discharge). A short
+# sha is what the gate REFUSES in a verdict; printing one in the gate's own
+# conclusion asks a reader to accept a weaker form of the field under dispute.
+# The parent/join lines stay short: those compare two shas the gate derived
+# itself and are diagnostics, not the bind.
+[ $fail = 0 ] && echo "GATE  PASS #$N @ $HEAD" || echo "GATE  FAIL #$N @ $HEAD"
 exit $fail
