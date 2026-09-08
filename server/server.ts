@@ -1,4 +1,5 @@
-import { openDb, findPeerAliasCollisions, findInvalidTopicNames, findTopicPrefixAgents, listPeers, listOutboundPeers } from './db.ts';
+import { openDb, findPeerAliasCollisions, findInvalidTopicNames, findTopicPrefixAgents, listPeers, listOutboundPeers,
+  findUngrammaticalAgentIds, findUngrammaticalTopicNames } from './db.ts';
 import { setPeerUpSource } from './metrics.ts';
 import { startBorder, forwarders } from './border.ts';
 import { startWsServer, WsServerHandle } from './ws-server.ts';
@@ -181,6 +182,31 @@ async function main() {
       console.warn(JSON.stringify({
         evt: 'agents.topic_prefix_ids', count: topicIds.length, ids: topicIds,
         msg: "agent ids in the reserved 'topic:' range are indistinguishable from topic ACL principals; rename when convenient",
+        at: Date.now(),
+      }));
+    }
+  } catch { /* never block boot on a diagnostic */ }
+
+  // #187: report ids and topic names that predate the CHARACTER GRAMMAR. Same
+  // shape and the same reason as the two reports above: the rule is enforced at
+  // creation, so a non-conformer can only predate it, and renaming one would
+  // silently rewire every ACL edge that names it. Ingest grandfathers exactly
+  // these, so this list is also what an operator would have to fix before the
+  // border could ever be tightened to strict.
+  try {
+    const ids = findUngrammaticalAgentIds(db);
+    if (ids.length > 0) {
+      console.warn(JSON.stringify({
+        evt: 'agents.ungrammatical_ids', count: ids.length, ids,
+        msg: 'agent ids outside ^[A-Za-z0-9._@-]+$ are rendered by consumers and matched by the ACL; rename when convenient',
+        at: Date.now(),
+      }));
+    }
+    const names = findUngrammaticalTopicNames(db);
+    if (names.length > 0) {
+      console.warn(JSON.stringify({
+        evt: 'topics.ungrammatical_names', count: names.length, names,
+        msg: 'topic names outside ^[A-Za-z0-9._@:-]+$ are rendered as a delivery\'s from_agent; rename when convenient',
         at: Date.now(),
       }));
     }

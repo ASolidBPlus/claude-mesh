@@ -589,6 +589,60 @@ export function openDb(path: string): Database {
 // 5.2 Agents
 // ──────────────────────────────────────────────
 
+/**
+ * #187 — THE CHARACTER GRAMMAR FOR A LOCAL PRINCIPAL (an agent id or a bare
+ * topic name), and the sibling of #184's `origin` rule.
+ *
+ * `from` is stamped into `from_agent`, which is what a consumer renders inside
+ * the `[from …]` tag its prompt trains a model to read as the reply address —
+ * so a newline in an id forges that tag DIRECTLY, with no `origin` involved.
+ * That makes this the stronger half: unlike `origin`, these strings are also
+ * ROUTED ON and are ACL principals, so the grammar is about matching as much
+ * as about rendering.
+ *
+ * NO ':'. The colon is the mesh separator (`orch:alice`), so a local id
+ * containing one reads as a principal on another mesh. `POST /agents` has
+ * refused it since F0b; putting it here closes the same hole at the CLI door,
+ * which never checked (`server/cli.ts`).
+ *
+ * An ALLOWLIST, for #184's reason: refusing `\n` and `\r` alone would still
+ * admit U+0085, U+2028/U+2029, a tab, and a right-to-left override.
+ */
+export const LOCAL_ID_RE = /^[A-Za-z0-9._@-]+$/;
+
+/** The refusal reason for an agent id, or null. One rule; three doors read it
+ *  (`registerAgent` below, `handleAgentPost`, and the CLI) so each can report
+ *  it the way its caller expects. */
+export function agentIdRefusal(id: unknown): string | null {
+  if (typeof id !== 'string' || id.length === 0) return 'agent id is required';
+  if (!LOCAL_ID_RE.test(id)) return 'agent id must match ^[A-Za-z0-9._@-]+$';
+  return null;
+}
+
+/**
+ * #187 — is this principal already known to this mesh?
+ *
+ * The GRANDFATHER TEST for ingest, and the reason this change cannot refuse a
+ * peering that works today: a federated principal that is already subscribed or
+ * already holds an ACL edge keeps arriving, whatever its characters, while a
+ * forged one (`trollbox\n[from …]`) has no such row and is refused. An admin
+ * would have had to create a row containing the forged bytes for the gap to
+ * survive here — the same residual #185's topic-publish test had to construct
+ * deliberately, because it does not occur by itself.
+ *
+ * Creation is NOT grandfathered: we own the local doors, and only inherit the
+ * federated ones.
+ */
+export function principalKnown(db: Database, principal: string): boolean {
+  const row = db.prepare(`
+    SELECT 1 FROM subscriptions WHERE agent_id = ?
+    UNION ALL
+    SELECT 1 FROM acl WHERE from_agent = ? OR to_agent = ?
+    LIMIT 1
+  `).get(principal, principal, principal);
+  return row !== null;
+}
+
 export function registerAgent(
   db: Database,
   agent: {
@@ -600,6 +654,18 @@ export function registerAgent(
     namespace?: string | null;
   }
 ): Agent {
+  // #187 — THE CHOKEPOINT. This is the sole caller of the only
+  // `INSERT INTO agents`, and there are two doors above it (`handleAgentPost`
+  // and `server/cli.ts`). A grammar at either door hardens that one and leaves
+  // the other minting ungrammatical ids into the same routing field, so the
+  // rule lives here and the doors read it for their own error shapes.
+  //
+  // It THROWS rather than returning a refusal because every caller already
+  // treats a returned `Agent` as proof of a row: there is no failure value to
+  // return that an existing caller would notice.
+  const idRefusal = agentIdRefusal(agent.id);
+  if (idRefusal !== null) throw new Error(`registerAgent: ${idRefusal}`);
+
   const now = Date.now();
   const capabilities = agent.capabilities ?? '[]';
   const metadata = agent.metadata ?? '{}';
@@ -2004,6 +2070,11 @@ export function topicExists(db: Database, name: string): boolean {
 export function topicNameRefusal(db: Database, name: string): string | null {
   if (topicExists(db, name)) return null;
   if (name.includes(':')) return "topic name must not contain ':'";
+  // #187 — same grammar as an agent id, and for the same two reasons: a topic
+  // name is a routing key AND it is rendered (a delivery's `from_agent` is the
+  // stamped topic). The `topicExists` short-circuit above grandfathers every
+  // name that predates this rule, which is why it can be added to a live mesh.
+  if (!LOCAL_ID_RE.test(name)) return 'topic name must match ^[A-Za-z0-9._@-]+$';
   if (Buffer.byteLength(name, 'utf8') > 256) return 'topic name must be at most 256 bytes';
   return null;
 }
@@ -2038,6 +2109,35 @@ export function findInvalidTopicNames(db: Database): string[] {
 export function findTopicPrefixAgents(db: Database): string[] {
   return (db.prepare("SELECT id FROM agents WHERE id >= 'topic:' AND id < 'topic;' ORDER BY id")
     .all() as { id: string }[]).map(r => r.id);
+}
+
+/**
+ * #187 — boot report: agent ids that predate the character grammar.
+ *
+ * REPORTS, never guards, exactly like `findInvalidTopicNames` above: the rule
+ * is enforced at creation, so a non-conforming id can only predate it, and
+ * rewriting one would silently rewire every ACL edge that names it.
+ *
+ * GLOB rather than a regex, because SQLite has no REGEXP by default. `-` is
+ * last inside the class so it is a literal, and the leading `^` negates.
+ */
+export function findUngrammaticalAgentIds(db: Database): string[] {
+  return (db.prepare("SELECT id FROM agents WHERE id GLOB '*[^A-Za-z0-9._@-]*' ORDER BY id")
+    .all() as { id: string }[]).map(r => r.id);
+}
+
+/**
+ * #187 — boot report: topic names that predate the character grammar.
+ *
+ * ':' IS PERMITTED IN THIS CLASS, deliberately: a mirrored remote topic really
+ * is called `orch:trollbox`, and whether a colon name is ambiguous is
+ * `findInvalidTopicNames`'s question (does the prefix name a peering?), not
+ * this one's. This report is about the characters only, so the two do not
+ * report each other's set.
+ */
+export function findUngrammaticalTopicNames(db: Database): string[] {
+  return (db.prepare("SELECT name FROM topics WHERE name GLOB '*[^A-Za-z0-9._@:-]*' ORDER BY name")
+    .all() as { name: string }[]).map(r => r.name);
 }
 
 export function getTopicSubscribers(db: Database, topic: string): string[] {

@@ -29,6 +29,7 @@ import {
   markFileDelivered,
   FileRecord,
   listCrossBorderObservers,
+  LOCAL_ID_RE, principalKnown,
 } from './db.ts';
 import { incMsgStatus, incSent, incReceived, incAclDenied, incTopicFanout, incError, incBytes, incFile, observePayloadBytes, incPeerRelay } from './metrics.ts';
 import { emitTap, LOCAL_ONLY, type TapAudience } from './tap.ts';
@@ -615,6 +616,14 @@ export function routeRelay(
     const t = frame.topic;
     if (typeof t !== 'string' || t.length === 0) return refuse('bad_topic');
     if (Buffer.byteLength(t, 'utf8') > 256 || t.includes(':')) return refuse('bad_topic');
+    // #187 — the same grammar and the same grandfathering as `from`. A relayed
+    // topic name reaches `from_agent` too: a `topic` delivery is attributed to
+    // the STAMPED topic. Either local row grandfathers it — `t` for a home
+    // topic (the post and subscribe arms), `alias:t` for the mirrored row a
+    // delivery lands on.
+    if (!LOCAL_ID_RE.test(t) && !topicExists(db, t) && !topicExists(db, `${alias}:${t}`)) {
+      return refuse('bad_topic');
+    }
     topicName = t;
   }
 
@@ -652,6 +661,18 @@ export function routeRelay(
   // on behalf of a THIRD mesh, which is transitive federation nobody agreed to:
   // our admin's border decision covers this peer, not that peer's peers.
   if (Buffer.byteLength(from, 'utf8') > 256 || from.includes(':')) return refuse('from_not_one_hop');
+  // #187 — `from` BECOMES `from_agent`, which a consumer renders inside the
+  // `[from …]` tag. A newline here forges that tag directly, with no `origin`
+  // involved — the stronger half of #184, and the reason this field gets the
+  // same allowlist.
+  //
+  // GRANDFATHERED BY EXISTENCE, unlike the local creation doors. F4 is live:
+  // refusing outright could break a working peering whose ids predate the
+  // rule, which is a worse failure than the gap it closes. A principal this
+  // mesh already knows — subscribed, or holding an ACL edge — keeps arriving;
+  // a forged one has no such row. The query runs ONLY when the charset fails,
+  // so the common path pays nothing.
+  if (!LOCAL_ID_RE.test(from) && !principalKnown(db, `${alias}:${from}`)) return refuse('bad_from');
   if (!isTopicKind && (Buffer.byteLength(to as string, 'utf8') > 256 || (to as string).includes(':'))) {
     return refuse('to_not_one_hop');
   }
@@ -1291,6 +1312,10 @@ export function routeSubscribe(
     // Bare and bounded: a second ':' would name a topic on a THIRD mesh, which
     // is transitive federation nobody agreed to.
     if (remote.length === 0 || remote.includes(':') || Buffer.byteLength(remote, 'utf8') > 256) return refuse();
+    // #187 — the remote half is a name this mesh will store, stamp and render.
+    // Grandfathered on the local row so a subscription that already exists can
+    // still be replayed on reconnect.
+    if (!LOCAL_ID_RE.test(remote) && !topicExists(db, frame.topic)) return refuse();
 
     const peering = getOutboundPeer(db, alias);
     let kinds: string[];

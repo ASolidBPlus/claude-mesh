@@ -232,7 +232,7 @@ export function isExported(src: string, name: string): boolean {
  * Returns the CODE-ONLY view: a mention inside a string or comment in the body
  * is not a reference.
  */
-export function bodyOf(src: string, name: string): string {
+export function bodyOf(src: string, name: string, opts: { keepStrings?: boolean } = {}): string {
   const code = codeOnly(src);
   const defRe = new RegExp(`(?:^|[^.\\w])(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${name}\\s*(?:<[^>]*>)?\\s*\\(`, 'm');
   const m = defRe.exec(code);
@@ -241,7 +241,14 @@ export function bodyOf(src: string, name: string): string {
 
   const end = code.indexOf('\n}', start);
   if (end === -1) throw new Error(`source-scan: no column-0 close for ${name} — refusing to return a truncated slice`);
-  const body = code.slice(start, end + 2);
+  // #187 — `keepStrings` returns the SAME RANGE from the comments-only view.
+  // The two views are the same length by construction (blanked, never deleted),
+  // so one set of offsets addresses both. It exists because some questions are
+  // about a STRING inside the body — an SQL statement lives in a template
+  // literal, and the code-only view blanks it, which would answer "is the only
+  // INSERT inside this function?" with a confident no.
+  const source = opts.keepStrings === true ? stripComments(src) : code;
+  const body = source.slice(start, end + 2);
 
   let depth = 0;
   for (const ch of body) {

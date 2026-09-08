@@ -1,4 +1,4 @@
-import { openDb, registerAgent, getAgentById } from './db.ts';
+import { openDb, registerAgent, getAgentById, agentIdRefusal } from './db.ts';
 import { generateToken, hashToken } from './auth.ts';
 
 const args = process.argv.slice(2);
@@ -19,6 +19,15 @@ if (!agentId || !hostname) {
 
 const dbPath = process.env.MESH_DB_PATH ?? '/data/mesh.db';
 const db = openDb(dbPath);
+
+// #187 — the same rule `registerAgent` enforces, read here so the CLI reports
+// it instead of dying on an uncaught throw. The chokepoint is what makes the
+// guarantee; this is the error message.
+const idRefusal = agentIdRefusal(agentId);
+if (idRefusal !== null) {
+  process.stderr.write(`error: ${idRefusal}\n`);
+  process.exit(1);
+}
 
 const existing = getAgentById(db, agentId);
 if (existing !== null) {
