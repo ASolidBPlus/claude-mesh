@@ -284,19 +284,42 @@ describe('#166 the page\'s stated forms, run through the shipped predicates', ()
     // than of a string this file typed.
     const scanLine = gate.split('\n').find(l => l.startsWith('nogo=$(gh api'))!;
     expect(scanLine).toContain('$NOGO_LINE_JQ');
-    // THE `(?m)` IS PART OF THE DERIVATION, not decoration: jq uses Oniguruma
-    // with Perl syntax, where `^` anchors to the STRING start, and jq's `"m"`
-    // flag is NOT a substitute (it means dot-matches-newline). Measured — the
-    // same pattern with flag "m" and no `(?m)` does not match a NO-GO on the
-    // second line. grep -P needs no flag because grep is line-based.
-    const re = '(?m)' + /^NOGO_LINE='(.+)'$/m.exec(gate)![1]!;
+    // THE PATTERN IS READ OUT OF THE SHIPPED DERIVATION, not rebuilt here
+    // (seat 1 on #197). This used to be `'(?m)' + <the NOGO_LINE definition>`
+    // — the test prepending the flag on its own side, which made it structurally
+    // incapable of noticing `NOGO_LINE_JQ` losing it. The comment explaining at
+    // length why `(?m)` is load-bearing sat directly above the line that
+    // hard-coded it, and a control compared against a hand-written literal is
+    // insensitive to the mutant class it names.
+    //
+    // `(?m)` is load-bearing because jq uses Oniguruma with Perl syntax, where
+    // `^` anchors to the STRING start; jq's own `"m"` flag is not a substitute
+    // (it means dot-matches-newline). grep -P needs no flag, being line-based.
+    const re = withPredicates('printf "%s" "$NOGO_LINE_JQ"').trim();
+    expect(re.startsWith('(?m)')).toBe(true);
 
     const anchoredByAnyone = 'random-contributor writes:\nVerdict: NO-GO — I disagree';
     const proseByAnyone = 'random-contributor writes:\nI would have said NO-GO here';
 
+    // THE PATTERN GOES INTO THE jq PROGRAM, exactly as the scan does it, NOT
+    // through `--arg`. `--arg` binds a raw string and applies no unescaping, so
+    // the derived value's DOUBLED backslashes arrive doubled and the regex
+    // matches nothing — which is the trap seat 2 hit while measuring the two
+    // dialects by hand, and which this test walked straight into on its first
+    // version: a green control that had stopped testing anything.
+    //
+    // Interpolating into the program means jq's string layer unescapes them,
+    // which is what the doubling exists for and what the shipped scan relies on.
+    //
+    // AND IT IS INTERPOLATED AS A SHELL VARIABLE, not as text this file writes:
+    // bash processes backslashes inside a double-quoted LITERAL (so `\\s`
+    // arrives as `\s` and jq rejects it as an invalid escape — measured), while
+    // a variable EXPANSION passes them through untouched. The scan's own
+    // construction is a variable expansion; copying its shape rather than its
+    // characters is what makes this drive the shipped derivation.
     const matches = (body: string) => withPredicates(
       `B=$(cat <<'EOF'\n${body}\nEOF\n)\n` +
-      `jq -n --arg b "$B" --arg re '${re}' '$b | test($re)' `,
+      `jq -rn --arg b "$B" "(\\$b|test(\\"$NOGO_LINE_JQ\\"))"`,
     ).trim();
 
     expect({ anchored: matches(anchoredByAnyone), prose: matches(proseByAnyone) })

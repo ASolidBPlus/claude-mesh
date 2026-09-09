@@ -401,14 +401,31 @@ if [ "${1:-}" = --selftest ]; then
     'Verdict: GO — binds nothing here|no'
     '~ Verdict: NO-GO — a marker the class does not admit|no'
   )
+  # MULTI-LINE FORMS, and they are the ones that matter (seat 1 on #197). Every
+  # case above is a SINGLE LINE — the one shape in which grep and jq cannot
+  # disagree about `^`, because there is only one line for it to anchor to. The
+  # fixture set was drawn from the region where the difference the derivation
+  # exists to manage does not exist, so dropping `(?m)` from `NOGO_LINE_JQ`
+  # changed nothing anywhere in the repository while the live merge scan stopped
+  # seeing a NO-GO written in the shape the gate REQUIRES: a header line, then
+  # the verdict.
+  nogo_cases+=(
+    "$(printf '**`sec-reviewer` — verdict**\nVerdict: NO-GO — binds a sha')|yes"
+    "$(printf '**`sec-reviewer` — verdict**\n> Verdict: NO-GO — quoted, second line')|yes"
+    "$(printf 'a header line\nthe earlier Verdict: NO-GO is discharged')|no"
+  )
   anchor_ok=1
   for case in "${nogo_cases[@]}"; do
     form=${case%|*}; want=${case##*|}
     g=no; j=no
     grep -qP "$NOGO_LINE" <<<"$form" && g=yes
     [ "$(jq -rn --arg b "$form" "(\$b|test(\"$NOGO_LINE_JQ\"))")" = true ] && j=yes
-    [ "$g" = "$want" ] || { echo "  BAD  grep -P: $form -> $g, expected $want"; anchor_ok=0; fails=$((fails+1)); }
-    [ "$j" = "$want" ] || { echo "  BAD  jq:      $form -> $j, expected $want"; anchor_ok=0; fails=$((fails+1)); }
+    # The label collapses newlines, because a multi-line form printed raw hides
+    # WHICH case failed behind its own first line — and the multi-line cases are
+    # the ones that catch the `(?m)` mutant.
+    label=$(tr '\n' '/' <<<"$form")
+    [ "$g" = "$want" ] || { echo "  BAD  grep -P: $label -> $g, expected $want"; anchor_ok=0; fails=$((fails+1)); }
+    [ "$j" = "$want" ] || { echo "  BAD  jq:      $label -> $j, expected $want"; anchor_ok=0; fails=$((fails+1)); }
   done
   [ "$anchor_ok" = 1 ] && echo "  ok   the NO-GO anchor answers ${#nogo_cases[@]} forms correctly, in BOTH engines"
   # The set is not vacuous by construction — it contains both answers — and the
@@ -426,9 +443,45 @@ if [ "${1:-}" = --selftest ]; then
   # the diagnostic's count. Two definitions are a decision; a use outside one is
   # the re-typed copy this check exists to forbid.
   for needle in "Verdict:"'\**\s*'"NO-GO" "Verdict:"'\**\s*'"GO\b" "Discharge:"'\**'; do
+    # THE SENSITIVITY CONTROL, WITHOUT WHICH THIS IS A COUNT OF NOTHING
+    # (build-triage, on their own proposal). Both loops are EMPTY-SET
+    # assertions: corrupt a needle so it can match nothing and the check passes
+    # loudly — "written outside its definition: none" and "the needle is broken"
+    # are the same output. So the needle must first be shown to FIND the
+    # definition it is derived from.
+    [ "$(grep -cF -- "$needle" "$0")" -ge 1 ] || {
+      echo "SELFTEST FAIL: the needle '$needle' matches nothing — it cannot be counting what it claims to count"; exit 1; }
     loose=$(grep -nF -- "$needle" "$0" | grep -vE '^[0-9]+:[A-Z_]+=' | grep -vE '^[0-9]+:[[:space:]]*#' || true)
     [ -z "$loose" ] || { echo "SELFTEST FAIL: the anchor '$needle' is written outside its definition:"; echo "$loose"; exit 1; }
   done
+  # THE SET OF ANCHOR DEFINITIONS IS CLOSED. `M-E` (seat 1): adding a SECOND
+  # variable holding the same pattern and pointing a call site at it passed
+  # every check above — the definition line is permitted by construction and the
+  # use carries no literal. That is exactly the four-encodings history repeating
+  # under a new name, so the names are enumerated: a fifth anchor is a decision
+  # someone has to make in the open, by editing this line and saying which
+  # MEANING it carries.
+  defs=$(grep -oE "^[A-Z_]+='\\^\\[" "$0" | sed "s/='.*//" | sort | tr '\n' ' ')
+  [ "$defs" = "ANY_GO_LINE DISCHARGE_LINE GO_LINE NOGO_LINE " ] || {
+    echo "SELFTEST FAIL: the anchor definitions are [$defs], expected exactly the four named meanings"; exit 1; }
+
+  # EVERY ANCHORED MATCH GOES THROUGH A NAMED VARIABLE, with exactly one
+  # deliberate exception. The denylist above is two known SPELLINGS, so it
+  # permits by construction what the four-encoding history was actually made of:
+  # someone writing a NEW spelling, or a new definition used at a call site
+  # (seat 1's M-E and M-F both passed it). This asks the other question — does
+  # any matcher carry a verdict anchor as a LITERAL? — and answers it about
+  # spellings nobody has thought of.
+  #
+  # `is_amend` is the exception and is named here rather than pattern-matched
+  # away: it has exactly one consumer, and a rule with one consumer has nothing
+  # to agree with. Adding a second consumer means giving it a variable.
+  inline=$(grep -nE 'grep -[qc]i?P|test\(' "$0" \
+    | grep -E 'Verdict:|Discharge:' \
+    | grep -vE '^[0-9]+:[[:space:]]*#' \
+    | grep -vE '^[0-9]+:is_amend\(\)' || true)
+  [ -z "$inline" ] || { echo "SELFTEST FAIL: a matcher carries a verdict anchor as a literal instead of a named variable:"; echo "$inline"; exit 1; }
+
   # ...and no jq-DIALECT copy survives either. Its absence is why the first
   # version of this check passed a mutant that re-typed the anchor inside the
   # `--jq` filter: that copy carries DOUBLED backslashes, so the grep-dialect
