@@ -114,9 +114,15 @@ chk_verdict(){ # $1 label $2 body $3 head $4 required seat or ""
   # instance; reproduced here). The asymmetry is the point and it is the
   # fail-safe direction:
   #
-  #   a quoted GO        must NOT certify   — `>` excluded below
-  #   a quoted NO-GO     must STILL block   — `>` kept in the scan
+  #   a quoted GO        must NOT certify     — `>` excluded below
+  #   a quoted DISCHARGE must NOT discharge   — `>` excluded in discharge_ok
+  #   a quoted NO-GO     must STILL block     — `>` kept in the scan
   #   a quoted GwA       must STILL downgrade — `>` kept in `is_amend`
+  #
+  # ALL FOUR HAVE A FIXTURE. The list used to name three and pin two: strip `>`
+  # from `is_amend` and the selftest stayed green, so the enumeration was failing
+  # on its own terms (seat 1). An enumeration in a comment is a promise about
+  # what is checked.
   #
   # `-`, `*`, `_` and backticks stay in the acceptance class: those are
   # formatting a reviewer applies to their OWN line. `>` is the one marker whose
@@ -129,6 +135,14 @@ chk_verdict(){ # $1 label $2 body $3 head $4 required seat or ""
     # like the gate malfunctioning rather than like a bind being refused, and a
     # gate whose correct refusal reads as a bug gets overridden.
     local nlines nhead nnogo
+    # THIS COUNT KEEPS `>`, DELIBERATELY, and it is the one place in the file
+    # where that is right: the diagnostic's job is to describe WHAT THE AUTHOR
+    # WROTE, not what the gate accepts. "1 GO line(s)" beside a refusal is the
+    # information a reader needs — they wrote a GO and it was quoted — where "0"
+    # would read as "your comment has no verdict at all" and send them looking
+    # for the wrong mistake. Seat 1 flagged this site as uncaught by the
+    # over-application mutant; it is uncaught because it is not the rule, and
+    # the fixture below pins the count so the distinction is a decision.
     nlines=$(grep -cP '^[\s*_\x60>-]*\**Verdict:\**\s*GO\b' <<<"$2")
     nhead=$(grep -c "$3" <<<"$2")
     nnogo=$(grep -cP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2")
@@ -180,9 +194,18 @@ discharge_ok(){ # $1 discharge body  $2 the amending seat  $3 head sha
   # must sit on it, and prose naming an earlier head binds nothing. That is a
   # change to what a reviewer WRITES, and it is documented on the page rather
   # than left to be discovered by a refusal.
+  #
+  # AND `>` IS EXCLUDED HERE TOO (seat 1 on #196). A DISCHARGE IS APPROVAL —
+  # approval of a deferral — so the rule one function up applies unchanged:
+  # quoting is reproduction, and reproduction must never ADD approval. The
+  # `Discharge:` grammar arrived one commit BEFORE that rule and inherited the
+  # symmetric class, so a quoted `> Discharge: … binds <head>` was accepted
+  # while a quoted GO was already refused. Found by the over-application mutant
+  # this PR introduced, applied to every `>` in a leading class — six sites, two
+  # of them unpinned, and this was one.
   local ds; ds=$(seat_of "$1")
   [ "$ds" = "$2" ] \
-    && grep -qP "^[\s*_\x60>-]*\**Discharge:\**[^\n]*\Q$3\E" <<<"$1" \
+    && grep -qP "^[\s*_\x60-]*\**Discharge:\**[^\n]*\Q$3\E" <<<"$1" \
     && ! grep -qP "^[\s*_\x60>-]*Verdict:\**\s*NO-GO" <<<"$1"
 }
 # #188 - ZERO VERDICTS IS NOT A PASS. `gate.sh <pr> <sha>` with no verdict ids
@@ -331,6 +354,10 @@ if [ "${1:-}" = --selftest ]; then
   V14=$(printf '**`sec-reviewer` - verdict**\n>> Verdict: GO - binds %s' $H); expect must-fail "a DOUBLY quoted GO line does not certify" "$(chk_verdict t "$V14" $H "")"
   V15=$(printf '**`sec-reviewer` - verdict**\n- Verdict: GO - binds %s' $H); expect must-pass "a BULLETED GO line is the reviewer's own line" "$(chk_verdict t "$V15" $H "")"
   V16=$(printf '**`sec-reviewer` - verdict**\n> Verdict: NO-GO - an earlier round\nVerdict: GO - binds %s' $H); expect must-fail "a quoted NO-GO still blocks" "$(chk_verdict t "$V16" $H "")"
+  # A QUOTED AMENDMENTS LINE MUST STILL DOWNGRADE — the third property the
+  # comment above promised and nothing pinned. Stripping `>` from `is_amend`
+  # left the selftest green.
+  is_amend "> Verdict: GO-WITH-AMENDMENTS — an earlier round" && echo "  ok   a QUOTED amendments verdict still downgrades" || { echo "  BAD  a quoted amendments verdict stopped being read"; fails=$((fails+1)); }
   # #188 - THE FIXTURES ABOVE ARE INVENTED FORMS. These two are the first lines
   # the seats ACTUALLY post, copied from live verdict comments, and they differ:
   # seat 1 wraps its id in backticks inside bold and continues the sentence,
@@ -369,6 +396,10 @@ if [ "${1:-}" = --selftest ]; then
   discharge_ok "$D_NOGO" 1 $H && { echo "  BAD  a discharge reproducing a NO-GO was accepted"; fails=$((fails+1)); } || echo "  ok   discharge reproducing a NO-GO refused"
   discharge_ok "$D_PROSE" 1 $H && { echo "  BAD  a discharge naming the head only in PROSE was accepted"; fails=$((fails+1)); } || echo "  ok   discharge naming the head only in prose refused"
   discharge_ok "$D_UNANCHORED" 1 $H && { echo "  BAD  a discharge with no anchored Discharge: line was accepted"; fails=$((fails+1)); } || echo "  ok   discharge with no anchored line refused"
+  # A QUOTED DISCHARGE IS A REPRODUCED ONE (seat 1 on #196): it must not
+  # discharge, for the same reason a quoted GO must not certify.
+  D_QUOTED=$(printf '**`sec-reviewer` — discharge**\n> Discharge: deferred; binds %s' $H)
+  discharge_ok "$D_QUOTED" 1 $H && { echo "  BAD  a QUOTED discharge was accepted"; fails=$((fails+1)); } || echo "  ok   a quoted discharge refused"
   # ── the refusals must DIAGNOSE, not merely refuse ────────────────────────
   # One per message a reader acts on. Each names a distinct branch, so a broken
   # message localises to the branch that rotted instead of failing the file.
@@ -378,6 +409,10 @@ if [ "${1:-}" = --selftest ]; then
     "$(chk_verdict t "$V8" $H "")" 'GO line\(s\).*appears \d+ time\(s\)'
   expect_why "a quoted GO is named as such in the refusal" \
     "$(chk_verdict t "$V13" $H "")" 'QUOTED GO line does not certify'
+  # ...and the count beside it SEES the quoted line, so the reader is told they
+  # wrote a GO rather than that they wrote nothing.
+  expect_why "the refusal counts the quoted GO line the author wrote" \
+    "$(chk_verdict t "$V13" $H "")" '1 GO line\(s\)'
   # THE OTHER HALF OF THE CONJUNCTION, which one message used to answer with the
   # wrong cause: here the GO line DOES bind and the NO-GO is what refuses.
   expect_why "a present NO-GO is named as the cause, not the bind" \

@@ -31,6 +31,7 @@ Three things, each on its own line, in the same comment:
    | line | leading markers read | effect |
    | --- | --- | --- |
    | `Verdict: GO` | whitespace, `-`, `*`, `_`, backticks — **not `>`** | certifies, and only as your OWN line |
+   | `Discharge:` | the same — **not `>`** | discharges, and only as your OWN line |
    | `Verdict: NO-GO` | those **and `>`** | blocks, quoted or not |
    | `Verdict: GO-WITH-AMENDMENTS` | those **and `>`** | downgrades, quoted or not |
 
@@ -77,6 +78,10 @@ A `GO-WITH-AMENDMENTS` verdict does not merge on its own. It merges when either
 
       **`sec-reviewer` — discharge**
       Discharge: amendment deferred to #NNN — binds <full 40-hex head sha>
+
+  A **quoted** `> Discharge:` line does not discharge, for the same reason a quoted
+  `Verdict: GO` does not certify: a discharge is approval — approval of a deferral — and
+  reproduction must never add approval (#196).
 
   **CHANGED (#195): the sha used to count anywhere in that comment, and there was no
   `Discharge:` line.** A discharge had no line that WAS the claim, so the head bound by
