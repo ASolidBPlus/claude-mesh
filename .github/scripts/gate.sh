@@ -75,9 +75,44 @@ chk_verdict(){ # $1 label $2 body $3 head $4 required seat or ""
   if [ "$s" = none ]; then bad "verdict $1: first line names no seat (unattributable)"
   elif [ -z "$4" ] || [ "$s" = "$4" ]; then ok "verdict $1 from seat $s"
   else bad "verdict $1 from seat $s, SEAT=$4 required"; fi
-  if grep -q "$3" <<<"$2" && grep -qP '^[\s*_\x60>-]*Verdict:\**\s*GO\b' <<<"$2" && ! grep -qP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2"; then
+  # A CONJUNCTION OF MEMBERSHIP CHECKS IS NOT A RELATION.
+  #
+  # This read `grep -q "$3"` AND `grep -qP '…Verdict:…GO'` as separate tests:
+  # the head appeared SOMEWHERE, a GO line existed SOMEWHERE, and nothing tied
+  # them together. The comment above calls this the binding between a human's
+  # judgement and a tree — that is a relation, this head on this GO line — and
+  # three independent memberships cannot express it.
+  #
+  # MEASURED ON REAL DATA (sec-reviewer-2): a comment whose only verdict line
+  # binds one sha, asked about a DIFFERENT sha that appears only in its prose,
+  # answered PASS. No attacker is needed — naming the head you supersede is
+  # good re-bind practice, and that is exactly what plants the superseded sha
+  # in the body. It only has to come back: a revert, a force-push, a reused
+  # branch.
+  #
+  # So: ONE grep, and the head must be ON the verdict line.
+  #
+  # NO `(?!-)` HERE, deliberately, and this is where I depart from the patch as
+  # proposed. Excluding the amendments form from this test makes a
+  # GO-WITH-AMENDMENTS verdict FAIL here, and the caller ANDs that failure with
+  # everything else — so a properly discharged amendments verdict could never
+  # merge, and nothing else checks that the amendments line itself binds this
+  # head. Measured by replaying the caller's own three lines: fail=1 with a
+  # valid discharge. `is_amend` and `discharge_ok` are what separate the two
+  # forms, downstream of this.
+  if grep -qP "^[\s*_\x60>-]*\**Verdict:\**\s*GO\b[^\n]*\Q$3\E" <<<"$2" && ! grep -qP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2"; then
     ok "verdict $1 binds $3 GO"
-  else bad "verdict $1: head=$(grep -c "$3" <<<"$2") GO=$(grep -cP '^[\s*_\x60>-]*Verdict:\**\s*GO\b' <<<"$2") NOGO=$(grep -cP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2")"; fi
+  else
+    # THE DIAGNOSTIC SHIPS WITH THE FIX. The old line printed three decoupled
+    # counts, so a CORRECT refusal now reads `head=1 GO=1 NOGO=0` — which looks
+    # like the gate malfunctioning rather than like a bind being refused, and a
+    # gate whose correct refusal reads as a bug gets overridden.
+    local nlines nhead nnogo
+    nlines=$(grep -cP '^[\s*_\x60>-]*\**Verdict:\**\s*GO\b' <<<"$2")
+    nhead=$(grep -c "$3" <<<"$2")
+    nnogo=$(grep -cP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2")
+    bad "verdict $1: NO VERDICT LINE BINDS $3 — $nlines GO line(s), the head appears $nhead time(s) anywhere in the body, $nnogo NO-GO line(s). A sha in prose does not bind; it must be ON the Verdict line."
+  fi
 }
 is_amend(){ grep -qiP '^[\s*_\x60>-]*Verdict:\**\s*GO[- ]WITH[- ]AMENDMENT' <<<"$1"; } # the VALUE is the amendments form; a mention later on the line is not
 
@@ -206,6 +241,25 @@ if [ "${1:-}" = --selftest ]; then
   # would satisfy - produced ZERO `BAD` lines. Measured on this file. A rule is
   # only tested by an input that distinguishes it from its weaker form.
   V7=$(printf '**`sec-reviewer` - verdict**\nVerdict: GO - binds %s' "${H:0:7}"); expect must-fail "GO binding a SHORT sha" "$(chk_verdict t "$V7" $H "")"
+  # THE RELATION, which no case above could see: the head appears in the body
+  # and a GO line exists, but they are on DIFFERENT lines. This is the shape
+  # that measured PASS on real data, and it is produced by GOOD practice —
+  # naming the head you supersede is exactly what puts a stale sha in the prose.
+  V8=$(printf '**`sec-reviewer` - verdict**\nSupersedes my earlier verdict at %s.\nVerdict: GO - binds %s' $H $X); expect must-fail "head in PROSE, GO line binds another" "$(chk_verdict t "$V8" $H "")"
+  # ...and the same shape the other way round, so the case above is not passing
+  # because of the word "Supersedes".
+  V9=$(printf '**`sec-reviewer` - verdict**\n%s was the previous head.\nVerdict: GO - binds %s' $H $X); expect must-fail "head named in an ordinary sentence, GO line binds another" "$(chk_verdict t "$V9" $H "")"
+  # The house variants that MUST still bind, so the relation is not tightened
+  # into a form nobody writes.
+  V10=$(printf '**`sec-reviewer` - verdict**\nVerdict: GO - bound to %s' $H); expect must-pass "the 'bound to' phrasing" "$(chk_verdict t "$V10" $H "")"
+  # AND THE AMENDMENTS FORM, which must still pass THIS predicate. Excluding it
+  # here (the `(?!-)` in the patch as proposed) makes a properly discharged
+  # GO-WITH-AMENDMENTS verdict unmergeable: the caller ANDs this failure with
+  # the discharge's success. `is_amend` and `discharge_ok` separate the two
+  # forms downstream; this test is what keeps that division from being undone
+  # by a one-token edit here.
+  V11=$(printf '**`sec-reviewer` - verdict**\nVerdict: GO-WITH-AMENDMENTS - binds %s' $H); expect must-pass "an amendments verdict binding the head" "$(chk_verdict t "$V11" $H "")"
+  V12=$(printf '**`sec-reviewer` - verdict**\nVerdict: GO-WITH-AMENDMENTS - binds %s' $X); expect must-fail "an amendments verdict binding ANOTHER head" "$(chk_verdict t "$V12" $H "")"
   # #188 - THE FIXTURES ABOVE ARE INVENTED FORMS. These two are the first lines
   # the seats ACTUALLY post, copied from live verdict comments, and they differ:
   # seat 1 wraps its id in backticks inside bold and continues the sentence,
