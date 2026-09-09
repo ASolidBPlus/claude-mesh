@@ -17,6 +17,7 @@ import { tmpdir } from 'os';
 import { startWsServer } from '../ws-server.ts';
 import { upsertPeer, aclCheck, getPeerByAlias } from '../db.ts';
 import { hashToken } from '../auth.ts';
+import { sourceFiles } from './helpers/source-files.ts';
 
 // F2b — the OUTBOUND border. Tests here cover the parts that do not need a
 // second live server: the drain query and its plan, the stale-window rule, the
@@ -36,16 +37,11 @@ afterEach(() => {
   db.close();
 });
 
-function sourceFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const name of readdirSync(dir)) {
-    if (name === 'node_modules' || name === '__tests__') continue;
-    const full = join(dir, name);
-    if (statSync(full).isDirectory()) out.push(...sourceFiles(full));
-    else if (name.endsWith('.ts')) out.push(full);
-  }
-  return out;
-}
+// #199: the walk moved to `./helpers/source-files.ts` — it was written here
+// and in one-token-helper.test.ts byte-identically, and #143's derived walks
+// needed a third copy. The INDEPENDENT re-implementation further down this file
+// stays: that control exists to catch divergence between two walks, and sharing
+// both halves would make it agree with itself.
 
 // THE edge classifier, used by BOTH #131 guards below (the reader/specifier pin
 // and the threshold walker). One function, so the two cannot disagree about

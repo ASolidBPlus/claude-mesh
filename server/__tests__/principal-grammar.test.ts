@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import * as net from 'net';
-import { mkdtempSync, readFileSync, readdirSync } from 'fs';
+import { mkdtempSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -13,6 +13,7 @@ import { routeRelay, routeSubscribe, resetRelayBuckets } from '../router.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
 import { insertLegacyAgent } from './helpers/legacy-rows.ts';
 import { codeOnly, stripComments, bodyOf, callSites } from './helpers/source-scan.ts';
+import { sourceFiles } from './helpers/source-files.ts';
 import type { WebSocket } from 'ws';
 
 // #187 - THE CHARACTER GRAMMAR FOR PRINCIPALS, the stronger sibling of #184.
@@ -111,8 +112,14 @@ describe('#187 registerAgent is the chokepoint', () => {
     // goes stale on exactly the commit that adds the file it should have
     // caught. The walk reads every server module instead.
     const dir = join(import.meta.dir, '..');
-    const others = readdirSync(dir)
-      .filter(f => f.endsWith('.ts') && f !== 'db.ts')
+    // RECURSIVE (#199 seat 1). `readdirSync` alone reads one level, and this
+    // walk's whole claim is "no OTHER server module writes the table" — a
+    // `server/admin/rogue.ts` was measured passing it. The population control
+    // below cannot see that: 27 flat files stay 27 when a subdirectory appears,
+    // so it proves the walk found SOMETHING, not everything.
+    const others = sourceFiles(dir)
+      .map(f => f.slice(dir.length + 1))
+      .filter(f => f !== 'db.ts')
       .sort();
     // Control on the walk: it found the modules, so "none of them writes" is
     // not an empty loop agreeing with anything.
@@ -520,8 +527,9 @@ describe('#187 one rule, read by every door', () => {
     // a list would have followed the code only because someone remembered.
     const dir = join(import.meta.dir, '..');
     const dbSrc = readFileSync(join(dir, 'db.ts'), 'utf8');
-    const doorNames = readdirSync(dir)
-      .filter(f => f.endsWith('.ts') && f !== 'db.ts')
+    const doorNames = sourceFiles(dir)
+      .map(f => f.slice(dir.length + 1))
+      .filter(f => f !== 'db.ts')
       .filter(f => callSites(readFileSync(join(dir, f), 'utf8'), 'registerAgent') > 0)
       .sort();
     // Control: the walk found the doors it is about to check. An empty list

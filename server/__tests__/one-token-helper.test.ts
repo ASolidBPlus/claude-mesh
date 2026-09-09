@@ -2,6 +2,7 @@ import { describe, it, expect } from 'bun:test';
 import { readFileSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { timingSafeEqual, hashToken } from '../auth.ts';
+import { sourceFiles } from './helpers/source-files.ts';
 
 // #79 — one helper, one behaviour, for every secret comparison.
 //
@@ -13,16 +14,9 @@ import { timingSafeEqual, hashToken } from '../auth.ts';
 
 const SERVER_ROOT = join(import.meta.dir, '..');
 
-function sourceFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const name of readdirSync(dir)) {
-    if (name === 'node_modules' || name === '__tests__') continue;
-    const full = join(dir, name);
-    if (statSync(full).isDirectory()) out.push(...sourceFiles(full));
-    else if (name.endsWith('.ts')) out.push(full);
-  }
-  return out;
-}
+// #199: the walk moved to `./helpers/source-files.ts`, where it was already
+// written byte-identically in border.test.ts and needed by #143's derived
+// walks. One rule, one copy.
 
 /** Source with comments stripped — a rule quoted in prose is not code. */
 function code(path: string): string {
