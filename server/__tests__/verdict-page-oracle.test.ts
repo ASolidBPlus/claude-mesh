@@ -218,7 +218,11 @@ describe('#166 the page\'s stated forms, run through the shipped predicates', ()
     // check in #192, met twice in one night.
     const codeOnlyCheck = check.split('\n').filter(l => !/^\s*#/.test(l)).join('\n');
     expect(codeOnlyCheck).not.toContain('grep -q "$3"');
-    expect(check).toContain('Verdict:\\**\\s*NO-GO');
+    // #186: the anchor has ONE definition per meaning and every consumer reads
+    // it, so the shape to assert here is the REFERENCE, not a copy of the
+    // pattern — a copy here would be a fifth encoding in the file whose whole
+    // subject is that there were four.
+    expect(check).toContain('$NOGO_LINE');
     // ...and all three are joined by AND. Seat 1's `&&` → `||` mutant is what
     // this line exists for; it is asserted on the SHAPE as well as driven
     // behaviourally below, because the two fail differently and a reader of a
@@ -273,15 +277,26 @@ describe('#166 the page\'s stated forms, run through the shipped predicates', ()
 
     // The regex is EXTRACTED from the scan, not retyped — a copy here would be
     // the same second-copy defect this file exists to close.
+    // #186: the scan no longer CONTAINS a pattern — it interpolates
+    // `$NOGO_LINE_JQ`, derived from the one definition. So this reads the
+    // definition and reconstructs the derivation, which is also what makes the
+    // assertion below a test of the jq DIALECT of the shipped anchor rather
+    // than of a string this file typed.
     const scanLine = gate.split('\n').find(l => l.startsWith('nogo=$(gh api'))!;
-    const re = /test\("(.+?)"\)/.exec(scanLine)![1]!.replace(/\\\\/g, '\\');
+    expect(scanLine).toContain('$NOGO_LINE_JQ');
+    // THE `(?m)` IS PART OF THE DERIVATION, not decoration: jq uses Oniguruma
+    // with Perl syntax, where `^` anchors to the STRING start, and jq's `"m"`
+    // flag is NOT a substitute (it means dot-matches-newline). Measured — the
+    // same pattern with flag "m" and no `(?m)` does not match a NO-GO on the
+    // second line. grep -P needs no flag because grep is line-based.
+    const re = '(?m)' + /^NOGO_LINE='(.+)'$/m.exec(gate)![1]!;
 
     const anchoredByAnyone = 'random-contributor writes:\nVerdict: NO-GO — I disagree';
     const proseByAnyone = 'random-contributor writes:\nI would have said NO-GO here';
 
     const matches = (body: string) => withPredicates(
       `B=$(cat <<'EOF'\n${body}\nEOF\n)\n` +
-      `jq -n --arg b "$B" --arg re '${re}' '$b | test($re; "m")' `,
+      `jq -n --arg b "$B" --arg re '${re}' '$b | test($re)' `,
     ).trim();
 
     expect({ anchored: matches(anchoredByAnyone), prose: matches(proseByAnyone) })

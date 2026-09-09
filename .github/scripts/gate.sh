@@ -29,6 +29,50 @@ R=ASolidBPlus/claude-mesh
 [ -x /usr/bin/grep ] && grep(){ /usr/bin/grep "$@"; }
 if [ "${1:-}" != --selftest ]; then N=$1; HEAD=$2; shift 2; VERDICTS=("$@"); fi
 fail=0; ok(){ echo "PASS  $1"; }; bad(){ echo "FAIL  $1"; fail=1; }; note(){ echo "NOTE  $1"; }
+
+# ── THE ANCHORS, ONE PER MEANING (#186) ─────────────────────────────────────
+# The leading-marker rule was written out SIX times: four in the predicates
+# (`grep -P`) and twice more inline below the guard, in jq's dialect, inside the
+# `--jq` filters that scan every comment and review for a blocking NO-GO.
+# Neither mechanism that checks this file can reach those two — the selftest
+# drives PREDICATES and the verdict page's oracle sources FUNCTIONS, and a
+# `--jq` string inside a command substitution is neither. That is the blind spot
+# #183's finding named, and the merge scan is its largest occupant.
+#
+# LATENT, NOT LIVE, AND MEASURED SO BY SEAT 2: the two dialects agreed on all
+# eight anchored and near-anchored forms they drove. What makes it worth closing
+# is the DIRECTION of a future divergence — widen the class in the functions
+# (#165 did once, #196 did again) and the jq copies do not follow, so a NO-GO
+# written in the newly accepted form is a verdict the predicates read and the
+# merge scan misses. That fails OPEN, on the check that stops merges.
+#
+# ONE VARIABLE PER MEANING, NOT PER SPELLING. `>` is excluded from the two
+# ACCEPTANCE anchors and kept in everything that BLOCKS or REPORTS (#196:
+# quoting is reproduction, and reproduction must never add approval):
+#
+#   GO_LINE         a GO that certifies      — the reviewer's own line
+#   DISCHARGE_LINE  a discharge that counts  — the reviewer's own line
+#   NOGO_LINE       a NO-GO that blocks      — quoted or not
+#   ANY_GO_LINE     a GO the author WROTE    — quoted or not; the DIAGNOSTIC's
+#                                              count, whose job is to describe
+#                                              what was written rather than what
+#                                              was accepted
+#
+# `is_amend`'s pattern stays inline deliberately: it has exactly one consumer,
+# and a rule with one consumer has nothing to agree with. What this section
+# removes is AGREEMENT, not inline regexes.
+GO_LINE='^[\s*_\x60-]*\**Verdict:\**\s*GO\b'
+DISCHARGE_LINE='^[\s*_\x60-]*\**Discharge:\**'
+NOGO_LINE='^[\s*_\x60>-]*Verdict:\**\s*NO-GO'
+ANY_GO_LINE='^[\s*_\x60>-]*\**Verdict:\**\s*GO\b'
+# DERIVED, NEVER RE-AUTHORED: jq parses its program as a string literal before
+# the regex engine sees it, where `\s` is an invalid escape — so every backslash
+# is doubled. `(?m)` is prepended because jq uses Oniguruma with Perl syntax,
+# where `^` anchors to the STRING start; jq's own `"m"` FLAG is not a substitute
+# (it means dot-matches-newline). Measured both ways. `grep -P` needs no flag at
+# all, because grep is line-based — two spellings of one meaning, which is the
+# argument for deriving the second rather than maintaining an agreement.
+NOGO_LINE_JQ="(?m)${NOGO_LINE//\\/\\\\}"
 seat_of(){ # anchored on the first line; seat 2 first
   local first; first=$(head -1 <<<"$1")
   if grep -qE '^\**`?sec-reviewer-2`?\**' <<<"$first"; then echo 2
@@ -132,7 +176,7 @@ chk_verdict(){ # $1 label $2 body $3 head $4 required seat or ""
   # `-`, `*`, `_` and backticks stay in the acceptance class: those are
   # formatting a reviewer applies to their OWN line. `>` is the one marker whose
   # meaning is "these are someone else's words".
-  if grep -qP "^[\s*_\x60-]*\**Verdict:\**\s*GO\b[^\n]*\Q$3\E" <<<"$2" && ! grep -qP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2"; then
+  if grep -qP "$GO_LINE[^\n]*\Q$3\E" <<<"$2" && ! grep -qP "$NOGO_LINE" <<<"$2"; then
     ok "verdict $1 binds $3 GO"
   else
     # THE DIAGNOSTIC SHIPS WITH THE FIX. The old line printed three decoupled
@@ -148,9 +192,9 @@ chk_verdict(){ # $1 label $2 body $3 head $4 required seat or ""
     # for the wrong mistake. Seat 1 flagged this site as uncaught by the
     # over-application mutant; it is uncaught because it is not the rule, and
     # the fixture below pins the count so the distinction is a decision.
-    nlines=$(grep -cP '^[\s*_\x60>-]*\**Verdict:\**\s*GO\b' <<<"$2")
+    nlines=$(grep -cP "$ANY_GO_LINE" <<<"$2")
     nhead=$(grep -c "$3" <<<"$2")
-    nnogo=$(grep -cP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2")
+    nnogo=$(grep -cP "$NOGO_LINE" <<<"$2")
     # WHICH CONDITION FAILED, not a list of counts the reader has to interpret.
     # The conjunction has two halves and they fail for opposite reasons, so one
     # message for both named the wrong cause whenever a NO-GO was present: the
@@ -210,8 +254,8 @@ discharge_ok(){ # $1 discharge body  $2 the amending seat  $3 head sha
   # of them unpinned, and this was one.
   local ds; ds=$(seat_of "$1")
   [ "$ds" = "$2" ] \
-    && grep -qP "^[\s*_\x60-]*\**Discharge:\**[^\n]*\Q$3\E" <<<"$1" \
-    && ! grep -qP "^[\s*_\x60>-]*Verdict:\**\s*NO-GO" <<<"$1"
+    && grep -qP "$DISCHARGE_LINE[^\n]*\Q$3\E" <<<"$1" \
+    && ! grep -qP "$NOGO_LINE" <<<"$1"
 }
 # #188 - ZERO VERDICTS IS NOT A PASS. `gate.sh <pr> <sha>` with no verdict ids
 # ran to completion silently: the `for c in "${VERDICTS[@]}"` loop simply had
@@ -326,6 +370,76 @@ if [ "${1:-}" = --selftest ]; then
     else echo "  BAD  $1: refusal does not name its reason"; fails=$((fails+1)); fi
   }
   T=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; H=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; X=cccccccccccccccccccccccccccccccccccccccc
+  # ── #186: THE ANCHOR'S CONTENT, IN BOTH ENGINES, PER FORM ────────────────
+  # Two assertions live here and they answer different questions:
+  #
+  #   CONTENT   does the anchor accept the right forms? Deriving one encoding
+  #             from another fixes DIVERGENCE and does nothing about the anchor
+  #             being wrong — and a single source is exactly what persuades a
+  #             reader the audit is unnecessary (build-triage).
+  #   BOTH PATHS  one shell value read by `grep -P` AND by jq is not one anchor;
+  #             it is one string interpreted by two engines. Quoting, escaping,
+  #             `\b`, POSIX classes and greediness are applied by the READER,
+  #             not carried by the string. So each engine is asserted against
+  #             the EXPECTATION separately: a mutant that reddens the shell path
+  #             and is never run through jq would report the collapse complete
+  #             while the jq encoding stayed free to diverge on the ninth form.
+  #             Sharing a source makes two paths testable together, not tested
+  #             together.
+  #
+  # Seat 2's eight forms, plus a GO (must not match) and a marker the class does
+  # not admit (the widen-mutant's target).
+  nogo_cases=(
+    'Verdict: NO-GO — plain|yes'
+    '> Verdict: NO-GO — blockquoted|yes'
+    '**Verdict: NO-GO** — bolded|yes'
+    '  Verdict: NO-GO — leading space|yes'
+    '- Verdict: NO-GO — bulleted|yes'
+    '_Verdict: NO-GO_ — underscored|yes'
+    'Verdict:NO-GO — no space|yes'
+    'the earlier Verdict: NO-GO is discharged — inline mention|no'
+    'Verdict: GO — binds nothing here|no'
+    '~ Verdict: NO-GO — a marker the class does not admit|no'
+  )
+  anchor_ok=1
+  for case in "${nogo_cases[@]}"; do
+    form=${case%|*}; want=${case##*|}
+    g=no; j=no
+    grep -qP "$NOGO_LINE" <<<"$form" && g=yes
+    [ "$(jq -rn --arg b "$form" "(\$b|test(\"$NOGO_LINE_JQ\"))")" = true ] && j=yes
+    [ "$g" = "$want" ] || { echo "  BAD  grep -P: $form -> $g, expected $want"; anchor_ok=0; fails=$((fails+1)); }
+    [ "$j" = "$want" ] || { echo "  BAD  jq:      $form -> $j, expected $want"; anchor_ok=0; fails=$((fails+1)); }
+  done
+  [ "$anchor_ok" = 1 ] && echo "  ok   the NO-GO anchor answers ${#nogo_cases[@]} forms correctly, in BOTH engines"
+  # The set is not vacuous by construction — it contains both answers — and the
+  # loop above would report a `yes`-only or `no`-only table as failures rather
+  # than agreeing with it.
+
+  # THE COLLAPSE IS A CLAIM WITH A ONE-LINE PROOF (build-triage): each anchor's
+  # literal text appears exactly once. The needles are ASSEMBLED at runtime so
+  # these lines do not contain the literals they count — the same self-reference
+  # trap as the run-log check above, met for the third time in this file.
+  # The property is "anchor text appears ONLY where an anchor is DEFINED", not
+  # "exactly once": the GO literal is written twice ON PURPOSE — `GO_LINE` (what
+  # certifies) and `ANY_GO_LINE` (what the author wrote) are two MEANINGS, and
+  # collapsing them to one string was the trap that would have silently changed
+  # the diagnostic's count. Two definitions are a decision; a use outside one is
+  # the re-typed copy this check exists to forbid.
+  for needle in "Verdict:"'\**\s*'"NO-GO" "Verdict:"'\**\s*'"GO\b" "Discharge:"'\**'; do
+    loose=$(grep -nF -- "$needle" "$0" | grep -vE '^[0-9]+:[A-Z_]+=' | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+    [ -z "$loose" ] || { echo "SELFTEST FAIL: the anchor '$needle' is written outside its definition:"; echo "$loose"; exit 1; }
+  done
+  # ...and no jq-DIALECT copy survives either. Its absence is why the first
+  # version of this check passed a mutant that re-typed the anchor inside the
+  # `--jq` filter: that copy carries DOUBLED backslashes, so the grep-dialect
+  # needle does not find it. A checker that knows one spelling of a rule cannot
+  # see the other spelling of the same rule — #186's own subject, reproduced
+  # inside #186's fix.
+  for needle in "Verdict:"'\\**\\s*'"NO-GO" "Verdict:"'\\**\\s*'"GO"; do
+    n=$(grep -cF -- "$needle" "$0")
+    [ "$n" = 0 ] || { echo "SELFTEST FAIL: a jq-dialect copy of the anchor ('$needle') is written $n time(s) — it must be DERIVED from the one definition, never re-typed"; exit 1; }
+  done
+
   echo "behavioural inventory (each check driven with known-bad and known-good input):"
   expect must-pass "parents fresh + mergeable" "$(chk_parents 2 $T $H $T $H true)"
   expect must-fail "parent 1 stale" "$(chk_parents 2 $X $H $T $H true)"
@@ -562,8 +676,13 @@ for c in "${VERDICTS[@]}"; do
     else bad "verdict $c is GO-WITH-AMENDMENTS at this head and no DISCHARGED comment cited"; fi
   fi
 done
-nogo=$(gh api "repos/$R/issues/$N/comments" --paginate --jq '[.[]|select(.body|test("(?m)^[\\s*_`>-]*Verdict:\\**\\s*NO-GO"))|.id]|join(",")')
-nogor=$(gh api "repos/$R/pulls/$N/reviews" --paginate --jq '[.[]|select((.body//"")|test("(?m)^[\\s*_`>-]*Verdict:\\**\\s*NO-GO"))|.id]|join(",")')
+# THE MERGE SCAN READS THE DERIVED FILTER (#186). It used to carry a
+# hand-written copy of the NO-GO anchor in jq's dialect — the largest occupant
+# of the blind spot, since neither the selftest nor the page's oracle can reach
+# a `--jq` string. Widening `$NOGO_LINE` above now widens these too, and the
+# selftest drives both dialects over one fixture set as the control on that.
+nogo=$(gh api "repos/$R/issues/$N/comments" --paginate --jq "[.[]|select(.body|test(\"$NOGO_LINE_JQ\"))|.id]|join(\",\")")
+nogor=$(gh api "repos/$R/pulls/$N/reviews" --paginate --jq "[.[]|select((.body//\"\")|test(\"$NOGO_LINE_JQ\"))|.id]|join(\",\")")
 [ -z "$nogo$nogor" ] && ok "no NO-GO in comments or reviews" || bad "NO-GO present: comments[$nogo] reviews[$nogor]"
 # 6b REQUIRE_MERGED=<pr>[,<pr>]: a conditional discharge names another PR as the enforcer
 # (an open PR reads identically to one that exists — #132's addendum); require it merged.
