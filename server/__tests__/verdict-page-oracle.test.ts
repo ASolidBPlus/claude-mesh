@@ -218,7 +218,11 @@ describe('#166 the page\'s stated forms, run through the shipped predicates', ()
     // check in #192, met twice in one night.
     const codeOnlyCheck = check.split('\n').filter(l => !/^\s*#/.test(l)).join('\n');
     expect(codeOnlyCheck).not.toContain('grep -q "$3"');
-    expect(check).toContain('Verdict:\\**\\s*NO-GO');
+    // #186: the anchor has ONE definition per meaning and every consumer reads
+    // it, so the shape to assert here is the REFERENCE, not a copy of the
+    // pattern — a copy here would be a fifth encoding in the file whose whole
+    // subject is that there were four.
+    expect(check).toContain('$NOGO_LINE');
     // ...and all three are joined by AND. Seat 1's `&&` → `||` mutant is what
     // this line exists for; it is asserted on the SHAPE as well as driven
     // behaviourally below, because the two fail differently and a reader of a
@@ -273,15 +277,49 @@ describe('#166 the page\'s stated forms, run through the shipped predicates', ()
 
     // The regex is EXTRACTED from the scan, not retyped — a copy here would be
     // the same second-copy defect this file exists to close.
+    // #186: the scan no longer CONTAINS a pattern — it interpolates
+    // `$NOGO_LINE_JQ`, derived from the one definition. So this reads the
+    // definition and reconstructs the derivation, which is also what makes the
+    // assertion below a test of the jq DIALECT of the shipped anchor rather
+    // than of a string this file typed.
     const scanLine = gate.split('\n').find(l => l.startsWith('nogo=$(gh api'))!;
-    const re = /test\("(.+?)"\)/.exec(scanLine)![1]!.replace(/\\\\/g, '\\');
+    expect(scanLine).toContain('$NOGO_LINE_JQ');
+    // THE PATTERN IS READ OUT OF THE SHIPPED DERIVATION, not rebuilt here
+    // (seat 1 on #197). This used to be `'(?m)' + <the NOGO_LINE definition>`
+    // — the test prepending the flag on its own side, which made it structurally
+    // incapable of noticing `NOGO_LINE_JQ` losing it. The comment explaining at
+    // length why `(?m)` is load-bearing sat directly above the line that
+    // hard-coded it, and a control compared against a hand-written literal is
+    // insensitive to the mutant class it names.
+    //
+    // `(?m)` is load-bearing because jq uses Oniguruma with Perl syntax, where
+    // `^` anchors to the STRING start; jq's own `"m"` flag is not a substitute
+    // (it means dot-matches-newline). grep -P needs no flag, being line-based.
+    const re = withPredicates('printf "%s" "$NOGO_LINE_JQ"').trim();
+    expect(re.startsWith('(?m)')).toBe(true);
 
     const anchoredByAnyone = 'random-contributor writes:\nVerdict: NO-GO — I disagree';
     const proseByAnyone = 'random-contributor writes:\nI would have said NO-GO here';
 
+    // THE PATTERN GOES INTO THE jq PROGRAM, exactly as the scan does it, NOT
+    // through `--arg`. `--arg` binds a raw string and applies no unescaping, so
+    // the derived value's DOUBLED backslashes arrive doubled and the regex
+    // matches nothing — which is the trap seat 2 hit while measuring the two
+    // dialects by hand, and which this test walked straight into on its first
+    // version: a green control that had stopped testing anything.
+    //
+    // Interpolating into the program means jq's string layer unescapes them,
+    // which is what the doubling exists for and what the shipped scan relies on.
+    //
+    // AND IT IS INTERPOLATED AS A SHELL VARIABLE, not as text this file writes:
+    // bash processes backslashes inside a double-quoted LITERAL (so `\\s`
+    // arrives as `\s` and jq rejects it as an invalid escape — measured), while
+    // a variable EXPANSION passes them through untouched. The scan's own
+    // construction is a variable expansion; copying its shape rather than its
+    // characters is what makes this drive the shipped derivation.
     const matches = (body: string) => withPredicates(
       `B=$(cat <<'EOF'\n${body}\nEOF\n)\n` +
-      `jq -n --arg b "$B" --arg re '${re}' '$b | test($re; "m")' `,
+      `jq -rn --arg b "$B" "(\\$b|test(\\"$NOGO_LINE_JQ\\"))"`,
     ).trim();
 
     expect({ anchored: matches(anchoredByAnyone), prose: matches(proseByAnyone) })
