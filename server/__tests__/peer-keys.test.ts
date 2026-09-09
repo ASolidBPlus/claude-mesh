@@ -10,6 +10,7 @@ import * as net from 'net';
 import { mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { insertLegacyAgent } from './helpers/legacy-rows.ts';
 
 // F0b — peer keys, peer registration, and the local-id rules (§3, §4, §6, D9).
 //
@@ -386,7 +387,7 @@ describe('F0b: local id rules bind NEW agents only (§6)', () => {
     // A validation change that made a live agent unable to re-register would be
     // worse than the ambiguity it fixes. Legacy ids are reported at boot, not
     // rejected.
-    registerAgent(db, { id: 'legacy:agent', token_hash: 'b'.repeat(64), hostname: 'h' });
+    insertLegacyAgent(db, { id: 'legacy:agent', token_hash: 'b'.repeat(64), hostname: 'h' });
     const found = db.prepare("SELECT id FROM agents WHERE id LIKE '%:%'").all() as { id: string }[];
     expect(found.map(r => r.id)).toEqual(['legacy:agent']);
   });

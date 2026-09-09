@@ -6,6 +6,7 @@ import { routeRelay, resetRelayBuckets } from '../router.ts';
 import { renderMetrics } from '../metrics.ts';
 import { RELAY_DEDUPE_MS } from '../cleanup.ts';
 import type { WebSocket } from 'ws';
+import { insertLegacyAgent } from './helpers/legacy-rows.ts';
 
 // F1b (§5.2) — the inbound relay.
 //
@@ -291,7 +292,9 @@ describe('F1b: the peering rule lives in the chokepoint, both doors map it', () 
     // Grammar-only refused NO_PEERING for two ORDINARY LOCAL AGENTS.
     const db = openDb(':memory:');
     registerAgent(db, { id: 'local-a', token_hash: 'a'.repeat(64), hostname: 'h' });
-    registerAgent(db, { id: 'legacy:node', token_hash: 'b'.repeat(64), hostname: 'h' });
+    // #187: `registerAgent` now refuses a colon id, so the LEGACY row is
+    // created the way a legacy row exists — directly in the table.
+    insertLegacyAgent(db, { id: 'legacy:node', token_hash: 'b'.repeat(64), hostname: 'h' });
 
     expect(() => aclGrant(db, 'local-a', 'legacy:node', 'admin')).not.toThrow();
     expect(() => aclGrant(db, 'legacy:node', 'local-a', 'admin')).not.toThrow();

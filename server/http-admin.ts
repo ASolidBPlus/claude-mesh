@@ -39,6 +39,8 @@ import {
   revokeObserver,
   isObserver,
   listObservers,
+
+  agentIdRefusal,
 } from './db.ts';
 import { generateToken, hashToken, timingSafeEqual } from './auth.ts';
 import {
@@ -653,6 +655,18 @@ async function handleAgentPost(ctx: AdminCtx): Promise<void> {
     // retroactively rejected.
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: "agent id must not contain ':'" }));
+    return;
+  }
+  // #187 — the CHARACTER GRAMMAR, read from `agentIdRefusal` rather than
+  // restated. `registerAgent` enforces the same rule and THROWS, which would
+  // reach the dispatcher as a 500; this door exists so a malformed id is
+  // answered as the 400 it is. The ':' check above stays where it is because
+  // its message names the specific reason, and the grammar would otherwise
+  // answer it with a less useful one.
+  const grammarRefusal = agentIdRefusal(id);
+  if (grammarRefusal !== null) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: grammarRefusal }));
     return;
   }
   if (id === RESERVED_ALIAS) {

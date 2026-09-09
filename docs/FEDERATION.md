@@ -281,6 +281,35 @@ checked here. It is an agent id an admin chose at `POST /agents`, not a peer's
 string, and it is the same value the frame already carries as `from` — the
 grammar that would constrain it belongs at the registration door.
 
+**(g) `from` and topic names are IDENTIFIERS too** (#187), and this half is the
+stronger one: `from` is stamped into `from_agent`, which a consumer renders
+*inside* the `[from …]` tag — so a break in an id forges that tag directly, with
+no `origin` involved. Unlike `origin` these strings are also routed on and are
+ACL principals, so the grammar is about matching as much as rendering.
+
+The split is deliberate:
+
+| door | rule |
+| --- | --- |
+| local creation (`registerAgent`, `topicNameRefusal`) | **strict** — `[A-Za-z0-9._@-]+`, and no `:` |
+| ingest (`routeRelay`'s `from` and `topic`, `routeSubscribe`'s remote half) | **grandfathered by existence** — a principal or topic this mesh already knows keeps arriving |
+| everything that predates the rule | **boot report**, never a rewrite |
+
+We own the local doors and only inherit the federated ones: F4 is live, and
+refusing a working peering whose ids merely predate the rule is a worse failure
+than the gap it closes. A forged principal has no prior subscription or ACL row,
+so grandfathering does not admit it.
+
+**A peer cannot create its own grandfather.** `topic-subscribe` is the one
+inbound arm that mints a row from a peer-supplied id with no ACL edge in the
+way, so the grammar is checked before it — otherwise a peer could plant a
+forged principal in `subscriptions` and that row would then read as prior
+authorisation. The residual is an ADMIN creating an edge for a forged
+principal, which grandfathers it; that is a deliberate, documented trade.
+
+Renaming a non-conforming principal is never done automatically: an ACL edge
+names a principal by string, so a rewrite would silently rewire authorisation.
+
 **Only the first segment is ours.** Everything after it is what the delivering
 peer asserted — including whether the post was relayed at all: a peer can invent
 a middle segment for a mesh that does not exist, or omit one for a relay that

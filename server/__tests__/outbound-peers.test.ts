@@ -12,6 +12,7 @@ import * as net from 'net';
 import { mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { insertLegacyAgent } from './helpers/legacy-rows.ts';
 
 const ADMIN = 'admin-secret';
 
@@ -57,7 +58,7 @@ describe('REQUIRED: routeRelay refuses a `to` containing ":" — and the mutant 
   // merely produced a different refusal would still be masked.
   it('a legacy colon-id local recipient is still refused — only the one-hop rule can', () => {
     const db = openDb(':memory:');
-    registerAgent(db, { id: 'legacy:node', token_hash: 'a'.repeat(64), hostname: 'h' });
+    insertLegacyAgent(db, { id: 'legacy:node', token_hash: 'a'.repeat(64), hostname: 'h' });
     upsertPeer(db, {
       alias: 'othermesh', token_hash: 'c'.repeat(64), minted_by_key: 'k',
       kinds: '["direct"]', rate_per_min: 600,
@@ -204,7 +205,7 @@ describe('F2a: routeDirect remote branch', () => {
   it('a LEGACY colon-id local agent still delivers locally', () => {
     // The fall-through must be unchanged: an alias with no outbound peering is
     // not remote, so `legacy:node` reaches the local lookup exactly as before.
-    registerAgent(db, { id: 'legacy:node', token_hash: 'c'.repeat(64), hostname: 'h' });
+    insertLegacyAgent(db, { id: 'legacy:node', token_hash: 'c'.repeat(64), hostname: 'h' });
     aclGrant(db, 'sender', 'legacy:node', 'admin');
 
     const sock = fakeSocket();
@@ -428,7 +429,7 @@ describe('F2a: POST /outbound-peers and the forwarder-factory refusal', () => {
   it('refuses an alias that would SHADOW a legacy local id', async () => {
     created = [];
     await start({ create: (row) => created.push(row.alias) });
-    registerAgent(db, { id: 'legacy:node', token_hash: 'a'.repeat(64), hostname: 'h' });
+    insertLegacyAgent(db, { id: 'legacy:node', token_hash: 'a'.repeat(64), hostname: 'h' });
 
     const res = await post({ ...VALID, alias: 'legacy' });
     expect(res.status).toBe(400);

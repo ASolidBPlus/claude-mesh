@@ -256,6 +256,43 @@ function after() { forbidden(); }
     expect(definitions(src, 'deep') + callSites(src, 'deep') + nonCallMentions(src, 'deep')).toBe(1);
   });
 
+  // #187 — the body of a function whose payload is a STRING. `codeOnly` blanks
+  // a template literal's text, so an SQL statement inside one is invisible to
+  // the default view; `keepStrings` addresses the same range in the
+  // comments-only view, which is sound because the two views are the same
+  // length by construction.
+  it('keepStrings returns the same range with string contents intact', () => {
+    const src = [
+      'function writer() {',
+      '  db.prepare(`INSERT INTO agents (id) VALUES (?)`).run(x);',
+      '  // INSERT INTO agents in a comment',
+      '}',
+      '',
+    ].join('\n');
+
+    expect(bodyOf(src, 'writer')).not.toContain('INSERT INTO agents');
+    expect(bodyOf(src, 'writer', { keepStrings: true })).toContain('INSERT INTO agents');
+    // ...and the COMMENT is still gone in both, or the count would be 2.
+    expect(bodyOf(src, 'writer', { keepStrings: true }).match(/INSERT INTO agents/g)?.length).toBe(1);
+    // THE PREMISE, asserted on the VIEWS rather than on the slices (seat 2 on
+    // #189). Two slices taken with the same indices are the same length by
+    // construction, so comparing them detects truncation and never
+    // MISALIGNMENT — `slice(start+1, end+3)` would stay green. What
+    // `keepStrings` actually relies on is that the two views are the same
+    // length as each other, which is the thing to assert.
+    expect(codeOnly(src).length).toBe(stripComments(src).length);
+    expect(codeOnly(src).length).toBe(src.length);
+
+    // ...and the WINDOW, because equal-length views do not pin WHERE the slice
+    // starts either: measured, `slice(start + 1, end + 3)` survives every
+    // assertion above. The boundaries are the definition and the column-0
+    // close, so assert exactly those.
+    const kept = bodyOf(src, 'writer', { keepStrings: true });
+    expect(kept.startsWith('function writer(')).toBe(true);
+    expect(kept.endsWith('\n}')).toBe(true);
+    expect(bodyOf(src, 'writer').startsWith('function writer(')).toBe(true);
+  });
+
   it('handles an exported async definition', () => {
     const body = bodyOf('export async function f(a) {\n  g();\n}\n', 'f');
     expect(body).toContain('g()');
