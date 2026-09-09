@@ -2,7 +2,10 @@ node_modules/
 *.db
 *.db-wal
 *.db-shm
-.env
+# THE FAMILY, not the bare name (#PR): a tool writing `.env.local` or
+# `.env.production` walks straight past `.env`, and the ignore file is the
+# PREVENTION half — no-committed-secrets.test.ts is the notice when it reopens.
+.env*
 
 # Internal dev/sprint + local-env artifacts (kept locally, not in the public repo)
 CLAUDE.md
