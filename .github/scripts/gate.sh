@@ -92,14 +92,21 @@ chk_verdict(){ # $1 label $2 body $3 head $4 required seat or ""
   #
   # So: ONE grep, and the head must be ON the verdict line.
   #
-  # NO `(?!-)` HERE, deliberately, and this is where I depart from the patch as
-  # proposed. Excluding the amendments form from this test makes a
-  # GO-WITH-AMENDMENTS verdict FAIL here, and the caller ANDs that failure with
-  # everything else — so a properly discharged amendments verdict could never
-  # merge, and nothing else checks that the amendments line itself binds this
-  # head. Measured by replaying the caller's own three lines: fail=1 with a
-  # valid discharge. `is_amend` and `discharge_ok` are what separate the two
-  # forms, downstream of this.
+  # NO `(?!-)` HERE, deliberately, and THE PORTED GATES DIFFER FROM THIS FILE ON
+  # PURPOSE — do not tidy the two into consistency without reading this.
+  #
+  # Excluding the amendments form from this test makes a GO-WITH-AMENDMENTS
+  # verdict FAIL here, and the caller ANDs that failure with everything else, so
+  # a properly discharged amendments verdict could never merge. Measured by
+  # replaying the caller's own three lines: fail=1 with a valid discharge.
+  #
+  # THE PREDICATE AND THE MACHINERY ARE ALTERNATIVE WAYS OF SEPARATING THE SAME
+  # TWO FORMS: `is_amend` + `discharge_ok` do it here, downstream of this line.
+  # A gate that lacks them — mesh-agent's port does — needs `(?!-)` instead, or
+  # an UNDISCHARGED amendments verdict certifies as a plain GO. So `(?!-)` is
+  # load-bearing exactly where `is_amend` is absent and harmful exactly where it
+  # is present (build-triage measured both files). You may have either; you must
+  # not have neither.
   if grep -qP "^[\s*_\x60>-]*\**Verdict:\**\s*GO\b[^\n]*\Q$3\E" <<<"$2" && ! grep -qP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2"; then
     ok "verdict $1 binds $3 GO"
   else

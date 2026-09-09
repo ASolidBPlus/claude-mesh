@@ -51,9 +51,17 @@ function withPredicates(script: string): string {
   return new TextDecoder().decode(out.stdout) + new TextDecoder().decode(out.stderr);
 }
 
-/** A verdict comment body: seat line, verdict line, full sha. */
+/**
+ * A verdict comment body: seat line, then the verdict line CARRYING the sha.
+ *
+ * #195 moved the sha ONTO that line. It used to sit on a line of its own here,
+ * which the old predicate accepted because it only asked whether the sha
+ * appeared somewhere — and that gap is the defect #195 fixes. This helper had
+ * to follow the page, which is the oracle working as intended: the interface
+ * changed, and the fixtures that claim to write it changed with it.
+ */
 const comment = (first: string, verdict: string, sha = HEAD) =>
-  `${first}\n${verdict}\nbinds ${sha}`;
+  `${first}\n${verdict} binds ${sha}`;
 
 const chk = (body: string, seat = '') =>
   withPredicates(`B=$(cat <<'EOF'\n${body}\nEOF\n)\nchk_verdict t "$B" ${HEAD} '${seat}'`);
@@ -124,6 +132,25 @@ describe('#166 the page\'s stated forms, run through the shipped predicates', ()
 
     const out = withPredicates(`is_amend 'we discussed GO-WITH-AMENDMENTS earlier' && echo AMEND || echo NOT`);
     expect(out.trim()).toBe('NOT');
+  });
+
+  // ── the BIND is a relation, not a membership (#195) ──────────────────────
+
+  it('the page says the sha goes ON the verdict line, and the gate agrees', () => {
+    expect(page).toContain('ON THE VERDICT LINE');
+    const body = `**\`sec-reviewer\` — verdict**\nVerdict: GO — binds ${HEAD}`;
+    expect(passes(chk(body))).toBe(true);
+  });
+
+  // THE CASE THE PAGE NOW WARNS ABOUT, and the one that measured PASS before
+  // #195: the head is in the body, a GO line exists, and they are on different
+  // lines. The page calls naming a superseded head good practice, so this shape
+  // is written deliberately by careful reviewers.
+  it('a sha in PROSE does not bind, exactly as the page now says', () => {
+    expect(page).toContain('binds nothing');
+    const other = 'b'.repeat(40);
+    const body = `**\`sec-reviewer\` — verdict**\nmy previous verdict was bound to ${HEAD}\nVerdict: GO — binds ${other}`;
+    expect(passes(chk(body))).toBe(false);
   });
 
   // ── the seat rules the page states ───────────────────────────────────────
