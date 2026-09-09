@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 
 // #177 — the identity files are LINE-INDEPENDENT.
@@ -22,9 +22,15 @@ import { join } from 'path';
 // rare, so the trade is worth making, and the script's DOWN branch says which
 // causes a vanished entry can have.
 //
-// THIS FILE IS THE ONLY THING THAT LOOKS AT THEM ON A NORMAL RUN. Without it,
-// the format could revert and nobody would find out until the next DOWN — the
-// same silence #177 exists to remove, one level up.
+// SINCE #80 THEY ARE THE GATE, not the list behind a number: the ratchet fails
+// on any identity that is not in these files, which is what catches a
+// count-preserving swap. The stored COUNT is gone — a value derivable from this
+// file (`wc -l`) but kept beside it is two encodings of one fact, and two
+// encodings drift.
+//
+// So the format matters on every run, not only on a drop, and this file is
+// still the only thing that reads these as DATA rather than as a comparison
+// set.
 
 const REPO = join(import.meta.dir, '../..');
 const read = (pkg: string) =>
@@ -49,12 +55,16 @@ describe('#177 typecheck identities are line-independent', () => {
       expect(malformed).toEqual([]);
     });
 
-    it(`${pkg}: the count matches the baseline, one line per diagnostic`, () => {
-      const baseline = Number(readFileSync(join(REPO, `.github/typecheck-baseline-${pkg}.txt`), 'utf8').trim());
-      // The invariant the `#n` suffix exists for: dedup must not COLLAPSE
-      // rows, or the number and the list would describe different worlds — and
-      // the number is the gate.
-      expect(read(pkg).length).toBe(baseline);
+    // WHAT THE RETIRED COUNT FILE WAS ACTUALLY GUARDING (#80). It asserted
+    // `lines === baseline`, which was a drift check between two encodings of
+    // one fact; with the count derived there is nothing left to drift. The
+    // invariant the `#n` suffix exists for survives and is checkable here
+    // alone: dedup must never COLLAPSE two diagnostics into one line, so no
+    // line may repeat.
+    it(`${pkg}: one line per diagnostic — no identity appears twice`, () => {
+      const ids = read(pkg);
+      const dupes = ids.filter((l, i) => ids.indexOf(l) !== i);
+      expect(dupes).toEqual([]);
     });
 
     it(`${pkg}: repeats are distinguished by a #n suffix, never merged`, () => {
@@ -68,6 +78,14 @@ describe('#177 typecheck identities are line-independent', () => {
       for (const id of ids.filter(l => /#\d+$/.test(l))) {
         expect(ids).toContain(id.replace(/#\d+$/, ''));
       }
+    });
+
+    // THE SECOND ENCODING IS GONE AND MUST STAY GONE (#80). A stored count
+    // beside the list it summarises is the trap this repo keeps meeting: the
+    // two disagree, and the one nobody reads is the one that rots. Asserted so
+    // reintroducing the file is a decision rather than a habit.
+    it(`${pkg}: no stored count file shadows the identity baseline`, () => {
+      expect(existsSync(join(REPO, `.github/typecheck-baseline-${pkg}.txt`))).toBe(false);
     });
 
     it(`${pkg}: sorted in C collation, which is what comm requires`, () => {

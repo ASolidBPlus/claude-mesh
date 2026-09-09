@@ -156,8 +156,13 @@ jobs:
   # #18 — tsc was unusable as a gate (every .ts import was TS5097). The config
   # fix makes its output meaningful; this job makes it BIND. A ratchet rather
   # than a blocking zero-error gate, because 155 real errors remain and a
-  # permanently-red job teaches people to ignore CI — see the script header for
-  # what a count-based ratchet does and does not catch.
+  # permanently-red job teaches people to ignore CI.
+  #
+  # #80: it gates on the SET of error identities
+  # (.github/typecheck-identities-*.txt), not on a count — a count-preserving
+  # swap passed, measured. A vanished identity is classified rather than
+  # congratulated: a file that left the program, or gained @ts-nocheck, FAILS.
+  # See the script header for what it still cannot see.
   typecheck:
     runs-on: ubuntu-latest
     steps:
