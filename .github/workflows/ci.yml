@@ -13,8 +13,10 @@ name: CI
 # exempt them.)
 # Jobs:
 #   test      — bun test, server and client
-#   typecheck — the error-count ratchet (.github/scripts/typecheck-ratchet.sh);
-#               fails when the count goes UP, lists what disappeared when it goes down
+#   typecheck — the identity-SET ratchet (.github/scripts/typecheck-ratchet.sh);
+#               fails on any error identity not in the committed baseline, and
+#               classifies what disappeared: a file that left the program or
+#               gained @ts-nocheck FAILS, a real fix is reported
 #   docker    — build the server image; publish to GitHub Container Registry
 #               (ghcr.io/<owner>/claude-mesh) on pushes to main and on version
 #               tags, and FROM NO OTHER EVENT. Everything else builds but does

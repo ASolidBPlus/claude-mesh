@@ -172,7 +172,13 @@ for pkg in server client; do
     done <<<"$vanished"
 
     if [ -n "$unchecked" ]; then
-      echo "::error::${pkg}: errors disappeared because their FILE IS NO LONGER TYPECHECKED (deleted, moved, or excluded). Coverage shrank; that is not a fix."
+      # A MOVE IS NOT A SHRINK, and saying so would be false in the one case
+      # where the identities are all still there: renamed, they vanish from the
+      # old path and reappear in the ADDED list above under the new one. The
+      # message names the state — this file is no longer checked — and points at
+      # the evidence that tells the three causes apart, rather than asserting
+      # the cause it cannot see (seat 2 on #191).
+      echo "::error::${pkg}: errors disappeared because their FILE IS NO LONGER TYPECHECKED. Deleted or excluded means coverage shrank; MOVED means the same identities are in the added list above under the new path. Confirm which — none of the three is a fix."
       printf '%s' "$unchecked" | sed 's/^/    - /' | head -20
       status=1
     fi
