@@ -905,6 +905,11 @@ export class MeshClient {
         this.lastPongAt = Date.now();
         return;
       default:
+        // #176 - AN UNKNOWN FRAME TYPE IS A NO-OP, deliberately. A server may
+        // add a frame type without a client roll, and an old client must
+        // ignore it rather than throw: a throw here tears the socket down and
+        // the client reconnects into the same frame, which is a loop. Removing
+        // this arm, or making it warn loudly, is a wire-protocol version bump.
         return;
     }
   }
@@ -1086,6 +1091,22 @@ export class MeshClient {
     return Object.assign(new Error(frame.message), { code: frame.code });
   }
 
+  /**
+   * #176 - THE RECEIVE PATH IS ADDITIVE-SAFE, and this method is half of why.
+   *
+   * A NAMED-FIELD COPY, never a spread. The server may ADD a deliver field
+   * without a client roll: the parse accepts it, nothing reads it, and it does
+   * not reach the consumer. F4 shipped exactly that (an 11th key, `origin`,
+   * while old clients were live) and it was a non-event - but by luck of
+   * construction, since nothing on this side said the property had to hold.
+   * Both halves are now pinned in `client/__tests__/receive-additive.test.ts`;
+   * the other half is `dispatch`'s default arm.
+   *
+   * Spreading `f` here would put a field from the future onto `Inbound`, where
+   * a consumer could come to depend on it without either side agreeing. That,
+   * or a runtime validator that REJECTS unknown fields, is a wire-protocol
+   * version bump rather than a refactor.
+   */
   private normalizeDeliver(f: DeliverFrame): Inbound {
     return {
       msgId: f.msg_id,

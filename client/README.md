@@ -147,6 +147,27 @@ await client.send('other-agent', JSON.stringify({ reply_to: token, body: 'ping?'
 The responder replies with `send(caller, JSON.stringify({ reply_to: token, body: 'pong' }))`.
 The webhook gateway runs this pattern in production and is the reference to copy.
 
+## Version compatibility
+
+The receive path is **additive-safe**, and it is pinned
+(`client/__tests__/receive-additive.test.ts`):
+
+- **A server may add a deliver field without a client roll.** Unknown keys are
+  parsed, never read, and do not reach `onMessage` — the normalize step copies
+  named fields rather than spreading the frame. F4 added `origin` to every
+  deliver frame while old clients were live; nothing broke.
+- **A server may add a frame TYPE.** An old client ignores it: the dispatch
+  falls through to a no-op rather than throwing, because a throw would tear the
+  socket down and reconnect into the same frame.
+- Bytes that are not JSON are ignored and the connection survives.
+
+Removing either property — spreading unknown fields onto the message, or
+rejecting unknown frames — is a **wire-protocol version bump**, not a refactor.
+
+What is NOT promised: the SDK does not VALIDATE types at runtime. A known key
+arriving with an unexpected type is passed through, so a consumer that needs a
+number checks for one.
+
 ## Limits / out of scope
 
 - Sending while disconnected rejects with `Error('not connected')` — the SDK does not
