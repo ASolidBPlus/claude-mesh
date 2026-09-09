@@ -25,12 +25,22 @@ Three things, each on its own line, in the same comment:
    - `Verdict: NO-GO — …`
    - `Verdict: GO-WITH-AMENDMENTS — binds <sha>` (see below)
    The value after `Verdict:` is what counts. **Only a line whose start matches `Verdict:`
-   is read — and that includes lines that begin with `>`, `-`, `*`, `_` or whitespace.** So
-   a *quoted* or *bulleted* `Verdict: NO-GO` line still counts as a NO-GO, and a quoted
+   is read.** The markers that may precede it differ by direction, and the asymmetry is
+   deliberate — **quoting is reproduction, and reproduction must never ADD approval:**
+
+   | line | leading markers read | effect |
+   | --- | --- | --- |
+   | `Verdict: GO` | whitespace, `-`, `*`, `_`, backticks — **not `>`** | certifies, and only as your OWN line |
+   | `Verdict: NO-GO` | those **and `>`** | blocks, quoted or not |
+   | `Verdict: GO-WITH-AMENDMENTS` | those **and `>`** | downgrades, quoted or not |
+
+   So a *quoted* or *bulleted* `Verdict: NO-GO` line still counts as a NO-GO, and a quoted
    earlier `Verdict: GO-WITH-AMENDMENTS` line makes the comment read as an amendments
-   verdict. Quoting a prior verdict line will block or downgrade the merge. Refer to an
-   earlier verdict by PR number, comment id and SHA, never by reproducing its verdict line.
-   Prose that mentions "NO-GO" mid-sentence is not read.
+   verdict — while a **quoted `Verdict: GO` does NOT certify** (#196: it used to, so an
+   addendum quoting your own earlier verdict for context re-certified it at the quoted
+   head). Quoting a prior verdict line will block or downgrade the merge and can never
+   grant one. Refer to an earlier verdict by PR number, comment id and SHA, never by
+   reproducing its verdict line. Prose that mentions "NO-GO" mid-sentence is not read.
 3. **The full 40-character head SHA, ON THE VERDICT LINE** — the `binds <sha>` half of the
    forms in 2, on that same line. A short SHA does not bind; the gate compares the branch ref, the PR head and this string
    byte for byte.

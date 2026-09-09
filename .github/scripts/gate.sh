@@ -107,7 +107,21 @@ chk_verdict(){ # $1 label $2 body $3 head $4 required seat or ""
   # load-bearing exactly where `is_amend` is absent and harmful exactly where it
   # is present (build-triage measured both files). You may have either; you must
   # not have neither.
-  if grep -qP "^[\s*_\x60>-]*\**Verdict:\**\s*GO\b[^\n]*\Q$3\E" <<<"$2" && ! grep -qP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2"; then
+  # QUOTING IS REPRODUCTION, AND REPRODUCTION MUST NOT ADD APPROVAL. The leading
+  # class used to include `>` on BOTH halves, so an addendum quoting an earlier
+  # verdict for context — which the page tells reviewers to do — CERTIFIED it
+  # again at the quoted head (seat 1, found by searching the shape not the
+  # instance; reproduced here). The asymmetry is the point and it is the
+  # fail-safe direction:
+  #
+  #   a quoted GO        must NOT certify   — `>` excluded below
+  #   a quoted NO-GO     must STILL block   — `>` kept in the scan
+  #   a quoted GwA       must STILL downgrade — `>` kept in `is_amend`
+  #
+  # `-`, `*`, `_` and backticks stay in the acceptance class: those are
+  # formatting a reviewer applies to their OWN line. `>` is the one marker whose
+  # meaning is "these are someone else's words".
+  if grep -qP "^[\s*_\x60-]*\**Verdict:\**\s*GO\b[^\n]*\Q$3\E" <<<"$2" && ! grep -qP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2"; then
     ok "verdict $1 binds $3 GO"
   else
     # THE DIAGNOSTIC SHIPS WITH THE FIX. The old line printed three decoupled
@@ -118,7 +132,16 @@ chk_verdict(){ # $1 label $2 body $3 head $4 required seat or ""
     nlines=$(grep -cP '^[\s*_\x60>-]*\**Verdict:\**\s*GO\b' <<<"$2")
     nhead=$(grep -c "$3" <<<"$2")
     nnogo=$(grep -cP '^[\s*_\x60>-]*Verdict:\**\s*NO-GO' <<<"$2")
-    bad "verdict $1: NO VERDICT LINE BINDS $3 — $nlines GO line(s), the head appears $nhead time(s) anywhere in the body, $nnogo NO-GO line(s). A sha in prose does not bind; it must be ON the Verdict line."
+    # WHICH CONDITION FAILED, not a list of counts the reader has to interpret.
+    # The conjunction has two halves and they fail for opposite reasons, so one
+    # message for both named the wrong cause whenever a NO-GO was present: the
+    # GO line DID bind, and the NO-GO is what refused. My own message, one
+    # commit old — the same "state the mechanism" rule it was written to serve.
+    if [ "$nnogo" -gt 0 ]; then
+      bad "verdict $1: a NO-GO line is present ($nnogo), so this comment refuses regardless of its GO line. Quoting an earlier NO-GO counts — refer to it by PR, comment id and sha instead."
+    else
+      bad "verdict $1: NO VERDICT LINE BINDS $3 — $nlines GO line(s), the head appears $nhead time(s) anywhere in the body. A sha in prose does not bind, and a QUOTED GO line does not certify; it must be your own Verdict line, with the sha on it."
+    fi
   fi
 }
 is_amend(){ grep -qiP '^[\s*_\x60>-]*Verdict:\**\s*GO[- ]WITH[- ]AMENDMENT' <<<"$1"; } # the VALUE is the amendments form; a mention later on the line is not
@@ -135,9 +158,16 @@ is_amend(){ grep -qiP '^[\s*_\x60>-]*Verdict:\**\s*GO[- ]WITH[- ]AMENDMENT' <<<"
 #
 # THREE CONDITIONS, all required: the discharge comes from the SAME seat that
 # gave the amendments verdict, it names the head, and it does not itself carry
-# an anchored NO-GO — so a discharge that reproduces the verdict it discharges
-# is refused. That last one is the writer rule ("never reproduce a verdict
-# line") with teeth rather than a separate rule to remember.
+# an anchored NO-GO on the `Discharge:` grammar's own terms — so a discharge that
+# reproduces the verdict it discharges is refused.
+#
+# THAT IS TEETH FOR ONE HALF OF THE WRITER RULE, not for the rule. This comment
+# used to claim the writer rule ("never reproduce a verdict line") had teeth
+# here rather than being a rule to remember — true of a reproduced NO-GO, and
+# false in the direction that matters: a reproduced GO had no teeth at all and
+# CERTIFIED, until `chk_verdict` stopped accepting a quoted line. A sentence
+# that is true of the half it describes and false as a general claim is exactly
+# the shape that survives review (build-triage, on my own diff).
 discharge_ok(){ # $1 discharge body  $2 the amending seat  $3 head sha
   # THE SAME RELATION AS `chk_verdict`, one function down (#195, build-triage).
   # This carried the byte-identical `grep -q "$3"` membership test while the
@@ -295,6 +325,12 @@ if [ "${1:-}" = --selftest ]; then
   # by a one-token edit here.
   V11=$(printf '**`sec-reviewer` - verdict**\nVerdict: GO-WITH-AMENDMENTS - binds %s' $H); expect must-pass "an amendments verdict binding the head" "$(chk_verdict t "$V11" $H "")"
   V12=$(printf '**`sec-reviewer` - verdict**\nVerdict: GO-WITH-AMENDMENTS - binds %s' $X); expect must-fail "an amendments verdict binding ANOTHER head" "$(chk_verdict t "$V12" $H "")"
+  # QUOTED LINES, both directions, because the asymmetry IS the rule and a
+  # symmetric leading class is what made a reproduced GO certify.
+  V13=$(printf '**`sec-reviewer` - addendum**\nFor context, my earlier verdict said:\n> Verdict: GO - binds %s' $H); expect must-fail "a QUOTED GO line does not certify" "$(chk_verdict t "$V13" $H "")"
+  V14=$(printf '**`sec-reviewer` - verdict**\n>> Verdict: GO - binds %s' $H); expect must-fail "a DOUBLY quoted GO line does not certify" "$(chk_verdict t "$V14" $H "")"
+  V15=$(printf '**`sec-reviewer` - verdict**\n- Verdict: GO - binds %s' $H); expect must-pass "a BULLETED GO line is the reviewer's own line" "$(chk_verdict t "$V15" $H "")"
+  V16=$(printf '**`sec-reviewer` - verdict**\n> Verdict: NO-GO - an earlier round\nVerdict: GO - binds %s' $H); expect must-fail "a quoted NO-GO still blocks" "$(chk_verdict t "$V16" $H "")"
   # #188 - THE FIXTURES ABOVE ARE INVENTED FORMS. These two are the first lines
   # the seats ACTUALLY post, copied from live verdict comments, and they differ:
   # seat 1 wraps its id in backticks inside bold and continues the sentence,
@@ -337,9 +373,15 @@ if [ "${1:-}" = --selftest ]; then
   # One per message a reader acts on. Each names a distinct branch, so a broken
   # message localises to the branch that rotted instead of failing the file.
   expect_why "verdict bind refusal names the relation" \
-    "$(chk_verdict t "$V8" $H "")" 'NO VERDICT LINE BINDS.*must be ON the Verdict line'
+    "$(chk_verdict t "$V8" $H "")" 'NO VERDICT LINE BINDS.*must be your own Verdict line, with the sha on it'
   expect_why "verdict bind refusal reports the evidence it weighed" \
-    "$(chk_verdict t "$V8" $H "")" 'GO line\(s\).*appears \d+ time\(s\).*NO-GO line\(s\)'
+    "$(chk_verdict t "$V8" $H "")" 'GO line\(s\).*appears \d+ time\(s\)'
+  expect_why "a quoted GO is named as such in the refusal" \
+    "$(chk_verdict t "$V13" $H "")" 'QUOTED GO line does not certify'
+  # THE OTHER HALF OF THE CONJUNCTION, which one message used to answer with the
+  # wrong cause: here the GO line DOES bind and the NO-GO is what refuses.
+  expect_why "a present NO-GO is named as the cause, not the bind" \
+    "$(chk_verdict t "$V16" $H "")" 'NO-GO line is present.*refuses regardless of its GO line'
   expect_why "seat refusal names the seat mismatch" \
     "$(chk_verdict t "$V2" $H 1)" 'from seat 2, SEAT=1 required'
   expect_why "arity refusal says why zero is not a pass" \

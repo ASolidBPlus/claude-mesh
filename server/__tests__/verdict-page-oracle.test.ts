@@ -111,6 +111,19 @@ describe('#166 the page\'s stated forms, run through the shipped predicates', ()
     expect(passes(chk(body))).toBe(false);
   });
 
+  // #196 — THE ASYMMETRY, which is the whole of the quoting rule: the same
+  // marker that must keep a refusal must not grant an approval.
+  it('the page states the asymmetry, and the gate enforces it in both directions', () => {
+    expect(page).toContain('quoting is reproduction, and reproduction must never ADD approval');
+    // A quoted GO does not certify...
+    const quotedGo = `**\`sec-reviewer\` — addendum**\nFor context, my earlier verdict said:\n> Verdict: GO — binds ${HEAD}`;
+    expect(passes(chk(quotedGo))).toBe(false);
+    // ...while the SAME line unquoted does, so the refusal is the `>` and not
+    // the wording around it.
+    const ownGo = `**\`sec-reviewer\` — addendum**\nFor context, my earlier verdict said:\nVerdict: GO — binds ${HEAD}`;
+    expect(passes(chk(ownGo))).toBe(true);
+  });
+
   it('a BULLETED verdict line still counts', () => {
     const body = comment('**`sec-reviewer` — verdict**', '- Verdict: NO-GO — an earlier round\nVerdict: GO — binds');
     expect(passes(chk(body))).toBe(false);
