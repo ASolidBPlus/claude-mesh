@@ -62,9 +62,22 @@ A `GO-WITH-AMENDMENTS` verdict does not merge on its own. It merges when either
 - the author lands the amendment and the **same seat** posts a new `Verdict: GO` binding
   the new head, or
 - the amendment is deliberately deferred and the **same seat** posts a **discharge**
-  comment containing the full head SHA; the gate is run with `DISCHARGED=<comment-id>`.
+  comment carrying a `Discharge:` line with the full head SHA **on it**; the gate is run
+  with `DISCHARGED=<comment-id>`:
+
+      **`sec-reviewer` — discharge**
+      Discharge: amendment deferred to #NNN — binds <full 40-hex head sha>
+
+  **CHANGED (#195): the sha used to count anywhere in that comment, and there was no
+  `Discharge:` line.** A discharge had no line that WAS the claim, so the head bound by
+  membership while the verdict half bound by relation — measured: a discharge whose own
+  line named one head, with another in prose, was accepted for the one in prose. The
+  anchored line is the same rule as the verdict's, so naming an earlier head in prose is
+  safe here too and binds nothing.
+
   The gate enforces **three** things about that comment: the seat matches, the full head
-  SHA is present, and it does **not** itself contain an anchored `Verdict: NO-GO` line —
+  SHA is on the `Discharge:` line, and it does **not** itself contain an anchored
+  `Verdict: NO-GO` line —
   so a discharge that reproduces the verdict it discharges is refused, which is the writer
   rule above with teeth. Naming where the amendment lands, and
   running the gate with `REQUIRE_MERGED=<pr>` / `REQUIRE_MAIN=path:regex` so a conditional

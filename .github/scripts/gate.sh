@@ -139,8 +139,21 @@ is_amend(){ grep -qiP '^[\s*_\x60>-]*Verdict:\**\s*GO[- ]WITH[- ]AMENDMENT' <<<"
 # is refused. That last one is the writer rule ("never reproduce a verdict
 # line") with teeth rather than a separate rule to remember.
 discharge_ok(){ # $1 discharge body  $2 the amending seat  $3 head sha
+  # THE SAME RELATION AS `chk_verdict`, one function down (#195, build-triage).
+  # This carried the byte-identical `grep -q "$3"` membership test while the
+  # verdict half was being repaired for exactly that — the head only had to
+  # appear SOMEWHERE in the discharge body. Measured: a discharge whose own line
+  # binds one head, naming another in prose, was accepted for the head in prose.
+  #
+  # A DISCHARGE THEREFORE NEEDS AN ANCHORED LINE, because unlike a verdict it
+  # had no line that was the claim. `Discharge:` mirrors `Verdict:`: the sha
+  # must sit on it, and prose naming an earlier head binds nothing. That is a
+  # change to what a reviewer WRITES, and it is documented on the page rather
+  # than left to be discovered by a refusal.
   local ds; ds=$(seat_of "$1")
-  [ "$ds" = "$2" ] && grep -q "$3" <<<"$1" && ! grep -qP "^[\s*_\x60>-]*Verdict:\**\s*NO-GO" <<<"$1"
+  [ "$ds" = "$2" ] \
+    && grep -qP "^[\s*_\x60>-]*\**Discharge:\**[^\n]*\Q$3\E" <<<"$1" \
+    && ! grep -qP "^[\s*_\x60>-]*Verdict:\**\s*NO-GO" <<<"$1"
 }
 # #188 - ZERO VERDICTS IS NOT A PASS. `gate.sh <pr> <sha>` with no verdict ids
 # ran to completion silently: the `for c in "${VERDICTS[@]}"` loop simply had
@@ -222,6 +235,21 @@ if [ "${1:-}" = --selftest ]; then
     if [ "$1" = must-fail ]; then grep -q '^FAIL' <<<"$out" && echo "  ok   $2 (rejected)" || { echo "  BAD  $2: known-bad input PASSED"; fails=$((fails+1)); }
     else grep -q '^FAIL' <<<"$out" && { echo "  BAD  $2: known-good input FAILED"; fails=$((fails+1)); } || echo "  ok   $2 (accepted)"; fi
   }
+  # THE DIAGNOSTIC IS A CONTROL, NOT COSMETICS, so it gets a fixture too
+  # (build-triage on the port's #27, pre-empted here because #195 rewrites the
+  # very message in question). `expect` above reads only whether the output
+  # starts with FAIL — so all four refusal texts could be replaced by the old
+  # decoupled counts, or by "everything looks fine, ignore this", and this
+  # selftest would still PASS. Measured on the port; the same hole is here.
+  #
+  # It matters because of the argument this fix rests on: a gate whose correct
+  # refusal reads like a malfunction gets overridden by whoever is trying to
+  # land something. A refusal that cannot say WHY is a refusal that will be
+  # ignored, and an untested message rots faster than code.
+  expect_why(){ # $1 label  $2 the check's OUTPUT  $3 pattern the reason must match
+    if grep -qP -- "$3" <<<"$2"; then echo "  ok   $1 (reason named)"
+    else echo "  BAD  $1: refusal does not name its reason"; fails=$((fails+1)); fi
+  }
   T=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; H=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; X=cccccccccccccccccccccccccccccccccccccccc
   echo "behavioural inventory (each check driven with known-bad and known-good input):"
   expect must-pass "parents fresh + mergeable" "$(chk_parents 2 $T $H $T $H true)"
@@ -283,18 +311,42 @@ if [ "${1:-}" = --selftest ]; then
   is_amend "Verdict: GO. Supersedes my GO-WITH-AMENDMENTS at $X" && { echo "  BAD  a mention of a superseded amendments verdict read as one"; fails=$((fails+1)); } || echo "  ok   mention of amendments is not a verdict"
   # discharge_ok: one known-good and one per condition, because three conditions
   # that a test has only seen satisfied together are ONE condition to that test.
-  D_OK=$(printf '**`sec-reviewer` — discharge**\ndeferred; binds %s' $H)
-  D_SEAT=$(printf '**`sec-reviewer-2` — discharge**\ndeferred; binds %s' $H)
-  D_SHA=$(printf '**`sec-reviewer` — discharge**\ndeferred; binds %s' $X)
-  D_NOGO=$(printf '**`sec-reviewer` — discharge**\n> Verdict: NO-GO — the earlier round\nbinds %s' $H)
+  D_OK=$(printf '**`sec-reviewer` — discharge**\nDischarge: deferred; binds %s' $H)
+  D_SEAT=$(printf '**`sec-reviewer-2` — discharge**\nDischarge: deferred; binds %s' $H)
+  D_SHA=$(printf '**`sec-reviewer` — discharge**\nDischarge: deferred; binds %s' $X)
+  D_NOGO=$(printf '**`sec-reviewer` — discharge**\n> Verdict: NO-GO — the earlier round\nDischarge: deferred; binds %s' $H)
+  # THE SIBLING OF #195's PARENT CASE: the Discharge line binds one head and the
+  # prose names another. This is the shape that measured ACCEPTED before the
+  # anchor, and it is written by the same good practice — naming what you
+  # supersede.
+  D_PROSE=$(printf '**`sec-reviewer` — discharge**\nThis supersedes my discharge at %s.\nDischarge: deferred; binds %s' $H $X)
+  # ...and a discharge with no anchored line at all, which is what every
+  # free-form discharge looked like before this rule.
+  D_UNANCHORED=$(printf '**`sec-reviewer` — discharge**\ndeferred; binds %s' $H)
   discharge_ok "$D_OK"   1 $H && echo "  ok   discharge accepted (seat, sha, no NO-GO)" || { echo "  BAD  a valid discharge was refused"; fails=$((fails+1)); }
   discharge_ok "$D_SEAT" 1 $H && { echo "  BAD  a discharge by another seat was accepted"; fails=$((fails+1)); } || echo "  ok   discharge by another seat refused"
   discharge_ok "$D_SHA"  1 $H && { echo "  BAD  a discharge naming another head was accepted"; fails=$((fails+1)); } || echo "  ok   discharge not binding the head refused"
   # The same short-sha gap one predicate over: `discharge_ok` binds with the
   # same `grep -q "$3"`, so it needs the same distinguishing input (#188).
-  D_SHORT=$(printf '**`sec-reviewer` - discharge**\ndeferred; binds %s' "${H:0:7}")
+  D_SHORT=$(printf '**`sec-reviewer` - discharge**\nDischarge: deferred; binds %s' "${H:0:7}")
   discharge_ok "$D_SHORT" 1 $H && { echo "  BAD  a discharge binding a SHORT sha was accepted"; fails=$((fails+1)); } || echo "  ok   discharge binding a short sha refused"
   discharge_ok "$D_NOGO" 1 $H && { echo "  BAD  a discharge reproducing a NO-GO was accepted"; fails=$((fails+1)); } || echo "  ok   discharge reproducing a NO-GO refused"
+  discharge_ok "$D_PROSE" 1 $H && { echo "  BAD  a discharge naming the head only in PROSE was accepted"; fails=$((fails+1)); } || echo "  ok   discharge naming the head only in prose refused"
+  discharge_ok "$D_UNANCHORED" 1 $H && { echo "  BAD  a discharge with no anchored Discharge: line was accepted"; fails=$((fails+1)); } || echo "  ok   discharge with no anchored line refused"
+  # ── the refusals must DIAGNOSE, not merely refuse ────────────────────────
+  # One per message a reader acts on. Each names a distinct branch, so a broken
+  # message localises to the branch that rotted instead of failing the file.
+  expect_why "verdict bind refusal names the relation" \
+    "$(chk_verdict t "$V8" $H "")" 'NO VERDICT LINE BINDS.*must be ON the Verdict line'
+  expect_why "verdict bind refusal reports the evidence it weighed" \
+    "$(chk_verdict t "$V8" $H "")" 'GO line\(s\).*appears \d+ time\(s\).*NO-GO line\(s\)'
+  expect_why "seat refusal names the seat mismatch" \
+    "$(chk_verdict t "$V2" $H 1)" 'from seat 2, SEAT=1 required'
+  expect_why "arity refusal says why zero is not a pass" \
+    "$(chk_arity 0)" 'zero verdicts reads exactly like every verdict passing'
+  expect_why "stale-ref refusal says the flag describes a stale tree" \
+    "$(chk_parents 2 $X $H $T $H true)" 'describes a stale tree.*not evidence either way'
+
   for kw in "Closes #12" "Closes: #12" "closes:#12" "Closes  #12" "Fixed: #7" "resolves #9"; do [ -n "$(kw_extract "$kw")" ] && echo "  ok   keyword form '$kw'" || { echo "  BAD  keyword form '$kw' missed"; fails=$((fails+1)); }; done
   [ -z "$(kw_extract "see #12 and the loop closed itself")" ] && echo "  ok   non-keyword '#12' ignored" || { echo "  BAD  non-keyword matched"; fails=$((fails+1)); }
   # join fixtures: guard on the resource the test CONSUMES (run logs), not run metadata

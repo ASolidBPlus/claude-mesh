@@ -194,7 +194,17 @@ describe('#166 the page\'s stated forms, run through the shipped predicates', ()
     expect(fnStart).toBeGreaterThan(-1);
     const check = gate.slice(fnStart, gate.indexOf('\n}', fnStart) + 2);
     expect(check).toContain('[ "$ds" = "$2" ]');
-    expect(check).toContain('grep -q "$3"');
+    // #195: the head binds on an ANCHORED `Discharge:` line, not by appearing
+    // anywhere in the body — the same relation the verdict half now requires.
+    expect(check).toContain('Discharge:');
+    expect(check).toContain('\\Q$3\\E');
+    // THE NEGATIVE IS ASSERTED ON THE CODE, NOT THE COMMENT. The predicate's
+    // own comment quotes the membership test it replaced, so the whole-slice
+    // form of this assertion reports the paragraph explaining the rule as a
+    // violation of it — the same self-reference trap as the run-log structural
+    // check in #192, met twice in one night.
+    const codeOnlyCheck = check.split('\n').filter(l => !/^\s*#/.test(l)).join('\n');
+    expect(codeOnlyCheck).not.toContain('grep -q "$3"');
     expect(check).toContain('Verdict:\\**\\s*NO-GO');
     // ...and all three are joined by AND. Seat 1's `&&` → `||` mutant is what
     // this line exists for; it is asserted on the SHAPE as well as driven
@@ -205,13 +215,18 @@ describe('#166 the page\'s stated forms, run through the shipped predicates', ()
     expect(section).toMatch(/same seat/i);
     expect(section).toMatch(/full head SHA/i);
     expect(section).toMatch(/NO-GO/);
+    // ...and the page states the anchored line the gate now requires (#195),
+    // since a rule about what a reviewer WRITES is useless undocumented.
+    expect(section).toContain('Discharge:');
   });
 
   it('the three discharge conditions behave as the page now describes', () => {
-    const ok = 'sec-reviewer — discharge\nthe amendment is deferred; binds ' + HEAD;
-    const wrongSeat = 'sec-reviewer-2 — discharge\nbinds ' + HEAD;
-    const noSha = 'sec-reviewer — discharge\nbinds ' + SHORT;
-    const reproducedNoGo = 'sec-reviewer — discharge\n> Verdict: NO-GO — the earlier round\nbinds ' + HEAD;
+    const ok = 'sec-reviewer — discharge\nDischarge: the amendment is deferred; binds ' + HEAD;
+    const wrongSeat = 'sec-reviewer-2 — discharge\nDischarge: binds ' + HEAD;
+    const noSha = 'sec-reviewer — discharge\nDischarge: binds ' + SHORT;
+    const reproducedNoGo = 'sec-reviewer — discharge\n> Verdict: NO-GO — the earlier round\nDischarge: binds ' + HEAD;
+    // #195's sibling: the anchored line binds another head, this one is prose.
+    const headInProse = 'sec-reviewer — discharge\nsupersedes my discharge at ' + HEAD + '\nDischarge: binds ' + 'b'.repeat(40);
 
     // RUNS THE SHIPPED PREDICATE (#182). This used to be a hand-written
     // RECONSTRUCTION of the gate's inline conjunction — the one blind spot an
@@ -224,8 +239,13 @@ describe('#166 the page\'s stated forms, run through the shipped predicates', ()
       `discharge_ok "$D" 1 "${HEAD}" && echo DISCHARGED || echo REFUSED`,
     ).trim();
 
-    expect({ ok: discharge(ok), wrongSeat: discharge(wrongSeat), noSha: discharge(noSha), reproducedNoGo: discharge(reproducedNoGo) })
-      .toEqual({ ok: 'DISCHARGED', wrongSeat: 'REFUSED', noSha: 'REFUSED', reproducedNoGo: 'REFUSED' });
+    expect({
+      ok: discharge(ok), wrongSeat: discharge(wrongSeat), noSha: discharge(noSha),
+      reproducedNoGo: discharge(reproducedNoGo), headInProse: discharge(headInProse),
+    }).toEqual({
+      ok: 'DISCHARGED', wrongSeat: 'REFUSED', noSha: 'REFUSED',
+      reproducedNoGo: 'REFUSED', headInProse: 'REFUSED',
+    });
   });
 
   // ── the any-author NO-GO scan (build-triage on #166) ─────────────────────
