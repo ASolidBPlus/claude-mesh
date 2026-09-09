@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { readFileSync, readdirSync, statSync } from 'fs';
+import { readFileSync } from 'fs';
 import { join } from 'path';
 import { timingSafeEqual, hashToken } from '../auth.ts';
 import { sourceFiles } from './helpers/source-files.ts';
