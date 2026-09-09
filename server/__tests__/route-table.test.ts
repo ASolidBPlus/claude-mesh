@@ -36,25 +36,37 @@ import { ROUTES } from '../http-admin.ts';
 const SRC = readFileSync(join(import.meta.dir, '../http-admin.ts'), 'utf8');
 
 /** The ROUTES entries as written: method, matcher text, handler, optional auth. */
-function sourceRoutes(): { method: string; matcher: string; handler: string; auth: string }[] {
-  const start = SRC.indexOf('export const ROUTES');
-  const table = SRC.slice(start, SRC.indexOf('\n];', start));
+export function sourceRoutes(src: string = SRC): { method: string; matcher: string; handler: string; auth: string }[] {
+  const start = src.indexOf('export const ROUTES');
+  const table = src.slice(start, src.indexOf('\n];', start));
   // LINE BY LINE, and the matcher is the text BETWEEN `match:` and `handler:`
   // rather than a regex for its shape. A pattern that tries to parse
   // `idMatch(/^\/files\/([^/]+)$/)` has to model slashes inside a character
   // class, and mine silently skipped that one route — which is the auth-scoped
   // one, i.e. exactly the route this file exists for. Taking the span keeps the
   // parser ignorant of matcher syntax.
+  //
+  // AN UNREADABLE LINE IS SKIPPED, NOT THROWN ON (seat 2). It used to assert
+  // its way through with `!`, so a route written across two lines — a
+  // reformatting, not a defect — raised a TypeError during the parse and NONE
+  // of the assertions below ran: "Ran 0 tests across 1 file", exit 1. It failed
+  // closed, but the correspondence control exists precisely to catch a source
+  // parse that has fallen behind the runtime table, and a crash pre-empts the
+  // one case it was built for. Skipping turns the exception into the
+  // assertion, which is what the file is for.
   return table.split('\n')
     .filter(l => /\bmethod:\s*'[A-Z]+'/.test(l))
     .map(l => {
-      const method = /\bmethod:\s*'([A-Z]+)'/.exec(l)![1]!;
-      const handler = /\bhandler:\s*([A-Za-z0-9_]+)/.exec(l)![1]!;
+      const method = /\bmethod:\s*'([A-Z]+)'/.exec(l)?.[1];
+      const handler = /\bhandler:\s*([A-Za-z0-9_]+)/.exec(l)?.[1];
+      const mi = l.indexOf('match:');
+      const hi = l.indexOf('handler:');
+      if (method === undefined || handler === undefined || mi === -1 || hi < mi) return null;
       const auth = /\bauth:\s*'([a-zA-Z]+)'/.exec(l)?.[1] ?? 'admin';
-      const matcher = l.slice(l.indexOf('match:') + 'match:'.length, l.indexOf('handler:'))
-        .replace(/,\s*$/, '').trim().replace(/,$/, '');
+      const matcher = l.slice(mi + 'match:'.length, hi).replace(/,\s*$/, '').trim().replace(/,$/, '');
       return { method, matcher, handler, auth };
-    });
+    })
+    .filter((r): r is { method: string; matcher: string; handler: string; auth: string } => r !== null);
 }
 
 /** One line per route, the form the expectation below is written in. */
@@ -129,6 +141,31 @@ describe('#199 the admin route table pins its auth surface', () => {
       "GET exact('/messages') auth=agentOrAdmin -> handleMessagesGet",
       "GET idMatch(/^\\/files\\/([^/]+)$/) auth=agentOrAdmin -> handleFileById",
     ]);
+  });
+
+  // THE PARSE FAILS AS AN ASSERTION, NOT AS AN EXCEPTION. A route written
+  // across two lines is a reformatting, not a defect, and the file's own claim
+  // is that the correspondence control catches a parse that has fallen behind.
+  // While the parser threw, that control never ran in the case it exists for —
+  // "Ran 0 tests across 1 file" is a red with zero assertions, which is the same
+  // fact as a green with zero assertions in different clothes.
+  it('CONTROL: an unreadable entry is skipped, so the count control can speak', () => {
+    const synthetic = [
+      'export const ROUTES: Route[] = [',
+      "  { method: 'GET', match: exact('/one'), handler: handleOne },",
+      "  { method: 'POST',",           // the reformatted entry: method here...
+      '    match: exact(\'/two\'), handler: handleTwo },',   // ...matcher and handler there
+      "  { method: 'GET', match: exact('/three'), handler: handleThree },",
+      '];',
+    ].join('\n');
+
+    const parsed = sourceRoutes(synthetic);
+    // No throw, and the unreadable entry is ABSENT rather than guessed at.
+    expect(parsed.map(r => r.handler)).toEqual(['handleOne', 'handleThree']);
+    // ...which is what lets the correspondence control report the difference:
+    // "source parsed 2, the runtime table has 3" is an assertion a reader can
+    // act on; a TypeError at line 47 is not.
+    expect(parsed.length).toBe(2);
   });
 
   // CONTROL ON THE RENDERER: the auth scope must actually reach the rendered
