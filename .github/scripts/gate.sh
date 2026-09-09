@@ -461,10 +461,22 @@ if [ "${1:-}" = --selftest ]; then
   # under a new name, so the names are enumerated: a fifth anchor is a decision
   # someone has to make in the open, by editing this line and saying which
   # MEANING it carries.
-  defs=$(grep -oE "^[A-Z_]+='\\^\\[" "$0" | sed "s/='.*//" | sort | tr '\n' ' ')
+  # BOTH QUOTE STYLES (seat 1's P1 residue on #197). This spelled a single quote
+  # only, so a fifth definition written with double quotes — the ordinary way to
+  # write one when the value needs expansion, and the way `NOGO_LINE_JQ` is
+  # written six lines up — was invisible to the check whose entire job is to
+  # notice a fifth definition. One character.
+  defs=$(grep -oE "^[A-Z_]+=['\"]\\^\\[" "$0" | sed -E "s/=['\"].*//" | sort | tr '\n' ' ')
   [ "$defs" = "ANY_GO_LINE DISCHARGE_LINE GO_LINE NOGO_LINE " ] || {
     echo "SELFTEST FAIL: the anchor definitions are [$defs], expected exactly the four named meanings"; exit 1; }
 
+  # KEEP BOTH OF THESE CHECKS: each is blind where the other sees (seat 1's P2
+  # note). This one is FILE-level — it reads every line and finds a matcher
+  # whose pattern continues onto the next line, which the SITE-level check below
+  # never looks at because it starts from the `grep -qP` token. The site-level
+  # one, in turn, finds a literal in a matcher this one has no opinion about.
+  # Two overlapping cheap checks beat one clever exhaustive one.
+  #
   # EVERY ANCHORED MATCH GOES THROUGH A NAMED VARIABLE, with exactly one
   # deliberate exception. The denylist above is two known SPELLINGS, so it
   # permits by construction what the four-encoding history was actually made of:
