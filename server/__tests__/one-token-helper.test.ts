@@ -82,7 +82,11 @@ describe('#79 one token-comparison helper', () => {
       .filter(f => /\btimingSafeEqual\s*\(/.test(code(f)))
       .map(f => f.slice(SERVER_ROOT.length + 1))
       .sort();
-    expect(callers).toEqual(['auth.ts', 'db.ts', 'http-admin.ts', 'mcp-server.ts']);
+    // #143 split http-admin.ts along URL families; `requireAdmin` — the door
+    // that compares the admin token — moved to admin-ctx.ts with the rest of
+    // the shared request context. The SET is what this asserts, so the entry
+    // moves rather than the assertion loosening.
+    expect(callers).toEqual(['admin-ctx.ts', 'auth.ts', 'db.ts', 'mcp-server.ts']);
   });
 
   // Behaviour is unchanged from the loop it replaces — the point was the

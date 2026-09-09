@@ -481,7 +481,11 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
     expect(readers.sort()).toEqual([
       'client/src/peer-client.ts <- client/src/protocol.ts',       // in-package
       'client/src/protocol.ts <- (defines it)',                    // the one definition
-      'server/http-admin.ts <- server/wire-version.ts',            // cached; must not cross
+      // #143 moved the peer-registration handler out of http-admin.ts, and the
+      // constant went with it. The invariant is unchanged and so is the
+      // specifier: a server-side reader reaches the constant through
+      // wire-version.ts, never across the package boundary.
+      'server/admin-peers.ts <- server/wire-version.ts',           // must not cross
       'server/wire-version.ts <- client/src/protocol.ts',          // THE server-side cross-package edge
       'server/ws-server.ts <- server/wire-version.ts',             // inside the band; must not cross
     ]);

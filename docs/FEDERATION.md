@@ -57,20 +57,20 @@ curl -X POST "$RECEIVER/peer-keys" \
 ```
 
 **`key` is shown exactly once and is never stored in the clear or returned by
-any read API** (`server/http-admin.ts` `handlePeerKeyPost`). If you lose it, revoke the
+any read API** (`server/admin-peers.ts` `handlePeerKeyPost`). If you lose it, revoke the
 key and mint another.
 
 | field | default | notes |
 |---|---|---|
-| `alias` | *required* | `^[a-z0-9][a-z0-9-]{0,62}$`; `mesh` is reserved, and an alias colliding with a local agent id is a `409` (`server/http-admin.ts` `handlePeerKeyPost`, `:495`) |
+| `alias` | *required* | `^[a-z0-9][a-z0-9-]{0,62}$`; `mesh` is reserved, and an alias colliding with a local agent id is a `409` (`server/admin-peers.ts` `handlePeerKeyPost`, `:495`) |
 | `kinds` | `["direct"]` | what this peering may carry: `direct`, `topic`, `topic-subscribe`, `topic-publish`. `topic-unsubscribe` is **not grantable** and is accepted whenever the peering exists — teardown is always allowed (`server/router.ts` `routeRelay`). See §3 for which side grants which |
-| `rate_per_min` | `600` | positive integer (`server/http-admin.ts` `handlePeerKeyPost`) |
+| `rate_per_min` | `600` | positive integer (`server/admin-peers.ts` `handlePeerKeyPost`) |
 | `expires_at` | `null` | ms timestamp; gates **registration only**, not an already-established peering |
-| `rotates` | `null` | the key id this one replaces. **Absent means rebind**, and a rebind drops the alias's existing inbound ACL edges (`server/http-admin.ts` `handlePeerKeyPost`) |
+| `rotates` | `null` | the key id this one replaces. **Absent means rebind**, and a rebind drops the alias's existing inbound ACL edges (`server/admin-peers.ts` `handlePeerKeyPost`) |
 
 Only **one live key per alias** exists at a time — minting a second is a `409`,
 so revoking one cannot leave a door open you believed you had closed
-(`server/http-admin.ts` `handlePeerKeyPost`).
+(`server/admin-peers.ts` `handlePeerKeyPost`).
 
 ### Step 2 — Sender registers with the key
 
@@ -89,12 +89,12 @@ curl -X POST "$RECEIVER/peers/register" \
 ```
 
 This route takes **no admin token** — the key *is* the credential
-(`server/http-admin.ts` `handlePeerRegister`). The returned `token` is the sender's
+(`server/admin-peers.ts` `handlePeerRegister`). The returned `token` is the sender's
 long-lived credential for the border socket, and is likewise shown once.
 
 > **Every failure of this step returns the same `403 {"error":"registration
 > refused"}`** — bad key, revoked key, expired key, unknown alias, malformed
-> JSON, all of it (`server/http-admin.ts` `refusePeerRegistration`). This is deliberate (C9):
+> JSON, all of it (`server/admin-peers.ts` `refusePeerRegistration`). This is deliberate (C9):
 > a caller who is not yet trusted must not be able to tell *which* thing was
 > wrong, because the differences are exactly what an attacker would enumerate.
 > **The real reason is in the receiver's log**, as `evt:"peer.register_refused"`
@@ -118,7 +118,7 @@ curl -X POST "$SENDER/outbound-peers" \
 ```
 
 **The response never contains `token`, and neither does `GET /outbound-peers`**
-(`server/http-admin.ts` `publicOutboundFields`) — it is a live credential, and returning it
+(`server/admin-outbound.ts` `publicOutboundFields`) — it is a live credential, and returning it
 would put it in every operator's shell history.
 
 ### Step 4 — Reverse the whole thing for two-way traffic
@@ -341,11 +341,11 @@ never queue. For a remote id, "online" means the peering socket is connected
 
 | call | shows |
 |---|---|
-| `GET /peers` | inbound peerings that have registered, **never their `token_hash`** — alias, the key that minted them, kinds, rate, `last_seen`, `disabled` (`server/http-admin.ts` `handlePeerGet`) |
-| `GET /peers/:alias/subscriptions` | what that peered mesh is subscribed to here — the answer to "why is that pod not receiving?" (`server/http-admin.ts` `handlePeerSubscriptionsGet`) |
-| `GET /peer-keys` | minted keys, **never the secrets** (`server/http-admin.ts` `handlePeerKeyGet`) |
-| `GET /outbound-peers` | configured outbound links, **never the tokens** (`server/http-admin.ts` `handleOutboundPeerGet`) |
-| `GET /agents` | the local roster, including four liveness readings — see below (`server/http-admin.ts` `handleAgentGet`) |
+| `GET /peers` | inbound peerings that have registered, **never their `token_hash`** — alias, the key that minted them, kinds, rate, `last_seen`, `disabled` (`server/admin-peers.ts` `handlePeerGet`) |
+| `GET /peers/:alias/subscriptions` | what that peered mesh is subscribed to here — the answer to "why is that pod not receiving?" (`server/admin-peers.ts` `handlePeerSubscriptionsGet`) |
+| `GET /peer-keys` | minted keys, **never the secrets** (`server/admin-peers.ts` `handlePeerKeyGet`) |
+| `GET /outbound-peers` | configured outbound links, **never the tokens** (`server/admin-outbound.ts` `handleOutboundPeerGet`) |
+| `GET /agents` | the local roster, including four liveness readings — see below (`server/admin-agents.ts` `handleAgentGet`) |
 
 **The roster's four liveness readings answer different questions**, and the
 difference matters when you are deciding whether an agent is stuck:
@@ -388,7 +388,7 @@ not "stuck".
 #### The admin audit log
 
 Every admin authentication writes one structured event, **success and failure**
-(`server/http-admin.ts` `recordAdminAuth`), and every mutation that succeeded
+(`server/admin-ctx.ts` `recordAdminAuth`), and every mutation that succeeded
 writes an `admin.mutation` event naming the route and the object in its path.
 
 **One route is outside that: `/metrics`.** It is answered before the dispatcher
@@ -440,7 +440,7 @@ curl -X POST "$MESH/observers" -H "Authorization: Bearer $ADMIN_TOKEN" \
 - Without it, an observer sees local traffic only and never a frame whose
   sender or recipient is a remote id (`server/tap.ts` `emitTap`).
 - `cross_border` must be a real `true`; `"true"`, `1` and `"yes"` are rejected
-  with `400` (`server/http-admin.ts` `handleObserverPost`) — a scope that
+  with `400` (`server/admin-observers.ts` `handleObserverPost`) — a scope that
   widened on a typo is the failure it exists to prevent.
 - **Existing grants, including every grant made before federation shipped, are
   local-only.** They are not grandfathered into the wider scope.
@@ -540,7 +540,7 @@ curl -X DELETE "$RECEIVER/peer-keys/$KEY_ID" -H "Authorization: Bearer $ADMIN_TO
 ```
 
 → `{"revoked": true, "id": "…"}`. **The peer's live socket is closed
-immediately**, not at the next sweep (`server/http-admin.ts` `handlePeerKeyDelete`).
+immediately**, not at the next sweep (`server/admin-peers.ts` `handlePeerKeyDelete`).
 A `404 {"error":"no such live peer key"}` means it was already revoked.
 
 #### What this costs the SENDER, which is more than it looks
