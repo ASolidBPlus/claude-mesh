@@ -110,12 +110,18 @@ describe('docs/FEDERATION.md citations name real symbols', () => {
   // Without it, a predicate that answered "true" for everything would satisfy
   // the test above and a rename would go through untouched.
   it('CONTROL: the definition check says NO to a symbol that is not there', () => {
-    expect(defines('server/http-admin.ts', 'handlePeerGet')).toBe(true);
-    expect(defines('server/http-admin.ts', 'handlePeerGetRenamed')).toBe(false);
+    // #143 moved the peer handlers out of http-admin.ts. The control follows
+    // the definition, and the negative case below is now BETTER than it was: it
+    // names a symbol http-admin.ts still IMPORTS and USES (the handler is in
+    // its route table) while defining it elsewhere, which is exactly the
+    // "called here, defined there" case this control exists for.
+    expect(defines('server/admin-peers.ts', 'handlePeerGet')).toBe(true);
+    expect(defines('server/admin-peers.ts', 'handlePeerGetRenamed')).toBe(false);
+    expect(defines('server/http-admin.ts', 'handlePeerGet')).toBe(false);
     // ...and a symbol that is CALLED in the file but defined elsewhere is not
     // a definition — the case that would let a deleted-but-still-called symbol
     // pass.
-    expect(defines('server/http-admin.ts', 'listPeers')).toBe(false);
+    expect(defines('server/admin-peers.ts', 'listPeers')).toBe(false);
   });
 
   // THE MUTANT SEAT 1 NAMED, run rather than described. The unanchored version
@@ -180,9 +186,19 @@ describe('docs/FEDERATION.md citations name real symbols', () => {
       .map(line => {
         const path = /`GET (\/[A-Za-z0-9_\-/]+)`/.exec(line);
         const symbol = /`(server\/[A-Za-z0-9_\-/]+\.ts)`\s*`([A-Za-z_][A-Za-z0-9_]*)`/.exec(line);
-        return path === null ? null : { path: path[1]!, symbol: symbol === null ? null : symbol[2]! };
+        // #143: the FILE half of the citation is used, not discarded. It was
+        // hard-coded to `server/http-admin.ts` below, which made this check
+        // silently about one file rather than about the row — and the split
+        // moved every one of these handlers out of it. Reading the cited path
+        // is also the stronger assertion: the row's claim is "this symbol, in
+        // this file", and that is now what is checked.
+        return path === null ? null : {
+          path: path[1]!,
+          file: symbol === null ? null : symbol[1]!,
+          symbol: symbol === null ? null : symbol[2]!,
+        };
       })
-      .filter((r): r is { path: string; symbol: string | null } => r !== null);
+      .filter((r): r is { path: string; file: string | null; symbol: string | null } => r !== null);
 
     // Control on the row parser, same reason as above.
     expect(rows.length).toBeGreaterThanOrEqual(4);
@@ -196,8 +212,8 @@ describe('docs/FEDERATION.md citations name real symbols', () => {
       // exist. A citation is not decoration — it is the step that makes the
       // claim fail to be written.
       if (row.symbol === null) { problems.push(`${row.path}: no citation`); continue; }
-      if (!defines('server/http-admin.ts', row.symbol)) {
-        problems.push(`${row.path}: cites ${row.symbol}, which is not defined`); continue;
+      if (!defines(row.file!, row.symbol)) {
+        problems.push(`${row.path}: cites ${row.file} ${row.symbol}, which is not defined there`); continue;
       }
       const entry = table.find(r => r.method === 'GET' && r.path === row.path);
       if (entry === undefined) { problems.push(`${row.path}: no GET route`); continue; }

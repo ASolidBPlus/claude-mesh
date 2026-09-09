@@ -17,6 +17,7 @@ import { tmpdir } from 'os';
 import { startWsServer } from '../ws-server.ts';
 import { upsertPeer, aclCheck, getPeerByAlias } from '../db.ts';
 import { hashToken } from '../auth.ts';
+import { sourceFiles } from './helpers/source-files.ts';
 
 // F2b — the OUTBOUND border. Tests here cover the parts that do not need a
 // second live server: the drain query and its plan, the stale-window rule, the
@@ -36,16 +37,11 @@ afterEach(() => {
   db.close();
 });
 
-function sourceFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const name of readdirSync(dir)) {
-    if (name === 'node_modules' || name === '__tests__') continue;
-    const full = join(dir, name);
-    if (statSync(full).isDirectory()) out.push(...sourceFiles(full));
-    else if (name.endsWith('.ts')) out.push(full);
-  }
-  return out;
-}
+// #199: the walk moved to `./helpers/source-files.ts` — it was written here
+// and in one-token-helper.test.ts byte-identically, and #143's derived walks
+// needed a third copy. The INDEPENDENT re-implementation further down this file
+// stays: that control exists to catch divergence between two walks, and sharing
+// both halves would make it agree with itself.
 
 // THE edge classifier, used by BOTH #131 guards below (the reader/specifier pin
 // and the threshold walker). One function, so the two cannot disagree about
@@ -481,7 +477,11 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
     expect(readers.sort()).toEqual([
       'client/src/peer-client.ts <- client/src/protocol.ts',       // in-package
       'client/src/protocol.ts <- (defines it)',                    // the one definition
-      'server/http-admin.ts <- server/wire-version.ts',            // cached; must not cross
+      // #143 moved the peer-registration handler out of http-admin.ts, and the
+      // constant went with it. The invariant is unchanged and so is the
+      // specifier: a server-side reader reaches the constant through
+      // wire-version.ts, never across the package boundary.
+      'server/admin-peers.ts <- server/wire-version.ts',           // must not cross
       'server/wire-version.ts <- client/src/protocol.ts',          // THE server-side cross-package edge
       'server/ws-server.ts <- server/wire-version.ts',             // inside the band; must not cross
     ]);

@@ -1,3 +1,14 @@
+../server/admin-agents.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+../server/admin-agents.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#2
+../server/admin-agents.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#3
+../server/admin-files.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+../server/admin-messages.ts:TS2379:Argument of type '{ agent: string | undefined; topic: string | undefined; since: number | undefined; limit: number | undefined; before: { sentAt: number; id: string; } | undefined; kinds: string[] | undefined; }' is not assignable to parameter of type '{ agent?: string; topic?: string; since?: number; limit?: number; before?: { sentAt: number; id: string; }; kinds?: string[]; }' with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' to the types of the target's properties.
+../server/admin-observers.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+../server/admin-observers.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#2
+../server/admin-reminders.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+../server/admin-reminders.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#2
+../server/admin-reminders.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#3
+../server/admin-reminders.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#4
 ../server/cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
 ../server/cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#2
 ../server/cron.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#3
@@ -8,20 +19,6 @@
 ../server/db.ts:TS2345:Argument of type 'unknown[]' is not assignable to parameter of type 'SQLQueryBindings[] | [null] | [string] | [number] | [bigint] | [false] | [true] | [Uint8Array<ArrayBufferLike>] | [Uint8ClampedArray<ArrayBufferLike>] | ... 10 more ... | [...]'.
 ../server/db.ts:TS2345:Argument of type 'unknown[]' is not assignable to parameter of type 'SQLQueryBindings[] | [null] | [string] | [number] | [bigint] | [false] | [true] | [Uint8Array<ArrayBufferLike>] | [Uint8ClampedArray<ArrayBufferLike>] | ... 10 more ... | [...]'.#2
 ../server/duration.ts:TS2538:Type 'undefined' cannot be used as an index type.
-../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
-../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#10
-../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#2
-../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#3
-../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#4
-../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#5
-../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#6
-../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#7
-../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#8
-../server/http-admin.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#9
-../server/http-admin.ts:TS2379:Argument of type '{ agent: string | undefined; topic: string | undefined; since: number | undefined; limit: number | undefined; before: { sentAt: number; id: string; } | undefined; kinds: string[] | undefined; }' is not assignable to parameter of type '{ agent?: string; topic?: string; since?: number; limit?: number; before?: { sentAt: number; id: string; }; kinds?: string[]; }' with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' to the types of the target's properties.
-../server/http-admin.ts:TS6133:'Reminder' is declared but its value is never read.
-../server/http-admin.ts:TS6133:'isObserver' is declared but its value is never read.
-../server/http-admin.ts:TS6133:'net' is declared but its value is never read.
 ../server/metrics.ts:TS2532:Object is possibly 'undefined'.
 ../server/metrics.ts:TS2532:Object is possibly 'undefined'.#2
 ../server/metrics.ts:TS2532:Object is possibly 'undefined'.#3

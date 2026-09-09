@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'bun:test';
-import { readFileSync, readdirSync, statSync } from 'fs';
+import { readFileSync } from 'fs';
 import { join } from 'path';
 import { timingSafeEqual, hashToken } from '../auth.ts';
+import { sourceFiles } from './helpers/source-files.ts';
 
 // #79 — one helper, one behaviour, for every secret comparison.
 //
@@ -13,16 +14,9 @@ import { timingSafeEqual, hashToken } from '../auth.ts';
 
 const SERVER_ROOT = join(import.meta.dir, '..');
 
-function sourceFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const name of readdirSync(dir)) {
-    if (name === 'node_modules' || name === '__tests__') continue;
-    const full = join(dir, name);
-    if (statSync(full).isDirectory()) out.push(...sourceFiles(full));
-    else if (name.endsWith('.ts')) out.push(full);
-  }
-  return out;
-}
+// #199: the walk moved to `./helpers/source-files.ts`, where it was already
+// written byte-identically in border.test.ts and needed by #143's derived
+// walks. One rule, one copy.
 
 /** Source with comments stripped — a rule quoted in prose is not code. */
 function code(path: string): string {
@@ -82,7 +76,11 @@ describe('#79 one token-comparison helper', () => {
       .filter(f => /\btimingSafeEqual\s*\(/.test(code(f)))
       .map(f => f.slice(SERVER_ROOT.length + 1))
       .sort();
-    expect(callers).toEqual(['auth.ts', 'db.ts', 'http-admin.ts', 'mcp-server.ts']);
+    // #143 split http-admin.ts along URL families; `requireAdmin` — the door
+    // that compares the admin token — moved to admin-ctx.ts with the rest of
+    // the shared request context. The SET is what this asserts, so the entry
+    // moves rather than the assertion loosening.
+    expect(callers).toEqual(['admin-ctx.ts', 'auth.ts', 'db.ts', 'mcp-server.ts']);
   });
 
   // Behaviour is unchanged from the loop it replaces — the point was the

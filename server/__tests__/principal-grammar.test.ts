@@ -13,6 +13,7 @@ import { routeRelay, routeSubscribe, resetRelayBuckets } from '../router.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
 import { insertLegacyAgent } from './helpers/legacy-rows.ts';
 import { codeOnly, stripComments, bodyOf, callSites } from './helpers/source-scan.ts';
+import { sourceFiles } from './helpers/source-files.ts';
 import type { WebSocket } from 'ws';
 
 // #187 - THE CHARACTER GRAMMAR FOR PRINCIPALS, the stronger sibling of #184.
@@ -106,9 +107,24 @@ describe('#187 registerAgent is the chokepoint', () => {
   // The premise of the structural test above: no OTHER server file inserts an
   // agent row. A second writer would make the chokepoint decorative.
   it('no other server file writes the agents table', () => {
+    // DERIVED, NOT LISTED (#143). This named six files, and the http-admin
+    // split created ten more — a hand-kept list of "everything except db.ts"
+    // goes stale on exactly the commit that adds the file it should have
+    // caught. The walk reads every server module instead.
     const dir = join(import.meta.dir, '..');
-    const files = ['http-admin.ts', 'ws-server.ts', 'router.ts', 'cli.ts', 'border.ts', 'server.ts'];
-    for (const f of files) {
+    // RECURSIVE (#199 seat 1). `readdirSync` alone reads one level, and this
+    // walk's whole claim is "no OTHER server module writes the table" — a
+    // `server/admin/rogue.ts` was measured passing it. The population control
+    // below cannot see that: 27 flat files stay 27 when a subdirectory appears,
+    // so it proves the walk found SOMETHING, not everything.
+    const others = sourceFiles(dir)
+      .map(f => f.slice(dir.length + 1))
+      .filter(f => f !== 'db.ts')
+      .sort();
+    // Control on the walk: it found the modules, so "none of them writes" is
+    // not an empty loop agreeing with anything.
+    expect(others.length).toBeGreaterThan(10);
+    for (const f of others) {
       expect([f, stripComments(readFileSync(join(dir, f), 'utf8')).includes('INSERT INTO agents')])
         .toEqual([f, false]);
     }
@@ -505,12 +521,26 @@ describe('#187 what predates the rule is reported, never rewritten', () => {
 
 describe('#187 one rule, read by every door', () => {
   it('agentIdRefusal has one definition and every door reads it', () => {
+    // THE DOORS ARE DERIVED (#143): every server module that calls
+    // `registerAgent` is a door, and every door must read the rule. Naming them
+    // was fine while there were two; the http-admin split moved one of them, and
+    // a list would have followed the code only because someone remembered.
     const dir = join(import.meta.dir, '..');
     const dbSrc = readFileSync(join(dir, 'db.ts'), 'utf8');
-    const doors = ['http-admin.ts', 'cli.ts'].map(f => readFileSync(join(dir, f), 'utf8'));
+    const doorNames = sourceFiles(dir)
+      .map(f => f.slice(dir.length + 1))
+      .filter(f => f !== 'db.ts')
+      .filter(f => callSites(readFileSync(join(dir, f), 'utf8'), 'registerAgent') > 0)
+      .sort();
+    // Control: the walk found the doors it is about to check. An empty list
+    // would satisfy the loop below and prove nothing.
+    expect(doorNames.length).toBeGreaterThanOrEqual(2);
+    const doors = doorNames.map(f => readFileSync(join(dir, f), 'utf8'));
 
     expect(callSites(dbSrc, 'agentIdRefusal')).toBe(1);          // registerAgent
-    for (const door of doors) expect(callSites(door, 'agentIdRefusal')).toBe(1);
+    for (const [i, door] of doors.entries()) {
+      expect([doorNames[i], callSites(door, 'agentIdRefusal')]).toEqual([doorNames[i], 1]);
+    }
 
     // The GRAMMAR itself appears ONCE, as a constant. A door that spelled the
     // character class out again is how two copies of one rule drift.

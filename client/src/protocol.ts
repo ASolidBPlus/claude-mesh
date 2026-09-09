@@ -248,7 +248,7 @@ export type InboundFrame =
  *
  *   - `server/ws-server.ts` — what this mesh ACCEPTS on a peer auth frame;
  *   - `client/src/peer-client.ts` — what a peer ANNOUNCES when connecting;
- *   - `server/http-admin.ts` — what REGISTRATION TELLS a new peer to send, in
+ *   - `server/admin-peers.ts` — what REGISTRATION TELLS a new peer to send, in
  *     the 201 body.
  *
  * The third is the consequential one and was the last to be found: bump the
