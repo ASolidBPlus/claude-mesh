@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Wired by: git config core.hooksPath .githooks   (once per clone)
+#
+# Git will not let a repository commit into `.git/hooks`, so the hook lives here
+# and `core.hooksPath` points at it. That one command is the difference between
+# the check being a mechanism and being a reminder — see the header of the script
+# it calls for the incident that made it exist.
+exec "$(git rev-parse --show-toplevel)/.github/scripts/pre-push.sh"
