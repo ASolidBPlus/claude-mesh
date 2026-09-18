@@ -73,6 +73,28 @@ ANY_GO_LINE='^[\s*_\x60>-]*\**Verdict:\**\s*GO\b'
 # all, because grep is line-based — two spellings of one meaning, which is the
 # argument for deriving the second rather than maintaining an agreement.
 NOGO_LINE_JQ="(?m)${NOGO_LINE//\\/\\\\}"
+# THE HEAD ARGUMENT, CHECKED BEFORE ANYTHING ASKS THE API ABOUT IT (#209).
+#
+# `actions/runs?head_sha=…` matches the FULL sha only: an abbreviated one returns
+# an EMPTY SET rather than an error. Measured — `head_sha=f43c980a` gives
+# total_count 0, the full forty gives 1. So a caller who pastes a short sha
+# reaches the empty-set refusal this gate just gained ("NO runs on this head. A
+# head with no runs is not a head that passed") — correct English, wrong
+# conclusion, and indistinguishable at the call site from the real case it was
+# built for.
+#
+# REFUSED BY NAME rather than normalised. Resolving the argument through
+# `repos/$R/commits/$2` would also quietly accept a TAG or a BRANCH, which
+# widens what "head" means in a gate whose entire job is binding a review to one
+# tree. One line, no drift, and it says the thing out loud.
+head_refusal(){ # $1 the head argument -> a reason, or nothing
+  if [ -z "${1:-}" ]; then echo "no head sha given"; return; fi
+  case "$1" in
+    *[!0-9a-f]*) echo "\`$1\` is not a sha: 40 lowercase hex characters, as git and the API print it";;
+    *) [ ${#1} -eq 40 ] || echo "\`$1\` is ${#1} characters, not 40. The runs query matches the FULL sha only and returns an EMPTY SET for an abbreviated one — which this gate would report as \"no runs on this head\", a true sentence about the wrong question";;
+  esac
+}
+
 seat_of(){ # anchored on the first line; seat 2 first
   local first; first=$(head -1 <<<"$1")
   if grep -qE '^\**`?sec-reviewer-2`?\**' <<<"$first"; then echo 2
@@ -336,7 +358,7 @@ if [ "${1:-}" = --selftest ]; then
   # shape directly: every function defined once, one selftest guard, one of each check marker
   # (an append-instead-of-replace edit once doubled the file; the selftest passed on the first
   # third and never saw the rest — build-triage, #151)
-  for fn in join_log run_log chk_parents chk_jobs chk_runs chk_verdict chk_arity is_amend discharge_ok kw_extract seat_of read_merge_ref; do
+  for fn in head_refusal join_log run_log chk_parents chk_jobs chk_runs chk_verdict chk_arity is_amend discharge_ok kw_extract seat_of read_merge_ref; do
     n=$(grep -c "^$fn()" "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: $fn defined $n times"; exit 1; }
   done
   [ "$(grep -c '^if \[ "\${1:-}" = --selftest' "$0")" = 1 ] || { echo "SELFTEST FAIL: more than one selftest block"; exit 1; }
@@ -371,9 +393,9 @@ if [ "${1:-}" = --selftest ]; then
   # COVERAGE, stated so the gaps are chosen rather than discovered. Three
   # mechanisms guard this file, and EVERY predicate is covered by at least one:
   #
-  #   invocation assertions (this list)  join_log, chk_parents, chk_jobs,
-  #                                      chk_runs, chk_verdict, chk_arity,
-  #                                      kw_extract; is_amend and
+  #   invocation assertions (this list)  head_refusal, join_log, chk_parents,
+  #                                      chk_jobs, chk_runs, chk_verdict,
+  #                                      chk_arity, kw_extract; is_amend and
   #                                      discharge_ok by their own greps below,
   #                                      whose call shapes this loop's
   #                                      "name + first argument" pattern cannot
@@ -390,7 +412,7 @@ if [ "${1:-}" = --selftest ]; then
   # Adding a predicate means adding a line here OR a case in the inventory. With
   # neither, deleting its call is silent — which is exactly the mutant this
   # block exists to catch.
-  for call in 'join_log "$(run_log' 'chk_parents "${#parents' 'chk_jobs "$jobs"' 'chk_runs "$runs"' 'chk_verdict "$c"' 'chk_arity "${#VERDICTS' 'kw_extract "$body"'; do
+  for call in 'head_refusal "${HEAD' 'join_log "$(run_log' 'chk_parents "${#parents' 'chk_jobs "$jobs"' 'chk_runs "$runs"' 'chk_verdict "$c"' 'chk_arity "${#VERDICTS' 'kw_extract "$body"'; do
     n=$(grep -cF -- "$call" "$0"); n=$((n-1)) # minus this loop's own literal
     [ "$n" = 1 ] || { echo "SELFTEST FAIL: predicate call '$call' appears $n times in the body (expected 1)"; exit 1; }
   done
@@ -595,6 +617,18 @@ if [ "${1:-}" = --selftest ]; then
   # the blind spot #186 was about, one layer out: the jobs check is CORRECT and
   # its literal-string fixtures could never notice that its input was chosen
   # wrong.
+  # THE HEAD ARGUMENT. The empty-set refusal is now the most likely thing a
+  # caller meets, so the argument that silently produces an empty set is checked
+  # before it can be mistaken for one.
+  [ -z "$(head_refusal "$H")" ] && echo "  ok   a full 40-hex head is accepted" || { echo "  BAD  a full 40-hex head was refused"; fails=$((fails+1)); }
+  [ -n "$(head_refusal "${H:0:7}")" ] && echo "  ok   a SHORT head is refused" || { echo "  BAD  a short head was accepted — the runs query would return an empty set"; fails=$((fails+1)); }
+  [ -n "$(head_refusal "")" ] && echo "  ok   an empty head argument is refused" || { echo "  BAD  an empty head argument was accepted"; fails=$((fails+1)); }
+  [ -n "$(head_refusal "main")" ] && echo "  ok   a branch NAME is refused" || { echo "  BAD  a branch name was accepted as a head"; fails=$((fails+1)); }
+  [ -n "$(head_refusal "$(tr 'a-f' 'A-F' <<<"$H")")" ] && echo "  ok   an UPPERCASE sha is refused (the API prints lowercase; the compares are byte-equal)" || { echo "  BAD  an uppercase sha was accepted"; fails=$((fails+1)); }
+  [ -n "$(head_refusal "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")" ] && echo "  ok   40 NON-hex characters are refused" || { echo "  BAD  a 40-character non-sha was accepted"; fails=$((fails+1)); }
+  expect_why "the short-head refusal names the empty set it prevents" \
+    "$(head_refusal "${H:0:7}")" 'EMPTY SET for an abbreviated one'
+
   expect must-pass "one run, completed+success" "$(chk_runs "111|CI|completed|success")"
   expect must-pass "three runs, all green" "$(chk_runs "$(printf '111|CI|completed|success\n222|Docs|completed|success\n333|Lint|completed|success')")"
   expect must-fail "NO runs on the head" "$(chk_runs "")"
@@ -747,6 +781,13 @@ if [ "${1:-}" = --selftest ]; then
   join_log "$NEG_LOG" 34025812806 c12e6ddd4192b4ebe3762be37d3bb82fd2ce70dc "$(gh api repos/$R/actions/runs/34026343625 --jq .head_sha)"; r2=$?
   if [ $fails = 0 ] && [ $r1 = 0 ] && [ $r2 = 1 ]; then echo "SELFTEST PASS"; exit 0; else echo "SELFTEST FAIL (inventory failures=$fails, positive rc=$r1, negative rc=$r2)"; exit 1; fi
 fi
+
+# EXIT 2, NOT A GATE VERDICT. An unusable argument means every check below is
+# answering the wrong question, and a pile of refusals about a head nobody meant
+# reads like a failing PR. Symmetric with the selftest's "fixtures unavailable"
+# exit: not a gate fault, so not a gate FAIL.
+hr=$(head_refusal "${HEAD:-}")
+if [ -n "$hr" ]; then echo "GATE  UNUSABLE ARGUMENT: $hr"; exit 2; fi
 
 PR=$(gh api "repos/$R/pulls/$N")
 state=$(jq -r .state <<<"$PR"); base=$(jq -r .base.ref <<<"$PR"); basesha=$(jq -r .base.sha <<<"$PR")
