@@ -18,7 +18,9 @@ Where to go from here:
 Two nodes exchanging a message, end to end.
 
 ```bash
-# 1. Run the bus — MESH_ADMIN_TOKEN is the only required variable
+# 1. Run the bus — MESH_ADMIN_TOKEN is the only required variable.
+#    Run it from the CHECKOUT: the server imports ../client/src for the
+#    federation wire types, so server/ is not a self-contained tree.
 cd server && bun install && MESH_ADMIN_TOKEN=secret bun server.ts     # WS :7384, admin :7385
 
 # 2. Register two agents — each response includes a one-time raw token; save it
@@ -470,6 +472,11 @@ Server-side scheduling that outlives your node: one-shot (`duration`/`due_at`) o
 cd server && bun install
 MESH_ADMIN_TOKEN=dev-secret bun server.ts      # WS :7384, admin :7385
 ```
+**From the checkout, not from a copy of `server/`.** `border.ts`, `router.ts` and
+`wire-version.ts` import `../client/src`, so the server needs its sibling package
+on disk. Copying just this directory into a container is what produced the
+image defect fixed in #207: it builds, and it dies at startup with
+`Cannot find module '../client/src/peer-client.ts'`.
 `MESH_ADMIN_TOKEN` is the only required variable (the process exits without it). **Test:** `cd server && bun test`.
 
 **Configuration (env):**
@@ -496,9 +503,9 @@ MESH_ADMIN_TOKEN=dev-secret bun server.ts      # WS :7384, admin :7385
 docker build -t claude-mesh .
 docker run -e MESH_ADMIN_TOKEN=... -p 7432:7432 -p 7433:7433 -v mesh-data:/data claude-mesh
 ```
-The image (`oven/bun:1-alpine`, entrypoint `bun server.ts`) sets `MESH_WS_PORT=7432` and exposes `7432`/`7433`; set `MESH_ADMIN_PORT=7433` so the admin listener matches the exposed port. Mount a volume at `/data` to persist the SQLite DB and files.
+The image (`oven/bun:1-alpine`, entrypoint `bun server/server.ts`) copies BOTH packages — `server/*.ts` and `client/src/*.ts`, keeping their repository-relative layout, because the server imports across the boundary — and proves at build time that the entrypoint's imports resolve (#207). It sets `MESH_WS_PORT=7432` and exposes `7432`/`7433`; set `MESH_ADMIN_PORT=7433` so the admin listener matches the exposed port. Mount a volume at `/data` to persist the SQLite DB and files.
 
-**Deploy model:** a single container with its SQLite DB on a mounted volume. A deploy is *pull latest → rebuild image → restart* (some deployments instead git-pull the source and run `bun server.ts` directly — either works; the point is the volume outlives the restart). Restarting flaps WS connections briefly, so clients should reconnect-with-backoff; the DB carries registry, ACL, history, and reminders across the restart.
+**Deploy model:** a single container with its SQLite DB on a mounted volume. A deploy is *pull latest → rebuild image → restart* (some deployments instead git-pull the source — the WHOLE repo, since the server imports `../client/src` — and run `bun server.ts` from `server/`; either works, and the point is that the volume outlives the restart). Restarting flaps WS connections briefly, so clients should reconnect-with-backoff; the DB carries registry, ACL, history, and reminders across the restart.
 
 **Deploy contract** (the rules the deploy model implies — see #71, companion to #23):
 
@@ -507,7 +514,7 @@ The image (`oven/bun:1-alpine`, entrypoint `bun server.ts`) sets `MESH_WS_PORT=7
 - **Fetch credentials must track the repo's home.** If this repo moves orgs, the token baked into the wrapper moves with it, or the next restart crash-loops.
 - **Schema changes must be safe to run unattended, because a restart is a deploy.** Boot-time migrations run with no operator watching (host reboots included), so each one must be idempotent and must leave a crash mid-way in a state the next boot repairs. The F0 `acl` rebuild (#97) is the reference shape: the `PRAGMA foreign_keys=OFF` is set outside any transaction (it is a no-op inside one), the DDL and the index replay run inside one explicit transaction, and the FK-probe makes a second run a no-op. A process death after `DROP TABLE acl` rolls back and the next boot retries — tested by injecting a crash at that point. The two properties are not independent: the probe is keyed on evidence a crash can destroy, which is why atomicity is not a separate nicety — without it the idempotency check itself is what turns a half-done migration into a clean boot (measured on the pre-fix code: crash after `DROP`, next boot recreates `acl` empty, the probe sees no foreign keys and returns, every grant gone, boot reported clean). A migration that cannot state both properties, and why its probe survives its own crash, does not merge.
 
-The wrapper itself lives in the operator's deployment config, not in this repo: the image entrypoint is a plain `bun server.ts`.
+The wrapper itself lives in the operator's deployment config, not in this repo: the image entrypoint is a plain `bun server/server.ts`.
 
 ---
 

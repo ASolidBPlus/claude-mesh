@@ -30,6 +30,27 @@ floating branch ref silently changes the SDK under you between installs:
 
 Then `bun add github:ASolidBPlus/claude-mesh#<ref>`.
 
+### What this package IS — and what a git install happens to bring with it
+
+**The package is the client.** `files: ["client/src"]` and `main: ./client/src/index.ts`
+say so, and a registry install delivers exactly that.
+
+A GIT install ignores `files` and clones the whole repository, so `server/` lands in
+your `node_modules` too. **That is an artefact of the install method, not a promise of
+the package**, and depending on it is depending on an accident:
+
+- the server's dependencies are declared in `server/package.json`, which is NOT this
+  manifest — a consumer running `node_modules/@claude-mesh/client/server/server.ts`
+  only starts it if they happen to depend on `@modelcontextprotocol/sdk` themselves;
+- the day this is published to a registry, `server/` stops arriving, and the failure
+  lands at boot on a change nobody would associate with it.
+
+**To run the server, use the repo:** the Docker image (which since #207 copies both
+packages and proves at build time that its entrypoint resolves), or a checkout pinned
+to a SHA. If you need the server and the client to be the same revision — the real
+reason to want them together — pin both to one SHA; that property is worth having
+deliberately rather than as a side effect of how npm treats git URLs.
+
 ### npm publish (future hand-off — no credentials in this container)
 
 The package is structured so publishing is a one-liner once creds exist:
