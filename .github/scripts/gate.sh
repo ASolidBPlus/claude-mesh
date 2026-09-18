@@ -73,6 +73,28 @@ ANY_GO_LINE='^[\s*_\x60>-]*\**Verdict:\**\s*GO\b'
 # all, because grep is line-based — two spellings of one meaning, which is the
 # argument for deriving the second rather than maintaining an agreement.
 NOGO_LINE_JQ="(?m)${NOGO_LINE//\\/\\\\}"
+# THE HEAD ARGUMENT, CHECKED BEFORE ANYTHING ASKS THE API ABOUT IT (#209).
+#
+# `actions/runs?head_sha=…` matches the FULL sha only: an abbreviated one returns
+# an EMPTY SET rather than an error. Measured — `head_sha=f43c980a` gives
+# total_count 0, the full forty gives 1. So a caller who pastes a short sha
+# reaches the empty-set refusal this gate just gained ("NO runs on this head. A
+# head with no runs is not a head that passed") — correct English, wrong
+# conclusion, and indistinguishable at the call site from the real case it was
+# built for.
+#
+# REFUSED BY NAME rather than normalised. Resolving the argument through
+# `repos/$R/commits/$2` would also quietly accept a TAG or a BRANCH, which
+# widens what "head" means in a gate whose entire job is binding a review to one
+# tree. One line, no drift, and it says the thing out loud.
+head_refusal(){ # $1 the head argument -> a reason, or nothing
+  if [ -z "${1:-}" ]; then echo "no head sha given"; return; fi
+  case "$1" in
+    *[!0-9a-f]*) echo "\`$1\` is not a sha: 40 lowercase hex characters, as git and the API print it";;
+    *) [ ${#1} -eq 40 ] || echo "\`$1\` is ${#1} characters, not 40. The runs query matches the FULL sha only and returns an EMPTY SET for an abbreviated one — which this gate would report as \"no runs on this head\", a true sentence about the wrong question";;
+  esac
+}
+
 seat_of(){ # anchored on the first line; seat 2 first
   local first; first=$(head -1 <<<"$1")
   if grep -qE '^\**`?sec-reviewer-2`?\**' <<<"$first"; then echo 2
@@ -84,26 +106,48 @@ seat_of(){ # anchored on the first line; seat 2 first
 # ("base (parent 1)"/"head (parent 2)") and actions/checkout's own
 # "HEAD is now at <merge> Merge <head> into <base>". If ours is absent but
 # checkout's is present, the PARSER is broken; both absent = run predates the step.
-join_check(){ # $1 run id, $2 expected base, $3 expected head -> prints, returns 0/1
-  local run=$1 eb=$2 eh=$3 log njobs nb nh nco cob coh
-  # -R "$R" because `gh run view` INFERS THE REPO FROM THE CALLER'S DIRECTORY
-  # otherwise. Every other call in this file goes through `gh api "repos/$R/…"`
-  # and is therefore location-independent; these two were not, so run from
-  # anywhere but a checkout of this repo the gate reported its fixtures as
-  # unreadable — an environment fault that is really an argument fault.
-  log=$(gh run view "$run" -R "$R" --log 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+join_log(){ # $1 log TEXT, $2 run label, $3 expected base, $4 expected head
+  # -> 0 joined and agrees · 1 disagrees or parser fault · 2 NO merge lines at all
+  #
+  # THE FETCH MOVED TO THE CALLER (#209). This used to take a run id and fetch
+  # its own log, which made it undrivable by the selftest with anything but two
+  # pinned real runs — so the cases that matter for a run SET (a workflow that
+  # builds no merge ref, a log with checkout lines and no provenance) could not
+  # be expressed at all. Taking TEXT makes them literals.
+  #
+  # AND IT RETURNS 2 RATHER THAN FAILING when a log carries neither kind of
+  # merge line. With one workflow that was correctly a failure; with several,
+  # a workflow that does not build the merge ref is not a fault, it is simply
+  # not a join. The CALLER decides what an all-skip set means — and it means
+  # failure, which is where that judgement belongs.
+  local log=$1 run=$2 eb=$3 eh=$4 njobs nb nh nco cob coh
   njobs=$(grep -cP '^\S+\t.*\t[0-9T:.Z-]+ base \(parent 1\)  [0-9a-f]{40}' <<<"$log")
   nb=$(grep -cP "^\S+\t.*\t[0-9T:.Z-]+ base \(parent 1\)  $eb\$" <<<"$log")
   nh=$(grep -cP "^\S+\t.*\t[0-9T:.Z-]+ head \(parent 2\)  $eh\$" <<<"$log")
   nco=$(grep -cP 'HEAD is now at [0-9a-f]+ Merge [0-9a-f]{40} into [0-9a-f]{40}' <<<"$log")
   coh=$(grep -cP "HEAD is now at [0-9a-f]+ Merge $eh into [0-9a-f]{40}" <<<"$log")
   cob=$(grep -cP "HEAD is now at [0-9a-f]+ Merge [0-9a-f]{40} into $eb" <<<"$log")
-  if [ "$nco" = 0 ] && [ "$njobs" = 0 ]; then bad "JOIN: run $run has neither checkout nor provenance merge lines (not a pull_request merge-ref run, or predates the step)"; return 1; fi
-  if [ "$njobs" = 0 ] && [ "$nco" != 0 ]; then bad "JOIN: checkout printed a merge ($nco jobs) but our provenance lines are absent — PARSER or ci.yml fault, not a missing signal"; return 1; fi
+  if [ "$nco" = 0 ] && [ "$njobs" = 0 ]; then note "JOIN: run $run carries no merge lines — not a merge-ref build, skipped"; return 2; fi
+  # TWO CAUSES, NAMED, because the log cannot tell them apart and the old message
+  # asserted the one it could not know. Checkout has always printed its merge
+  # line; our provenance step is newer — so on an OLD run this shape means
+  # "predates the step", and on a current one it means the parser or ci.yml
+  # broke. Either way the join cannot be proved and the answer is the same, but
+  # a reader chasing a parser bug that is really an old run loses an hour to a
+  # sentence. Surfaced by running the new set logic against a PR from August
+  # (#74): its only run is a workflow that no longer exists.
+  if [ "$njobs" = 0 ] && [ "$nco" != 0 ]; then bad "JOIN: run $run — checkout printed a merge ($nco jobs) and our provenance lines are absent. Either this run PREDATES the provenance step (an old run: re-run it on the current workflow) or the PARSER/ci.yml broke (a recent run: that is a fault, not a missing signal). The join cannot be proved either way."; return 1; fi
   if [ "$nb" = "$njobs" ] && [ "$nh" = "$njobs" ] && [ "$cob" = "$nco" ] && [ "$coh" = "$nco" ]; then
     ok "JOIN: run $run built exactly (${eb:0:7}, ${eh:0:7}) — provenance $njobs/$njobs and checkout $nco/$nco agree"; return 0; fi
   bad "JOIN: run $run ≠ (${eb:0:7}, ${eh:0:7}) — provenance base $nb/$njobs head $nh/$njobs; checkout base $cob/$nco head $coh/$nco (older merge: re-run and gate again)"; return 1
 }
+
+# Fetch a run's log, with the colour codes stripped. -R "$R" because
+# `gh run view` INFERS THE REPO FROM THE CALLER'S DIRECTORY otherwise — every
+# other call in this file goes through `gh api "repos/$R/…"`, and these did not,
+# so run from anywhere but a checkout of this repo the gate reported its
+# fixtures as unreadable: an environment fault that was really an argument one.
+run_log(){ gh run view "$1" -R "$R" --log 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g'; }
 # ---- pure predicates: every outcome check lives here so --selftest can drive it with
 # ---- known-bad input (an inventory of SOURCE STRINGS cannot tell a deleted check from a
 # ---- passing one; only behaviour can — sec-reviewer, #151 finding 3)
@@ -118,6 +162,43 @@ chk_parents(){ # $1 nparents $2 p1 $3 p2 $4 maintip $5 head $6 mergeable
 chk_jobs(){ # $1 "name:conclusion …" — every job must be success; no jobs is not a pass
   local j; j=$(tr ' ' '\n' <<<"$1" | grep . | cut -d: -f2)
   if [ -n "$j" ] && ! grep -qv '^success$' <<<"$j"; then ok "jobs: $1"; else bad "jobs: ${1:-none}"; fi
+}
+
+# THE HEAD'S RUN SET IS THE UNIT (#209) — there was no selection happening.
+#
+# This used to read `.workflow_runs|sort_by(.created_at)|last` and judge that one
+# run. Every run from one push carries an IDENTICAL created_at, so that sort
+# cannot discriminate: the answer was whatever the API returned last, which makes
+# the gate not merely wrong on a multi-workflow repo but NOT REPRODUCIBLE — a
+# re-run to check it can agree with itself by luck. In the sibling repo, on the
+# same selector, a PR passed its gate 3 of 3 while the workflow testing the very
+# change it makes was still in progress.
+#
+# claude-mesh has one workflow file, so one-of-one was one-of-all and the gate
+# was right BY ACCIDENT — a property of the repository, recorded nowhere.
+#
+# AN EMPTY SET IS A REFUSAL, not a pass, and it is reachable: measured here on
+# 2026-09-09, a push to a branch whose PR had just merged produced
+# `total_count = 0` for that head (the `pull_request` event fires only for an
+# OPEN PR), while main's runs listed fine on the same credential in the same
+# minute. The old code "failed" that case only by empty-variable expansion
+# printing `none/none` — by accident, not by a rule.
+chk_runs(){ # $1 "id|workflow|status|conclusion" lines, one run per line
+  local lines=$1 n bad_ones
+  n=$(grep -c . <<<"${lines:-}")
+  [ -z "${lines:-}" ] && n=0
+  if [ "$n" = 0 ]; then
+    bad "CI: NO runs on this head. A head with no runs is not a head that passed — a push to a closed PR's branch fires no workflow, and a workflow that never started is indistinguishable here from one that never existed."
+    return 1
+  fi
+  bad_ones=$(awk -F'|' '$3 != "completed" || $4 != "success" {print "      " $1 " " $2 " -> " $3 "/" $4}' <<<"$lines")
+  if [ -n "$bad_ones" ]; then
+    bad "CI: $n run(s) on this head, and not all are completed+success:"
+    echo "$bad_ones"
+    return 1
+  fi
+  ok "CI: $n run(s) on this head, all completed+success: $(awk -F'|' '{printf "%s(%s) ", $2, $1}' <<<"$lines")"
+  return 0
 }
 chk_verdict(){ # $1 label $2 body $3 head $4 required seat or ""
   local s; s=$(seat_of "$2")
@@ -277,7 +358,7 @@ if [ "${1:-}" = --selftest ]; then
   # shape directly: every function defined once, one selftest guard, one of each check marker
   # (an append-instead-of-replace edit once doubled the file; the selftest passed on the first
   # third and never saw the rest — build-triage, #151)
-  for fn in join_check chk_parents chk_jobs chk_verdict chk_arity is_amend discharge_ok kw_extract seat_of read_merge_ref; do
+  for fn in head_refusal join_log run_log chk_parents chk_jobs chk_runs chk_verdict chk_arity is_amend discharge_ok kw_extract seat_of read_merge_ref; do
     n=$(grep -c "^$fn()" "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: $fn defined $n times"; exit 1; }
   done
   [ "$(grep -c '^if \[ "\${1:-}" = --selftest' "$0")" = 1 ] || { echo "SELFTEST FAIL: more than one selftest block"; exit 1; }
@@ -312,9 +393,9 @@ if [ "${1:-}" = --selftest ]; then
   # COVERAGE, stated so the gaps are chosen rather than discovered. Three
   # mechanisms guard this file, and EVERY predicate is covered by at least one:
   #
-  #   invocation assertions (this list)  join_check, chk_parents, chk_jobs,
-  #                                      chk_verdict, chk_arity, kw_extract;
-  #                                      is_amend and
+  #   invocation assertions (this list)  head_refusal, join_log, chk_parents,
+  #                                      chk_jobs, chk_runs, chk_verdict,
+  #                                      chk_arity, kw_extract; is_amend and
   #                                      discharge_ok by their own greps below,
   #                                      whose call shapes this loop's
   #                                      "name + first argument" pattern cannot
@@ -331,7 +412,7 @@ if [ "${1:-}" = --selftest ]; then
   # Adding a predicate means adding a line here OR a case in the inventory. With
   # neither, deleting its call is silent — which is exactly the mutant this
   # block exists to catch.
-  for call in 'join_check "${runid' 'chk_parents "${#parents' 'chk_jobs "$jobs"' 'chk_verdict "$c"' 'chk_arity "${#VERDICTS' 'kw_extract "$body"'; do
+  for call in 'head_refusal "${HEAD' 'join_log "$(run_log' 'chk_parents "${#parents' 'chk_jobs "$jobs"' 'chk_runs "$runs"' 'chk_verdict "$c"' 'chk_arity "${#VERDICTS' 'kw_extract "$body"'; do
     n=$(grep -cF -- "$call" "$0"); n=$((n-1)) # minus this loop's own literal
     [ "$n" = 1 ] || { echo "SELFTEST FAIL: predicate call '$call' appears $n times in the body (expected 1)"; exit 1; }
   done
@@ -454,6 +535,20 @@ if [ "${1:-}" = --selftest ]; then
     loose=$(grep -nF -- "$needle" "$0" | grep -vE '^[0-9]+:[A-Z_]+=' | grep -vE '^[0-9]+:[[:space:]]*#' || true)
     [ -z "$loose" ] || { echo "SELFTEST FAIL: the anchor '$needle' is written outside its definition:"; echo "$loose"; exit 1; }
   done
+  # NO RUN SELECTOR SURVIVES IN THE BODY (#209). `chk_runs` is drivable and the
+  # QUERY that feeds it is not — reverting that query to a one-run selector
+  # passes every behavioural case above, measured — so the shape is forbidden by
+  # text, which is the only instrument that reaches a `--jq` string in the body.
+  # The needle is assembled so this block does not contain the literal it
+  # forbids; comment lines are excluded so the paragraph explaining the rule is
+  # not read as a violation of it. Both traps, met before, in this file.
+  selector="sort_by"'(.created_at)'
+  if grep -nF -- "$selector" "$0" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -q .; then
+    echo "SELFTEST FAIL: a run selector ($selector) is back in the body — there is no selection to make, the head's run SET is the unit"
+    grep -nF -- "$selector" "$0" | grep -vE '^[0-9]+:[[:space:]]*#'
+    exit 1
+  fi
+
   # THE SET OF ANCHOR DEFINITIONS IS CLOSED. `M-E` (seat 1): adding a SECOND
   # variable holding the same pattern and pointing a call site at it passed
   # every check above — the definition line is permitted by construction and the
@@ -515,6 +610,48 @@ if [ "${1:-}" = --selftest ]; then
   expect must-pass "all jobs success" "$(chk_jobs "test:success typecheck:success docker:success")"
   expect must-fail "a cancelled job" "$(chk_jobs "test:success typecheck:cancelled docker:success")"
   expect must-fail "no jobs" "$(chk_jobs "")"
+  # ── #209: the run SET, and the join over a log rather than a run id ───────
+  #
+  # THESE CASES COULD NOT EXIST BEFORE. The selection was inline in the body and
+  # the join fetched its own log, so the selftest could drive neither — which is
+  # the blind spot #186 was about, one layer out: the jobs check is CORRECT and
+  # its literal-string fixtures could never notice that its input was chosen
+  # wrong.
+  # THE HEAD ARGUMENT. The empty-set refusal is now the most likely thing a
+  # caller meets, so the argument that silently produces an empty set is checked
+  # before it can be mistaken for one.
+  [ -z "$(head_refusal "$H")" ] && echo "  ok   a full 40-hex head is accepted" || { echo "  BAD  a full 40-hex head was refused"; fails=$((fails+1)); }
+  [ -n "$(head_refusal "${H:0:7}")" ] && echo "  ok   a SHORT head is refused" || { echo "  BAD  a short head was accepted — the runs query would return an empty set"; fails=$((fails+1)); }
+  [ -n "$(head_refusal "")" ] && echo "  ok   an empty head argument is refused" || { echo "  BAD  an empty head argument was accepted"; fails=$((fails+1)); }
+  [ -n "$(head_refusal "main")" ] && echo "  ok   a branch NAME is refused" || { echo "  BAD  a branch name was accepted as a head"; fails=$((fails+1)); }
+  [ -n "$(head_refusal "$(tr 'a-f' 'A-F' <<<"$H")")" ] && echo "  ok   an UPPERCASE sha is refused (the API prints lowercase; the compares are byte-equal)" || { echo "  BAD  an uppercase sha was accepted"; fails=$((fails+1)); }
+  [ -n "$(head_refusal "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")" ] && echo "  ok   40 NON-hex characters are refused" || { echo "  BAD  a 40-character non-sha was accepted"; fails=$((fails+1)); }
+  expect_why "the short-head refusal names the empty set it prevents" \
+    "$(head_refusal "${H:0:7}")" 'EMPTY SET for an abbreviated one'
+
+  expect must-pass "one run, completed+success" "$(chk_runs "111|CI|completed|success")"
+  expect must-pass "three runs, all green" "$(chk_runs "$(printf '111|CI|completed|success\n222|Docs|completed|success\n333|Lint|completed|success')")"
+  expect must-fail "NO runs on the head" "$(chk_runs "")"
+  expect must-fail "one run still in progress" "$(chk_runs "$(printf '111|CI|completed|success\n222|Slow|in_progress|null')")"
+  expect must-fail "one run failed" "$(chk_runs "$(printf '111|CI|completed|success\n222|Docs|completed|failure')")"
+  # THE SIBLING'S LIVE CASE, as a fixture: three runs from one push share an
+  # identical created_at, and one is still going. The old selector could return
+  # any of them, and returned a green one.
+  expect must-fail "three identical-timestamp runs, one in progress" \
+    "$(chk_runs "$(printf '111|CI|completed|success\n222|Money|in_progress|null\n333|Docs|completed|success')")"
+  expect_why "the empty-set refusal says why a head with no runs is not a pass" \
+    "$(chk_runs "")" 'NO runs on this head'
+
+  # join_log's three outcomes, driven with SYNTHETIC logs — the two that matter
+  # for a run set are the ones the real fixtures cannot express.
+  JT=$'\t'
+  GOOD_LOG=$(printf 'test%sstep%s2026-01-01T00:00:00.0Z base (parent 1)  %s\ntest%sstep%s2026-01-01T00:00:00.0Z head (parent 2)  %s\nHEAD is now at abc1234 Merge %s into %s\n' "$JT" "$JT" "$T" "$JT" "$JT" "$H" "$H" "$T")
+  join_log "$GOOD_LOG" synthetic-good "$T" "$H"; [ $? = 0 ] && echo "  ok   a log whose provenance and checkout agree joins" || { echo "  BAD  a good log did not join"; fails=$((fails+1)); }
+  join_log "$GOOD_LOG" synthetic-wrong "$T" "$X"; [ $? = 1 ] && echo "  ok   a log built on another head is refused" || { echo "  BAD  a log built on another head was accepted"; fails=$((fails+1)); }
+  join_log "some unrelated build output" synthetic-none "$T" "$H"; [ $? = 2 ] && echo "  ok   a log with no merge lines is SKIPPED, not failed" || { echo "  BAD  a log with no merge lines was not skipped"; fails=$((fails+1)); }
+  CO_ONLY=$(printf 'HEAD is now at abc1234 Merge %s into %s\n' "$H" "$T")
+  join_log "$CO_ONLY" synthetic-parser "$T" "$H"; [ $? = 1 ] && echo "  ok   checkout without our provenance is a PARSER fault, not a skip" || { echo "  BAD  checkout-without-provenance was not treated as a fault"; fails=$((fails+1)); }
+
   expect must-pass "one verdict supplied" "$(chk_arity 1)"
   expect must-fail "no verdict supplied" "$(chk_arity 0)"
   V1=$(printf '**`sec-reviewer` — verdict**\n**Verdict: GO** binds %s' $H); expect must-pass "seat 1 GO binding the head" "$(chk_verdict t "$V1" $H "")"
@@ -632,11 +769,25 @@ if [ "${1:-}" = --selftest ]; then
     [ "$(gh run view "$f" -R "$R" --log 2>/dev/null | wc -l)" -gt 0 ] || { echo "SELFTEST FIXTURES UNAVAILABLE (run $f has no readable log: expired, or this token cannot read logs) — not a gate fault; re-pin two current runs or use a token with Actions read"; exit 2; }
   done
   echo "positive: run 34026343625 must PASS for (c12e6dd, 6258a5c)"
-  join_check 34026343625 c12e6ddd4192b4ebe3762be37d3bb82fd2ce70dc "$(gh api repos/$R/actions/runs/34026343625 --jq .head_sha)"; r1=$?
+  # The log goes into a variable first, deliberately. The invocation assertion
+  # above pins the body's single join call site by its literal text, and a
+  # fixture written in the same shape counts as another one — so the shape is
+  # spelled around here, and this comment does not contain it either. Third time
+  # today a check counted its own explanation.
+  POS_LOG=$(run_log 34026343625)
+  join_log "$POS_LOG" 34026343625 c12e6ddd4192b4ebe3762be37d3bb82fd2ce70dc "$(gh api repos/$R/actions/runs/34026343625 --jq .head_sha)"; r1=$?
   echo "negative: run 34025812806 (head e2b788b) must FAIL for the same pair"
-  join_check 34025812806 c12e6ddd4192b4ebe3762be37d3bb82fd2ce70dc "$(gh api repos/$R/actions/runs/34026343625 --jq .head_sha)"; r2=$?
+  NEG_LOG=$(run_log 34025812806)
+  join_log "$NEG_LOG" 34025812806 c12e6ddd4192b4ebe3762be37d3bb82fd2ce70dc "$(gh api repos/$R/actions/runs/34026343625 --jq .head_sha)"; r2=$?
   if [ $fails = 0 ] && [ $r1 = 0 ] && [ $r2 = 1 ]; then echo "SELFTEST PASS"; exit 0; else echo "SELFTEST FAIL (inventory failures=$fails, positive rc=$r1, negative rc=$r2)"; exit 1; fi
 fi
+
+# EXIT 2, NOT A GATE VERDICT. An unusable argument means every check below is
+# answering the wrong question, and a pile of refusals about a head nobody meant
+# reads like a failing PR. Symmetric with the selftest's "fixtures unavailable"
+# exit: not a gate fault, so not a gate FAIL.
+hr=$(head_refusal "${HEAD:-}")
+if [ -n "$hr" ]; then echo "GATE  UNUSABLE ARGUMENT: $hr"; exit 2; fi
 
 PR=$(gh api "repos/$R/pulls/$N")
 state=$(jq -r .state <<<"$PR"); base=$(jq -r .base.ref <<<"$PR"); basesha=$(jq -r .base.sha <<<"$PR")
@@ -683,8 +834,20 @@ if [ "$p1" != "$maintip" ]; then
   bad "merge ref stale: parent 1 ${p1:0:7} != main ${maintip:0:7} — push an empty commit on the branch (git commit --allow-empty), then re-gate at the new head"
 fi
 if [ "${REFRESH:-0}" = 1 ]; then
-  for i in $(seq 1 60); do nr=$(gh api "repos/$R/actions/runs?head_sha=$HEAD&event=pull_request" --jq '.workflow_runs|sort_by(.created_at)|last|"\(.id) \(.status)"'); set -- $nr; [ "${2:-}" = completed ] && break; sleep 10; done
-  note "newest run: ${nr:-none}"
+  # WAIT ON THE SET, OR DO NOT WAIT (#209). This waited for the newest run to
+  # reach `completed` and broke — and a wait that returns early is worse than no
+  # wait, because its entire purpose is to license the read below as fresh: it
+  # converts "the gate read too soon" into "the gate waited, therefore this is
+  # settled". An empty set is not "done" either; it is nothing to wait for, and
+  # the check below says so.
+  for i in $(seq 1 60); do
+    pending=$(gh api "repos/$R/actions/runs?head_sha=$HEAD&event=pull_request" \
+      --jq '[.workflow_runs[]|select(.status != "completed")]|length')
+    total=$(gh api "repos/$R/actions/runs?head_sha=$HEAD&event=pull_request" --jq '.workflow_runs|length')
+    [ "${total:-0}" != 0 ] && [ "${pending:-1}" = 0 ] && break
+    sleep 10
+  done
+  note "runs on head: ${total:-0}, still running: ${pending:-unknown}"
 fi
 # 3b REACHABILITY — what merged since this head was reviewed. Two correct PRs composed into an
 # unreachable feature (#147 shipped a field only loop_alive advances; #145, merged hours later,
@@ -719,12 +882,36 @@ fi
 # authoritative for "CI passed on the tree that lands"; this gate stays authoritative for
 # what the queue cannot know (verdict bound to the head, no NO-GO, closing keywords,
 # amendments discharged) and checks 3–5 become informational.
-read -r runid rstatus rconc rcreated < <(gh api "repos/$R/actions/runs?head_sha=$HEAD&event=pull_request" --jq '.workflow_runs|sort_by(.created_at)|last|"\(.id) \(.status) \(.conclusion) \(.created_at)"')
-if [ "${rstatus:-}" = completed ] && [ "${rconc:-}" = success ]; then ok "CI run $runid success ($rcreated)"; else bad "CI run ${runid:-none}: ${rstatus:-none}/${rconc:-none} (cancelled/in_progress = re-run)"; fi
-jobs=$(gh api "repos/$R/actions/runs/${runid:-0}/jobs" --jq '.jobs[]|"\(.name):\(.conclusion)"' 2>/dev/null | tr '\n' ' ')
-chk_jobs "$jobs"
-# 5 the join (function defined above)
-join_check "${runid:-0}" "$p1" "$p2"
+# EVERY run on the head, not one of them. `event=pull_request` stays for the
+# reason above; the change is that the SET is judged rather than a member of it.
+runs=$(gh api "repos/$R/actions/runs?head_sha=$HEAD&event=pull_request" --jq '.workflow_runs[]|"\(.id)|\(.name)|\(.status)|\(.conclusion)"')
+chk_runs "$runs"
+# JOBS, PER RUN. The jobs check is correct and its selftest drives it with
+# literal strings — which is exactly why it could never notice that its INPUT
+# was chosen wrong. It now runs over every run rather than over whichever one
+# the old selector happened to return.
+while IFS='|' read -r rid rname _ _; do
+  [ -z "${rid:-}" ] && continue
+  jobs=$(gh api "repos/$R/actions/runs/$rid/jobs" --jq '.jobs[]|"\(.name):\(.conclusion)"' 2>/dev/null | tr '\n' ' ')
+  chk_jobs "$jobs"
+done <<<"$runs"
+# 5 the join (function defined above), OVER THE SET.
+#
+# The join used to be handed the selected run id, so it inherited a selector
+# that could not select — and a join validating the wrong run's parents fails
+# toward quiet agreement, which is precisely what a join exists to prevent.
+#
+# Every run is offered to it; runs that build no merge ref are skipped (rc 2);
+# AT LEAST ONE must join, with teeth — "no merge lines" reported for every run
+# is indistinguishable from a join that never ran, which is the failure mode of
+# the whole check.
+joined=0
+while IFS='|' read -r rid rname _ _; do
+  [ -z "${rid:-}" ] && continue
+  join_log "$(run_log "$rid")" "$rid ($rname)" "$p1" "$p2"
+  [ $? = 0 ] && joined=$((joined+1))
+done <<<"$runs"
+[ "$joined" -ge 1 ] || bad "JOIN: not one run on this head built the merge ref — nothing joined the review to a tree, and an all-skipped set reads exactly like a join that never ran"
 # 6
 chk_arity "${#VERDICTS[@]}"
 for c in "${VERDICTS[@]}"; do
