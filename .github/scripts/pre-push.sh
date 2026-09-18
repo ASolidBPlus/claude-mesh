@@ -103,8 +103,18 @@ if [ "${1:-}" = --selftest ]; then
   o=$(verdict OPEN "$P" "$Q" no); rc=$?; expect want-refuse "a moved head with a shared 7-char prefix refuses" "$o" $rc
   if grep -q "$P" <<<"$o" && grep -q "$Q" <<<"$o"; then echo "  ok   the refusal prints both heads in full"
   else echo "  BAD  the refusal truncates the heads it asks a reader to compare"; fails=$((fails+1)); fi
-  # ...and the SUCCESS case may truncate: nobody is comparing two SHAs there.
-  o=$(verdict OPEN "$P" "$Q" yes); grep -q "${P:0:7}" <<<"$o" && echo "  ok   the success line is short" || { echo "  BAD  the success line lost its head"; fails=$((fails+1)); }
+  # ...and the SUCCESS case truncates: nobody is comparing two SHAs there.
+  #
+  # BOTH HALVES, because either alone is satisfied by the thing it exists to
+  # rule out (#205, seat 1's surviving mutant on #204). A PREFIX match is
+  # satisfied by the FULL sha — `grep -q "${P:0:7}"` says yes to a line printing
+  # all forty characters — so on its own it could not fail in the direction it
+  # names, and the over-application mutant survived INSIDE the PR written to fix
+  # truncation. "Does not contain the full sha" alone is satisfied by a line
+  # that prints no sha at all.
+  o=$(verdict OPEN "$P" "$Q" yes)
+  if grep -q "${P:0:7}" <<<"$o" && ! grep -q "$P" <<<"$o"; then echo "  ok   the success line is short"
+  else echo "  BAD  the success line is not the short form (missing head, or printing it in full)"; fails=$((fails+1)); fi
   # THE TWO REFUSALS MUST NOT SHARE A REASON STRING, or naming them separately
   # buys nothing.
   m=$(verdict MERGED "$A" "$B" yes); h=$(verdict OPEN "$A" "$B" no)
