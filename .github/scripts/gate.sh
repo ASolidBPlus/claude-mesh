@@ -358,7 +358,12 @@ if [ "${1:-}" = --selftest ]; then
   # shape directly: every function defined once, one selftest guard, one of each check marker
   # (an append-instead-of-replace edit once doubled the file; the selftest passed on the first
   # third and never saw the rest — build-triage, #151)
-  for fn in head_refusal join_log run_log chk_parents chk_jobs chk_runs chk_verdict chk_arity is_amend discharge_ok kw_extract seat_of read_merge_ref; do
+  # DERIVED FROM THE FILE, not listed (#211 follow-up). This was a hand-kept list
+  # of thirteen names, and a fourteenth function could be added without joining
+  # it — which is the same "a list nobody updates" shape the ratchet, the
+  # anchors and the agent-id doors have each been through in this repo.
+  defined=$(grep -oE '^[a-z_]+\(\)' "$0" | tr -d '()' | sort -u)
+  for fn in $defined; do
     n=$(grep -c "^$fn()" "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: $fn defined $n times"; exit 1; }
   done
   [ "$(grep -c '^if \[ "\${1:-}" = --selftest' "$0")" = 1 ] || { echo "SELFTEST FAIL: more than one selftest block"; exit 1; }
@@ -412,9 +417,45 @@ if [ "${1:-}" = --selftest ]; then
   # Adding a predicate means adding a line here OR a case in the inventory. With
   # neither, deleting its call is silent — which is exactly the mutant this
   # block exists to catch.
-  for call in 'head_refusal "${HEAD' 'join_log "$(run_log' 'chk_parents "${#parents' 'chk_jobs "$jobs"' 'chk_runs "$runs"' 'chk_verdict "$c"' 'chk_arity "${#VERDICTS' 'kw_extract "$body"'; do
-    n=$(grep -cF -- "$call" "$0"); n=$((n-1)) # minus this loop's own literal
+  CALLS=(
+    'head_refusal "${HEAD'
+    'join_log "$(run_log'
+    'chk_parents "${#parents'
+    'chk_jobs "$jobs"'
+    'chk_runs "$runs"'
+    'chk_verdict "$c"'
+    'chk_arity "${#VERDICTS'
+    'kw_extract "$body"'
+  )
+  for call in "${CALLS[@]}"; do
+    n=$(grep -cF -- "$call" "$0"); n=$((n-1)) # minus this list's own literal
     [ "$n" = 1 ] || { echo "SELFTEST FAIL: predicate call '$call' appears $n times in the body (expected 1)"; exit 1; }
+  done
+
+  # EVERY DEFINED FUNCTION IS EITHER CALL-CHECKED OR EXEMPTED BY NAME, so a new
+  # predicate cannot exist without a decision about it (#211 follow-up). The
+  # invocation list caught a deleted call and could not catch an ADDED function
+  # that never joined it — and that is not hypothetical: `head_refusal` shipped
+  # outside the list, its body-call mutant survived, and the gap was found by
+  # running that mutant rather than by reading the list. A list that a new
+  # predicate can be absent from is documentation.
+  #
+  # The checked names are DERIVED from CALLS above rather than written again —
+  # one list, two uses — and each exemption carries its reason, because an
+  # exemption without one is how the list becomes optional in practice.
+  checked=$(printf '%s\n' "${CALLS[@]}" | awk '{print $1}' | sort -u)
+  #   run_log         — checked as part of join_log's call shape above
+  #   seat_of         — called from INSIDE other predicates, never from the body
+  #   read_merge_ref  — called at column 0 but takes no argument, so the
+  #                     "name + first argument" pattern cannot express it
+  #   is_amend        — its own grep below (the call shape is an `if`)
+  #   discharge_ok    — its own grep below (multi-line call)
+  exempt="run_log seat_of read_merge_ref is_amend discharge_ok"
+  for fn in $defined; do
+    case " $(tr '\n' ' ' <<<"$checked") $exempt " in
+      *" $fn "*) ;;
+      *) echo "SELFTEST FAIL: '$fn' is defined but is neither call-checked nor exempted — add its call shape to CALLS, or exempt it above WITH A REASON"; exit 1 ;;
+    esac
   done
   n=$(grep -c '^  if is_amend "\$cb"; then' "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: is_amend invocation appears $n times"; exit 1; }
   n=$(grep -c '^      discharge_ok "\$db" "\$s" "\$HEAD"' "$0"); [ "$n" = 1 ] || { echo "SELFTEST FAIL: discharge_ok invocation appears $n times"; exit 1; }
