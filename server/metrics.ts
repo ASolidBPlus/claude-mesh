@@ -475,8 +475,24 @@ export function renderMetrics(db: Database): string {
 // ──────────────────────────────────────────────
 
 export function __resetMetricsForTest(): void {
+  // EVERY COUNTER, and the two that were missing are why this comment exists
+  // (#200). `adminAuth` and `peerRelays` were not cleared, so a test calling
+  // this for isolation got PARTIAL isolation and no sign of it: a walk that
+  // asserted "this fixture drives every declared metric" still passed on
+  // `mesh_admin_auth_total` counted by a different FILE, because the reset that
+  // was supposed to remove the borrowing left that counter alone.
+  //
+  // A partial reset carrying a whole reset's name is worse than no reset: the
+  // caller stops looking. `metrics.test.ts` now asserts totality by rendering
+  // before and after rather than by listing what to clear — a list here and a
+  // list there is the same two-encodings problem one layer down.
+  //
+  // `peerUpSource` is deliberately NOT reset: it is a wiring, not a counter,
+  // and the tests that set it own its teardown.
   msgStatus.clear();
   topicFanout.clear();
+  adminAuth.clear();
+  peerRelays.clear();
   sent.clear();
   received.clear();
   aclDenied.clear();

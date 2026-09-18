@@ -8,7 +8,7 @@ import { routeDirect, routeRelay, MAX_TTL_MS } from '../router.ts';
 import { RELAY_DEDUPE_MS } from '../cleanup.ts';
 import { startBorder, forwarders, borderEvents, Forwarder } from '../border.ts';
 import { validateOutboundPeerUrl } from '../http-admin.ts';
-import { renderMetrics, setPeerUpSource, incPeerRelay, incSent, incReceived, incAclDenied, incError, incTopicFanout, PARTY_FREE_LABELS } from '../metrics.ts';
+import { renderMetrics, setPeerUpSource, incPeerRelay, incSent, incReceived, incAclDenied, incError, incTopicFanout, PARTY_FREE_LABELS, __resetMetricsForTest, incAdminAuth, incBytes, incMsgStatus} from '../metrics.ts';
 import { Database } from 'bun:sqlite';
 import type { WebSocket } from 'ws';
 import { readFileSync, readdirSync, statSync, mkdtempSync } from 'fs';
@@ -251,6 +251,15 @@ describe('F2b: mesh_peer_up (#108) and the peer-label flag', () => {
   // meaningful names, so the labels ARE the disclosure. The exemption that made
   // unauthenticated /metrics acceptable rests on "the admin port is
   // internal-only", a DEPLOYMENT claim the code cannot enforce.
+  // #200 — THE REGISTRY IS RESET BEFORE EACH CASE, because it is module-global
+  // and bun runs the whole suite in ONE process. Without this, what these tests
+  // see is whatever every other FILE happened to count first: the walk below
+  // claimed to drive every declared metric and was borrowing three of them.
+  //
+  // Both tests in this describe drive their own emitters and assert on series
+  // they produce, so the reset makes them more precise rather than narrower —
+  // the identity-leak test now greps a document containing only what it caused.
+  beforeEach(() => { __resetMetricsForTest(); });
   afterEach(() => { delete process.env.MESH_METRICS_IDENTITY_LABELS; setPeerUpSource(() => []); });
 
   it('DEFAULT: no peer alias AND no agent id appears anywhere in the bytes', () => {
@@ -337,6 +346,22 @@ describe('F2b: mesh_peer_up (#108) and the peer-label flag', () => {
     // #136's series. The walk's blind-spot arm reds on a declared-but-unexercised
     // metric, which is how this line came to exist rather than being remembered.
     incTopicFanout('filtered');
+    // #200 — THE THREE THIS FIXTURE WAS BORROWING. With the registry reset, the
+    // walk reported `mesh_admin_auth_total`, `mesh_bytes_total` and
+    // `mesh_messages_total` as unwalked: the first is counted by the #161
+    // admin-audit tests in ANOTHER FILE, the other two by other tests in THIS
+    // one. The comment below has always said "this fixture drives every
+    // declared metric"; until now it drove seven of ten and the process
+    // supplied the rest.
+    //
+    // DRIVEN THROUGH THE EMITTERS, like the six above, and that is what "drives"
+    // means here: the walk inspects LABEL KEYS, and an emitter call produces
+    // exactly the series it inspects. Routing one of the ten through an HTTP
+    // round-trip beside nine direct calls would make the odd one out look like
+    // the correct one.
+    incAdminAuth('success');
+    incBytes('out', 128);
+    incMsgStatus('direct', 'delivered');
 
     const rendered = renderMetrics(db).split('\n');
     const series = rendered.filter(l => l.length > 0 && !l.startsWith('#'));
@@ -372,6 +397,14 @@ describe('F2b: mesh_peer_up (#108) and the peer-label flag', () => {
     // Empty is the goal: this fixture drives every declared metric. If a new
     // metric lands here, EXERCISE it above rather than adding it to this list —
     // an entry here is a label set nobody has ever checked.
+    //
+    // #200: THAT SENTENCE IS TRUE FOR THE FIRST TIME. It was written as a goal
+    // and read as a fact, while three metrics were supplied by neighbours — a
+    // green here meant "somebody in this process counted that", and the file
+    // whose comment claimed to drive them was not the file that did. The
+    // beforeEach reset is what turns the claim into a measurement; without it,
+    // the next metric exercised only by an unrelated file reads as walked and
+    // the sentence is false again by the same route.
     expect(unwalked).toEqual([]);
   });
 

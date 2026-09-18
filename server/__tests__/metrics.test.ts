@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
-import { mkdtempSync } from 'fs';
+import { mkdtempSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import * as net from 'net';
@@ -13,6 +13,7 @@ import { generateToken, hashToken } from '../auth.ts';
 import {
   incMsgStatus, incSent, incReceived, incAclDenied, incError, incBytes,
   incFile, incReminderFired, incExpiredByKind,
+  incPeerRelay, incTopicFanout, incAdminAuth,
   observePayloadBytes,
   renderMetrics, __resetMetricsForTest,
 } from '../metrics.ts';
@@ -517,5 +518,64 @@ describe('metrics file error paths', () => {
     expect(rb.ok).toBe(false);
     out = renderMetrics(dbB);
     expect(lineValue(out, 'mesh_errors_total{error_code="INVALID_BASE64"}')).toBe(1);
+  });
+});
+
+// #200 — THE RESET IS TOTAL, asserted by RENDERING rather than by listing.
+//
+// `__resetMetricsForTest` cleared eight counters and left two alone —
+// `adminAuth` and `peerRelays` — so every caller that used it for isolation got
+// PARTIAL isolation with no sign of it. The cost was not hypothetical: a walk
+// in border.test.ts asserting "this fixture drives every declared metric"
+// passed on a metric counted by a DIFFERENT FILE, because the reset that was
+// supposed to remove the borrowing left that counter untouched.
+//
+// A LIST HERE AND A LIST THERE IS THE SAME TWO-ENCODINGS PROBLEM the reset
+// itself just failed at, so this does not enumerate counters. It drives every
+// emitter, renders, resets, and requires the document to return to what it was
+// — which is the property, and which catches a counter nobody has thought of.
+describe('#200 __resetMetricsForTest clears everything a render can see', () => {
+  it('the document after a reset is byte-identical to the document before counting', () => {
+    const db = openDb(':memory:');
+    __resetMetricsForTest();
+    const before = renderMetrics(db);
+
+    // Every exported emitter, driven once. The list is checked against the
+    // module's own exports below, so a new emitter is a red here rather than a
+    // silent gap.
+    incPeerRelay('some-peer', 'in', 'delivered', 'direct');
+    incTopicFanout('allowed');
+    incAdminAuth('success');
+    incReminderFired();
+    incMsgStatus('direct', 'queued');
+    incSent('a'); incReceived('b'); incAclDenied('c');
+    incError('ACL_DENIED');
+    incBytes('out', 512);
+    incFile();
+    incExpiredByKind('direct', 2);
+    observePayloadBytes(4096);
+
+    // CONTROL: driving them changed the document. Without this, a reset that
+    // cleared nothing and a render that emitted nothing would both "pass".
+    const dirty = renderMetrics(db);
+    expect(dirty).not.toBe(before);
+
+    __resetMetricsForTest();
+    expect(renderMetrics(db)).toBe(before);
+    db.close();
+  });
+
+  it('CONTROL: the emitter list above covers every emitter the module exports', () => {
+    // DERIVED from the source, because the test above is only as total as its
+    // list. `setPeerUpSource` is excluded by name: it installs a source rather
+    // than counting anything, and the reset deliberately leaves it alone.
+    const src = readFileSync(join(import.meta.dir, '../metrics.ts'), 'utf8');
+    const exported = [...src.matchAll(/^export function ((?:inc|observe)[A-Za-z]+)/gm)].map(m => m[1]!);
+    expect(exported.length).toBeGreaterThan(10);
+
+    const thisFile = readFileSync(join(import.meta.dir, 'metrics.test.ts'), 'utf8');
+    const driven = thisFile.slice(thisFile.indexOf('#200 __resetMetricsForTest'));
+    const missing = exported.filter(fn => !new RegExp(`\\b${fn}\\(`).test(driven));
+    expect(missing).toEqual([]);
   });
 });
