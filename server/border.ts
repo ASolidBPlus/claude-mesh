@@ -55,15 +55,31 @@ const BACKOFF_MIN_MS = 1_000;
 const BACKOFF_MAX_MS = 60_000;
 
 /**
- * One outbound peering's forwarder.
+ * What a link failure IS, in one string.
  *
- * PACING IS SENDER-SIDE AND DELIBERATE. The receiver has its own bucket and
- * answers RATE_LIMITED, but arriving at its limit and being refused is worse
- * than not arriving: the refusal costs a round trip, counts against the
- * receiver's bucket (refused relays count, by design), and leaves the row to
- * retry. So we pace to the rate the peering was configured with and treat a
- * RATE_LIMITED as evidence our estimate is too high.
+ * `String(e)` is not enough: the socket delivers an ErrorEvent whose own
+ * stringification is the literal "[object ErrorEvent]" — measured, not assumed
+ * — and a down line that cannot say WHY is the silence this fix exists to end,
+ * moved one indirection along. The cause lives in `.message` (or in a nested
+ * `.error`), and the code, where there is one, is what tells a refused port
+ * apart from an unverifiable certificate.
+ *
+ * C7: the message can embed the peering's URL, which `publicOutboundFields`
+ * already returns from the read API. `outbound_peers.token` is a different
+ * column and never reaches this function.
  */
+function describeErr(e: unknown): string {
+  if (typeof e === 'string') return e;
+  const o = e as { message?: unknown; error?: unknown; code?: unknown };
+  const nested = o?.error as { code?: unknown } | undefined;
+  const code = typeof o?.code === 'string' ? o.code
+    : typeof nested?.code === 'string' ? nested.code : undefined;
+  const msg = typeof o?.message === 'string' && o.message !== '' ? o.message
+    : o?.error !== undefined ? String(o.error)
+    : String(e);
+  return code === undefined ? msg : `${code}: ${msg}`;
+}
+
 /**
  * STATE AN UNTRUSTED INPUT CAN DEGRADE, and what restores it.
  *
@@ -103,6 +119,16 @@ const BACKOFF_MAX_MS = 60_000;
  *                  AGENT_NOT_FOUND, because the edges are missing.
  *   cap            readonly, derived at construction.
  */
+/**
+ * One outbound peering's forwarder.
+ *
+ * PACING IS SENDER-SIDE AND DELIBERATE. The receiver has its own bucket and
+ * answers RATE_LIMITED, but arriving at its limit and being refused is worse
+ * than not arriving: the refusal costs a round trip, counts against the
+ * receiver's bucket (refused relays count, by design), and leaves the row to
+ * retry. So we pace to the rate the peering was configured with and treat a
+ * RATE_LIMITED as evidence our estimate is too high.
+ */
 export class Forwarder {
   private client: PeerClient | null = null;
   private inFlight = new Set<string>();
@@ -113,6 +139,8 @@ export class Forwarder {
   private backoffTimer: ReturnType<typeof setTimeout> | null = null;
   private tick: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
+  /** null = no outcome observed yet, so the first one is always a transition. */
+  private linkUp: boolean | null = null;
   private readonly cap: number;
 
   constructor(
@@ -126,8 +154,15 @@ export class Forwarder {
   }
 
   get alias(): string { return this.row.alias; }
-  /** For #108's gauge: 0 or 1, never absent. */
-  get connected(): boolean { return this.client !== null; }
+  /**
+   * For #108's gauge: 0 or 1, never absent — and it is the LINK, not the
+   * object. `this.client !== null` is true from the moment start() constructs
+   * the SDK, so a peering whose socket has never once opened (wrong CA, wrong
+   * port, far side down) read 1 for as long as it retried. That made the
+   * alert #108 exists for — "this peering went to 0" — unreachable for the
+   * failure it most needs to catch.
+   */
+  get connected(): boolean { return this.linkUp === true; }
 
   start(): void {
     if (this.stopped) return;
@@ -138,8 +173,23 @@ export class Forwarder {
       agentId: this.row.assigned_alias,
       agentToken: this.row.token,
     });
-    this.client.on('error', (e: unknown) => this.onFatal(e as { code?: string }));
-    this.client.connect().then(() => this.drain()).catch(() => this.scheduleRetry());
+    this.client.on('connect', () => this.noteLink(true));
+    this.client.on('error', (e: unknown) => {
+      // ORDER IS LOAD-BEARING. onFatal stops the forwarder on a fatal code, and
+      // a stopped forwarder logs no link line — so a revocation produces its
+      // own line and not a second one calling it a link failure. Reversed,
+      // every revocation would report twice, the first time wrongly.
+      this.onFatal(e as { code?: string });
+      this.noteLink(false, e);
+    });
+    this.client.on('disconnect', () => this.noteLink(false, 'connection closed'));
+    // The SDK rejects this promise ONLY on a fatal error frame (a transport
+    // failure leaves it pending forever while the SDK reconnects underneath),
+    // so this catch is not the connect-failure path — the handlers above are.
+    this.client.connect().then(() => this.drain()).catch((err) => {
+      this.noteLink(false, err);
+      this.scheduleRetry();
+    });
     this.tick = setInterval(() => this.drain(), BACKSTOP_MS);
   }
 
@@ -149,6 +199,35 @@ export class Forwarder {
     if (this.backoffTimer !== null) { clearTimeout(this.backoffTimer); this.backoffTimer = null; }
     try { this.client?.close(); } catch { /* ignore */ }
     this.client = null;
+    // A stopped forwarder is not an up peering. This matters for the one that
+    // stops itself: after revocation the object stays in `forwarders` until an
+    // operator PATCHes the row, and without this the #108 gauge would keep
+    // reporting 1 for a peering the far side has refused.
+    this.linkUp = false;
+  }
+
+  /**
+   * Log link state CHANGES, never events. The SDK reconnects forever on its
+   * own (floor 30s + jitter), and one failed attempt emits both 'error' and
+   * 'disconnect', so a line per event is ~5.7k lines/day per broken peering
+   * and a line per transition is one. The reason travels with the DOWN edge,
+   * where it is known.
+   *
+   * C7: `why` is the SDK's error or a fixed string, and `alias` is public.
+   * The row — and with it the token — never reaches this line.
+   */
+  private noteLink(up: boolean, why?: unknown): void {
+    // stop() closes the socket, which fires 'disconnect'. A deliberate stop is
+    // not a link failure, and revocation has already logged its own line.
+    if (this.stopped || this.linkUp === up) return;
+    this.linkUp = up;
+    if (up) {
+      console.log(JSON.stringify({ evt: 'border.link_up', alias: this.row.alias, at: Date.now() }));
+    } else {
+      console.error(JSON.stringify({
+        evt: 'border.link_down', alias: this.row.alias, error: describeErr(why), at: Date.now(),
+      }));
+    }
   }
 
   private scheduleRetry(): void {
