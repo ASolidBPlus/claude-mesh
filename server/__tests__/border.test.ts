@@ -691,6 +691,74 @@ describe('F2b: the protocol version has exactly ONE definition', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// Link state: what the border says when a peering goes down, and what the
+// #108 gauge reads while it is down.
+//
+// Both halves of one defect. An outbound peering pointed at a host it cannot
+// reach (wrong port, wrong CA, far side down) logged NOTHING after
+// `outbound_peering.created` and read UP for as long as it retried — the SDK
+// reconnects forever underneath, and `connected` was `client !== null`, true
+// from the moment start() constructed the client. The bus looked healthy and
+// carried nothing.
+// ════════════════════════════════════════════════════════════════════════════
+
+function captureConsole(): { lines: string[]; restore: () => void } {
+  const lines: string[] = [];
+  const origErr = console.error;
+  const origLog = console.log;
+  const cap = (...a: unknown[]): void => { lines.push(a.map(String).join(' ')); };
+  console.error = cap as typeof console.error;
+  console.log = cap as typeof console.log;
+  return { lines, restore: () => { console.error = origErr; console.log = origLog; } };
+}
+
+/** The captured lines that are THIS event, parsed. Anything else is noise. */
+function eventsNamed(lines: string[], evt: string): Record<string, unknown>[] {
+  return lines.flatMap(l => {
+    try {
+      const o = JSON.parse(l) as Record<string, unknown>;
+      return o?.evt === evt ? [o] : [];
+    } catch { return []; }
+  });
+}
+
+describe('border: link state is logged on TRANSITIONS, and the gauge follows it', () => {
+  it('an unreachable peering says so ONCE, names the cause, and reads DOWN', async () => {
+    insertOutboundPeer(db, {
+      alias: 'deadpeer', url: 'ws://127.0.0.1:9', token: 'SUPER-SECRET-TOKEN',
+      assigned_alias: 'us', kinds: '["direct"]', rate_per_min: 600, created_at: Date.now(),
+    });
+
+    const cap = captureConsole();
+    let border: ReturnType<typeof startBorder> | undefined;
+    try {
+      border = startBorder(db, new Map<string, WebSocket>());
+      await new Promise(r => setTimeout(r, 1200));
+    } finally { cap.restore(); }
+
+    const down = eventsNamed(cap.lines, 'border.link_down');
+    // ONE line, and this window is long enough to prove it is a collapse
+    // rather than a single event: a failed attempt emits BOTH 'error' and
+    // 'disconnect', and the SDK retries at 500ms — measured at 2 errors + 2
+    // disconnects in 1200ms. A line per event would be ~5.7k/day per broken
+    // peering once the backoff reaches its 30s floor.
+    expect(down.length).toBe(1);
+    expect(down[0]!.alias).toBe('deadpeer');
+    // It must name the CAUSE. `String()` on what the socket delivers is the
+    // literal "[object ErrorEvent]" — a line that says a peering is down and
+    // cannot say why is the same silence one indirection along.
+    expect(String(down[0]!.error)).not.toContain('[object');
+    expect(String(down[0]!.error)).toContain('127.0.0.1:9');
+    // C7: this forwarder is holding the token. The log is not.
+    expect(cap.lines.join('\n')).not.toContain('SUPER-SECRET-TOKEN');
+    // #108's gauge, whose stated purpose is the alert "this peering went to
+    // 0". Read BEFORE stopAll, which would make 0 true for a different reason.
+    expect(forwarders.get('deadpeer')!.connected).toBe(false);
+    border?.stopAll();
+  }, 20_000);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // Two real servers in one process. A stub PeerClient would prove the
 // forwarder's bookkeeping and nothing about the wire; these drive B's actual
 // WS server, so the relay is refused or accepted by the code that ships.
@@ -825,6 +893,45 @@ describe('F2b: end to end over two servers', () => {
     expect(getOutboundPeer(db, 'far')?.enabled).toBe(0);
     expect(countPendingMessages(db)).toBe(0);      // rows expired by endOutboundPeering
     expect(aclCheck(db, 'sender', 'far:bob')).toBe(false);   // outbound edges gone
+  }, 20_000);
+
+  it('a peering that comes up says so ONCE and reads UP', async () => {
+    outboundToB();
+    const cap = captureConsole();
+    try {
+      border = startBorder(db, new Map<string, WebSocket>());
+      await wait(900);
+    } finally { cap.restore(); }
+
+    const up = eventsNamed(cap.lines, 'border.link_up');
+    expect(up.length).toBe(1);
+    expect(up[0]!.alias).toBe('far');
+    expect(forwarders.get('far')!.connected).toBe(true);
+    // A healthy link reports nothing else. Without the transition guard the
+    // reconnects would make this a log of attempts.
+    expect(eventsNamed(cap.lines, 'border.link_down').length).toBe(0);
+  }, 20_000);
+
+  it('a REVOKED peering logs the revocation and NOT a link failure — one event, one line', async () => {
+    insertOutboundPeer(db, {
+      alias: 'far', url: `ws://127.0.0.1:${bPort}`, token: 'WRONG-TOKEN',
+      assigned_alias: 'ourmesh', kinds: '["direct"]', rate_per_min: 600, created_at: Date.now(),
+    });
+    const cap = captureConsole();
+    try {
+      border = startBorder(db, new Map<string, WebSocket>());
+      await wait(900);
+    } finally { cap.restore(); }
+
+    // AUTH_FAILED is fatal: onFatal logs it, disables the peering and stops the
+    // forwarder — and the stop closes the socket, which fires 'disconnect'.
+    // A link_down here would be a second line about a failure already named,
+    // and it would say "connection closed" where the truth is "revoked".
+    expect(eventsNamed(cap.lines, 'outbound_peering.revoked_by_receiver').length).toBe(1);
+    expect(eventsNamed(cap.lines, 'border.link_down').length).toBe(0);
+    expect(getOutboundPeer(db, 'far')?.enabled).toBe(0);
+    // And a peering the far side refuses does not read UP.
+    expect(forwarders.get('far')!.connected).toBe(false);
   }, 20_000);
 });
 
