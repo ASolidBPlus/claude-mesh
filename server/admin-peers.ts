@@ -40,7 +40,10 @@ import {
   PEER_PROTOCOL_VERSION,
 } from './wire-version.ts';
 import type { AdminCtx } from './admin-ctx.ts';
-import { readBody } from './admin-ctx.ts';
+import { readBody, readBodyCapped } from './admin-ctx.ts';
+
+/** A registration body is a key and two small fields; this is generous. */
+export const PEER_REGISTER_MAX_BYTES = 8 * 1024;
 
 export function publicPeerKeyFields(db: Database, key: PeerKey) {
   const peer = getPeerByAlias(db, key.alias);
@@ -317,7 +320,19 @@ export async function handlePeerRegister(ctx: AdminCtx): Promise<void> {
   // auth:'handler' — the dispatcher checked NOTHING. This handler is the only
   // authentication on this route, and ctx.auth is 'unauthenticated' by
   // construction so nothing it was handed can act as a grant.
-  const raw = await readBody(req);
+  // BOUNDED. This route is served on the WS listener too — the one port that
+  // must face the network — and until then nothing limited it on either door:
+  // readBody buffered whatever arrived. A registration body is a key and two
+  // small fields, so the ceiling cannot refuse a real caller; it refuses a body
+  // sent to make the bus hold it. Same uniform 403 as every other refusal
+  // (C9), and the connection is closed rather than left to drain the rest.
+  const raw = await readBodyCapped(req, PEER_REGISTER_MAX_BYTES);
+  if (raw === null) {
+    res.setHeader('Connection', 'close');
+    res.on('finish', () => req.socket.destroy());
+    refusePeerRegistration(res, 'body_too_large', null);
+    return;
+  }
   let body: Record<string, unknown>;
   try { body = JSON.parse(raw); } catch {
     refusePeerRegistration(res, 'invalid_json', null); return;

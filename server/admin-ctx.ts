@@ -20,6 +20,26 @@ import {
   incAdminAuth,
 } from './metrics.ts';
 
+/**
+ * readBody with a ceiling: null once the body exceeds `max` bytes, without
+ * buffering the rest. For a route a caller reaches before it is trusted, where
+ * an unbounded read is a way to make the bus hold whatever it is sent.
+ */
+export function readBodyCapped(req: http.IncomingMessage, max: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    let body = '';
+    let size = 0;
+    let done = false;
+    req.on('data', (chunk: Buffer | string) => {
+      if (done) return;
+      size += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
+      if (size > max) { done = true; resolve(null); return; }
+      body += chunk;
+    });
+    req.on('end', () => { if (!done) { done = true; resolve(body); } });
+  });
+}
+
 export function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve) => {
     let body = '';

@@ -16,6 +16,7 @@ import {
 } from './router.ts';
 import { incMsgStatus, incReceived, incBytes } from './metrics.ts';
 import type { ServerTls } from './tls-config.ts';
+import { PEER_REGISTER_ROUTE, serveRoute } from './http-admin.ts';
 
 /** F1a (§5.1): the only inbound peer protocol this mesh speaks. A version is a
  *  property of a LIVE CONNECTION, never of a stored row (D7) — which is why it
@@ -989,6 +990,30 @@ export function startWsServer(
         res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
         res.end(body);
         return;
+      }
+      // PEER REGISTRATION — the one admin route that also faces peers. A
+      // peer's operator posts a one-time key, which is neither the admin
+      // token nor an agent token; on the admin port alone, a cross-host
+      // registration forced that port onto the network, where /metrics is
+      // unauthenticated and every other route is one token away. Here it
+      // rides the port peers must reach anyway, and inherits its TLS.
+      //
+      // ONE ROUTE, TWO DOORS: the same route object and the same wrapper
+      // (serveRoute: crash guard + mutation record) as the admin listener, so
+      // there is no second rule to drift. Served only while the route is
+      // handler-authenticated: if it were ever changed to need the admin
+      // token, this door closes rather than serving it without one. Nothing
+      // else from the admin table is reachable here.
+      if (PEER_REGISTER_ROUTE.auth === 'handler' && req.method === PEER_REGISTER_ROUTE.method) {
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        const params = PEER_REGISTER_ROUTE.match(url.pathname);
+        if (params !== null) {
+          void serveRoute(PEER_REGISTER_ROUTE, {
+            req, res, db, url, params, agentIndex, observerIndex, peerIndex,
+            forwarders: {}, maxFileBytes, filesDir, auth: { mode: 'unauthenticated' },
+          }, 'ws');
+          return;
+        }
       }
       // Everything else keeps the previous shape as closely as anything can:
       // a plain 404 rather than a hang. An unroutable request now gets an
