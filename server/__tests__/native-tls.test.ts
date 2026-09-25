@@ -111,12 +111,17 @@ describe('loadTls: PATH or PEM CONTENT', () => {
     }
   });
 
-  it('an unreadable path is refused, naming the PATH', () => {
-    const r = loadTls({ MESH_TLS_CERT: f('bus.pem'), MESH_TLS_KEY: f('no-such.key') });
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.error).toContain('MESH_TLS_KEY');
-      expect(r.error).toContain(f('no-such.key'));
+  it('an unreadable CERT path is refused naming the path; an unreadable KEY value is NEVER shown', () => {
+    const cert = loadTls({ MESH_TLS_CERT: f('no-such.pem'), MESH_TLS_KEY: f('bus.key') });
+    expect(cert.ok).toBe(false);
+    if (!cert.ok) expect(cert.error).toContain(f('no-such.pem'));
+
+    const key = loadTls({ MESH_TLS_CERT: f('bus.pem'), MESH_TLS_KEY: f('no-such.key') });
+    expect(key.ok).toBe(false);
+    if (!key.ok) {
+      expect(key.error).toStartWith('MESH_TLS_KEY: cannot read the key — value not shown (ENOENT)');
+      // Not even a path: this branch cannot tell a path from mangled content.
+      expect(key.error).not.toContain('no-such.key');
     }
   });
 
@@ -150,6 +155,45 @@ describe('loadTls: an invalid or MISMATCHED pair refuses at boot — and never e
       expect(r.error).toStartWith('MESH_TLS_KEY is unreadable');
       for (const l of pemBody(broken)) expect(r.error).not.toContain(l);
     }
+  });
+
+  it('KEY CONTENT WITH A LEADING PREFIX never reaches the error, whether it parses or not', () => {
+    // The hole this closes: content that does not START with -----BEGIN was
+    // routed to the path branch, whose refusal echoed the value — the whole
+    // private key, into the boot error, exactly when something went wrong. A
+    // well-formed value never errors, which is why a check on the happy path
+    // could not see it. Every realistic prefix, plus one nothing strips.
+    const key = pem('bus.key');
+    const body = pemBody(key);
+    expect(body.length).toBeGreaterThan(0);   // the needle exists
+    const variants: [string, string][] = [
+      ['leading newline (YAML block scalar)', '\n' + key],
+      ['leading space', ' ' + key],
+      ['BOM', '\uFEFF' + key],
+      ['leading escaped \\n', '\\n' + key.replace(/\n/g, '\\n')],
+      ['a prefix nothing strips', 'x' + key],
+    ];
+    const outcomes: Record<string, string> = {};
+    for (const [name, value] of variants) {
+      const r = loadTls({ MESH_TLS_CERT: f('bus.pem'), MESH_TLS_KEY: value });
+      outcomes[name] = r.ok ? 'parsed' : 'refused';
+      // EVERY case, parsed or refused: nothing of the key in what comes back.
+      const said = JSON.stringify(r.ok ? { ...r, server: r.server && { ...r.server, key: '<held>', cert: '<held>' } } : r);
+      for (const line of body) {
+        for (let i = 0; i + 24 <= line.length; i += 8) {
+          expect({ name, leaked: said.includes(line.slice(i, i + 24)) }).toEqual({ name, leaked: false });
+        }
+      }
+    }
+    // The strippable prefixes are CONTENT and load; the one that isn't is
+    // refused — without being shown.
+    expect(outcomes).toEqual({
+      'leading newline (YAML block scalar)': 'parsed',
+      'leading space': 'parsed',
+      'BOM': 'parsed',
+      'leading escaped \\n': 'parsed',
+      'a prefix nothing strips': 'refused',
+    });
   });
 
   it('an invalid certificate', () => {

@@ -44,14 +44,32 @@ const PEM_START = '-----BEGIN';
 
 /** Content or path → PEM text. `what` is the env var name, for messages. */
 function readPemSetting(what: string, value: string, secret: boolean): { ok: true; pem: string } | { ok: false; error: string } {
-  if (value.startsWith(PEM_START)) return { ok: true, pem: value.replace(/\\n/g, '\n') };
+  // Leading noise is stripped BEFORE deciding content-or-path: a YAML block
+  // scalar's newline, a stray space, an escaped `\n`, a BOM. Left in, it
+  // misroutes content to the path branch, where the refusal below would have
+  // echoed it.
+  const lead = value.replace(/^(?:\uFEFF|\s|\\n)+/, '');
+  if (lead.startsWith(PEM_START)) return { ok: true, pem: lead.replace(/\\n/g, '\n') };
   try {
     return { ok: true, pem: readFileSync(value, 'utf8') };
   } catch (err) {
     const code = (err as { code?: string }).code ?? 'unreadable';
-    // A path is not the secret; its CONTENT is. Naming the path is what makes
-    // the refusal actionable.
-    return { ok: false, error: `${what}: cannot read ${secret ? 'key' : 'file'} at path ${JSON.stringify(value)} (${code})` };
+    if (secret) {
+      // NEVER the value, not even "as a path". This branch cannot know that
+      // the "path" it failed to open is not the key itself, mangled by some
+      // prefix nobody anticipated — and echoing it would put the private key
+      // into the boot error and the container log exactly when something went
+      // wrong. Guessing "does this look like a path" would be a second opinion
+      // about the same unknown; the only safe answer is to say nothing about
+      // the value.
+      return {
+        ok: false,
+        error: `${what}: cannot read the key — value not shown (${code}). If you supplied PEM content, it must begin with ${PEM_START}; if you supplied a path, check it exists and is readable.`,
+      };
+    }
+    // The certificate and CA are public, so naming the path is safe, and it is
+    // what makes the refusal actionable.
+    return { ok: false, error: `${what}: cannot read file at path ${JSON.stringify(value)} (${code})` };
   }
 }
 
