@@ -4,7 +4,7 @@ import { WebSocket } from 'ws';
 import { renderMetrics } from './metrics.ts';
 import { handleAclDelete, handleAclGet, handleAclPost } from './admin-acl.ts';
 import { handleAgentById, handleAgentDelete, handleAgentGet, handleAgentPatch, handleAgentPost } from './admin-agents.ts';
-import type { ForwarderRegistry, Route } from './admin-ctx.ts';
+import type { AdminCtx, ForwarderRegistry, Route } from './admin-ctx.ts';
 import { exact, idMatch, requestSource, resolveRouteAuth } from './admin-ctx.ts';
 import { handleFileById, handleFilePost } from './admin-files.ts';
 import { handleMessagesGet } from './admin-messages.ts';
@@ -89,6 +89,68 @@ export const ROUTES: Route[] = [
   { method: 'DELETE', match: idMatch(/^\/reminders\/([^/]+)$/),      handler: handleReminderDelete },
 ];
 
+/**
+ * Run one matched route: the handler, the crash guard, and the #161 mutation
+ * record. Extracted so the WS listener's door for /peers/register runs the
+ * SAME wrapper as this one — the handler alone is not the behaviour; the guard
+ * that keeps a throw from killing the process and the audit line are part of
+ * it, and a second door without them would be a second, weaker rule.
+ */
+export async function serveRoute(route: Route, ctx: AdminCtx, listener: 'admin' | 'ws'): Promise<void> {
+  const { req, res } = ctx;
+  // A handler throw here used to become an unhandled rejection (async
+  // createServer callback, no catch) and KILL THE PROCESS — the header
+  // incident was one instance; any future handler bug is another. One
+  // request fails loudly instead of the whole mesh dying quietly: log,
+  // 500 if the head isn't out yet, sever the socket if it is.
+  try {
+    await route.handler(ctx);
+    // #161 — EVERY privileged mutation leaves a record, DERIVED rather
+    // than enumerated. 23 of 28 routes emitted nothing, and the fix for
+    // that cannot be a hand-maintained list of mutators: the next route
+    // added is exactly the one whose entry nobody remembers. This asks
+    // the route table instead — a non-GET that succeeded changed
+    // something — so a route added tomorrow is covered by existing code.
+    //
+    // The detail events (peer_key.minted, acl.granted, …) stay: this one
+    // says THAT a mutation happened and names the object in the path;
+    // those say WHAT changed, from inside the handler where the object is
+    // known. Neither reads the request body, which is where credentials
+    // arrive.
+    if (req.method !== 'GET' && res.statusCode >= 200 && res.statusCode < 300) {
+      console.log(JSON.stringify({
+        evt: 'admin.mutation',
+        method: req.method, path: ctx.url.pathname, status: res.statusCode,
+        // Path parameters only — object ids by construction. No query
+        // string and no body.
+        params: ctx.params,
+        actor: ctx.auth.mode,       // 'admin' | 'agent' | 'unauthenticated'
+        ...requestSource(req),
+        // Which door: registration is served on the WS listener too.
+        listener,
+        at: Date.now(),
+      }));
+    }
+  } catch (err) {
+    console.error(`[http-admin] handler crashed: ${req.method} ${ctx.url.pathname}:`, err);
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'internal error' }));
+    } else {
+      res.destroy();
+    }
+  }
+}
+
+/**
+ * The one admin route that also faces peers, as the SAME object the table
+ * holds: a peer presents a key that is neither the admin token nor an agent
+ * token, so it must be reachable from the port peers can reach (the WS
+ * listener) and not only from the admin port. Looked up rather than
+ * re-declared, so there is one route and two doors.
+ */
+export const PEER_REGISTER_ROUTE: Route = ROUTES.find(r => r.handler === handlePeerRegister)!;
+
 export function startHttpAdmin(
   port: number,
   db: Database,
@@ -143,46 +205,7 @@ export function startHttpAdmin(
       if (auth === null) return; // 401 already written
 
       if (matched) {
-        // A handler throw here used to become an unhandled rejection (async
-        // createServer callback, no catch) and KILL THE PROCESS — the header
-        // incident was one instance; any future handler bug is another. One
-        // request fails loudly instead of the whole mesh dying quietly: log,
-        // 500 if the head isn't out yet, sever the socket if it is.
-        try {
-          await matched.handler({ req, res, db, url, params, agentIndex, observerIndex, peerIndex, forwarders, maxFileBytes, filesDir, auth });
-          // #161 — EVERY privileged mutation leaves a record, DERIVED rather
-          // than enumerated. 23 of 28 routes emitted nothing, and the fix for
-          // that cannot be a hand-maintained list of mutators: the next route
-          // added is exactly the one whose entry nobody remembers. This asks
-          // the route table instead — a non-GET that succeeded changed
-          // something — so a route added tomorrow is covered by existing code.
-          //
-          // The detail events (peer_key.minted, acl.granted, …) stay: this one
-          // says THAT a mutation happened and names the object in the path;
-          // those say WHAT changed, from inside the handler where the object is
-          // known. Neither reads the request body, which is where credentials
-          // arrive.
-          if (method !== 'GET' && res.statusCode >= 200 && res.statusCode < 300) {
-            console.log(JSON.stringify({
-              evt: 'admin.mutation',
-              method, path: pathname, status: res.statusCode,
-              // Path parameters only — object ids by construction. No query
-              // string and no body.
-              params,
-              actor: auth.mode,       // 'admin' | 'agent' | 'unauthenticated'
-              ...requestSource(req),
-              at: Date.now(),
-            }));
-          }
-        } catch (err) {
-          console.error(`[http-admin] handler crashed: ${method} ${pathname}:`, err);
-          if (!res.headersSent) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'internal error' }));
-          } else {
-            res.destroy();
-          }
-        }
+        await serveRoute(matched, { req, res, db, url, params, agentIndex, observerIndex, peerIndex, forwarders, maxFileBytes, filesDir, auth }, 'admin');
         return;
       }
 

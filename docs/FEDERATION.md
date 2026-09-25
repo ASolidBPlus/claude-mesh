@@ -31,8 +31,9 @@
 
 ## 2. Setting up a peering
 
-Two meshes, **Receiver** (accepts inbound) and **Sender** (sends outbound). All
-calls are to the admin port with `Authorization: Bearer $ADMIN_TOKEN`.
+Two meshes, **Receiver** (accepts inbound) and **Sender** (sends outbound). Every
+call is to the admin port with `Authorization: Bearer $ADMIN_TOKEN`, except
+registration (Step 2), which the sender makes against the receiver's **WS port**.
 
 ### Step 1 — Receiver mints a peer key
 
@@ -75,10 +76,12 @@ so revoking one cannot leave a door open you believed you had closed
 ### Step 2 — Sender registers with the key
 
 The receiver sends the key to the sender's operator out of band. The sender's
-mesh then registers **against the receiver's admin port**:
+mesh then registers **against the receiver's WS port**, the port peers must
+reach anyway. With native TLS on the receiver (`MESH_TLS_CERT`/`MESH_TLS_KEY`),
+the key crosses TLS (`https://`, trusting the receiver's CA):
 
 ```bash
-curl -X POST "$RECEIVER/peers/register" \
+curl -X POST "$RECEIVER_WS/peers/register" \
   -H 'Content-Type: application/json' \
   -d '{"key":"•••• the minted key ••••","assigned_alias":"us","protocol":1}'
 ```
@@ -89,7 +92,14 @@ curl -X POST "$RECEIVER/peers/register" \
 ```
 
 This route takes **no admin token** — the key *is* the credential
-(`server/admin-peers.ts` `handlePeerRegister`). The returned `token` is the sender's
+(`server/admin-peers.ts` `handlePeerRegister`). It is the **only** admin route
+served on the WS listener: the same route object and the same wrapper as on the
+admin port (`server/http-admin.ts` `PEER_REGISTER_ROUTE`, `serveRoute`), and
+every other admin path is a `404` there. It is still served on the admin port
+too, so existing deployments keep working. With registration on the WS port,
+`MESH_ADMIN_BIND=127.0.0.1` is correct for every cross-host deployment. The body
+is capped (`server/admin-peers.ts` `PEER_REGISTER_MAX_BYTES`, 8 KiB) on both
+doors, and an oversize body gets the same uniform `403`. The returned `token` is the sender's
 long-lived credential for the border socket, and is likewise shown once.
 
 > **Every failure of this step returns the same `403 {"error":"registration
