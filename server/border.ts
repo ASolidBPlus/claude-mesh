@@ -148,6 +148,10 @@ export class Forwarder {
     private readonly db: Database,
     private row: OutboundPeer,
     private readonly agentIndex: Map<string, WebSocket>,
+    // MESH_TLS_CA: the CA this bus verifies the peers it dials against. It
+    // REPLACES the runtime's default trust store for these connections (see
+    // the SDK's `ca` option) — a private range trusts exactly its own CA.
+    private readonly ca: string | null = null,
   ) {
     this.refillPerMin = row.rate_per_min;
     this.tokens = row.rate_per_min;              // burst == sustained
@@ -187,6 +191,7 @@ export class Forwarder {
       serverUrl: this.row.url,
       agentId: this.row.assigned_alias,
       agentToken: this.row.token,
+      ...(this.ca === null ? {} : { ca: this.ca }),
     });
     this.client.on('connect', () => this.noteLink(true));
     this.client.on('error', (e: unknown) => {
@@ -436,14 +441,14 @@ export const forwarders = new Map<string, Forwarder>();
  * the front half inert between the two merges, and it means the boot path had
  * no owner until now.
  */
-export function startBorder(db: Database, agentIndex: Map<string, WebSocket>): {
+export function startBorder(db: Database, agentIndex: Map<string, WebSocket>, opts: { ca?: string | null } = {}): {
   create: (row: OutboundPeer) => void;
   stop: (alias: string) => void;
   stopAll: () => void;
 } {
   const create = (row: OutboundPeer): void => {
     forwarders.get(row.alias)?.stop();
-    const f = new Forwarder(db, row, agentIndex);
+    const f = new Forwarder(db, row, agentIndex, opts.ca ?? null);
     forwarders.set(row.alias, f);
     f.start();
   };

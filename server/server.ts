@@ -3,6 +3,7 @@ import { openDb, findPeerAliasCollisions, findInvalidTopicNames, findTopicPrefix
 import { setPeerUpSource } from './metrics.ts';
 import { startBorder, forwarders } from './border.ts';
 import { parsePlaintextPeerCidrs, applyPlaintextPeerCidrs, type PlaintextCidr } from './plaintext-peers.ts';
+import { loadTls, expiryWarning, type ServerTls } from './tls-config.ts';
 import { startWsServer, WsServerHandle } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
@@ -26,6 +27,8 @@ export interface Config {
   mcpMode: boolean;
   retentionMs: number | null;
   plaintextPeerCidrs: PlaintextCidr[];
+  tls: ServerTls | null;
+  tlsCa: string | null;
 }
 
 export function loadConfig(): Config {
@@ -136,7 +139,18 @@ export function loadConfig(): Config {
   }
   const plaintextPeerCidrs = plaintext.cidrs;
 
-  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs };
+  // Native TLS (tls-config.ts): a half configuration, an unreadable file or a
+  // key that does not match its certificate refuses to start. Falling back to
+  // plain HTTP instead would be a silent downgrade the operator cannot see.
+  const tlsLoad = loadTls(process.env);
+  if (!tlsLoad.ok) {
+    process.stderr.write(`${tlsLoad.error}\n`);
+    process.exit(1);
+  }
+  const tls = tlsLoad.server;
+  const tlsCa = tlsLoad.ca;
+
+  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, tls, tlsCa };
 }
 
 async function main() {
@@ -248,7 +262,11 @@ async function main() {
 
   let wsHandle: WsServerHandle;
   try {
-    wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes, config.filesDir, config.presenceDebounceMs, observerIndex);
+    if (config.tls !== null) {
+      const warn = expiryWarning(config.tls.info, Date.now());
+      if (warn !== null) console.error(JSON.stringify(warn));
+    }
+    wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes, config.filesDir, config.presenceDebounceMs, observerIndex, config.tls);
   } catch (err) {
     process.stderr.write(`Failed to start WebSocket server: ${err}\n`);
     process.exit(1);
@@ -282,7 +300,7 @@ async function main() {
   // Before the border: every forwarder startBorder starts re-checks its URL
   // against this list, so it must be the operator's list and not the default.
   applyPlaintextPeerCidrs(config.plaintextPeerCidrs);
-  const border = startBorder(db, wsHandle.agentIndex);
+  const border = startBorder(db, wsHandle.agentIndex, { ca: config.tlsCa });
 
   const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, observerIndex, peerIndex, border);
 
