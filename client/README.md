@@ -139,13 +139,20 @@ new MeshClient({ serverUrl: 'wss://10.20.0.5:7384', /* … */ ca: process.env.ME
 **Runtime floor, which is a security property:** IP-literal `wss://`
 verification requires **Bun ≥ 1.4**. On earlier Bun, *any certificate from any
 trusted CA is accepted for any IP address*, and `ca` is added to the default
-store rather than replacing it. Measured:
+store rather than replacing it. The hole is in Bun's **WebSocket client** — the
+`ws` import (Bun's implementation) and the global `WebSocket` — which is the
+transport this SDK and any `ws`-based code use. Measured with that client:
 
-| | Bun 1.3.14 | Bun 1.4.2 | Node 22 + `ws` |
+| WebSocket client (`ws`) | Bun 1.3.14 | Bun 1.4.2 | Node 22 + `ws` |
 |---|---|---|---|
 | `wss://<ip>`, IP not in the cert's SANs | **accepted** | refused | refused |
 | `wss://<ip>` of a public site (cert names only its DNS name) | **accepted** | refused | refused |
 | `ca` = private CA, dial a publicly-trusted site | **accepted** (ca adds) | refused (ca replaces) | refused (ca replaces) |
+
+For contrast, Bun's **`fetch`** on 1.3.14 *does* check IP identity: the same
+IP-outside-the-SANs and public-site-by-IP cases are refused with
+`ERR_TLS_CERT_ALTNAME_INVALID` (measured). Code that reaches a bus only through
+`fetch` is not exposed by this hole; code that opens a WebSocket is.
 
 `connect()` therefore **refuses** `wss://` to an IP literal on Bun < 1.4, with
 `err.code === 'TLS_IDENTITY_UNVERIFIABLE'`, instead of opening a connection
