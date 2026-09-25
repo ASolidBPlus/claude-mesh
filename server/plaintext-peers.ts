@@ -104,6 +104,12 @@ export function parsePlaintextPeerCidrs(raw: string | undefined): ParseResult {
     if (!/^\d{1,3}$/.test(len) || Number(len) > max) {
       return { ok: false, entry, reason: `prefix must be an integer 0-${max}` };
     }
+    // A /0 is not a network, it is the rule switched off: plaintext to every
+    // address, the public internet included. No other prefix floor — only the
+    // one entry nobody writes meaning a network.
+    if (Number(len) === 0) {
+      return { ok: false, entry, reason: 'a /0 permits plaintext to every address; list the networks you mean, or use wss://' };
+    }
     const bits = Number(len) + (v4 ? 96 : 0);
     const base = addressToBig(addr)!;
     const net = base & mask(bits);

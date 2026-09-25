@@ -179,7 +179,7 @@ describe('loadConfig', () => {
   it('MESH_PLAINTEXT_PEER_CIDRS: an unreadable entry REFUSES TO START and names the entry', async () => {
     // Each of these is a typo that would otherwise have shrunk or widened the
     // set of networks the peering token crosses in cleartext.
-    for (const bad of ['10.20.0.0/16,10.30.0.0', '10.20.0.0/16,', 'lab.example/24', '10.20.0.5/16', '10.0.0.0/33']) {
+    for (const bad of ['10.20.0.0/16,10.30.0.0', '10.20.0.0/16,', 'lab.example/24', '10.20.0.5/16', '10.0.0.0/33', '0.0.0.0/0', '::/0', '10.20.0.0/16,10.0.0.0/0']) {
       const writes: string[] = [];
       const realWrite = process.stderr.write.bind(process.stderr);
       process.stderr.write = ((chunk: string) => { writes.push(String(chunk)); return true; }) as typeof process.stderr.write;

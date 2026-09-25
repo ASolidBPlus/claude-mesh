@@ -75,6 +75,21 @@ describe('MESH_PLAINTEXT_PEER_CIDRS: the empty list is TODAY\'S RULE exactly', (
   });
 });
 
+describe('MESH_PLAINTEXT_PEER_CIDRS: boot parsing', () => {
+  it('a /0 is refused at boot — it is the rule switched off, not a network', () => {
+    for (const raw of ['0.0.0.0/0', '::/0', '::ffff:0.0.0.0/0']) {
+      const r = parsePlaintextPeerCidrs(`10.20.0.0/16,${raw}`);
+      expect(r).toEqual({
+        ok: false, entry: raw,
+        reason: 'a /0 permits plaintext to every address; list the networks you mean, or use wss://',
+      });
+    }
+    // Every other prefix is the operator's call, however wide.
+    expect(parsePlaintextPeerCidrs('0.0.0.0/1').ok).toBe(true);
+    expect(parsePlaintextPeerCidrs('::/1').ok).toBe(true);
+  });
+});
+
 describe('MESH_PLAINTEXT_PEER_CIDRS: matching', () => {
   const list = cidrs('10.20.0.0/16,fd00::/8');
 

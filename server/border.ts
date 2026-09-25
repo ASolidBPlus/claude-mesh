@@ -172,7 +172,10 @@ export class Forwarder {
     // a wider list would otherwise keep dialling in cleartext after the
     // operator narrowed it. Refused here, it says so on the link_down line —
     // as policy, so nobody reads it as a network fault — and it does not
-    // retry: nothing about the link changes until the list or the row does.
+    // retry. That is deliberate, not an omission to "fix" into a retry loop:
+    // the list is immutable for the life of the process, so a refusal here
+    // can only change after a restart (which re-runs start()) or a PATCH of
+    // the row (which replaces this forwarder).
     const policy = validateOutboundPeerUrl(this.row.url);
     if (!policy.ok) {
       this.noteLink(false, `refused by policy: ${policy.error}`);
