@@ -11,6 +11,7 @@ import {
 } from './db.ts';
 import type { AdminCtx } from './admin-ctx.ts';
 import { readBody } from './admin-ctx.ts';
+import { addressToBig, cidrContains, plaintextPeerCidrs, type PlaintextCidr } from './plaintext-peers.ts';
 
 /**
  * (d)+(g) THE OUTBOUND URL RULE — ONE predicate, both doors.
@@ -22,10 +23,24 @@ import { readBody } from './admin-ctx.ts';
  * reach the admin API would look. Two copies of a security predicate is one
  * predicate and one hole waiting to be opened.
  *
- * The rule: `wss://` anywhere; `ws://` ONLY for loopback. Plaintext to a remote
- * host would put `outbound_peers.token` — a live credential (C7) — on the wire
- * in cleartext on every reconnect, and the peer protocol has no other
- * authentication to fall back on.
+ * The rule: `wss://` anywhere; `ws://` for loopback, and for LITERAL addresses
+ * inside MESH_PLAINTEXT_PEER_CIDRS when the operator has declared any (see
+ * plaintext-peers.ts). Plaintext puts `outbound_peers.token` — a live
+ * credential (C7) — on the wire in cleartext on every reconnect, and the peer
+ * protocol has no other authentication to fall back on; the list is where an
+ * operator accepts that for a network they control, and nowhere else does.
+ *
+ * NAMES ARE REFUSED FOR PLAINTEXT even when they would resolve in range. The
+ * check resolves once and the dial resolves again, later: a name that points
+ * in range when checked and elsewhere when dialled (DNS rebinding) passes the
+ * check and delivers the token in cleartext to wherever it points. A literal
+ * is the only host for which the check and the dial reach the same place.
+ * `localhost` is the exception it always was — it is in LOOPBACK_HOSTS.
+ *
+ * ONE PREDICATE, THREE CALLERS: POST, PATCH, and the forwarder's start() in
+ * border.ts. The list is fixed at boot, so tightening it is a restart — and a
+ * check only at registration would let every peering registered under the old
+ * list dial on regardless.
  *
  * Certificate verification is never disabled: the SDK uses `ws`'s default
  * (rejectUnauthorized: true), and a source-scan test pins that
@@ -35,7 +50,10 @@ import { readBody } from './admin-ctx.ts';
  */
 export const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 
-export function validateOutboundPeerUrl(raw: unknown): { ok: true } | { ok: false; error: string } {
+export function validateOutboundPeerUrl(
+  raw: unknown,
+  cidrs: readonly PlaintextCidr[] = plaintextPeerCidrs(),
+): { ok: true } | { ok: false; error: string } {
   if (typeof raw !== 'string' || raw.length === 0) {
     return { ok: false, error: 'url must be ws:// or wss://' };
   }
@@ -47,8 +65,25 @@ export function validateOutboundPeerUrl(raw: unknown): { ok: true } | { ok: fals
   if (parsed.protocol !== 'ws:') {
     return { ok: false, error: 'url must be ws:// or wss://' };
   }
-  if (!LOOPBACK_HOSTS.has(parsed.hostname)) {
+  const host = parsed.hostname;
+  if (LOOPBACK_HOSTS.has(host)) return { ok: true };
+  // Before anything else is consulted: an empty list is today's rule, with
+  // today's words.
+  if (cidrs.length === 0) {
     return { ok: false, error: 'ws:// is permitted only for loopback; use wss://' };
+  }
+  const addr = addressToBig(host);
+  if (addr === null) {
+    return {
+      ok: false,
+      error: `ws://${host} is a name, not an address; plaintext peering needs a literal address so the check and the dial reach the same host — use wss:// or give the address`,
+    };
+  }
+  if (!cidrs.some(c => cidrContains(c, addr))) {
+    return {
+      ok: false,
+      error: `ws://${host} is outside MESH_PLAINTEXT_PEER_CIDRS (${cidrs.map(c => c.text).join(', ')}); use wss:// or add its range`,
+    };
   }
   return { ok: true };
 }

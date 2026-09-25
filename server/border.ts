@@ -44,6 +44,7 @@ import {
   type OutboundPeer, type Message,
 } from './db.ts';
 import { RELAY_DEDUPE_MS } from './cleanup.ts';
+import { validateOutboundPeerUrl } from './admin-outbound.ts';
 import { incPeerRelay } from './metrics.ts';
 import type { Database } from 'bun:sqlite';
 import type { WebSocket } from 'ws';
@@ -166,6 +167,20 @@ export class Forwarder {
 
   start(): void {
     if (this.stopped) return;
+    // The URL rule again, at DIAL time. POST and PATCH check it at
+    // registration, but the list is fixed at boot: a peering registered under
+    // a wider list would otherwise keep dialling in cleartext after the
+    // operator narrowed it. Refused here, it says so on the link_down line —
+    // as policy, so nobody reads it as a network fault — and it does not
+    // retry. That is deliberate, not an omission to "fix" into a retry loop:
+    // the list is immutable for the life of the process, so a refusal here
+    // can only change after a restart (which re-runs start()) or a PATCH of
+    // the row (which replaces this forwarder).
+    const policy = validateOutboundPeerUrl(this.row.url);
+    if (!policy.ok) {
+      this.noteLink(false, `refused by policy: ${policy.error}`);
+      return;
+    }
     // C7: the ONLY production read of outbound_peers.token. It goes to the
     // SDK's auth frame and nowhere else — not to a log, not to a metric label.
     this.client = new PeerClient({

@@ -5,7 +5,7 @@ import type { Config } from '../server.ts';
 async function callLoadConfig(env: Record<string, string | undefined>): Promise<{ config?: Config; exitCode?: number }> {
   // Save original env
   const saved: Record<string, string | undefined> = {};
-  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS'];
+  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS', 'MESH_PLAINTEXT_PEER_CIDRS'];
   for (const key of keys) {
     saved[key] = process.env[key];
     if (env[key] !== undefined) {
@@ -65,7 +65,7 @@ describe('loadConfig', () => {
   it('returns defaults when only MESH_ADMIN_TOKEN is set', async () => {
     const { config, exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok' });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, adminToken: 'tok', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null });
+    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, adminToken: 'tok', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [] });
   });
 
   it('returns correct values when all valid env vars are set', async () => {
@@ -75,7 +75,7 @@ describe('loadConfig', () => {
       MESH_WS_PORT: '8080',
     });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, adminToken: 'secret', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null });
+    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, adminToken: 'secret', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [] });
   });
 
   it('MESH_MAX_FILE_BYTES: defaults to 10 MB when not set', async () => {
@@ -166,6 +166,33 @@ describe('loadConfig', () => {
   it('MESH_RETENTION_MS: exits with 1 when set to 0', async () => {
     const { exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_RETENTION_MS: '0' });
     expect(exitCode).toBe(1);
+  });
+
+  it('MESH_PLAINTEXT_PEER_CIDRS: parsed at boot into its NORMALISED form', async () => {
+    const { config, exitCode } = await callLoadConfig({
+      MESH_ADMIN_TOKEN: 'tok', MESH_PLAINTEXT_PEER_CIDRS: ' 10.20.0.0/16 , FD00::/8,::ffff:192.168.0.0/120',
+    });
+    expect(exitCode).toBeUndefined();
+    expect(config?.plaintextPeerCidrs.map(c => c.text)).toEqual(['10.20.0.0/16', 'fd00::/8', '192.168.0.0/24']);
+  });
+
+  it('MESH_PLAINTEXT_PEER_CIDRS: an unreadable entry REFUSES TO START and names the entry', async () => {
+    // Each of these is a typo that would otherwise have shrunk or widened the
+    // set of networks the peering token crosses in cleartext.
+    for (const bad of ['10.20.0.0/16,10.30.0.0', '10.20.0.0/16,', 'lab.example/24', '10.20.0.5/16', '10.0.0.0/33', '0.0.0.0/0', '::/0', '10.20.0.0/16,10.0.0.0/0']) {
+      const writes: string[] = [];
+      const realWrite = process.stderr.write.bind(process.stderr);
+      process.stderr.write = ((chunk: string) => { writes.push(String(chunk)); return true; }) as typeof process.stderr.write;
+      let exitCode: number | undefined;
+      try {
+        ({ exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_PLAINTEXT_PEER_CIDRS: bad }));
+      } finally { process.stderr.write = realWrite; }
+      expect(exitCode).toBe(1);
+      const said = writes.join('');
+      expect(said).toContain('MESH_PLAINTEXT_PEER_CIDRS');
+      const offending = bad.split(',').map(e => e.trim()).find(e => !/^(10\.20\.0\.0\/16)$/.test(e))!;
+      expect(said).toContain(JSON.stringify(offending));
+    }
   });
 
   it('MESH_RETENTION_MS: exits with 1 when non-integer', async () => {

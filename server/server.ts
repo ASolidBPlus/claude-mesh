@@ -2,6 +2,7 @@ import { openDb, findPeerAliasCollisions, findInvalidTopicNames, findTopicPrefix
   findUngrammaticalAgentIds, findUngrammaticalTopicNames } from './db.ts';
 import { setPeerUpSource } from './metrics.ts';
 import { startBorder, forwarders } from './border.ts';
+import { parsePlaintextPeerCidrs, applyPlaintextPeerCidrs, type PlaintextCidr } from './plaintext-peers.ts';
 import { startWsServer, WsServerHandle } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
@@ -24,6 +25,7 @@ export interface Config {
   presenceDebounceMs: number;
   mcpMode: boolean;
   retentionMs: number | null;
+  plaintextPeerCidrs: PlaintextCidr[];
 }
 
 export function loadConfig(): Config {
@@ -124,7 +126,17 @@ export function loadConfig(): Config {
     retentionMs = parsed;
   }
 
-  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs };
+  // Same stance as MESH_RETENTION_MS: an entry the parser cannot read refuses
+  // to start, naming it. Guessing would silently shrink or widen the set of
+  // networks the peering token crosses in cleartext.
+  const plaintext = parsePlaintextPeerCidrs(process.env.MESH_PLAINTEXT_PEER_CIDRS);
+  if (!plaintext.ok) {
+    process.stderr.write(`MESH_PLAINTEXT_PEER_CIDRS: invalid entry ${JSON.stringify(plaintext.entry)} — ${plaintext.reason}\n`);
+    process.exit(1);
+  }
+  const plaintextPeerCidrs = plaintext.cidrs;
+
+  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs };
 }
 
 async function main() {
@@ -267,6 +279,9 @@ async function main() {
   // absent, which is what kept main inert between the two merges. This call
   // also starts one forwarder per ENABLED row, the boot path F2a had no owner
   // for.
+  // Before the border: every forwarder startBorder starts re-checks its URL
+  // against this list, so it must be the operator's list and not the default.
+  applyPlaintextPeerCidrs(config.plaintextPeerCidrs);
   const border = startBorder(db, wsHandle.agentIndex);
 
   const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, observerIndex, peerIndex, border);
