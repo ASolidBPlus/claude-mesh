@@ -1,6 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
+import * as https from 'https';
 import * as net from 'net';
 import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
 import { validateToken } from './auth.ts';
@@ -14,6 +15,7 @@ import {
   PublishFrame, SubscribeFrame, UnsubscribeFrame,
 } from './router.ts';
 import { incMsgStatus, incReceived, incBytes } from './metrics.ts';
+import type { ServerTls } from './tls-config.ts';
 
 /** F1a (§5.1): the only inbound peer protocol this mesh speaks. A version is a
  *  property of a LIVE CONNECTION, never of a stored row (D7) — which is why it
@@ -935,6 +937,7 @@ export function startWsServer(
   filesDir: string = '/data/files',
   presenceDebounceMs: number = 0,   // 0 = immediate (legacy). Production passes config value.
   observerIndex: Map<string, WebSocket> = new Map(),   // NEW — defaulted
+  tls: ServerTls | null = null,   // MESH_TLS_CERT + MESH_TLS_KEY; null = plain HTTP, as before
 ): Promise<WsServerHandle> {
   return new Promise((resolve, reject) => {
     // #87: reconcile the durable `online` flag with reality BEFORE binding the
@@ -968,7 +971,7 @@ export function startWsServer(
     // which is only a distinct question once there is a second instance to
     // shift traffic to (#23, parked). A /readyz that always agreed with
     // /healthz would be a promise the system cannot keep.
-    const httpServer = http.createServer((req, res) => {
+    const onRequest = (req: http.IncomingMessage, res: http.ServerResponse): void => {
       if (req.method === 'GET' && (req.url === '/healthz' || req.url === '/healthz/')) {
         // db_ok is a real query, not a flag: an open handle to a corrupt or
         // closed database would answer `true` to anything cheaper, and the
@@ -992,7 +995,17 @@ export function startWsServer(
       // answer, which is strictly better for a caller and reveals nothing.
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'not found' }));
-    });
+    };
+    // NATIVE TLS, ON THIS LISTENER ONLY. With a cert and key the same handler
+    // and the same WebSocketServer sit behind https instead of http, so
+    // /healthz, every agent and every peering cross TLS together — and every
+    // client of this bus must then dial wss:// and trust the CA. The admin
+    // listener is deliberately NOT coupled to this: it is meant to be bound to
+    // loopback (MESH_ADMIN_BIND) and never cross hosts. No hot reload: the
+    // certificate is read once at boot, and rotating it is a restart.
+    const httpServer = tls === null
+      ? http.createServer(onRequest)
+      : https.createServer({ cert: tls.cert, key: tls.key }, onRequest);
     // (c) Drop oversize frames at the CONNECTION level, before JSON.parse.
     //
     // The 1 MiB payload check in the router runs AFTER parsing, so a 100 MiB
@@ -1081,6 +1094,16 @@ export function startWsServer(
         evt: 'ws.listening',
         bind: wsBindHost ?? '(all interfaces)',
         bound,
+        // Printed when OFF too, for the same reason as the rest of this line:
+        // a verifier must be able to PROVE which one it is, and "no field"
+        // cannot be told apart from "a build that predates the field". What
+        // is said about the certificate comes from the CERT — never the key.
+        tls: tls !== null,
+        ...(tls === null ? {} : {
+          tls_subject: tls.info.subject,
+          tls_sans: tls.info.sans,
+          tls_not_after: tls.info.not_after,
+        }),
         note: wsBindHost === undefined
           ? 'agent/peer port bound to ALL interfaces — every agent and peering must reach it, so restricting it is a deployment decision with reachability consequences'
           : 'agent/peer port restricted; every agent and peering must be able to reach this address',

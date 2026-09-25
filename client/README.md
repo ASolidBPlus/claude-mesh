@@ -118,6 +118,48 @@ error and retry/queue policy is yours.
 new MeshClient({ /* … */ pingIntervalMs: 25_000, pongDeadlineMs: 60_000, ackTimeoutMs: 10_000 });
 ```
 
+### TLS: `wss://` and `ca`
+
+Pass `ca` (PEM text, one or more CA certificates) to verify a `wss://` server
+against a private CA:
+
+```ts
+new MeshClient({ serverUrl: 'wss://10.20.0.5:7384', /* … */ ca: process.env.MESH_TLS_CA_PEM });
+```
+
+- **`ca` REPLACES the default trust store for this connection; it does not add
+  to it.** A client given a private range CA trusts exactly that CA and will
+  refuse a publicly-trusted certificate. This is right for a private range, and
+  it is a property to be aware of. Omit `ca` to use the runtime's defaults, as
+  before.
+- The certificate's names are checked against the URL's host, **IP SANs
+  included**: a certificate for `10.20.0.5` and `127.0.0.1` is accepted at
+  either address and refused at any other.
+
+**Runtime floor, which is a security property:** IP-literal `wss://`
+verification requires **Bun ≥ 1.4**. On earlier Bun, *any certificate from any
+trusted CA is accepted for any IP address*, and `ca` is added to the default
+store rather than replacing it. The hole is in Bun's **WebSocket client** — the
+`ws` import (Bun's implementation) and the global `WebSocket` — which is the
+transport this SDK and any `ws`-based code use. Measured with that client:
+
+| WebSocket client (`ws`) | Bun 1.3.14 | Bun 1.4.2 | Node 22 + `ws` |
+|---|---|---|---|
+| `wss://<ip>`, IP not in the cert's SANs | **accepted** | refused | refused |
+| `wss://<ip>` of a public site (cert names only its DNS name) | **accepted** | refused | refused |
+| `ca` = private CA, dial a publicly-trusted site | **accepted** (ca adds) | refused (ca replaces) | refused (ca replaces) |
+
+For contrast, Bun's **`fetch`** on 1.3.14 *does* check IP identity: the same
+IP-outside-the-SANs and public-site-by-IP cases are refused with
+`ERR_TLS_CERT_ALTNAME_INVALID` (measured). Code that reaches a bus only through
+`fetch` is not exposed by this hole; code that opens a WebSocket is.
+
+`connect()` therefore **refuses** `wss://` to an IP literal on Bun < 1.4, with
+`err.code === 'TLS_IDENTITY_UNVERIFIABLE'`, instead of opening a connection
+whose peer it cannot authenticate. On an old runtime, either upgrade Bun or dial
+by a DNS name the certificate carries (DNS names are verified on both
+versions). Node is unaffected.
+
 Config resolution is `constructor value ?? env var`
 (`MESH_SERVER_URL` / `MESH_AGENT_ID` / `MESH_AGENT_TOKEN`). If any is still
 undefined at `connect()` time, `connect()` rejects with a clear error.

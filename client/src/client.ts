@@ -1,4 +1,5 @@
-import { WebSocket } from 'ws';
+import { WebSocket, type ClientOptions } from 'ws';
+import { isIP } from 'net';
 import type {
   AuthFrame,
   SendFrame,
@@ -56,6 +57,21 @@ export interface MeshClientConfig {
   /** How long an in-flight send/remind/list may wait for its server ack before
    *  rejecting with `code: 'ACK_TIMEOUT'` (default 10 000 ms). */
   ackTimeoutMs?: number;
+
+  /**
+   * PEM CA certificate(s) to verify a `wss://` server against. It REPLACES the
+   * runtime's default trust store for this connection rather than adding to
+   * it: a client given a private range CA trusts exactly that CA, and will
+   * refuse a publicly-trusted certificate. Omit it for the defaults, as before.
+   *
+   * RUNTIME FLOOR — a security property, not a compatibility note: verifying
+   * the certificate's IDENTITY for an IP-literal `wss://` URL requires Bun ≥
+   * 1.4. On earlier Bun, any certificate from any trusted CA is accepted for
+   * any IP address, and a `ca` given here is ADDED to the default store rather
+   * than replacing it. connect() refuses that combination (see
+   * assertRuntimeVerifiesIpIdentity); Node verifies correctly.
+   */
+  ca?: string;
 }
 
 export type MeshClientEvent = 'connect' | 'disconnect' | 'error' | 'presence';
@@ -146,6 +162,7 @@ interface ResolvedConfig {
   serverUrl: string;
   agentId: string;
   agentToken: string;
+  ca?: string;
 }
 
 type Settler<T> = {
@@ -186,6 +203,50 @@ const LIVENESS_CHECK_MS = 5_000;
 /** How long a waiter may sit unanswered before it rejects with ACK_TIMEOUT.
     Bounds every in-flight promise so a send can never silently vanish. */
 const ACK_TIMEOUT_MS = 10_000;
+
+/**
+ * Refuse a `wss://` connection to an IP LITERAL on a runtime that cannot verify
+ * who answers it.
+ *
+ * Measured on Bun 1.3.14: dialling `wss://<ip>` accepts any certificate that
+ * chains to any trusted CA — public ones included — whatever names it carries.
+ * A certificate for `postman-echo.com` was accepted at that host's bare IP;
+ * Node's TLS refused the same connection, and Bun 1.4.2 refuses it too. DNS
+ * names are identity-checked on both Bun versions; it is IP identity that the
+ * older runtime skips.
+ *
+ * A version check is the wrong instrument almost everywhere, and the test suite
+ * proves the property rather than the version. But a library cannot run a test
+ * inside a consumer's image, and this is the one protection that reaches a
+ * consumer who never reads the README. It refuses rather than warns because the
+ * connection it would open is not authenticated, and nothing downstream can
+ * tell that it isn't.
+ */
+export function assertRuntimeVerifiesIpIdentity(
+  serverUrl: string,
+  bunVersion: string | undefined = (globalThis as { Bun?: { version?: string } }).Bun?.version,
+): void {
+  if (bunVersion === undefined) return;   // not Bun: Node verifies IP identity
+  let host: string;
+  try {
+    const u = new URL(serverUrl);
+    if (u.protocol !== 'wss:') return;
+    host = u.hostname.startsWith('[') ? u.hostname.slice(1, -1) : u.hostname;
+  } catch {
+    return;   // an unparseable URL fails at the socket, as it always has
+  }
+  if (isIP(host) === 0) return;
+  const [major, minor] = bunVersion.split('.').map(n => Number(n));
+  if (major! > 1 || (major === 1 && minor! >= 4)) return;
+  throw Object.assign(
+    new Error(
+      `MeshClient: refusing ${serverUrl} — IP-literal wss:// verification requires Bun >= 1.4; ` +
+      `on Bun ${bunVersion} any certificate from any trusted CA is accepted for any IP address. ` +
+      `Upgrade Bun, or dial the server by a DNS name its certificate carries.`,
+    ),
+    { code: 'TLS_IDENTITY_UNVERIFIABLE' },
+  );
+}
 
 export class MeshClient {
   private config: MeshClientConfig;
@@ -278,7 +339,7 @@ export class MeshClient {
     // provide — but "the compiler checks it" beats "someone remembers".
     const KNOWN_KEYS: Record<keyof MeshClientConfig, true> = {
       serverUrl: true, agentId: true, agentToken: true, httpUrl: true,
-      pingIntervalMs: true, pongDeadlineMs: true, ackTimeoutMs: true,
+      pingIntervalMs: true, pongDeadlineMs: true, ackTimeoutMs: true, ca: true,
     };
     const KNOWN = Object.keys(KNOWN_KEYS);
     const unknown = Object.keys(config).filter(k => !KNOWN.includes(k));
@@ -300,6 +361,7 @@ export class MeshClient {
     let resolved: ResolvedConfig;
     try {
       resolved = this.resolveConfig();
+      assertRuntimeVerifiesIpIdentity(resolved.serverUrl);
     } catch (err) {
       return Promise.reject(err);
     }
@@ -587,7 +649,9 @@ export class MeshClient {
     if (agentToken === undefined || agentToken === '') {
       throw new Error('MeshClient: agentToken is required (config or MESH_AGENT_TOKEN)');
     }
-    return { serverUrl, agentId, agentToken };
+    return this.config.ca === undefined
+      ? { serverUrl, agentId, agentToken }
+      : { serverUrl, agentId, agentToken, ca: this.config.ca };
   }
 
   // Resolve the admin HTTP base for fetchFile(): explicit httpUrl / MESH_HTTP_URL,
@@ -787,7 +851,14 @@ export class MeshClient {
   }
 
   private openSocket(config: ResolvedConfig): void {
-    const ws = new WebSocket(config.serverUrl);
+    // BOTH SPELLINGS of the one option, because the two runtimes read different
+    // ones — measured, not assumed: Bun's `ws` implementation ignores a
+    // top-level `ca` and reads `tls.ca`; Node's `ws` reads `ca` and ignores
+    // `tls`. Passing both gives the same verification on each. With no `ca`,
+    // the constructor is called exactly as it always was.
+    const ws = config.ca === undefined
+      ? new WebSocket(config.serverUrl)
+      : new WebSocket(config.serverUrl, { ca: config.ca, tls: { ca: config.ca } } as ClientOptions);
     this.ws = ws;
 
     this.clearConnectTimeout();

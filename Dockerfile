@@ -1,4 +1,9 @@
-FROM oven/bun:1-alpine AS base
+# 1.4 is a FLOOR, not a preference: Bun < 1.4 does not verify the identity of
+# an IP-literal wss:// server (any certificate from any trusted CA is accepted
+# for any IP), and the border dials peers by IP. The property is proven by
+# server/__tests__/native-tls.test.ts; this line keeps a rebuild from landing
+# on a runtime where that test would fail.
+FROM oven/bun:1.4-alpine AS base
 WORKDIR /app
 
 # Install deps separately for layer caching.
