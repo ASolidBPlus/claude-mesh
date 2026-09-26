@@ -823,7 +823,8 @@ export const STATUS_DETAIL_MAX = 80;
  *
  * It will sit inside a roster line another agent reads, so anything that can
  * forge STRUCTURE there goes: line breaks of every kind (C0 incl. CR/LF, NEL
- * and the rest of C1, U+2028/U+2029) and DEL, and brackets — square ones
+ * and the rest of C1, U+2028/U+2029) and DEL, zero-width and bidi controls,
+ * and brackets — square ones
  * because `[from x]` is how a relayed message is attributed, angle ones
  * because the channel envelope is a `<channel …>` tag. Then capped at
  * STATUS_DETAIL_MAX code points. Empty after cleaning is null: a stored
@@ -836,6 +837,13 @@ export function statusDetailClean(detail: string | null | undefined): string | n
     .replace(/[\t\n\v\f\r\x85\u2028\u2029]/g, ' ')
     // eslint-disable-next-line no-control-regex -- the control set is the point
     .replace(/[\x00-\x1f\x7f-\x9f\[\]<>]/g, '')
+    // Invisible and bidi controls — zero-width U+200B-200F, embeddings and
+    // overrides U+202A-202E, isolates U+2066-2069, BOM. Removed rather than
+    // spaced: U+202E (right-to-left override) makes a line DISPLAY in an order
+    // other than the order it is stored in ("Trojan Source"), and any agent
+    // can set its own detail to anything. The same set as mesh-agent #101's
+    // seat name (arena/seat.ts INVISIBLE), which is the rule this follows.
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '')
     .replace(/ {2,}/g, ' ')
     .trim();
   const capped = [...cleaned].slice(0, STATUS_DETAIL_MAX).join('').trim();

@@ -136,6 +136,15 @@ describe('agent status: detail is made safe to render into another agent\'s cont
     expect(d).not.toMatch(/[\n\r\u2028\u2029[\]<>\x00-\x1f]/);
   });
 
+  it('bidi overrides, isolates and zero-width characters are removed — stored order is display order', async () => {
+    const alice = await connect('alice');
+    // U+202E would make "resets 09:00" DISPLAY reversed while stored forwards.
+    await alice.setStatus('limited', 'a\u202Eresets 09:00\u202C b\u200Bc\u2066d\u2069\uFEFFe');
+    const d = row('alice').status_detail!;
+    expect(d).toBe('aresets 09:00 bcde');
+    expect(d).not.toMatch(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/);
+  });
+
   it(`capped at ${STATUS_DETAIL_MAX} characters; empty after cleaning is null`, async () => {
     const alice = await connect('alice');
     await alice.setStatus('limited', 'x'.repeat(STATUS_DETAIL_MAX + 40));
