@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
-import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver } from './db.ts';
+import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
 import { validateToken } from './auth.ts';
 import { PEER_PROTOCOL_VERSION } from './wire-version.ts';  // #131: via the tiny module, never cross-package from here
 import { parseDuration } from './duration.ts';
@@ -616,7 +616,43 @@ function handlePing(ctx: FrameCtx): void {
  */
 function handleLoopAlive(ctx: FrameCtx): void {
   const { state, db } = ctx;
-  if (state.agentId !== null) touchResponded(db, state.agentId);
+  if (state.agentId === null) return;
+  touchResponded(db, state.agentId);
+  // A LIMITED AGENT THAT IS ACTING IS NO LONGER LIMITED. loop_alive is sent
+  // only from the plugin's tool-call dispatch — the loop acting — so its
+  // arrival is proof the limit has lifted, whatever set it. Clearing here
+  // rather than waiting for an explicit `status: null` makes the clear robust
+  // to the one miss that matters: the plugin failing to recognise the
+  // harness's reset record, which would otherwise leave a working agent
+  // labelled limited indefinitely. Conditional, so the per-turn cost is one
+  // indexed no-op UPDATE.
+  clearAgentStatusIfSet(db, state.agentId);
+}
+
+/**
+ * The agent sets (or clears) its OWN status: `{type:'status', msg_id?,
+ * status: 'limited' | null, detail?}`. See setAgentStatus for why it is an
+ * enum and why this is self-scoped by construction — the frame carries no
+ * target, and the row written is the socket's own authenticated agent.
+ */
+function handleStatus(ctx: FrameCtx): void {
+  const { ws, state, db, parsed } = ctx;
+  const f = parsed as Record<string, unknown>;
+  const ref = typeof f.msg_id === 'string' ? f.msg_id : undefined;
+  const reply = (frame: Record<string, unknown>): void => {
+    try { ws.send(JSON.stringify(ref === undefined ? frame : { ...frame, ref })); } catch (_) { /* ignore */ }
+  };
+  const status = f.status;
+  if (status !== null && !(AGENT_STATUSES as readonly unknown[]).includes(status)) {
+    reply({ type: 'error', code: 'INVALID_STATUS', message: `status must be one of ${AGENT_STATUSES.map(s => JSON.stringify(s)).join(', ')} or null` });
+    return;
+  }
+  if (f.detail !== undefined && f.detail !== null && typeof f.detail !== 'string') {
+    reply({ type: 'error', code: 'INVALID_STATUS', message: 'detail must be a string' });
+    return;
+  }
+  setAgentStatus(db, state.agentId!, status as AgentStatus | null, (f.detail as string | null | undefined) ?? null);
+  reply({ type: 'ack', ok: true });
 }
 
 function handleSend(ctx: FrameCtx): void {
@@ -901,7 +937,10 @@ function handleListPresence(ctx: FrameCtx): void {
   const peers = listAclPeers(db, caller);
   const result = all
     .filter(a => a.id === caller || peers.has(a.id))
-    .map(a => ({ id: a.id, online: a.online === 1, last_seen: a.last_seen, last_alive: a.last_alive ?? null, last_responded: a.last_responded ?? null }));
+    .map(a => ({
+      id: a.id, online: a.online === 1, last_seen: a.last_seen, last_alive: a.last_alive ?? null, last_responded: a.last_responded ?? null,
+      status: a.status ?? null, status_detail: a.status_detail ?? null, status_at: a.status_at ?? null,
+    }));
   const resp: { type: string; ref?: string; agents: typeof result } = { type: 'presence_list', agents: result };
   if (typeof frame.msg_id === 'string' && frame.msg_id.length > 0) resp.ref = frame.msg_id;
   try {
@@ -919,6 +958,7 @@ function handleListPresence(ctx: FrameCtx): void {
 export const POST_AUTH_HANDLERS: Record<string, FrameHandler> = {
   ping: handlePing,
   loop_alive: handleLoopAlive,   // #133
+  status: handleStatus,
   send: handleSend,
   ack: handleAck,
   publish: handlePublish,
@@ -1077,7 +1117,7 @@ export function startWsServer(
     // self-edge, but it is a behaviour change and is pinned by a test.
     function broadcastStatus(agentId: string, online: boolean, lastSeen: number, excludeWs: WebSocket | null) {
       const subject = getAgentById(db, agentId);
-      const statusMsg = JSON.stringify({ type: 'agent_status', agent_id: agentId, online, last_seen: lastSeen, last_alive: subject?.last_alive ?? null, last_responded: subject?.last_responded ?? null });
+      const statusMsg = JSON.stringify({ type: 'agent_status', agent_id: agentId, online, last_seen: lastSeen, last_alive: subject?.last_alive ?? null, last_responded: subject?.last_responded ?? null, status: subject?.status ?? null, status_detail: subject?.status_detail ?? null, status_at: subject?.status_at ?? null });
       const peers = listAclPeers(db, agentId);
       for (const [otherWs, otherState] of registry) {
         if (otherWs === excludeWs) continue;

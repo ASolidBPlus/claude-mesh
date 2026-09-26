@@ -229,6 +229,9 @@ export function formatAgent(agent: Agent): Record<string, unknown> {
     // emitter ships (spawner#346) — a null is honest; a number that meant
     // something else is what this exists to stop.
     last_responded: agent.last_responded ?? null,
+    status: agent.status ?? null,
+    status_detail: agent.status_detail ?? null,
+    status_at: agent.status_at ?? null,
   };
 }
 

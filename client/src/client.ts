@@ -5,6 +5,7 @@ import type {
   SendFrame,
   PublishFrame,
   SubscribeFrame,
+  StatusFrame,
   UnsubscribeFrame,
   RemindFrame,
   ListRemindersFrame,
@@ -118,6 +119,16 @@ export interface PresenceEntry {
       distinguishable from the transport's proof-of-life, it does not
       authenticate it. */
   lastResponded?: number | null;
+  /** What the agent says about itself: `'limited'` = its model is
+      usage-capped, so a stale lastResponded is expected and is NOT a wedge.
+      `null` = nothing said. Absent from a bus that predates the field. Set by
+      the agent itself, and cleared by the server as soon as its loop acts. */
+  status?: 'limited' | null;
+  /** Short free text beside status (e.g. when the limit resets), cleaned by
+      the server: no line breaks, no brackets, at most 80 characters. */
+  statusDetail?: string | null;
+  /** When the status was set (unix ms). */
+  statusAt?: number | null;
 }
 
 /**
@@ -453,6 +464,20 @@ export class MeshClient {
     this.subscribedTopics.add(topic);
     const frame: SubscribeFrame = { type: 'subscribe', topic };
     return this.sendWithAck(topic, frame);
+  }
+
+  /**
+   * Set this agent's OWN status on its presence row, or clear it with null.
+   * `'limited'` says the model is usage-capped, so the roster can tell that
+   * apart from a wedged loop. The server clears it on its own the next time
+   * this agent's loop acts (`loop_alive`), so a missed clear cannot strand it.
+   * Rejects with `INVALID_STATUS` for anything outside the enum.
+   */
+  setStatus(status: 'limited' | null, detail?: string): Promise<void> {
+    const msgId = this.id();
+    const frame: StatusFrame = { type: 'status', msg_id: msgId, status };
+    if (detail !== undefined) frame.detail = detail;
+    return this.sendWithAck(msgId, frame);
   }
 
   unsubscribe(topic: string): Promise<void> {
@@ -1064,6 +1089,9 @@ export class MeshClient {
       lastSeen: frame.last_seen,
       lastAlive: frame.last_alive ?? null,
       lastResponded: frame.last_responded ?? null,
+      status: frame.status ?? null,
+      statusDetail: frame.status_detail ?? null,
+      statusAt: frame.status_at ?? null,
     } as PresenceEntry);
   }
 
@@ -1079,6 +1107,9 @@ export class MeshClient {
         lastSeen: a.last_seen,
         lastAlive: a.last_alive ?? null,
         lastResponded: a.last_responded ?? null,
+        status: a.status ?? null,
+        statusDetail: a.status_detail ?? null,
+        statusAt: a.status_at ?? null,
       }))
     );
   }

@@ -166,6 +166,10 @@ export interface AgentStatusFrame {
   last_alive?: number | null;
   /** #133: the LOOP's proof-of-life, optional exactly as last_alive is. */
   last_responded?: number | null;
+  /** The agent's own status (see StatusFrame); absent on an older bus. */
+  status?: 'limited' | null;
+  status_detail?: string | null;
+  status_at?: number | null;
 }
 
 /**
@@ -177,6 +181,19 @@ export interface LoopAliveFrame {
   type: 'loop_alive';
 }
 
+/**
+ * The agent sets or clears its OWN status. `status` is an enum — never free
+ * text, because the roster is read into other agents' context — and `detail`
+ * is cleaned server-side (control characters, line breaks and brackets
+ * stripped, capped at 80). Acked like a send; refused with INVALID_STATUS.
+ */
+export interface StatusFrame {
+  type: 'status';
+  msg_id: string;
+  status: 'limited' | null;
+  detail?: string;
+}
+
 export interface PresenceListFrame {
   type: 'presence_list';
   ref?: string;
@@ -185,7 +202,11 @@ export interface PresenceListFrame {
   // client built against an older bus sees the key absent and one built against
   // a newer bus sees it null until something writes it. Both are the same
   // "unknown", which is why one optional field covers both.
-  agents: { id: string; online: boolean; last_seen: number; last_alive?: number | null; last_responded?: number | null }[];
+  // status*: optional for the same reason — a bus that predates them omits them.
+  agents: {
+    id: string; online: boolean; last_seen: number; last_alive?: number | null; last_responded?: number | null;
+    status?: 'limited' | null; status_detail?: string | null; status_at?: number | null;
+  }[];
 }
 
 export interface RemindersListFrame {
@@ -223,6 +244,7 @@ export type OutboundFrame =
   | ListRemindersFrame
   | CancelReminderFrame
   | ListPresenceFrame
+  | StatusFrame
   | AuthFrame;
 
 export type InboundFrame =

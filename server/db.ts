@@ -23,6 +23,13 @@ export interface Agent {
       silently change its meaning for every existing consumer. */
   last_alive: number | null;
   last_responded: number | null;
+  /** The agent's own STATUS (see setAgentStatus): an enum value or null.
+      Optional because rows read by code that predates the migration, and
+      Agent literals in tests, do not carry it; absent and null both mean
+      "no status". */
+  status?: string | null;
+  status_detail?: string | null;
+  status_at?: number | null;
   online: number;          // 0 | 1
 }
 
@@ -535,6 +542,13 @@ export function openDb(path: string): Database {
   // than one showing a number that means something else.
   try { db.exec('ALTER TABLE agents ADD COLUMN last_responded INTEGER'); } catch {}
 
+  // Agent STATUS — a small, self-set flag on the presence row ("limited": the
+  // agent's model is usage-capped). Nullable and additive: every existing row
+  // reads as "no status", which is what it had.
+  try { db.exec('ALTER TABLE agents ADD COLUMN status TEXT'); } catch {}
+  try { db.exec('ALTER TABLE agents ADD COLUMN status_detail TEXT'); } catch {}
+  try { db.exec('ALTER TABLE agents ADD COLUMN status_at INTEGER'); } catch {}
+
   // F3 migration: observer grants made before federation existed are LOCAL-ONLY.
   // The default is 0 rather than 1 on purpose — an operator who granted "see
   // everything" in a mesh with no borders did not consent to cross-border
@@ -780,6 +794,74 @@ export function touchAlive(db: Database, id: string): void {
  */
 export function touchResponded(db: Database, id: string): void {
   db.prepare('UPDATE agents SET last_responded = ? WHERE id = ?').run(Date.now(), id);
+}
+
+/**
+ * AGENT STATUS — what an agent says about itself on its presence row.
+ *
+ * WHY IT EXISTS. An agent usage-capped for 5.68 h read on the roster as
+ * "heartbeat fresh, last response hours old" — exactly what a wedged loop looks
+ * like — and it was chased as one. `limited` lets the roster say the true
+ * thing: the loop is not stuck, it is not allowed to run.
+ *
+ * AN ENUM, NEVER FREE TEXT. The roster is read by OTHER agents, into their
+ * context; a free-form status is a message nobody sent, delivered to everyone
+ * who asks who is around. The only free text is `detail`, and it is cleaned
+ * by statusDetailClean before it is stored.
+ *
+ * SELF-SCOPED BY CONSTRUCTION: the only writer is the `status` frame handler,
+ * which passes the id of the socket's own authenticated agent. Nothing in the
+ * frame names a target, so there is nothing to check.
+ */
+export const AGENT_STATUSES = ['limited'] as const;
+export type AgentStatus = typeof AGENT_STATUSES[number];
+
+export const STATUS_DETAIL_MAX = 80;
+
+/**
+ * `detail`, made safe to render into another agent's context.
+ *
+ * It will sit inside a roster line another agent reads, so anything that can
+ * forge STRUCTURE there goes: line breaks of every kind (C0 incl. CR/LF, NEL
+ * and the rest of C1, U+2028/U+2029) and DEL, zero-width and bidi controls,
+ * and brackets — square ones
+ * because `[from x]` is how a relayed message is attributed, angle ones
+ * because the channel envelope is a `<channel …>` tag. Then capped at
+ * STATUS_DETAIL_MAX code points. Empty after cleaning is null: a stored
+ * empty string is a hole every reader has to special-case.
+ */
+export function statusDetailClean(detail: string | null | undefined): string | null {
+  if (typeof detail !== 'string') return null;
+  const cleaned = detail
+    // Breaks become a space, so "capped\nuntil 9" stays two words.
+    .replace(/[\t\n\v\f\r\x85\u2028\u2029]/g, ' ')
+    // eslint-disable-next-line no-control-regex -- the control set is the point
+    .replace(/[\x00-\x1f\x7f-\x9f\[\]<>]/g, '')
+    // Invisible and bidi controls — zero-width U+200B-200F, embeddings and
+    // overrides U+202A-202E, isolates U+2066-2069, BOM. Removed rather than
+    // spaced: U+202E (right-to-left override) makes a line DISPLAY in an order
+    // other than the order it is stored in ("Trojan Source"), and any agent
+    // can set its own detail to anything. The same set as mesh-agent #101's
+    // seat name (arena/seat.ts INVISIBLE), which is the rule this follows.
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '')
+    .replace(/ {2,}/g, ' ')
+    .trim();
+  const capped = [...cleaned].slice(0, STATUS_DETAIL_MAX).join('').trim();
+  return capped.length > 0 ? capped : null;
+}
+
+export function setAgentStatus(db: Database, id: string, status: AgentStatus | null, detail: string | null): void {
+  if (status === null) {
+    db.prepare('UPDATE agents SET status = NULL, status_detail = NULL, status_at = NULL WHERE id = ?').run(id);
+    return;
+  }
+  db.prepare('UPDATE agents SET status = ?, status_detail = ?, status_at = ? WHERE id = ?')
+    .run(status, statusDetailClean(detail), Date.now(), id);
+}
+
+/** Clear a status if one is set; a no-op write otherwise (see handleLoopAlive). */
+export function clearAgentStatusIfSet(db: Database, id: string): void {
+  db.prepare('UPDATE agents SET status = NULL, status_detail = NULL, status_at = NULL WHERE id = ? AND status IS NOT NULL').run(id);
 }
 
 /**
