@@ -302,8 +302,20 @@ export function fanOutTopicLocal(
      *  right to hear is a property of the topic rather than of whoever posted. */
     aclPrincipal: string;
     payloadBytes: number;
+    /** LOCAL PUBLISH ONLY (routePublish). Also deliver through the documented
+     *  topic shape: `aclPrincipal` → `topic:<t>` AND `topic:<t>` → subscriber.
+     *  Absent on the hub re-origination and spoke delivery callers, which stay
+     *  exactly as they were — there the principal already IS the topic. */
+    viaTopicEdges?: true;
   },
 ): void {
+  // ONE LOOKUP for the poster's half of the topic shape; the subscriber's half
+  // is per subscriber below. Additive by construction: the direct edge is
+  // checked first and still delivers on its own, so nothing that delivered
+  // before this stops. The topic shape does NOT open DMs — routeDirect checks
+  // the direct edge alone, and neither topic edge is one.
+  const topicPrincipal = `${TOPIC_PRINCIPAL_PREFIX}${m.topic}`;
+  const postsToTopic = m.viaTopicEdges === true && aclCheck(db, m.aclPrincipal, topicPrincipal);
   const subscribers = getTopicSubscribers(db, m.topic)
     .filter(id => id !== m.from_agent)
     .filter(id => !isRemoteEndpoint(db, id));
@@ -330,7 +342,8 @@ export function fanOutTopicLocal(
     // DIRECT sends, where the sender did choose the recipient. Fan-out outcomes
     // go to mesh_topic_fanout_total, which carries no topic label because topic
     // names are agent-chosen.
-    if (!aclCheck(db, m.aclPrincipal, subscriber_id)) {
+    if (!aclCheck(db, m.aclPrincipal, subscriber_id)
+        && !(postsToTopic && aclCheck(db, topicPrincipal, subscriber_id))) {
       incTopicFanout('filtered');
       continue;
     }
@@ -1250,6 +1263,9 @@ export function routePublish(
     // spoke can show who said it.
     origin: from_agent,
     aclPrincipal: from_agent,
+    // A local post may reach subscribers through poster → topic → subscriber,
+    // as well as through a direct poster → subscriber edge.
+    viaTopicEdges: true,
     payload: frame.payload,
     content_type,
     sent_at,

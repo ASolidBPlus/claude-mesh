@@ -216,6 +216,15 @@ curl -X POST "$POD/acl" -H "Authorization: Bearer $ADMIN_TOKEN" \
 `topic` is a reserved alias at both peering doors for that reason
 (`server/db.ts` `isRemoteEndpoint`).
 
+**Local topics accept either ACL shape.** A LOCAL agent's post reaches a local
+subscriber through the topic — `poster → topic:<name>` **and**
+`topic:<name> → subscriber`, the pair above — or through a direct
+`poster → subscriber` edge, as before. Grant the topic pair when you want a
+topic without a DM channel: **topic edges do not open direct messages**, since a
+direct send checks the direct edge alone (`server/router.ts`
+`fanOutTopicLocal`, `viaTopicEdges`). Only the local publish takes the topic
+pair; a spoke still needs its direct hear edge (`orch:trollbox → sub`).
+
 **What `pod1:alice` actually asserts.** The alias half is yours: it is the name
 *you* gave that peering, and the credential proves it. **The agent half is
 asserted by the peer, not authenticated by you** — pod1 tells you the post came
