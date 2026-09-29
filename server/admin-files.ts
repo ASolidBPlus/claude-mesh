@@ -103,7 +103,11 @@ export async function handleFilePost(ctx: AdminCtx): Promise<void> {
       body: rawBody,
     });
 
-    let formData: FormData;
+    // Typed FROM THE CALL, not as the global `FormData`: under @types/bun
+    // `Request.formData()` returns undici's FormData, which is not assignable
+    // to the global one, so a consumer type-checking this file with that
+    // config (the plugin) got TS2322 here. The value was always fine.
+    let formData: Awaited<ReturnType<typeof bunReq.formData>>;
     try {
       formData = await bunReq.formData();
     } catch {
