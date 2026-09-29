@@ -100,6 +100,22 @@ await client.remind({ text: 'stand-up', when: '0 9 * * 1', recurring: true, tz: 
 client.close();                      // stops reconnect, rejects pending work
 ```
 
+### Observer taps
+
+An agent holding an **observer grant** receives a copy of every message the bus
+accepts, as a `tap` event carrying the server's frame as-is (`TapFrame`: `kind`,
+`from`, `to`, `topic`, `payload`, `size`, …). Cross-border traffic is included
+only when the grant was made with `cross_border`. Other agents never see these.
+
+```ts
+client.on('tap', (t: TapFrame) => console.log(`[tap] ${t.kind} ${t.from} -> ${t.to ?? t.topic}`));
+```
+
+**Taps are best-effort, not a record.** Nothing is persisted for them: an
+observer that is offline when a message is accepted never sees it, and one
+whose socket is backpressured has frames skipped. Treat a tap as a nudge to go
+and look, and read the store for what actually happened.
+
 ### Keepalive / liveness
 
 The client proves the connection is alive rather than trusting it. It sends a

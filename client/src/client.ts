@@ -75,7 +75,17 @@ export interface MeshClientConfig {
   ca?: string;
 }
 
-export type MeshClientEvent = 'connect' | 'disconnect' | 'error' | 'presence';
+/**
+ * `tap` — an observer's copy of an accepted message, the frame as the server
+ * sent it (`TapFrame`). Only an agent with an observer grant receives these.
+ *
+ * BEST-EFFORT, NOT A RECORD. Nothing about a tap is persisted: an observer
+ * that is offline when a message is accepted never sees it, and one whose
+ * socket is backpressured has frames skipped (server/tap.ts,
+ * TAP_BUFFER_LIMIT_BYTES). Treat a tap as a nudge to go and look; read the
+ * store for what actually happened.
+ */
+export type MeshClientEvent = 'connect' | 'disconnect' | 'error' | 'presence' | 'tap';
 
 export interface SendOpts {
   /** Delivery TTL in ms for a direct send. Omit for the server default (5 min);
@@ -269,7 +279,8 @@ export class MeshClient {
     disconnect: ((...args: any[]) => void)[];
     error: ((...args: any[]) => void)[];
     presence: ((...args: any[]) => void)[];
-  } = { connect: [], disconnect: [], error: [], presence: [] };
+    tap: ((...args: any[]) => void)[];
+  } = { connect: [], disconnect: [], error: [], presence: [], tap: [] };
 
   private subscribedTopics = new Set<string>();
 
@@ -994,6 +1005,11 @@ export class MeshClient {
         return;
       case 'presence_list':
         this.onPresenceList(frame);
+        return;
+      case 'tap':
+        // As-is: the observer asked to see what crossed the bus, and a
+        // reshaped copy would be one more thing that could disagree with it.
+        this.emit('tap', frame);
         return;
       case 'pong':
         // Liveness proof: the server's frame handler produced this, so the path

@@ -247,6 +247,29 @@ export type OutboundFrame =
   | StatusFrame
   | AuthFrame;
 
+/**
+ * An OBSERVER's copy of an accepted message (server/tap.ts `TapFrame`),
+ * delivered only to agents holding an observer grant — and cross-border
+ * traffic only to grants with cross_border. Mirrored rather than imported: the
+ * client package does not import server code (#131). A type-level test in
+ * client/__tests__/tap-event.test.ts holds the two in step.
+ */
+export interface TapFrame {
+  type: 'tap';
+  msg_id: string;
+  kind: string;                       // direct | topic | file
+  from: string;
+  to: string | null;
+  topic: string | null;
+  correlation_id: string | null;
+  sent_at: number;
+  size: number;                       // payload byte length (file: file size_bytes)
+  payload?: string | null;            // present for non-file kinds; null/omitted for file
+  file_id?: string;
+  filename?: string;
+  content_type?: string;
+}
+
 export type InboundFrame =
   | AuthOkFrame
   | DeliverFrame
@@ -256,7 +279,8 @@ export type InboundFrame =
   | AgentStatusFrame
   | PresenceListFrame
   | RemindersListFrame
-  | FileDeliverFrame;
+  | FileDeliverFrame
+  | TapFrame;
 
 // ──────────────────────────────────────────────
 // Protocol version — ONE authority (#F2b item 7)
