@@ -218,3 +218,37 @@ describe('the number of UNAUTHENTICATED sockets is capped — per source address
     expect(c4.upgraded()).toBe(true);
   });
 });
+
+describe('the caps come from the environment (end to end, the real server)', () => {
+  it('MESH_PREAUTH_PER_IP=1 is applied: the boot line says so, and a 2nd pre-auth socket from one address is refused', async () => {
+    const [p] = ports();
+    const dataDir = mkdtempSync(join(tmpdir(), 'r69-e2e-'));
+    const proc = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'server.ts')], {
+      env: { ...process.env, MESH_ADMIN_TOKEN: 'a', MESH_DB_PATH: join(dataDir, 'm.db'), MESH_FILES_DIR: join(dataDir, 'f'),
+        MESH_WS_PORT: String(p), MESH_ADMIN_PORT: String(p + 1), MESH_PREAUTH_MAX: '5', MESH_PREAUTH_PER_IP: '1' },
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    try {
+      let out = '';
+      const reader = proc.stdout.getReader();
+      let pending = reader.read();
+      const deadline = Date.now() + 15_000;
+      while (!out.includes('"mesh.listeners"') && Date.now() < deadline) {
+        const r = await Promise.race([pending, wait(500).then(() => null)]);
+        if (r === null) continue;
+        if (r.done) break;
+        if (r.value) out += new TextDecoder().decode(r.value);
+        pending = reader.read();
+      }
+      const line = out.split('\n').find(l => l.includes('"mesh.listeners"'));
+      expect(JSON.parse(line!).preauth).toEqual({ max: 5, per_ip: 1 });
+      const first = await raw(p); raws.push(first);
+      const second = await raw(p); raws.push(second);
+      expect([first.upgraded(), second.upgraded()]).toEqual([true, false]);
+      expect(second.refusedHttp()).toContain('503');
+    } finally {
+      proc.kill();
+      await proc.exited;
+    }
+  }, 30_000);
+});

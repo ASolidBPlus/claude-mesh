@@ -5,7 +5,7 @@ import type { Config } from '../server.ts';
 async function callLoadConfig(env: Record<string, string | undefined>): Promise<{ config?: Config; exitCode?: number }> {
   // Save original env
   const saved: Record<string, string | undefined> = {};
-  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS', 'MESH_PLAINTEXT_PEER_CIDRS', 'MESH_TLS_CERT', 'MESH_TLS_KEY', 'MESH_TLS_CA', 'MESH_METRICS_TOKEN', 'MESH_ADMIN_PORT', 'MESH_WS_TLS_PORT', 'MESH_ADMIN_TLS_PORT', 'MESH_ADMIN_TOKEN_PREV'];
+  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS', 'MESH_PLAINTEXT_PEER_CIDRS', 'MESH_TLS_CERT', 'MESH_TLS_KEY', 'MESH_TLS_CA', 'MESH_METRICS_TOKEN', 'MESH_ADMIN_PORT', 'MESH_WS_TLS_PORT', 'MESH_ADMIN_TLS_PORT', 'MESH_ADMIN_TOKEN_PREV', 'MESH_PREAUTH_MAX', 'MESH_PREAUTH_PER_IP'];
   for (const key of keys) {
     saved[key] = process.env[key];
     if (env[key] !== undefined) {
@@ -65,7 +65,7 @@ describe('loadConfig', () => {
   it('returns defaults when only MESH_ADMIN_TOKEN is set', async () => {
     const { config, exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok' });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'tok', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], tls: null, tlsCa: null, metricsToken: null });
+    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'tok', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], tls: null, tlsCa: null, metricsToken: null, preAuth: { global: 64, perIp: 8 } });
   });
 
   it('returns correct values when all valid env vars are set', async () => {
@@ -75,7 +75,7 @@ describe('loadConfig', () => {
       MESH_WS_PORT: '8080',
     });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'secret', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], tls: null, tlsCa: null, metricsToken: null });
+    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'secret', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], tls: null, tlsCa: null, metricsToken: null, preAuth: { global: 64, perIp: 8 } });
   });
 
   it('MESH_MAX_FILE_BYTES: defaults to 10 MB when not set', async () => {
@@ -286,6 +286,16 @@ describe('loadConfig', () => {
     expect((await refused({ MESH_ADMIN_TOKEN_PREV: '   ' })).exitCode).toBe(1);
     const { config } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_ADMIN_TOKEN_PREV: 'old' });
     expect(config?.adminTokenPrev).toBe('old');
+  });
+
+  it('R-69: MESH_PREAUTH_MAX / MESH_PREAUTH_PER_IP — positive integers, defaults 64 and 8; anything else refuses', async () => {
+    const { config } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_PREAUTH_MAX: '20', MESH_PREAUTH_PER_IP: '3' });
+    expect(config?.preAuth).toEqual({ global: 20, perIp: 3 });
+    for (const [name, bad] of [['MESH_PREAUTH_MAX', '0'], ['MESH_PREAUTH_MAX', '-1'], ['MESH_PREAUTH_PER_IP', '2.5'], ['MESH_PREAUTH_PER_IP', 'eight'], ['MESH_PREAUTH_MAX', '']]) {
+      const r = await refused({ [name!]: bad! });
+      expect({ name, bad, exitCode: r.exitCode }).toEqual({ name, bad, exitCode: 1 });
+      expect(r.said).toContain(`${name} must be a positive integer`);
+    }
   });
 
   it('MESH_RETENTION_MS: exits with 1 when non-integer', async () => {
