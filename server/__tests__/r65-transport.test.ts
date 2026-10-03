@@ -46,7 +46,9 @@ beforeAll(() => {
   OTHER_CA = readFileSync(f('other-ca.pem'), 'utf8');
 });
 
-const ports = () => { const b = 31000 + Math.floor(Math.random() * 3000); return [b, b + 1, b + 2, b + 3] as const; };
+// Below the ephemeral port range (32768+): a random listen port in it can
+// collide with an outgoing connection's source port (CI flake, R-69).
+const ports = () => { const b = 12000 + Math.floor(Math.random() * 2900); return [b, b + 1, b + 2, b + 3] as const; };
 const wait = (ms: number) => new Promise(r => setTimeout(r, ms));
 const ADMIN = 'admin-r65';
 
@@ -324,7 +326,7 @@ describe('the ALTER is idempotent on an existing database', () => {
     const d3 = openDb(file);                                   // and again: no duplicate-column failure
     expect((d3.prepare("SELECT COUNT(*) AS n FROM pragma_table_info('agents') WHERE name = 'tls_seen'").get() as { n: number }).n).toBe(1);
     d3.close();
-  });
+  }, 20_000);   // three file-backed opens: a fresh one alone measured 1.3-3.2 s on a loaded disk
 });
 
 describe('M3: the client CA — WS connect AND fetchFile, from config AND env', () => {

@@ -39,7 +39,9 @@ beforeAll(() => {
 const ca = () => require('fs').readFileSync(f('ca.pem'), 'utf8') as string;
 
 const ADMIN = 'admin-r65b';
-const ports = () => { const b = 35000 + Math.floor(Math.random() * 3000); return [b, b + 1, b + 2, b + 3] as const; };
+// Below the ephemeral port range (32768+): a random listen port in it can
+// collide with an outgoing connection's source port (CI flake, R-69).
+const ports = () => { const b = 15000 + Math.floor(Math.random() * 2900); return [b, b + 1, b + 2, b + 3] as const; };
 const wait = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 /** Capture console output for the duration of fn — the log lines ARE the M4 contract. */
@@ -375,7 +377,7 @@ describe('the ALTER is idempotent on an existing database', () => {
     const cols = (d3.prepare("SELECT name FROM pragma_table_info('agents')").all() as { name: string }[]).map(x => x.name);
     for (const c of ['last_scheme', 'last_src_ip', 'last_auth_at', 'last_plaintext_at']) expect(cols).toContain(c);
     d3.close();
-  });
+  }, 20_000);   // three file-backed opens: a fresh one alone measured 1.3-3.2 s on a loaded disk
 });
 
 describe('review fixes', () => {

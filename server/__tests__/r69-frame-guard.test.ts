@@ -35,7 +35,9 @@ beforeAll(() => {
 });
 
 const wait = (ms: number) => new Promise(r => setTimeout(r, ms));
-const ports = () => { const b = 39000 + Math.floor(Math.random() * 2500); return [b, b + 1] as const; };
+// Below the ephemeral port range (32768+): a random listen port in it can
+// collide with an outgoing connection's source port (CI flake, R-69).
+const ports = () => { const b = 18000 + Math.floor(Math.random() * 1900); return [b, b + 1] as const; };
 
 /** One masked text frame, zero mask key (legal, and masking is the identity). */
 function frame(payload: Buffer): Buffer {
