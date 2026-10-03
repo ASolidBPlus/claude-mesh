@@ -122,6 +122,9 @@ describe('#199 the admin route table pins its auth surface', () => {
       "DELETE idMatch(/^\\/agents\\/([^/]+)$/) auth=admin -> handleAgentDelete",
       // R-65: clears an agent's TLS latch — admin-scoped like the rest of /agents.
       "DELETE idMatch(/^\\/agents\\/([^/]+)\\/tls-latch$/) auth=admin -> handleAgentTlsLatchDelete",
+      // R-65 PR-B: rotate (M5) and the connection report (M6) — both admin.
+      "POST idMatch(/^\\/agents\\/([^/]+)\\/rotate$/) auth=admin -> handleAgentRotate",
+      "GET exact('/connections') auth=admin -> handleConnectionsGet",
       "GET exact('/messages') auth=agentOrAdmin -> handleMessagesGet",
       "GET idMatch(/^\\/files\\/([^/]+)$/) auth=agentOrAdmin -> handleFileById",
       "POST exact('/files') auth=admin -> handleFilePost",

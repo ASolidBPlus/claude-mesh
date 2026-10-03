@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
-import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, markTlsSeen, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
+import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, markTlsSeen, recordAgentConnection, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
 import { validateToken } from './auth.ts';
 import { PEER_PROTOCOL_VERSION } from './wire-version.ts';  // #131: via the tiny module, never cross-package from here
 import { parseDuration } from './duration.ts';
@@ -16,6 +16,7 @@ import {
 } from './router.ts';
 import { incMsgStatus, incReceived, incBytes } from './metrics.ts';
 import type { ServerTls } from './tls-config.ts';
+import { recordCaller } from './connections.ts';
 import { PEER_REGISTER_ROUTE, serveRoute } from './http-admin.ts';
 
 /** F1a (§5.1): the only inbound peer protocol this mesh speaks. A version is a
@@ -56,6 +57,9 @@ interface ConnState {
   /** R-65: the socket arrived on a TLS listener. Fixed at accept time from the
    *  listener it came through — never from anything the client says. */
   tls: boolean;
+  /** R-65 M4: the TCP peer address, from the socket — never a header. Behind a
+   *  proxy this is the proxy, which is the honest answer. */
+  srcIp: string | null;
 }
 
 interface PresenceState {
@@ -132,6 +136,28 @@ interface AuthCtx {
  * about the auth frame, and moving it would put the timer's lifetime in a
  * function that has no other reason to know about it.
  */
+/**
+ * R-65 M4 — ONE line per agent auth outcome, success and refusal alike:
+ * `agent.auth` (or `observer.auth` for an observer) with the socket's src_ip
+ * and the listener's scheme. The reason for a refusal is log-only; the wire
+ * keeps its uniform answer (C9). The claimed id is capped: an unauthenticated
+ * caller chooses it.
+ */
+function logAuth(db: Database, state: ConnState, agentId: string | null, fields: Record<string, unknown>): void {
+  let observer = false;
+  if (agentId !== null) {
+    try { observer = isObserver(db, agentId); } catch (_) { /* logging never breaks auth */ }
+  }
+  console.log(JSON.stringify({
+    evt: observer ? 'observer.auth' : 'agent.auth',
+    agent_id: agentId === null ? null : agentId.slice(0, 128),
+    src_ip: state.srcIp,
+    tls: state.tls,
+    ...fields,
+    at: Date.now(),
+  }));
+}
+
 function handleAuthFrame(ctx: AuthCtx): void {
   const { ws, state, db, frame, parsed, agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus, latchOnTls } = ctx;
 
@@ -150,6 +176,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
   if (typeof agentId !== 'string' || typeof token !== 'string') {
     try {
       ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'missing agent_id or token' }));
+      logAuth(db, state, typeof agentId === 'string' ? agentId : null, { refused: 'malformed' });
     } catch (_) { /* ignore */ }
     ws.close(1008, 'auth failed');
     return;
@@ -295,6 +322,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
 
   const agent = getAgentById(db, agentId);
   if (agent === null) {
+    logAuth(db, state, agentId, { refused: 'unknown_agent' });
     try {
       ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
     } catch (_) { /* ignore */ }
@@ -315,6 +343,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
   // stays distinct: it answers a different question — what the caller
   // SENT — and reveals nothing about what exists here.
   if (!validateToken(token, agent.token_hash)) {
+    logAuth(db, state, agentId, { refused: 'bad_token' });
     try {
       ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
     } catch (_) { /* ignore */ }
@@ -328,9 +357,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
   // socket displaces nothing and changes no presence. The refusal is the
   // uniform AUTH_FAILED body; the reason goes to the log, not the wire.
   if (!state.tls && agent.tls_seen != null) {
-    console.log(JSON.stringify({
-      evt: 'agent.auth', agent_id: agentId, tls: false, refused: 'tls_latched', at: Date.now(),
-    }));
+    logAuth(db, state, agentId, { refused: 'tls_latched' });
     try {
       ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
     } catch (_) { /* ignore */ }
@@ -385,6 +412,15 @@ function handleAuthFrame(ctx: AuthCtx): void {
     // than dropped, and does not reconnect into a fight with itself.
     try { displaced.close(1008, 'displaced by a newer connection'); } catch (_) { /* ignore */ }
   }
+  logAuth(db, state, agentId, { displaced: displaced !== undefined && displaced !== ws });
+  // R-65 M6: the persisted per-agent report, and — for an observer — the
+  // in-memory caller list too, which is where the operator looks for
+  // non-agent callers.
+  const scheme = state.tls ? 'wss' : 'ws';
+  try {
+    recordAgentConnection(db, agentId, scheme, state.srcIp);
+    if (isObserver(db, agentId)) recordCaller(state.srcIp ?? undefined, 'observer', scheme);
+  } catch (_) { /* the report never breaks auth */ }
 
   const pending = getPendingMessages(db, agentId);
   const queued = pending.length;
@@ -1251,10 +1287,13 @@ export function startWsServer(
           at: Date.now(),
         }));
       }
-      wss.on('connection', (ws: WebSocket, _req: http.IncomingMessage, scheme: 'ws' | 'wss') => {
+      wss.on('connection', (ws: WebSocket, req: http.IncomingMessage, scheme: 'ws' | 'wss') => {
         connections.add(ws);
 
-        const state: ConnState = { ws, agentId: null, peerAlias: null, authed: false, tls: scheme === 'wss' };
+        const state: ConnState = {
+          ws, agentId: null, peerAlias: null, authed: false, tls: scheme === 'wss',
+          srcIp: req.socket.remoteAddress ?? null,
+        };
         registry.set(ws, state);
 
         // #143: NO local `authed` mirror. It used to sit here beside

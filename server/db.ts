@@ -34,6 +34,13 @@ export interface Agent {
       or null. Once set, a plaintext auth for it is refused. Optional for the
       same reason as the status fields: older readers and test literals. */
   tls_seen?: number | null;
+  /** R-65 M6: the agent's most recent authenticated contact on ANY channel —
+      a WS auth or an agent-token HTTP request — and when it last used a
+      PLAINTEXT one. Optional for the same reason as the fields above. */
+  last_scheme?: string | null;
+  last_src_ip?: string | null;
+  last_auth_at?: number | null;
+  last_plaintext_at?: number | null;
   online: number;          // 0 | 1
 }
 
@@ -558,6 +565,13 @@ export function openDb(path: string): Database {
   // duplicate-column error on a second boot is the no-op.
   try { db.exec('ALTER TABLE agents ADD COLUMN tls_seen INTEGER'); } catch {}
 
+  // R-65 M6 — the per-agent connection report. Nullable and additive; every
+  // existing row reads "never seen", which is the truth for this build.
+  try { db.exec('ALTER TABLE agents ADD COLUMN last_scheme TEXT'); } catch {}
+  try { db.exec('ALTER TABLE agents ADD COLUMN last_src_ip TEXT'); } catch {}
+  try { db.exec('ALTER TABLE agents ADD COLUMN last_auth_at INTEGER'); } catch {}
+  try { db.exec('ALTER TABLE agents ADD COLUMN last_plaintext_at INTEGER'); } catch {}
+
   // F3 migration: observer grants made before federation existed are LOCAL-ONLY.
   // The default is 0 rather than 1 on purpose — an operator who granted "see
   // everything" in a mesh with no borders did not consent to cross-border
@@ -884,6 +898,31 @@ export function setAgentStatus(db: Database, id: string, status: AgentStatus | n
  */
 export function markTlsSeen(db: Database, id: string): void {
   db.prepare('UPDATE agents SET tls_seen = ? WHERE id = ? AND tls_seen IS NULL').run(Date.now(), id);
+}
+
+/**
+ * R-65 M6 — record one authenticated contact by an agent: scheme is the
+ * listener's ('ws' | 'wss' | 'http' | 'https'), src_ip the socket's.
+ *
+ * WHY `last_plaintext_at` AND NOT ONLY `last_scheme`: an agent can hold its WS
+ * over TLS and still fetch files over plaintext HTTP, and a single "last
+ * scheme" would show whichever happened last. The gate for closing plaintext
+ * is "has anyone used it since <t>", which only a plaintext timestamp answers.
+ */
+export function recordAgentConnection(db: Database, id: string, scheme: string, srcIp: string | null): void {
+  const now = Date.now();
+  const plaintext = scheme === 'ws' || scheme === 'http';
+  db.prepare(`UPDATE agents SET last_scheme = ?, last_src_ip = ?, last_auth_at = ?${plaintext ? ', last_plaintext_at = ?' : ''} WHERE id = ?`)
+    .run(...(plaintext ? [scheme, srcIp, now, now, id] : [scheme, srcIp, now, id]));
+}
+
+/**
+ * R-65 M5 — replace an agent's token. ONLY the hash changes: ACL edges,
+ * namespace, metadata and the TLS latch are the identity's, not the
+ * credential's. Returns false when no such agent exists.
+ */
+export function rotateAgentToken(db: Database, id: string, tokenHash: string): boolean {
+  return db.prepare('UPDATE agents SET token_hash = ? WHERE id = ?').run(tokenHash, id).changes > 0;
 }
 
 export function isTlsLatched(db: Database, id: string): boolean {

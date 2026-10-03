@@ -272,6 +272,9 @@ export interface AdminCtx {
   // routes it is 'admin' or the specific agent. Handlers that don't scope by
   // caller ignore it.
   auth: AuthResult;
+  /** R-65 M6: every listener the bus runs, for GET /connections. Absent on a
+   *  ctx built outside the admin listener (the WS door). */
+  listeners?: { name: string; port: number | 'off'; scheme: string }[];
 }
 
 export type AdminHandler = (ctx: AdminCtx) => Promise<void> | void;
@@ -291,12 +294,24 @@ export interface Route {
 
 // Path matchers: `exact` for a literal path, `idMatch` to capture a single
 // `:id` segment into params.id.
-export const exact = (p: string) => (pathname: string): Record<string, string> | null =>
-  pathname === p ? {} : null;
-export const idMatch = (re: RegExp) => (pathname: string): Record<string, string> | null => {
-  const m = pathname.match(re);
-  return m ? { id: m[1] as string } : null;
-};
+//
+// R-65 M4: each matcher carries its PATTERN (`/files/:id`), so a log line can
+// name the route without the id in it — an id or a query string in a log is
+// the caller's data, and the route is all the line needs.
+type Matcher = ((pathname: string) => Record<string, string> | null) & { pattern: string };
+export const exact = (p: string): Matcher =>
+  Object.assign((pathname: string): Record<string, string> | null => (pathname === p ? {} : null), { pattern: p });
+export const idMatch = (re: RegExp): Matcher =>
+  Object.assign((pathname: string): Record<string, string> | null => {
+    const m = pathname.match(re);
+    return m ? { id: m[1] as string } : null;
+  }, { pattern: re.source.replace(/^\^/, '').replace(/\$$/, '').replace(/\(\[\^\/\]\+\)/g, ':id').replace(/\\\//g, '/') });
+
+/** `METHOD /pattern` for a matched route — or for no route, a placeholder. */
+export function routeLabel(method: string | undefined, route: Route | undefined): string {
+  const pattern = (route?.match as Partial<Matcher> | undefined)?.pattern;
+  return `${method ?? '?'} ${pattern ?? '(unmatched)'}`;
+}
 
 /**
  * The dispatcher's whole auth decision, in one place, keyed on the route's
