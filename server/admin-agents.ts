@@ -15,10 +15,11 @@ import {
   generateToken, hashToken,
 } from './auth.ts';
 import {
-  Agent, RESERVED_ALIAS, agentIdRefusal, clearTlsLatch, deleteAgent, getAgentById, getLivePeerKeyForAlias, getPeerByAlias, listAgents, registerAgent, updateAgent,
+  Agent, RESERVED_ALIAS, agentIdRefusal, clearTlsLatch, deleteAgent, rotateAgentToken, getAgentById, getLivePeerKeyForAlias, getPeerByAlias, listAgents, registerAgent, updateAgent,
 } from './db.ts';
 import type { AdminCtx } from './admin-ctx.ts';
 import { readBody, formatAgent } from './admin-ctx.ts';
+import { listCallers } from './connections.ts';
 
 export async function handleAgentPost(ctx: AdminCtx): Promise<void> {
   const { req, res, db } = ctx;
@@ -180,6 +181,54 @@ export function handleAgentTlsLatchDelete(ctx: AdminCtx): void {
   console.log(JSON.stringify({ evt: 'agent.tls_latch_cleared', agent_id: id, at: Date.now() }));
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ id, tls_latched: false }));
+}
+
+/**
+ * R-65 M5 — rotate an agent's token. The new token is returned ONCE and
+ * logged nowhere; ACL edges, namespace and the TLS latch are kept (only the
+ * hash changes). Every live socket authenticated as the id — its agent socket
+ * and its observer socket — is CLOSED, with a reason that is not
+ * displacement, so a live socket opened with a captured token is not left
+ * running and an offline victim reconnecting later cannot displace anything:
+ * the old token is refused from this instant, on WS and HTTP alike.
+ */
+export function handleAgentRotate(ctx: AdminCtx): void {
+  const { res, db, params, agentIndex, observerIndex } = ctx;
+  const id = params.id as string;
+  const token = generateToken();
+  if (!rotateAgentToken(db, id, hashToken(token))) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'agent not found' }));
+    return;
+  }
+  const sockets = new Set([agentIndex.get(id), observerIndex.get(id)].filter((s): s is NonNullable<typeof s> => s !== undefined));
+  for (const sock of sockets) {
+    try { sock.send(JSON.stringify({ type: 'error', code: 'TOKEN_ROTATED', message: 'token rotated' })); } catch { /* ignore */ }
+    try { sock.close(1008, 'token rotated'); } catch { /* ignore */ }
+    // close() only STARTS the handshake: a client holding a stolen token can
+    // ignore it and keep sending until the 30 s close timeout. terminate()
+    // ends the socket now; the frame and code above are already written.
+    try { sock.terminate(); } catch { /* ignore */ }
+  }
+  console.log(JSON.stringify({ evt: 'agent.token_rotated', agent_id: id, closed_sockets: sockets.size, at: Date.now() }));
+  // A credential in the body: never cached by anything between here and the operator.
+  res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify({ id, token }));
+}
+
+/**
+ * R-65 M6 — the connection report. Per agent: PERSISTED on its row. Per
+ * non-agent caller: in memory since boot, and `since_boot` says when that
+ * window began. `listeners` is every listener the bus runs, `off` included, so
+ * "no plaintext listener" can be read from here rather than inferred.
+ */
+export function handleConnectionsGet(ctx: AdminCtx): void {
+  const { res, db } = ctx;
+  const agents = (db.prepare('SELECT id, last_scheme, last_src_ip, last_auth_at, last_plaintext_at FROM agents ORDER BY id').all() as
+    { id: string; last_scheme: string | null; last_src_ip: string | null; last_auth_at: number | null; last_plaintext_at: number | null }[]);
+  const { since_boot, callers } = listCallers();
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ since_boot, listeners: ctx.listeners ?? [], agents, callers }));
 }
 
 export function handleAgentDelete(ctx: AdminCtx): void {

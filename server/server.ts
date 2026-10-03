@@ -392,25 +392,23 @@ async function main() {
   applyPlaintextPeerCidrs(config.plaintextPeerCidrs);
   const border = startBorder(db, wsHandle.agentIndex, { ca: config.tlsCa });
 
+  // R-65: EVERY listener, built ONCE from the config that was actually applied
+  // and used twice — the boot line below and GET /connections — so the two
+  // cannot disagree. 'off' ones included, so a verifier can PROVE plaintext is
+  // closed rather than infer it from a line that is missing.
+  const listeners = [
+    { name: 'ws', port: config.wsPort, scheme: config.wsPort === 'off' ? 'off' : (config.wsTlsPort === null && config.tls !== null ? 'wss' : 'ws') },
+    ...(config.wsTlsPort === null ? [] : [{ name: 'ws_tls', port: config.wsTlsPort, scheme: 'wss' }]),
+    { name: 'admin', port: config.adminPort, scheme: config.adminPort === 'off' ? 'off' : 'http' },
+    ...(config.adminTlsPort === null ? [] : [{ name: 'admin_tls', port: config.adminTlsPort, scheme: 'https' }]),
+  ];
   const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, observerIndex, peerIndex, border, {
     metricsToken: config.metricsToken,
     adminTokenPrev: config.adminTokenPrev,
+    listeners,
     ...(config.adminTlsPort === null ? {} : { tls: config.tls, tlsPort: config.adminTlsPort }),
   });
-
-  // R-65: EVERY listener, in one line — including the ones that are 'off', so
-  // a verifier can PROVE plaintext is closed rather than infer it from a line
-  // that is missing. Built from the config that was actually applied.
-  console.log(JSON.stringify({
-    evt: 'mesh.listeners',
-    listeners: [
-      { name: 'ws', port: config.wsPort, scheme: config.wsPort === 'off' ? 'off' : (config.wsTlsPort === null && config.tls !== null ? 'wss' : 'ws') },
-      ...(config.wsTlsPort === null ? [] : [{ name: 'ws_tls', port: config.wsTlsPort, scheme: 'wss' }]),
-      { name: 'admin', port: config.adminPort, scheme: config.adminPort === 'off' ? 'off' : 'http' },
-      ...(config.adminTlsPort === null ? [] : [{ name: 'admin_tls', port: config.adminTlsPort, scheme: 'https' }]),
-    ],
-    at: Date.now(),
-  }));
+  console.log(JSON.stringify({ evt: 'mesh.listeners', listeners, at: Date.now() }));
 
   let cleanupHandle: CleanupHandle | null = null;
   let reminderHandle: ReminderSchedulerHandle | null = null;

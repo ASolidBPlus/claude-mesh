@@ -6,9 +6,11 @@ import { timingSafeEqual, adminTokenMatches } from './auth.ts';
 import * as https from 'https';
 import type { ServerTls } from './tls-config.ts';
 import { handleAclDelete, handleAclGet, handleAclPost } from './admin-acl.ts';
-import { handleAgentById, handleAgentDelete, handleAgentGet, handleAgentPatch, handleAgentPost, handleAgentTlsLatchDelete } from './admin-agents.ts';
+import { handleAgentById, handleAgentDelete, handleAgentGet, handleAgentPatch, handleAgentPost, handleAgentTlsLatchDelete, handleAgentRotate, handleConnectionsGet } from './admin-agents.ts';
 import type { AdminCtx, ForwarderRegistry, Route } from './admin-ctx.ts';
-import { exact, idMatch, requestSource, resolveRouteAuth } from './admin-ctx.ts';
+import { exact, idMatch, requestSource, resolveRouteAuth, routeLabel } from './admin-ctx.ts';
+import { recordCaller, normaliseIp } from './connections.ts';
+import { recordAgentConnection } from './db.ts';
 import { handleFileById, handleFilePost } from './admin-files.ts';
 import { handleMessagesGet } from './admin-messages.ts';
 import { handleObserverDelete, handleObserverGet, handleObserverPost } from './admin-observers.ts';
@@ -89,6 +91,10 @@ export const ROUTES: Route[] = [
   // R-65: clears the TLS latch. Two segments, so it cannot contend with the
   // one-segment DELETE above.
   { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)\/tls-latch$/), handler: handleAgentTlsLatchDelete },
+  // R-65 M5: a new token for the id; every socket held under the old one closes.
+  { method: 'POST',   match: idMatch(/^\/agents\/([^/]+)\/rotate$/), handler: handleAgentRotate },
+  // R-65 M6: who connects, by what scheme — the gate for closing plaintext.
+  { method: 'GET',    match: exact('/connections'),                  handler: handleConnectionsGet },
   { method: 'GET',    match: exact('/messages'),                     handler: handleMessagesGet, auth: 'agentOrAdmin' },
   { method: 'GET',    match: idMatch(/^\/files\/([^/]+)$/),          handler: handleFileById, auth: 'agentOrAdmin' },
   { method: 'POST',   match: exact('/files'),                        handler: handleFilePost },
@@ -99,13 +105,13 @@ export const ROUTES: Route[] = [
 ];
 
 /** Bearer credential for /metrics: the metrics token or the admin token. */
-function metricsAuthorized(req: http.IncomingMessage, metricsToken: string, adminToken: string, adminTokenPrev: string | null): boolean {
+function metricsAuthorized(req: http.IncomingMessage, metricsToken: string, adminToken: string, adminTokenPrev: string | null): 'metrics' | 'admin' | null {
   const auth = req.headers['authorization'];
-  if (typeof auth !== 'string' || !auth.startsWith('Bearer ')) return false;
+  if (typeof auth !== 'string' || !auth.startsWith('Bearer ')) return null;
   const presented = auth.slice('Bearer '.length);
   const viaMetrics = timingSafeEqual(presented, metricsToken);
   const viaAdmin = adminTokenMatches(presented, adminToken, adminTokenPrev);
-  return viaMetrics || viaAdmin;
+  return viaMetrics ? 'metrics' : viaAdmin ? 'admin' : null;
 }
 
 /**
@@ -198,6 +204,8 @@ export function startHttpAdmin(
     tls?: ServerTls | null;
     tlsPort?: number;
     adminTokenPrev?: string | null;
+    /** R-65 M6: every listener the bus runs (server.ts builds it), for GET /connections. */
+    listeners?: { name: string; port: number | 'off'; scheme: string }[];
   } = {},
 ): Promise<HttpAdminHandle> {
   const metricsToken = opts.metricsToken ?? null;
@@ -223,10 +231,23 @@ export function startHttpAdmin(
         // run, so the timing does not say which one matched. The refusal is
         // byte-identical to every other admin 401. Nothing about the
         // presented credential is logged.
-        if (metricsToken !== null && !metricsAuthorized(req, metricsToken, adminToken, adminTokenPrev)) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'unauthorized' }));
-          return;
+        const scheme = tls ? 'https' : 'http';
+        const srcIp = normaliseIp(req.socket.remoteAddress);
+        if (metricsToken !== null) {
+          const via = metricsAuthorized(req, metricsToken, adminToken, adminTokenPrev);
+          if (via === null) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'unauthorized' }));
+            return;
+          }
+          // R-65 M4/M6: a token-authenticated scrape is logged and recorded
+          // like any other token-authenticated request.
+          console.log(JSON.stringify({ evt: 'agent.http', principal: via, agent_id: null, route: 'GET /metrics', src_ip: srcIp, tls, at: Date.now() }));
+          recordCaller(srcIp, via, scheme);
+        } else {
+          // Unauthenticated scrape: no credential to log, but still a caller —
+          // the one most likely to still be on plaintext.
+          recordCaller(srcIp, 'metrics', scheme);
         }
         try {
           const body = renderMetrics(db);
@@ -259,8 +280,31 @@ export function startHttpAdmin(
       const auth = resolveRouteAuth(req, res, db, adminToken, matched?.auth, { adminTokenPrev, tls });
       if (auth === null) return; // 401 already written
 
+      // R-65 M4 + M6: every TOKEN-authenticated request — admin or agent — is
+      // logged with the route PATTERN (never the raw URL: no ids, no query
+      // string), the socket's address and the listener's scheme, and recorded
+      // in the connection report. `handler`-authenticated routes carry no
+      // token the dispatcher checked, so they are not "token-authenticated".
+      if (auth.mode !== 'unauthenticated') {
+        const scheme = tls ? 'https' : 'http';
+        const srcIp = normaliseIp(req.socket.remoteAddress);
+        // `principal` says WHAT authenticated; `agent_id` is only ever a real
+        // agent id. 'admin' and 'metrics' are legal agent ids, so putting them
+        // in agent_id would make an agent of that name look like the admin.
+        console.log(JSON.stringify({
+          evt: 'agent.http',
+          principal: auth.mode === 'admin' ? 'admin' : 'agent',
+          agent_id: auth.mode === 'admin' ? null : auth.agentId,
+          route: routeLabel(method, matched), src_ip: srcIp, tls, at: Date.now(),
+        }));
+        try {
+          if (auth.mode === 'agent') recordAgentConnection(db, auth.agentId, scheme, srcIp);
+          else recordCaller(srcIp, 'admin', scheme);
+        } catch (_) { /* the report never breaks a request */ }
+      }
+
       if (matched) {
-        await serveRoute(matched, { req, res, db, url, params, agentIndex, observerIndex, peerIndex, forwarders, maxFileBytes, filesDir, auth }, 'admin');
+        await serveRoute(matched, { req, res, db, url, params, agentIndex, observerIndex, peerIndex, forwarders, maxFileBytes, filesDir, auth, listeners: opts.listeners ?? [] }, 'admin');
         return;
       }
 
