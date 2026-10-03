@@ -26,7 +26,7 @@ describe('#133 MeshClient.loopAlive()', () => {
     db = openDb(':memory:');
     registerAgent(db, { id: 'looper', token_hash: hashToken('tok-loop'), hostname: 'h' });
     handle = await startWsServer(0, db, 10_485_760, mkdtempSync(join(tmpdir(), 'mesh-loopalive-')));
-    port = (handle.wss.address() as { port: number }).port;
+    port = handle.address().port;
   });
   afterEach(async () => {
     try { client?.close(); } catch { /* ignore */ }

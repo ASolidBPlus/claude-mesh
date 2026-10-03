@@ -77,7 +77,10 @@ describe('#79 one token-comparison helper', () => {
   // adding a plain compare.
   it('every door that compares the admin token calls the helper', () => {
     const callers = sourceFiles(SERVER_ROOT)
-      .filter(f => /\btimingSafeEqual\s*\(/.test(code(f)))
+      // R-65 M7: adminTokenMatches is the admin-token form of the same helper
+      // (it calls timingSafeEqual twice), so a door calling it IS a door
+      // calling the helper — the SET below is unchanged by that move.
+      .filter(f => /\b(?:timingSafeEqual|adminTokenMatches)\s*\(/.test(code(f)))
       .map(f => f.slice(SERVER_ROOT.length + 1))
       .sort();
     // #143 split http-admin.ts along URL families; `requireAdmin` — the door

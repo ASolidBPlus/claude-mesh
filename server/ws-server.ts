@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
-import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
+import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, markTlsSeen, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
 import { validateToken } from './auth.ts';
 import { PEER_PROTOCOL_VERSION } from './wire-version.ts';  // #131: via the tiny module, never cross-package from here
 import { parseDuration } from './duration.ts';
@@ -36,6 +36,12 @@ export interface WsServerHandle {
    *  return something with the other's semantics. */
   peerIndex: Map<string, WebSocket>;
   observerIndex: Map<string, WebSocket>;
+  /** R-65: the first listener's address (the plaintext one when there is
+   *  one). The WebSocketServer has no address of its own any more: it is fed
+   *  by every listener (`noServer`). */
+  address(): net.AddressInfo;
+  /** R-65: every listener, by name. */
+  listeners: { name: 'ws' | 'ws_tls'; scheme: 'ws' | 'wss'; server: http.Server }[];
   shutdown(): Promise<void>;
 }
 
@@ -47,6 +53,9 @@ interface ConnState {
    *  collision gates guarantee an alias and an agent id cannot coincide. */
   peerAlias: string | null;
   authed: boolean;
+  /** R-65: the socket arrived on a TLS listener. Fixed at accept time from the
+   *  listener it came through — never from anything the client says. */
+  tls: boolean;
 }
 
 interface PresenceState {
@@ -310,6 +319,23 @@ function handleAuthFrame(ctx: AuthCtx): void {
     ws.close(1008, 'auth failed');
     return;
   }
+
+  // R-65 TLS LATCH — checked HERE: after the credential (so it answers only a
+  // caller who already holds the token, and adds no oracle for one who does
+  // not) and BEFORE setOnline and newer-wins below, so a refused plaintext
+  // socket displaces nothing and changes no presence. The refusal is the
+  // uniform AUTH_FAILED body; the reason goes to the log, not the wire.
+  if (!state.tls && agent.tls_seen != null) {
+    console.log(JSON.stringify({
+      evt: 'agent.auth', agent_id: agentId, tls: false, refused: 'tls_latched', at: Date.now(),
+    }));
+    try {
+      ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
+    } catch (_) { /* ignore */ }
+    ws.close(1008, 'auth failed');
+    return;
+  }
+  if (state.tls) markTlsSeen(db, agentId);
 
   const connectTime = Date.now();
   setOnline(db, agentId, true);
@@ -972,13 +998,19 @@ export const POST_AUTH_HANDLERS: Record<string, FrameHandler> = {
 };
 
 export function startWsServer(
-  port: number,
+  port: number | 'off',
   db: Database,
   maxFileBytes: number = 10_485_760,
   filesDir: string = '/data/files',
   presenceDebounceMs: number = 0,   // 0 = immediate (legacy). Production passes config value.
   observerIndex: Map<string, WebSocket> = new Map(),   // NEW — defaulted
   tls: ServerTls | null = null,   // MESH_TLS_CERT + MESH_TLS_KEY; null = plain HTTP, as before
+  // R-65 M1: a TLS listener BESIDE the plaintext one. Absent = the #215 shape,
+  // byte for byte: one listener at `port`, TLS iff `tls` is set. With it,
+  // `port` is the PLAINTEXT listener (or 'off') and `tlsPort` serves TLS with
+  // the same certificate. server.ts enforces the pairing rules; this function
+  // trusts them and refuses only what it cannot serve.
+  opts: { tlsPort?: number } = {},
 ): Promise<WsServerHandle> {
   return new Promise((resolve, reject) => {
     // #87: reconcile the durable `online` flag with reality BEFORE binding the
@@ -1068,9 +1100,33 @@ export function startWsServer(
     // listener is deliberately NOT coupled to this: it is meant to be bound to
     // loopback (MESH_ADMIN_BIND) and never cross hosts. No hot reload: the
     // certificate is read once at boot, and rotating it is a restart.
-    const httpServer = tls === null
-      ? http.createServer(onRequest)
-      : https.createServer({ cert: tls.cert, key: tls.key }, onRequest);
+    //
+    // R-65: ONE STATE, ONE OR TWO DOORS. Each listener is its own http(s)
+    // server, and every one of them hands its upgrades to the SAME
+    // WebSocketServer — so registry, agentIndex, peerIndex, observerIndex and
+    // presenceState stay single, and newer-wins works across ports. The scheme
+    // is stamped on the connection by the listener it came through.
+    const sideBySide = opts.tlsPort !== undefined;
+    if (sideBySide && tls === null) {
+      reject(new Error('a TLS listener needs MESH_TLS_CERT and MESH_TLS_KEY'));
+      return;
+    }
+    if (!sideBySide && port === 'off') {
+      reject(new Error("the WS port can be 'off' only beside a TLS listener"));
+      return;
+    }
+    const listenerSpecs: { name: 'ws' | 'ws_tls'; port: number; scheme: 'ws' | 'wss' }[] = sideBySide
+      ? [
+        ...(port === 'off' ? [] : [{ name: 'ws' as const, port, scheme: 'ws' as const }]),
+        { name: 'ws_tls' as const, port: opts.tlsPort!, scheme: 'wss' as const },
+      ]
+      : [{ name: 'ws' as const, port: port as number, scheme: tls === null ? 'ws' as const : 'wss' as const }];
+    const listeners = listenerSpecs.map(spec => ({
+      spec,
+      server: spec.scheme === 'wss'
+        ? https.createServer({ cert: tls!.cert, key: tls!.key }, onRequest)
+        : http.createServer(onRequest),
+    }));
     // (c) Drop oversize frames at the CONNECTION level, before JSON.parse.
     //
     // The 1 MiB payload check in the router runs AFTER parsing, so a 100 MiB
@@ -1081,7 +1137,12 @@ export function startWsServer(
     // Headroom above the payload cap because the frame carries envelope too
     // (type, ids, content_type); the ROUTER's 1 MiB check is still the payload
     // authority and is unchanged.
-    const wss = new WebSocketServer({ server: httpServer, maxPayload: 1_100_000 });
+    const wss = new WebSocketServer({ noServer: true, maxPayload: 1_100_000 });
+    for (const { spec, server } of listeners) {
+      server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
+        wss.handleUpgrade(req, socket, head, (ws: WebSocket) => wss.emit('connection', ws, req, spec.scheme));
+      });
+    }
     const connections = new Set<WebSocket>();
     const sockets = new Set<net.Socket>();
     // Connection registry: ws -> state
@@ -1128,12 +1189,13 @@ export function startWsServer(
     }
 
     // Track all raw TCP sockets so we can destroy them on shutdown
-    httpServer.on('connection', (socket) => {
-      sockets.add(socket);
-      socket.once('close', () => sockets.delete(socket));
-    });
-
-    httpServer.on('error', reject);
+    for (const { server } of listeners) {
+      server.on('connection', (socket: net.Socket) => {
+        sockets.add(socket);
+        socket.once('close', () => sockets.delete(socket));
+      });
+      server.on('error', reject);
+    }
     wss.on('error', reject);
 
     // #127, symmetry: MESH_WS_BIND for the agent/peer listener. Same default —
@@ -1146,38 +1208,46 @@ export function startWsServer(
     // every peering; the admin port need only be reachable by operators and the
     // spawner stack. One variable for both would force the more permissive.
     const wsBindHost = process.env.MESH_WS_BIND;
-    httpServer.listen({ port, host: wsBindHost }, () => {
+    Promise.all(listeners.map(({ spec, server }) => new Promise<void>((res) => {
+      server.listen({ port: spec.port, host: wsBindHost }, () => res());
+    }))).then(() => {
       // #139 shipped MESH_WS_BIND without this line, which made the two ports
       // asymmetric in exactly the way that matters: the admin port announces
       // where it bound and what is unauthenticated on it, while the port every
       // agent and peering must reach announced nothing. A deployer restricting
       // one and not the other had no way to see it. Same shape as the admin
       // line, and it fires when nothing is set — the case that needs telling.
-      const addr = httpServer.address();
-      const bound = typeof addr === 'object' && addr !== null ? `${addr.address}:${addr.port}` : String(addr);
-      console.log(JSON.stringify({
-        evt: 'ws.listening',
-        bind: wsBindHost ?? '(all interfaces)',
-        bound,
-        // Printed when OFF too, for the same reason as the rest of this line:
-        // a verifier must be able to PROVE which one it is, and "no field"
-        // cannot be told apart from "a build that predates the field". What
-        // is said about the certificate comes from the CERT — never the key.
-        tls: tls !== null,
-        ...(tls === null ? {} : {
-          tls_subject: tls.info.subject,
-          tls_sans: tls.info.sans,
-          tls_not_after: tls.info.not_after,
-        }),
-        note: wsBindHost === undefined
-          ? 'agent/peer port bound to ALL interfaces — every agent and peering must reach it, so restricting it is a deployment decision with reachability consequences'
-          : 'agent/peer port restricted; every agent and peering must be able to reach this address',
-        at: Date.now(),
-      }));
-      wss.on('connection', (ws: WebSocket) => {
+      for (const { spec, server } of listeners) {
+        const addr = server.address();
+        const bound = typeof addr === 'object' && addr !== null ? `${addr.address}:${addr.port}` : String(addr);
+        const onTls = spec.scheme === 'wss';
+        console.log(JSON.stringify({
+          evt: 'ws.listening',
+          // R-65: named only when there is more than one door to name, so the
+          // single-listener line stays exactly what #215's verifiers read.
+          ...(sideBySide ? { listener: spec.name } : {}),
+          bind: wsBindHost ?? '(all interfaces)',
+          bound,
+          // Printed when OFF too, for the same reason as the rest of this line:
+          // a verifier must be able to PROVE which one it is, and "no field"
+          // cannot be told apart from "a build that predates the field". What
+          // is said about the certificate comes from the CERT — never the key.
+          tls: onTls,
+          ...(!onTls ? {} : {
+            tls_subject: tls!.info.subject,
+            tls_sans: tls!.info.sans,
+            tls_not_after: tls!.info.not_after,
+          }),
+          note: wsBindHost === undefined
+            ? 'agent/peer port bound to ALL interfaces — every agent and peering must reach it, so restricting it is a deployment decision with reachability consequences'
+            : 'agent/peer port restricted; every agent and peering must be able to reach this address',
+          at: Date.now(),
+        }));
+      }
+      wss.on('connection', (ws: WebSocket, _req: http.IncomingMessage, scheme: 'ws' | 'wss') => {
         connections.add(ws);
 
-        const state: ConnState = { ws, agentId: null, peerAlias: null, authed: false };
+        const state: ConnState = { ws, agentId: null, peerAlias: null, authed: false, tls: scheme === 'wss' };
         registry.set(ws, state);
 
         // #143: NO local `authed` mirror. It used to sit here beside
@@ -1421,6 +1491,8 @@ export function startWsServer(
 
       const handle: WsServerHandle = {
         wss,
+        address: () => listeners[0]!.server.address() as net.AddressInfo,
+        listeners: listeners.map(({ spec, server }) => ({ name: spec.name, scheme: spec.scheme, server })),
         agentIndex,
         peerIndex,
         observerIndex,
@@ -1468,7 +1540,7 @@ export function startWsServer(
             }, 5000);
 
             // Stop accepting new connections, then destroy all underlying TCP sockets
-            // so httpServer.close() resolves promptly
+            // so each server.close() resolves promptly
             wss.close(() => {
               // wss (http server) closed
             });
@@ -1483,8 +1555,9 @@ export function startWsServer(
               for (const sock of sockets) {
                 try { sock.destroy(); } catch (_) { /* ignore */ }
               }
-              httpServer.close(() => res());
-              // Safety: resolve even if httpServer.close hangs
+              let open = listeners.length;
+              for (const { server } of listeners) server.close(() => { if (--open === 0) res(); });
+              // Safety: resolve even if a server's close hangs
               setTimeout(res, 500);
             }, 100);
           });

@@ -15,7 +15,7 @@ import {
   generateToken, hashToken,
 } from './auth.ts';
 import {
-  Agent, RESERVED_ALIAS, agentIdRefusal, deleteAgent, getAgentById, getLivePeerKeyForAlias, getPeerByAlias, listAgents, registerAgent, updateAgent,
+  Agent, RESERVED_ALIAS, agentIdRefusal, clearTlsLatch, deleteAgent, getAgentById, getLivePeerKeyForAlias, getPeerByAlias, listAgents, registerAgent, updateAgent,
 } from './db.ts';
 import type { AdminCtx } from './admin-ctx.ts';
 import { readBody, formatAgent } from './admin-ctx.ts';
@@ -161,6 +161,25 @@ export function handleAgentById(ctx: AdminCtx): void {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(formatAgent(agent)));
+}
+
+/**
+ * R-65: clear an agent's TLS latch, so it may authenticate over plaintext
+ * again. The way back for an agent latched by mistake, or moved off TLS on
+ * purpose; the next TLS auth latches it again. Admin only. The dispatcher's
+ * admin.mutation record names the agent.
+ */
+export function handleAgentTlsLatchDelete(ctx: AdminCtx): void {
+  const { res, db, params } = ctx;
+  const id = params.id as string;
+  if (!clearTlsLatch(db, id)) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'agent not found' }));
+    return;
+  }
+  console.log(JSON.stringify({ evt: 'agent.tls_latch_cleared', agent_id: id, at: Date.now() }));
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ id, tls_latched: false }));
 }
 
 export function handleAgentDelete(ctx: AdminCtx): void {

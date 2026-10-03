@@ -30,6 +30,10 @@ export interface Agent {
   status?: string | null;
   status_detail?: string | null;
   status_at?: number | null;
+  /** R-65 TLS LATCH: when this agent first authenticated over TLS (unix ms),
+      or null. Once set, a plaintext auth for it is refused. Optional for the
+      same reason as the status fields: older readers and test literals. */
+  tls_seen?: number | null;
   online: number;          // 0 | 1
 }
 
@@ -549,6 +553,11 @@ export function openDb(path: string): Database {
   try { db.exec('ALTER TABLE agents ADD COLUMN status_detail TEXT'); } catch {}
   try { db.exec('ALTER TABLE agents ADD COLUMN status_at INTEGER'); } catch {}
 
+  // R-65 TLS LATCH. Nullable and additive: every existing row is unlatched,
+  // which is exactly what it was. Idempotent like every ALTER here — the
+  // duplicate-column error on a second boot is the no-op.
+  try { db.exec('ALTER TABLE agents ADD COLUMN tls_seen INTEGER'); } catch {}
+
   // F3 migration: observer grants made before federation existed are LOCAL-ONLY.
   // The default is 0 rather than 1 on purpose — an operator who granted "see
   // everything" in a mesh with no borders did not consent to cross-border
@@ -857,6 +866,34 @@ export function setAgentStatus(db: Database, id: string, status: AgentStatus | n
   }
   db.prepare('UPDATE agents SET status = ?, status_detail = ?, status_at = ? WHERE id = ?')
     .run(status, statusDetailClean(detail), Date.now(), id);
+}
+
+/**
+ * R-65 TLS LATCH — once an agent has authenticated over TLS, it may not come
+ * back over plaintext.
+ *
+ * WHAT IT BUYS: a plaintext socket can no longer DISPLACE a TLS one (newer-wins
+ * would otherwise hand an on-path attacker holding a captured token the live
+ * identity and its queue), and a misconfigured agent cannot quietly fall back
+ * to plaintext. WHAT IT DOES NOT: protect a token already seen in cleartext —
+ * whoever captured it can authenticate over TLS too. Only rotating the token
+ * after the agent migrates closes that (R-65 M5).
+ *
+ * Set once (first TLS auth wins the timestamp); cleared only by the admin
+ * route DELETE /agents/:id/tls-latch.
+ */
+export function markTlsSeen(db: Database, id: string): void {
+  db.prepare('UPDATE agents SET tls_seen = ? WHERE id = ? AND tls_seen IS NULL').run(Date.now(), id);
+}
+
+export function isTlsLatched(db: Database, id: string): boolean {
+  const row = db.prepare('SELECT tls_seen FROM agents WHERE id = ?').get(id) as { tls_seen: number | null } | null;
+  return row !== null && row.tls_seen !== null;
+}
+
+/** Returns false when no such agent exists. */
+export function clearTlsLatch(db: Database, id: string): boolean {
+  return db.prepare('UPDATE agents SET tls_seen = NULL WHERE id = ?').run(id).changes > 0;
 }
 
 /** Clear a status if one is set; a no-op write otherwise (see handleLoopAlive). */

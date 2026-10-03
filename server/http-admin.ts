@@ -2,9 +2,11 @@ import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import { WebSocket } from 'ws';
 import { renderMetrics } from './metrics.ts';
-import { timingSafeEqual } from './auth.ts';
+import { timingSafeEqual, adminTokenMatches } from './auth.ts';
+import * as https from 'https';
+import type { ServerTls } from './tls-config.ts';
 import { handleAclDelete, handleAclGet, handleAclPost } from './admin-acl.ts';
-import { handleAgentById, handleAgentDelete, handleAgentGet, handleAgentPatch, handleAgentPost } from './admin-agents.ts';
+import { handleAgentById, handleAgentDelete, handleAgentGet, handleAgentPatch, handleAgentPost, handleAgentTlsLatchDelete } from './admin-agents.ts';
 import type { AdminCtx, ForwarderRegistry, Route } from './admin-ctx.ts';
 import { exact, idMatch, requestSource, resolveRouteAuth } from './admin-ctx.ts';
 import { handleFileById, handleFilePost } from './admin-files.ts';
@@ -47,7 +49,10 @@ export { validateOutboundPeerUrl } from './admin-outbound.ts';
 // below where the definition moved.
 
 export interface HttpAdminHandle {
+  /** The first listener: the plaintext one when there is one, else the TLS one. */
   server: http.Server;
+  /** R-65: every listener this handle owns, by name. */
+  servers: { name: 'admin' | 'admin_tls'; scheme: 'http' | 'https'; server: http.Server }[];
   shutdown(): Promise<void>;
 }
 
@@ -81,6 +86,9 @@ export const ROUTES: Route[] = [
   { method: 'GET',    match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentById },
   { method: 'PATCH',  match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentPatch },
   { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentDelete },
+  // R-65: clears the TLS latch. Two segments, so it cannot contend with the
+  // one-segment DELETE above.
+  { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)\/tls-latch$/), handler: handleAgentTlsLatchDelete },
   { method: 'GET',    match: exact('/messages'),                     handler: handleMessagesGet, auth: 'agentOrAdmin' },
   { method: 'GET',    match: idMatch(/^\/files\/([^/]+)$/),          handler: handleFileById, auth: 'agentOrAdmin' },
   { method: 'POST',   match: exact('/files'),                        handler: handleFilePost },
@@ -91,12 +99,12 @@ export const ROUTES: Route[] = [
 ];
 
 /** Bearer credential for /metrics: the metrics token or the admin token. */
-function metricsAuthorized(req: http.IncomingMessage, metricsToken: string, adminToken: string): boolean {
+function metricsAuthorized(req: http.IncomingMessage, metricsToken: string, adminToken: string, adminTokenPrev: string | null): boolean {
   const auth = req.headers['authorization'];
   if (typeof auth !== 'string' || !auth.startsWith('Bearer ')) return false;
   const presented = auth.slice('Bearer '.length);
   const viaMetrics = timingSafeEqual(presented, metricsToken);
-  const viaAdmin = timingSafeEqual(presented, adminToken);
+  const viaAdmin = adminTokenMatches(presented, adminToken, adminTokenPrev);
   return viaMetrics || viaAdmin;
 }
 
@@ -163,7 +171,7 @@ export async function serveRoute(route: Route, ctx: AdminCtx, listener: 'admin' 
 export const PEER_REGISTER_ROUTE: Route = ROUTES.find(r => r.handler === handlePeerRegister)!;
 
 export function startHttpAdmin(
-  port: number,
+  port: number | 'off',
   db: Database,
   adminToken: string,
   maxFileBytes: number = 10_485_760,
@@ -180,11 +188,33 @@ export function startHttpAdmin(
   forwarders: ForwarderRegistry = {},
   // R-18: MESH_METRICS_TOKEN, parsed and validated by loadConfig. null (the
   // default) = /metrics unauthenticated, exactly as before.
-  opts: { metricsToken?: string | null } = {},
+  //
+  // R-65: `tls` + `tlsPort` add a TLS listener BESIDE the plaintext one (M2),
+  // with the same handler, so every route — /messages and /files/:id
+  // included — is served on both. Absent = one plaintext listener, as before.
+  // `adminTokenPrev` (M7) is accepted wherever the admin token is.
+  opts: {
+    metricsToken?: string | null;
+    tls?: ServerTls | null;
+    tlsPort?: number;
+    adminTokenPrev?: string | null;
+  } = {},
 ): Promise<HttpAdminHandle> {
   const metricsToken = opts.metricsToken ?? null;
+  const adminTokenPrev = opts.adminTokenPrev ?? null;
   return new Promise((resolve, reject) => {
-    const server = http.createServer(async (req, res) => {
+    const sideBySide = opts.tlsPort !== undefined;
+    if (sideBySide && (opts.tls ?? null) === null) {
+      reject(new Error('a TLS admin listener needs MESH_TLS_CERT and MESH_TLS_KEY'));
+      return;
+    }
+    if (!sideBySide && port === 'off') {
+      reject(new Error("the admin port can be 'off' only beside a TLS listener"));
+      return;
+    }
+    // `tls` is fixed per LISTENER, never read from the request: it is which
+    // door the request came through.
+    const handleRequest = async (req: http.IncomingMessage, res: http.ServerResponse, tls: boolean): Promise<void> => {
       // /metrics is unauthenticated by design — this listener binds to the admin port
       // which is internal-only (not exposed publicly). Read-only Prometheus exposition.
       if (req.method === 'GET' && new URL(req.url!, 'http://localhost').pathname === '/metrics') {
@@ -193,7 +223,7 @@ export function startHttpAdmin(
         // run, so the timing does not say which one matched. The refusal is
         // byte-identical to every other admin 401. Nothing about the
         // presented credential is logged.
-        if (metricsToken !== null && !metricsAuthorized(req, metricsToken, adminToken)) {
+        if (metricsToken !== null && !metricsAuthorized(req, metricsToken, adminToken, adminTokenPrev)) {
           res.writeHead(401, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'unauthorized' }));
           return;
@@ -226,7 +256,7 @@ export function startHttpAdmin(
         break;
       }
 
-      const auth = resolveRouteAuth(req, res, db, adminToken, matched?.auth);
+      const auth = resolveRouteAuth(req, res, db, adminToken, matched?.auth, { adminTokenPrev, tls });
       if (auth === null) return; // 401 already written
 
       if (matched) {
@@ -236,9 +266,21 @@ export function startHttpAdmin(
 
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'not found' }));
-    });
+    };
 
-    server.on('error', reject);
+    const specs: { name: 'admin' | 'admin_tls'; port: number; scheme: 'http' | 'https' }[] = sideBySide
+      ? [
+        ...(port === 'off' ? [] : [{ name: 'admin' as const, port, scheme: 'http' as const }]),
+        { name: 'admin_tls' as const, port: opts.tlsPort!, scheme: 'https' as const },
+      ]
+      : [{ name: 'admin' as const, port: port as number, scheme: 'http' as const }];
+    const servers = specs.map(spec => ({
+      ...spec,
+      server: spec.scheme === 'https'
+        ? https.createServer({ cert: opts.tls!.cert, key: opts.tls!.key }, (req, res) => { void handleRequest(req, res, true); })
+        : http.createServer((req, res) => { void handleRequest(req, res, false); }),
+    }));
+    for (const { server } of servers) server.on('error', reject);
 
     // #127: MESH_ADMIN_BIND — the bind address for the ADMIN listener.
     //
@@ -257,14 +299,17 @@ export function startHttpAdmin(
     // the deployer, at boot. C9 does not need the premise true everywhere; it
     // needs it falsifiable somewhere.
     const bindHost = process.env.MESH_ADMIN_BIND;
-    const onListening = () => {
-      const addr = server.address();
+    const logListening = (spec: typeof servers[number]): void => {
+      const addr = spec.server.address();
       const bound = typeof addr === 'object' && addr !== null ? `${addr.address}:${addr.port}` : String(addr);
       // Names the bind AND what is unauthenticated on it. A deployer reading
       // 0.0.0.0 here is being told, at boot, that /metrics is reachable from
       // wherever that resolves to — which is the whole point of the line.
       console.log(JSON.stringify({
         evt: 'admin.listening',
+        // R-65: named only when there is more than one door, so the single-
+        // listener line keeps the shape existing readers parse.
+        ...(sideBySide ? { listener: spec.name, tls: spec.scheme === 'https' } : {}),
         bind: bindHost ?? '(all interfaces)',
         bound,
         // R-18: which mode /metrics is in, stated in both. The old flag stays
@@ -272,6 +317,9 @@ export function startHttpAdmin(
         // readers look for it.
         metrics_auth: metricsToken === null ? 'none' : 'token',
         ...(metricsToken === null ? { metrics_unauthenticated: true } : {}),
+        // R-65 M7: whether a previous admin token is ALSO accepted. A boolean
+        // only — never the value, never its length.
+        admin_token_prev: adminTokenPrev !== null,
         note: metricsToken !== null
           ? (bindHost === undefined
             ? 'admin port bound to ALL interfaces; /metrics requires MESH_METRICS_TOKEN or the admin token'
@@ -281,22 +329,27 @@ export function startHttpAdmin(
             : '/metrics is unauthenticated on this bind — set MESH_METRICS_TOKEN to require a token',
         at: Date.now(),
       }));
-      const handle: HttpAdminHandle = {
-        server,
-        shutdown(): Promise<void> {
-          return new Promise((res, rej) => {
-            server.close((err) => {
-              if (err) rej(err);
-              else res();
-            });
-          });
-        },
-      };
-      resolve(handle);
     };
     // `host: undefined` is byte-identical to listen(port) — verified, both bind
     // `::` — so the default path is unchanged by construction rather than by
     // a branch that could drift from it.
-    server.listen({ port, host: bindHost }, onListening);
+    Promise.all(servers.map(spec => new Promise<void>((res) => {
+      spec.server.listen({ port: spec.port, host: bindHost }, () => res());
+    }))).then(() => {
+      for (const spec of servers) logListening(spec);
+      const handle: HttpAdminHandle = {
+        server: servers[0]!.server,
+        servers: servers.map(({ name, scheme, server }) => ({ name, scheme, server })),
+        shutdown(): Promise<void> {
+          return Promise.all(servers.map(({ server }) => new Promise<void>((res, rej) => {
+            server.close((err) => {
+              if (err) rej(err);
+              else res();
+            });
+          }))).then(() => undefined);
+        },
+      };
+      resolve(handle);
+    });
   });
 }

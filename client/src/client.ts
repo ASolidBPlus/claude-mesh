@@ -1,5 +1,6 @@
 import { WebSocket, type ClientOptions } from 'ws';
 import { isIP } from 'net';
+import { readFileSync } from 'fs';
 import type {
   AuthFrame,
   SendFrame,
@@ -64,6 +65,10 @@ export interface MeshClientConfig {
    * runtime's default trust store for this connection rather than adding to
    * it: a client given a private range CA trusts exactly that CA, and will
    * refuse a publicly-trusted certificate. Omit it for the defaults, as before.
+   *
+   * R-65: falls back to the MESH_TLS_CA env var, which may be the PEM itself
+   * or a PATH to it (a value beginning `-----BEGIN` is content). fetchFile()
+   * uses it too, not only the WS connection.
    *
    * RUNTIME FLOOR — a security property, not a compatibility note: verifying
    * the certificate's IDENTITY for an IP-literal `wss://` URL requires Bun ≥
@@ -243,6 +248,34 @@ const ACK_TIMEOUT_MS = 10_000;
  * connection it would open is not authenticated, and nothing downstream can
  * tell that it isn't.
  */
+/**
+ * R-65 M3 — the CA to verify the server with: the `ca` config value (PEM, as
+ * before), else the MESH_TLS_CA env var — which may be PEM CONTENT or a PATH,
+ * by the server's rule (server/tls-config.ts): a value beginning `-----BEGIN` (after leading
+ * whitespace) is content, with literal `\n` sequences turned into newlines;
+ * anything else is a file to read. A path that cannot be read throws rather
+ * than falling back to the default trust store, which would quietly verify
+ * against a different set of CAs than the one configured.
+ */
+export function resolveCa(configCa: string | undefined, envCa: string | undefined): string | undefined {
+  // config.ca is the PEM, passed through untouched as it always was; only the
+  // env fallback is new, and only it takes a path.
+  if (configCa !== undefined) return configCa;
+  const raw = envCa === '' ? undefined : envCa;
+  if (raw === undefined) return undefined;
+  const lead = raw.replace(/^(?:\uFEFF|\s|\\n)+/, '');
+  if (lead.startsWith('-----BEGIN')) return lead.replace(/\\n/g, '\n');
+  try {
+    return readFileSync(raw, 'utf8');
+  } catch (err) {
+    const code = (err as { code?: string }).code ?? 'unreadable';
+    throw Object.assign(
+      new Error(`MeshClient: cannot read the CA at ${JSON.stringify(raw)} (${code}) — from MESH_TLS_CA`),
+      { code: 'CA_UNREADABLE' },
+    );
+  }
+}
+
 export function assertRuntimeVerifiesIpIdentity(
   serverUrl: string,
   bunVersion: string | undefined = (globalThis as { Bun?: { version?: string } }).Bun?.version,
@@ -596,9 +629,14 @@ export class MeshClient {
     const cfg = this.resolveConfig();
     const httpBase = this.resolveHttpUrl(cfg.serverUrl);
     const url = new URL(`/files/${encodeURIComponent(fileId)}`, httpBase);
+    // R-65 M3: the same CA as the WS connection. `tls.ca` is Bun's fetch
+    // option; Node's fetch has no per-request CA and ignores it, so on Node a
+    // private CA must come from NODE_EXTRA_CA_CERTS instead — and without it
+    // the request is REFUSED, not sent unverified.
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${cfg.agentToken}` },
-    });
+      ...(cfg.ca === undefined ? {} : { tls: { ca: cfg.ca } }),
+    } as RequestInit);
     if (!res.ok) {
       throw Object.assign(new Error(`fetchFile ${fileId} failed: HTTP ${res.status}`), {
         code: `HTTP_${res.status}`,
@@ -685,9 +723,10 @@ export class MeshClient {
     if (agentToken === undefined || agentToken === '') {
       throw new Error('MeshClient: agentToken is required (config or MESH_AGENT_TOKEN)');
     }
-    return this.config.ca === undefined
+    const ca = resolveCa(this.config.ca, process.env.MESH_TLS_CA);
+    return ca === undefined
       ? { serverUrl, agentId, agentToken }
-      : { serverUrl, agentId, agentToken, ca: this.config.ca };
+      : { serverUrl, agentId, agentToken, ca };
   }
 
   // Resolve the admin HTTP base for fetchFile(): explicit httpUrl / MESH_HTTP_URL,

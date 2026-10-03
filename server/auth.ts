@@ -51,6 +51,19 @@ export function timingSafeEqual(a: string, b: string): boolean {
 }
 
 /**
+ * R-65 M7 — the admin credential, during a rotation: the current token or
+ * MESH_ADMIN_TOKEN_PREV. BOTH comparisons always run, so the timing says
+ * nothing about which one matched, or whether a previous token is configured
+ * at all (with none, the second compare runs against the current token and its
+ * answer is discarded). The one helper every admin-token door calls.
+ */
+export function adminTokenMatches(presented: string, current: string, prev: string | null): boolean {
+  const viaCurrent = timingSafeEqual(presented, current);
+  const viaPrev = timingSafeEqual(presented, prev ?? current);
+  return viaCurrent || (prev !== null && viaPrev);
+}
+
+/**
  * Validate a raw bearer token against a stored hash.
  */
 export function validateToken(rawToken: string, storedHash: string): boolean {

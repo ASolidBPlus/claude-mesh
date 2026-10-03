@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { openDb, registerAgent, upsertPeer, getPeerByAlias, getAgentById } from '../db.ts';
+import { openDb, registerAgent, upsertPeer, getPeerByAlias, getAgentById, markTlsSeen } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { startWsServer, WsServerHandle, PEER_PROTOCOL_VERSION } from '../ws-server.ts';
 import { startCleanup } from '../cleanup.ts';
@@ -176,7 +176,9 @@ describe('F1a: peer authentication', () => {
     // to it, and every set test stays green. The closed form counts the PARSED
     // value — the AST, or the set of codes the door emits at runtime (#119 item 3).
     const emits = src.match(/code:\s*['"]AUTH_FAILED['"]/g) ?? [];
-    expect(emits.length).toBe(4);
+    // R-65 added the fifth: a TLS-latched agent's plaintext auth. It is in the
+    // agent-door set test below, byte-identical to the other two.
+    expect(emits.length).toBe(5);
   });
 
   // C9 SET TEST — the agent door. Every reachable cause of the one question
@@ -187,12 +189,18 @@ describe('F1a: peer authentication', () => {
     const { db, handle, port } = await setup();
     const unknownId = await open(port, { type: 'auth', agent_id: 'no-such-agent', token: 'whatever' });
     const wrongToken = await open(port, { type: 'auth', agent_id: 'local-a', token: 'WRONG' });
+    // R-65: the RIGHT token for an agent latched to TLS, presented over
+    // plaintext. A distinct answer here would tell a caller who has captured a
+    // token that its owner has moved to TLS.
+    registerAgent(db, { id: 'latched-b', token_hash: hashToken('latched-tok'), hostname: 'h' });
+    markTlsSeen(db, 'latched-b');
+    const latched = await open(port, { type: 'auth', agent_id: 'latched-b', token: 'latched-tok' });
     try {
-      const errs = [unknownId, wrongToken].map(s => JSON.stringify(s.frames.find(f => f.type === 'error')));
+      const errs = [unknownId, wrongToken, latched].map(s => JSON.stringify(s.frames.find(f => f.type === 'error')));
       expect(new Set(errs).size).toBe(1);
       expect(JSON.parse(errs[0]!)).toEqual({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' });
     } finally {
-      try { unknownId.ws.close(); wrongToken.ws.close(); } catch { /* ignore */ }
+      try { unknownId.ws.close(); wrongToken.ws.close(); latched.ws.close(); } catch { /* ignore */ }
       await handle.shutdown().catch(() => {});
       db.close();
     }

@@ -9,7 +9,7 @@ import {
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import { listAgents, aclGrant, aclRevoke, getAgentSubscriptions, getAgentById, getPendingMessages } from './db.ts';
-import { timingSafeEqual } from './auth.ts';
+import { adminTokenMatches } from './auth.ts';
 
 const SERVER_START_MS = Date.now();
 import { routeDirect, routePublish, routeSubscribe, routeUnsubscribe } from './router.ts';
@@ -164,6 +164,8 @@ interface ToolCtx {
   observerIndex: Map<string, WebSocket>;
   /** The configured MESH_ADMIN_TOKEN, for the ACL tools' admin gate (#8). */
   adminToken: string;
+  /** R-65 M7: MESH_ADMIN_TOKEN_PREV, accepted beside the current token. */
+  adminTokenPrev: string | null;
 }
 
 /**
@@ -188,7 +190,7 @@ interface ToolCtx {
  *   requireAdmin's plain `===` (http-admin.ts:61). Where the two existing
  *   doors disagree, the stricter one is the parity worth having.
  */
-function adminTokenOk(provided: unknown, configured: string): boolean {
+function adminTokenOk(provided: unknown, configured: string, prev: string | null = null): boolean {
   // NOT mutually redundant — an earlier version of this comment said they were,
   // and the reviewer disproved it by reading the mutant's OUTPUT rather than
   // its count. Measured, both directions:
@@ -217,7 +219,7 @@ function adminTokenOk(provided: unknown, configured: string): boolean {
   // Hardening the shared helper is a separate question, not smuggled in here.
   if (typeof configured !== 'string' || configured.length === 0) return false;
   if (typeof provided !== 'string' || provided.length === 0) return false;
-  return timingSafeEqual(provided, configured);
+  return adminTokenMatches(provided, configured, prev);
 }
 
 /** The refusal, shaped like every other tool error on this plane. */
@@ -311,12 +313,12 @@ function handleMeshSend(ctx: ToolCtx): ToolResult {
 }
 
 function handleMeshAclAllow(ctx: ToolCtx): ToolResult {
-  const { args, db, adminToken } = ctx;
+  const { args, db, adminToken, adminTokenPrev } = ctx;
   const { agent_id, as_agent, admin_token } = args as {
     agent_id: string; as_agent: string; admin_token?: unknown;
   };
   // Checked BEFORE the write, so a refusal cannot leave a half-applied grant.
-  if (!adminTokenOk(admin_token, adminToken)) return unauthorizedResult();
+  if (!adminTokenOk(admin_token, adminToken, adminTokenPrev)) return unauthorizedResult();
   // F0a — DELIBERATE SHAPE CHANGE, the one in this PR. aclGrant now throws
   // AGENT_NOT_FOUND for a bare endpoint that is not a local agent. Previously
   // this tool had no such case: the acl foreign key raised a raw SQLite error
@@ -407,11 +409,11 @@ function handleMeshUnsubscribe(ctx: ToolCtx): ToolResult {
 }
 
 function handleMeshAclDeny(ctx: ToolCtx): ToolResult {
-  const { args, db, adminToken } = ctx;
+  const { args, db, adminToken, adminTokenPrev } = ctx;
   const { agent_id, as_agent, admin_token } = args as {
     agent_id: string; as_agent: string; admin_token?: unknown;
   };
-  if (!adminTokenOk(admin_token, adminToken)) return unauthorizedResult();
+  if (!adminTokenOk(admin_token, adminToken, adminTokenPrev)) return unauthorizedResult();
   // F0a — DELIBERATE SHAPE CHANGE, the second in this PR. Same rule as the
   // HTTP door: revoke is about EDGE existence, and a remote endpoint is never
   // refused. This tool previously reported success whether or not anything was
@@ -486,7 +488,8 @@ export async function startMcpServer(
       which `adminTokenOk` treats as "no admin operations are possible",
       NOT as "an empty token matches". An embedder that forgets to pass it
       loses the two ACL tools; it does not silently open them. */
-  adminToken = ''
+  adminToken = '',
+  adminTokenPrev: string | null = null,
 ): Promise<McpServerHandle> {
   const server = new Server(
     { name: 'mesh', version: '0.1.0' },
@@ -517,7 +520,7 @@ export async function startMcpServer(
     // as the prior if-chain did.
     const handler = TOOL_HANDLERS[toolName];
     if (handler !== undefined) {
-      return handler({ args, db, agentIndex, observerIndex, adminToken });
+      return handler({ args, db, agentIndex, observerIndex, adminToken, adminTokenPrev });
     }
 
     return NOT_IMPLEMENTED_RESPONSE;
