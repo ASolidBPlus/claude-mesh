@@ -14,7 +14,7 @@ import type { WebSocket } from 'ws';
 import { readFileSync, readdirSync, statSync, mkdtempSync } from 'fs';
 import { join, dirname, resolve, relative } from 'path';
 import { tmpdir } from 'os';
-import { startWsServer } from '../ws-server.ts';
+import { startWsServer, postAuthFrameMax } from '../ws-server.ts';
 import { upsertPeer, aclCheck, getPeerByAlias } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { sourceFiles } from './helpers/source-files.ts';
@@ -1043,21 +1043,26 @@ describe('F2b (d)+(g): ONE url predicate, ws:// only for loopback', () => {
   });
 });
 
-describe('F2b (c): oversize frames are dropped before the parser', () => {
-  it('the WS server sets maxPayload below the router payload cap + envelope', async () => {
-    // The router's 1 MiB check runs AFTER JSON.parse, so without this the cost
-    // of a hostile frame is paid before anything refuses it.
+describe('F2b (c): the frame-size option agrees with the enforced limit', () => {
+  it('maxPayload is the POST-AUTH frame limit — the value the R-69 guard enforces', async () => {
+    // This test used to claim maxPayload "drops oversize frames before the
+    // parser". It never did on Bun: the ws shim stores the option and never
+    // passes it on (R-69, measured). The enforcement is now the size check in
+    // the message handler, tested BEHAVIOURALLY in r69-frame-guard.test.ts.
+    // What is left to pin here is that the option is not a different number:
+    // on a runtime that honours it, 1.1 MB would refuse every file_send above
+    // ~800 KB.
     const port = 23900 + Math.floor(Date.now() % 90);
     const d = openDb(':memory:');
     const h = await startWsServer(port, d, 10_485_760, mkdtempSync(join(tmpdir(), 'mesh-mp-')));
     try {
-      expect((h.wss as unknown as { options: { maxPayload: number } }).options.maxPayload)
-        .toBeLessThan(2 * 1024 * 1024);
-      expect((h.wss as unknown as { options: { maxPayload: number } }).options.maxPayload)
-        .toBeGreaterThan(1_048_576);
+      expect((h.wss as unknown as { options: { maxPayload: number } }).options.maxPayload).toBe(postAuthFrameMax(10_485_760));
+      expect(postAuthFrameMax(10_485_760)).toBeGreaterThan(4 * Math.ceil(10_485_760 / 3));   // a full base64 file fits
+      expect(postAuthFrameMax(1)).toBe(1_100_000);                                          // never below the router cap
     } finally {
       await h.shutdown().catch(() => {});
       d.close();
     }
   }, 20_000);
 });
+

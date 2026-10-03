@@ -1041,6 +1041,39 @@ export const POST_AUTH_HANDLERS: Record<string, FrameHandler> = {
   list_presence: handleListPresence,
 };
 
+/**
+ * R-69 — FRAME SIZE, enforced here because nothing else does on Bun.
+ *
+ * Bun's `ws` shim stores `maxPayload` and never passes it on: frames are
+ * handled by Bun's native WebSocket layer, whose only limit is its default
+ * 16 MiB per message (measured: 16 MiB delivered, 16 MiB + 1 closed; a 32 MiB
+ * message in fragments closed). A JS listener on the raw socket sees none of
+ * the bytes, so the earliest point JS can act is the 'message' event — after
+ * Bun has buffered the frame, BEFORE it is parsed. That is where these apply.
+ *
+ * PRE-AUTH, the only legal frame is the auth frame (an id, a token, a protocol
+ * number), so the limit is small: an unauthenticated socket cannot make the bus
+ * parse anything large. POST-AUTH, the largest legal frame is a `file_send`
+ * carrying a base64 file of up to maxFileBytes, so the limit follows that
+ * (with envelope headroom), never below the router's 1 MiB payload cap.
+ */
+export const PRE_AUTH_FRAME_MAX = 16 * 1024;
+export function postAuthFrameMax(maxFileBytes: number): number {
+  return Math.max(1_100_000, 4 * Math.ceil(maxFileBytes / 3) + 64 * 1024);
+}
+
+/**
+ * R-69 — UNAUTHENTICATED SOCKETS ARE COUNTED. Bun still buffers up to 16 MiB
+ * per socket before the guard above can speak, so the remaining exposure is
+ * MANY sockets. Pre-auth sockets are capped globally and per source address
+ * (normalised); a socket stops counting the moment it authenticates or
+ * closes. At a cap, the upgrade is refused with a 503 before any WebSocket
+ * exists. The auth deadline (5 s from connect, AUTH_TIMEOUT) bounds how long
+ * any one of them can hold its slot.
+ */
+export const PRE_AUTH_LIMITS = { global: 64, perIp: 8 };
+const PREAUTH_LOG_INTERVAL_MS = 60_000;
+
 export function startWsServer(
   port: number | 'off',
   db: Database,
@@ -1054,7 +1087,7 @@ export function startWsServer(
   // `port` is the PLAINTEXT listener (or 'off') and `tlsPort` serves TLS with
   // the same certificate. server.ts enforces the pairing rules; this function
   // trusts them and refuses only what it cannot serve.
-  opts: { tlsPort?: number } = {},
+  opts: { tlsPort?: number; preAuth?: { global: number; perIp: number } } = {},
 ): Promise<WsServerHandle> {
   return new Promise((resolve, reject) => {
     // #87: reconcile the durable `online` flag with reality BEFORE binding the
@@ -1181,10 +1214,60 @@ export function startWsServer(
     // Headroom above the payload cap because the frame carries envelope too
     // (type, ids, content_type); the ROUTER's 1 MiB check is still the payload
     // authority and is unchanged.
-    const wss = new WebSocketServer({ noServer: true, maxPayload: 1_100_000 });
+    // NOT ENFORCED ON BUN (R-69, see PRE_AUTH_FRAME_MAX). Kept, at the real
+    // post-auth limit, so that on a runtime that does honour it the two agree
+    // — 1.1 MB here would refuse every file_send above ~800 KB.
+    const frameMax = postAuthFrameMax(maxFileBytes);
+    const wss = new WebSocketServer({ noServer: true, maxPayload: frameMax });
+    const preAuthLimits = opts.preAuth ?? PRE_AUTH_LIMITS;
+    let preAuthTotal = 0;
+    const preAuthByIp = new Map<string, number>();
+    const preAuthLog: Record<'global' | 'per_ip', { last: number; suppressed: number }> = {
+      global: { last: 0, suppressed: 0 }, per_ip: { last: 0, suppressed: 0 },
+    };
+    /** Reserve a pre-auth slot for `ip`, or null at a cap. The returned release is idempotent. */
+    const reservePreAuth = (ip: string): (() => void) | null => {
+      const n = preAuthByIp.get(ip) ?? 0;
+      const scope = preAuthTotal >= preAuthLimits.global ? 'global' : n >= preAuthLimits.perIp ? 'per_ip' : null;
+      if (scope !== null) {
+        const l = preAuthLog[scope];
+        const now = Date.now();
+        if (now - l.last >= PREAUTH_LOG_INTERVAL_MS) {
+          console.log(JSON.stringify({
+            evt: 'ws.preauth_refused', scope, src_ip: ip, suppressed_since_last: l.suppressed,
+            limit: scope === 'global' ? preAuthLimits.global : preAuthLimits.perIp, at: now,
+          }));
+          l.last = now; l.suppressed = 0;
+        } else {
+          l.suppressed++;
+        }
+        return null;
+      }
+      preAuthTotal++;
+      preAuthByIp.set(ip, n + 1);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        preAuthTotal--;
+        const left = (preAuthByIp.get(ip) ?? 1) - 1;
+        if (left <= 0) preAuthByIp.delete(ip); else preAuthByIp.set(ip, left);
+      };
+    };
     for (const { spec, server } of listeners) {
       server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
-        wss.handleUpgrade(req, socket, head, (ws: WebSocket) => wss.emit('connection', ws, req, spec.scheme));
+        const release = reservePreAuth(normaliseIp(socket.remoteAddress) ?? 'unknown');
+        if (release === null) {
+          try { socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); } catch (_) { /* ignore */ }
+          try { socket.destroy(); } catch (_) { /* ignore */ }
+          return;
+        }
+        // Released on auth, or when the RAW socket closes — which fires for an
+        // upgraded socket's close (measured on Bun and Node's ws) AND for a
+        // handshake that is aborted before any WebSocket exists, the case a
+        // WebSocket 'close' listener could never see. Either way, once.
+        socket.once('close', release);
+        wss.handleUpgrade(req, socket, head, (ws: WebSocket) => wss.emit('connection', ws, req, spec.scheme, release));
       });
     }
     const connections = new Set<WebSocket>();
@@ -1288,7 +1371,7 @@ export function startWsServer(
           at: Date.now(),
         }));
       }
-      wss.on('connection', (ws: WebSocket, req: http.IncomingMessage, scheme: 'ws' | 'wss') => {
+      wss.on('connection', (ws: WebSocket, req: http.IncomingMessage, scheme: 'ws' | 'wss', releasePreAuth: () => void = () => {}) => {
         connections.add(ws);
 
         const state: ConnState = {
@@ -1327,6 +1410,23 @@ export function startWsServer(
           // starts the handshake, and a peer that ignores it would otherwise
           // keep being served until the close timeout.
           if (ws.readyState !== WebSocket.OPEN) return;
+          // R-69: SIZE BEFORE PARSE. Bun has buffered the frame (it cannot be
+          // stopped earlier from JS); it is not parsed, routed or answered.
+          const size = typeof data === 'string' ? Buffer.byteLength(data)
+            : Array.isArray(data) ? data.reduce((n, b) => n + b.length, 0)
+            : (data as Buffer | ArrayBuffer).byteLength;
+          const limit = state.authed ? frameMax : PRE_AUTH_FRAME_MAX;
+          if (size > limit) {
+            console.log(JSON.stringify({
+              evt: 'ws.frame_too_large', authed: state.authed, agent_id: state.agentId ?? state.peerAlias,
+              size, limit, src_ip: state.srcIp, tls: state.tls, at: Date.now(),
+            }));
+            try { ws.close(1009, 'message too big'); } catch (_) { /* ignore */ }
+            // The close frame first, so the client learns why; then the socket
+            // goes whether or not the client ever answers.
+            setTimeout(() => { try { ws.terminate(); } catch (_) { /* ignore */ } }, 500).unref?.();
+            return;
+          }
           let parsed: unknown;
           try {
             parsed = JSON.parse(data.toString());
@@ -1360,6 +1460,8 @@ export function startWsServer(
               agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus,
               latchOnTls: sideBySide,
             });
+            // Authenticated (agent or peer): no longer an unauthenticated socket.
+            if (state.authed) releasePreAuth();
             return;
           }
 
