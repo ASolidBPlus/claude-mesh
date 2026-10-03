@@ -205,9 +205,14 @@ export function handleAgentRotate(ctx: AdminCtx): void {
   for (const sock of sockets) {
     try { sock.send(JSON.stringify({ type: 'error', code: 'TOKEN_ROTATED', message: 'token rotated' })); } catch { /* ignore */ }
     try { sock.close(1008, 'token rotated'); } catch { /* ignore */ }
+    // close() only STARTS the handshake: a client holding a stolen token can
+    // ignore it and keep sending until the 30 s close timeout. terminate()
+    // ends the socket now; the frame and code above are already written.
+    try { sock.terminate(); } catch { /* ignore */ }
   }
   console.log(JSON.stringify({ evt: 'agent.token_rotated', agent_id: id, closed_sockets: sockets.size, at: Date.now() }));
-  res.writeHead(200, { 'Content-Type': 'application/json' });
+  // A credential in the body: never cached by anything between here and the operator.
+  res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify({ id, token }));
 }
 

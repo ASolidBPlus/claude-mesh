@@ -9,7 +9,9 @@ import { hashToken } from '../auth.ts';
 import { startWsServer, type WsServerHandle } from '../ws-server.ts';
 import { startHttpAdmin, type HttpAdminHandle } from '../http-admin.ts';
 import { loadTls, type ServerTls } from '../tls-config.ts';
-import { __resetCallersForTest } from '../connections.ts';
+import { __resetCallersForTest, recordCaller, listCallers, CALLER_CAP } from '../connections.ts';
+import * as net from 'net';
+import { randomBytes } from 'crypto';
 
 // R-65 PR-B — identity and visibility.
 //   M4  agent.auth / observer.auth / agent.http log lines, with src_ip and tls
@@ -116,6 +118,7 @@ describe('M5: POST /agents/:id/rotate', () => {
 
     const { v: res, lines } = await capture(() => adminFetch(base, '/agents/alice/rotate', { method: 'POST' }));
     expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-store');   // a credential in the body
     const body = await res.json() as { id: string; token: string };
     expect(body.id).toBe('alice');
     expect(typeof body.token).toBe('string');
@@ -193,7 +196,7 @@ describe('M4: agent.auth / observer.auth / agent.http', () => {
     await startWs(p, t);
     const { v: first, lines: l1 } = await capture(() => rawAuth(`ws://127.0.0.1:${p}`, 'bob', 'bob-tok')); socks.push(first.ws);
     expect(evts(l1, 'agent.auth')).toMatchObject([{ agent_id: 'bob', tls: false, displaced: false }]);
-    expect(String(evts(l1, 'agent.auth')[0]!.src_ip)).toMatch(/127\.0\.0\.1$/);
+    expect(String(evts(l1, 'agent.auth')[0]!.src_ip)).toBe('127.0.0.1');
 
     const { v: second, lines: l2 } = await capture(() => rawAuth(`wss://127.0.0.1:${t}`, 'bob', 'bob-tok', true)); socks.push(second.ws);
     expect(evts(l2, 'agent.auth')).toMatchObject([{ agent_id: 'bob', tls: true, displaced: true }]);
@@ -211,7 +214,7 @@ describe('M4: agent.auth / observer.auth / agent.http', () => {
       await wait(150);
     });
     const line = evts(lines, 'agent.auth')[0]!;
-    expect(String(line.src_ip)).toMatch(/127\.0\.0\.1$/);
+    expect(String(line.src_ip)).toBe('127.0.0.1');
     expect(JSON.stringify(line)).not.toContain('203.0.113.9');
   });
 
@@ -224,7 +227,7 @@ describe('M4: agent.auth / observer.auth / agent.http', () => {
     expect(evts(l1, 'agent.auth')).toMatchObject([{ agent_id: 'bob', tls: false, refused: 'bad_token' }]);
     const { v: latched, lines: l2 } = await capture(() => rawAuth(`ws://127.0.0.1:${p}`, 'alice', 'alice-tok')); socks.push(latched.ws);
     expect(evts(l2, 'agent.auth')).toMatchObject([{ agent_id: 'alice', tls: false, refused: 'tls_latched' }]);
-    expect(String(evts(l2, 'agent.auth')[0]!.src_ip)).toMatch(/127\.0\.0\.1$/);
+    expect(String(evts(l2, 'agent.auth')[0]!.src_ip)).toBe('127.0.0.1');
   });
 
   it('an observer\'s auth is logged as observer.auth', async () => {
@@ -242,22 +245,26 @@ describe('M4: agent.auth / observer.auth / agent.http', () => {
     const [, , a, at] = ports();
     await startAdmin(a, null, at);
     const { lines } = await capture(async () => {
-      await fetch(`http://127.0.0.1:${a}/messages?with=bob&limit=5`, { headers: { Authorization: 'Bearer alice-tok' } });
+      await fetch(`http://127.0.0.1:${a}/messages?with=bob&limit=5`, { headers: { Authorization: 'Bearer alice-tok', 'X-Forwarded-For': '203.0.113.9' } });
       await fetch(`https://127.0.0.1:${at}/files/secret-file-id-123`, { headers: { Authorization: 'Bearer alice-tok' }, tls: { ca: ca() } } as RequestInit);
       await fetch(`http://127.0.0.1:${a}/agents/bob`, { headers: { Authorization: `Bearer ${ADMIN}` } });
       await fetch(`http://127.0.0.1:${a}/agents`);   // unauthenticated: not a token-authenticated request
     });
     const http = evts(lines, 'agent.http');
-    expect(http.map(e => ({ agent_id: e.agent_id, route: e.route, tls: e.tls }))).toEqual([
-      { agent_id: 'alice', route: 'GET /messages', tls: false },
-      { agent_id: 'alice', route: 'GET /files/:id', tls: true },
-      { agent_id: 'admin', route: 'GET /agents/:id', tls: false },
+    // `principal` says WHAT authenticated; agent_id is only ever a real agent
+    // id — 'admin' and 'metrics' are legal agent ids, so overloading the field
+    // would make an agent called `admin` indistinguishable from the admin.
+    expect(http.map(e => ({ principal: e.principal, agent_id: e.agent_id, route: e.route, tls: e.tls }))).toEqual([
+      { principal: 'agent', agent_id: 'alice', route: 'GET /messages', tls: false },
+      { principal: 'agent', agent_id: 'alice', route: 'GET /files/:id', tls: true },
+      { principal: 'admin', agent_id: null, route: 'GET /agents/:id', tls: false },
     ]);
-    for (const e of http) expect(String(e.src_ip)).toMatch(/127\.0\.0\.1$/);
+    for (const e of http) expect(String(e.src_ip)).toBe('127.0.0.1');
     const all = JSON.stringify(http);
     expect(all).not.toContain('secret-file-id-123');
     expect(all).not.toContain('limit=5');
     expect(all).not.toContain('alice-tok');
+    expect(all).not.toContain('203.0.113.9');   // XFF is not believed on HTTP either
   });
 });
 
@@ -280,7 +287,7 @@ describe('M6: GET /connections', () => {
     expect(byId.bob).toMatchObject({ last_scheme: 'ws' });
     expect(typeof byId.bob!.last_plaintext_at).toBe('number');
     expect(byId.alice).toMatchObject({ last_scheme: 'wss', last_plaintext_at: null });
-    expect(String(byId.alice!.last_src_ip)).toMatch(/127\.0\.0\.1$/);
+    expect(String(byId.alice!.last_src_ip)).toBe('127.0.0.1');
     expect(typeof byId.alice!.last_auth_at).toBe('number');
     expect(byId.watcher).toMatchObject({ last_scheme: null, last_auth_at: null });   // never connected
     // Persisted: survives in the row, not just in memory.
@@ -306,9 +313,9 @@ describe('M6: GET /connections', () => {
     const { v: res } = await capture(() => adminFetch(`http://127.0.0.1:${a}`, '/connections'));
     const body = await res.json() as { since_boot: number; callers: Record<string, unknown>[] };
     expect(typeof body.since_boot).toBe('number');
-    const kinds = body.callers.map(c => `${c.kind}/${c.last_scheme}`).sort();
+    const kinds = body.callers.map(c => `${c.principal}/${c.last_scheme}`).sort();
     expect(kinds).toEqual(['admin/http', 'metrics/http']);
-    for (const c of body.callers) expect(String(c.src_ip)).toMatch(/127\.0\.0\.1$/);
+    for (const c of body.callers) expect(String(c.src_ip)).toBe('127.0.0.1');
   });
 });
 
@@ -368,5 +375,115 @@ describe('the ALTER is idempotent on an existing database', () => {
     const cols = (d3.prepare("SELECT name FROM pragma_table_info('agents')").all() as { name: string }[]).map(x => x.name);
     for (const c of ['last_scheme', 'last_src_ip', 'last_auth_at', 'last_plaintext_at']) expect(cols).toContain(c);
     d3.close();
+  });
+});
+
+describe('review fixes', () => {
+  it('BLOCKER: the non-agent caller list is BOUNDED — oldest last_seen evicted at the cap', async () => {
+    __resetCallersForTest();
+    for (let i = 0; i < CALLER_CAP + 100; i++) recordCaller(`2001:db8::${i.toString(16)}`, 'metrics', 'http');
+    const { callers } = listCallers();
+    expect(callers.length).toBe(CALLER_CAP);
+    const ips = new Set(callers.map(c => c.src_ip));
+    expect(ips.has('2001:db8::0')).toBe(false);                                    // oldest gone
+    expect(ips.has(`2001:db8::${(CALLER_CAP + 99).toString(16)}`)).toBe(true);     // newest kept
+    // A REFRESH of an existing caller is not a new entry and evicts nothing.
+    recordCaller(`2001:db8::${(CALLER_CAP + 99).toString(16)}`, 'metrics', 'https');
+    expect(listCallers().callers.length).toBe(CALLER_CAP);
+  });
+
+  it('rotate: a stolen-token client that IGNORES the close frame is cut off — TCP dropped, nothing more accepted', async () => {
+    // A hand-rolled WebSocket client over raw TCP that never answers the
+    // server's close frame (the ws library would, so a well-behaved client
+    // cannot show this).
+    //
+    // WHAT THIS GUARDS — the PROPERTY, not (on this runtime) the fix. Measured
+    // after a bare close(1008) to such a client:
+    //   Node 22 + ws (standalone): 16 of 20 later frames still delivered —
+    //                  the 30 s close-timeout window the review named;
+    //   Bun 1.4.2 (standalone): 0 delivered;
+    //   Bun 1.4.2 (THIS server): 0 delivered, and the TCP connection dropped
+    //                  5-7 ms after the rotate WITH OR WITHOUT terminate() and
+    //                  the not-OPEN guard (both removed and re-run).
+    // So here both assertions hold with or without the fix: they pin that a
+    // rotated socket is cut off, and would catch the fix's absence on a
+    // runtime with Node's ws behaviour. terminate() and the not-OPEN guard are
+    // kept as the defence for that runtime; this test cannot show them.
+    freshDb();
+    aclGrant(db!, 'alice', 'bob', 'admin');
+    // Side by side, so `p` is a PLAINTEXT listener the raw client can speak to.
+    const [p, t, a] = ports();
+    const wsh = await startWs(p, t);
+    await startAdmin(a, wsh);
+    const sock = net.connect(p, '127.0.0.1');
+    await new Promise<void>(r => sock.once('connect', () => r()));
+    sock.on('error', () => { /* a terminated socket errors on write; that is the point */ });
+    let tcpClosedAt = 0;
+    sock.on('close', () => { tcpClosedAt = Date.now(); });
+    let buf = Buffer.alloc(0);
+    const texts: string[] = [];
+    let upgraded = false;
+    sock.on('data', (d: Buffer) => {
+      buf = Buffer.concat([buf, d]);
+      if (!upgraded) {
+        const i = buf.indexOf('\r\n\r\n');
+        if (i === -1) return;
+        upgraded = true; buf = buf.subarray(i + 4);
+      }
+      while (buf.length >= 2) {
+        let len = buf[1]! & 0x7f; let off = 2;
+        if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
+        else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
+        if (buf.length < off + len) return;
+        if ((buf[0]! & 0x0f) === 1) texts.push(buf.subarray(off, off + len).toString());
+        buf = buf.subarray(off + len);      // close frames (opcode 8) are read and IGNORED
+      }
+    });
+    const sendFrame = (obj: unknown): void => {
+      const payload = Buffer.from(JSON.stringify(obj));
+      const mask = randomBytes(4);
+      const head = payload.length < 126 ? Buffer.from([0x81, 0x80 | payload.length])
+        : Buffer.concat([Buffer.from([0x81, 0x80 | 126]), Buffer.from([payload.length >> 8, payload.length & 0xff])]);
+      const masked = Buffer.from(payload.map((b, i) => b ^ mask[i % 4]!));
+      try { sock.write(Buffer.concat([head, mask, masked])); } catch { /* terminated */ }
+    };
+    sock.write(`GET / HTTP/1.1\r\nHost: 127.0.0.1:${p}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${randomBytes(16).toString('base64')}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
+    await wait(150);
+    sendFrame({ type: 'auth', agent_id: 'alice', token: 'alice-tok' });
+    await wait(150);
+    expect(texts.some(t => t.includes('auth_ok'))).toBe(true);
+
+    const sent = (n: number) => (db!.prepare("SELECT COUNT(*) AS n FROM messages WHERE from_agent = 'alice'").get() as { n: number }).n === n;
+    sendFrame({ type: 'send', msg_id: 'before', to: 'bob', payload: 'before rotate', content_type: 'text/plain' });
+    await wait(150);
+    expect(sent(1)).toBe(true);                      // positive control: this socket CAN send
+
+    const rotatedAt = Date.now();
+    await capture(() => adminFetch(`http://127.0.0.1:${a}`, '/agents/alice/rotate', { method: 'POST' }));
+    for (let i = 0; i < 5; i++) {
+      sendFrame({ type: 'send', msg_id: `after-${i}`, to: 'bob', payload: 'after rotate', content_type: 'text/plain' });
+      await wait(60);
+    }
+    await wait(150);
+    expect(sent(1)).toBe(true);                      // nothing after the rotate got through
+    // terminate(): the connection is GONE, not left half-closed for 30 s.
+    expect(tcpClosedAt).toBeGreaterThan(0);
+    expect(tcpClosedAt - rotatedAt).toBeLessThan(1000);
+    sock.destroy();
+  });
+
+  it('the connection report writes only on change or when stale — not on every request', async () => {
+    freshDb();
+    const [, , a, at] = ports();
+    await startAdmin(a, null, at);
+    const get = (url: string, extra: RequestInit = {}) => capture(() => fetch(url, { headers: { Authorization: 'Bearer alice-tok' }, ...extra }));
+    await get(`http://127.0.0.1:${a}/messages`);
+    const first = getAgentById(db!, 'alice')!.last_auth_at;
+    await wait(20);
+    await get(`http://127.0.0.1:${a}/messages`);
+    expect(getAgentById(db!, 'alice')!.last_auth_at).toBe(first);            // same scheme+ip, fresh: no write
+    await get(`https://127.0.0.1:${at}/messages`, { tls: { ca: ca() } } as RequestInit);
+    expect(getAgentById(db!, 'alice')!.last_scheme).toBe('https');           // scheme changed: written
+    expect(getAgentById(db!, 'alice')!.last_auth_at).not.toBe(first);
   });
 });

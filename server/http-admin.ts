@@ -9,7 +9,7 @@ import { handleAclDelete, handleAclGet, handleAclPost } from './admin-acl.ts';
 import { handleAgentById, handleAgentDelete, handleAgentGet, handleAgentPatch, handleAgentPost, handleAgentTlsLatchDelete, handleAgentRotate, handleConnectionsGet } from './admin-agents.ts';
 import type { AdminCtx, ForwarderRegistry, Route } from './admin-ctx.ts';
 import { exact, idMatch, requestSource, resolveRouteAuth, routeLabel } from './admin-ctx.ts';
-import { recordCaller } from './connections.ts';
+import { recordCaller, normaliseIp } from './connections.ts';
 import { recordAgentConnection } from './db.ts';
 import { handleFileById, handleFilePost } from './admin-files.ts';
 import { handleMessagesGet } from './admin-messages.ts';
@@ -232,7 +232,7 @@ export function startHttpAdmin(
         // byte-identical to every other admin 401. Nothing about the
         // presented credential is logged.
         const scheme = tls ? 'https' : 'http';
-        const srcIp = req.socket.remoteAddress ?? null;
+        const srcIp = normaliseIp(req.socket.remoteAddress);
         if (metricsToken !== null) {
           const via = metricsAuthorized(req, metricsToken, adminToken, adminTokenPrev);
           if (via === null) {
@@ -242,12 +242,12 @@ export function startHttpAdmin(
           }
           // R-65 M4/M6: a token-authenticated scrape is logged and recorded
           // like any other token-authenticated request.
-          console.log(JSON.stringify({ evt: 'agent.http', agent_id: via, route: 'GET /metrics', src_ip: srcIp, tls, at: Date.now() }));
-          recordCaller(srcIp ?? undefined, via, scheme);
+          console.log(JSON.stringify({ evt: 'agent.http', principal: via, agent_id: null, route: 'GET /metrics', src_ip: srcIp, tls, at: Date.now() }));
+          recordCaller(srcIp, via, scheme);
         } else {
           // Unauthenticated scrape: no credential to log, but still a caller —
           // the one most likely to still be on plaintext.
-          recordCaller(srcIp ?? undefined, 'metrics', scheme);
+          recordCaller(srcIp, 'metrics', scheme);
         }
         try {
           const body = renderMetrics(db);
@@ -287,14 +287,19 @@ export function startHttpAdmin(
       // token the dispatcher checked, so they are not "token-authenticated".
       if (auth.mode !== 'unauthenticated') {
         const scheme = tls ? 'https' : 'http';
-        const srcIp = req.socket.remoteAddress ?? null;
+        const srcIp = normaliseIp(req.socket.remoteAddress);
+        // `principal` says WHAT authenticated; `agent_id` is only ever a real
+        // agent id. 'admin' and 'metrics' are legal agent ids, so putting them
+        // in agent_id would make an agent of that name look like the admin.
         console.log(JSON.stringify({
-          evt: 'agent.http', agent_id: auth.mode === 'admin' ? 'admin' : auth.agentId,
+          evt: 'agent.http',
+          principal: auth.mode === 'admin' ? 'admin' : 'agent',
+          agent_id: auth.mode === 'admin' ? null : auth.agentId,
           route: routeLabel(method, matched), src_ip: srcIp, tls, at: Date.now(),
         }));
         try {
           if (auth.mode === 'agent') recordAgentConnection(db, auth.agentId, scheme, srcIp);
-          else recordCaller(srcIp ?? undefined, 'admin', scheme);
+          else recordCaller(srcIp, 'admin', scheme);
         } catch (_) { /* the report never breaks a request */ }
       }
 

@@ -16,7 +16,7 @@ import {
 } from './router.ts';
 import { incMsgStatus, incReceived, incBytes } from './metrics.ts';
 import type { ServerTls } from './tls-config.ts';
-import { recordCaller } from './connections.ts';
+import { recordCaller, normaliseIp } from './connections.ts';
 import { PEER_REGISTER_ROUTE, serveRoute } from './http-admin.ts';
 
 /** F1a (§5.1): the only inbound peer protocol this mesh speaks. A version is a
@@ -174,9 +174,10 @@ function handleAuthFrame(ctx: AuthCtx): void {
   const token = frame.token;
 
   if (typeof agentId !== 'string' || typeof token !== 'string') {
+    // Logged BEFORE the send, so a socket that is already gone cannot skip it.
+    logAuth(db, state, typeof agentId === 'string' ? agentId : null, { refused: 'malformed' });
     try {
       ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'missing agent_id or token' }));
-      logAuth(db, state, typeof agentId === 'string' ? agentId : null, { refused: 'malformed' });
     } catch (_) { /* ignore */ }
     ws.close(1008, 'auth failed');
     return;
@@ -419,7 +420,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
   const scheme = state.tls ? 'wss' : 'ws';
   try {
     recordAgentConnection(db, agentId, scheme, state.srcIp);
-    if (isObserver(db, agentId)) recordCaller(state.srcIp ?? undefined, 'observer', scheme);
+    if (isObserver(db, agentId)) recordCaller(state.srcIp, 'observer', scheme);
   } catch (_) { /* the report never breaks auth */ }
 
   const pending = getPendingMessages(db, agentId);
@@ -1292,7 +1293,7 @@ export function startWsServer(
 
         const state: ConnState = {
           ws, agentId: null, peerAlias: null, authed: false, tls: scheme === 'wss',
-          srcIp: req.socket.remoteAddress ?? null,
+          srcIp: normaliseIp(req.socket.remoteAddress),
         };
         registry.set(ws, state);
 
@@ -1321,6 +1322,11 @@ export function startWsServer(
         }, 5000);
 
         ws.on('message', (data) => {
+          // R-65 review: a socket that is no longer OPEN — closed by rotate, by
+          // displacement, by a refusal — processes NOTHING more. close() only
+          // starts the handshake, and a peer that ignores it would otherwise
+          // keep being served until the close timeout.
+          if (ws.readyState !== WebSocket.OPEN) return;
           let parsed: unknown;
           try {
             parsed = JSON.parse(data.toString());

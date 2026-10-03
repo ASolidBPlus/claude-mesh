@@ -900,6 +900,8 @@ export function markTlsSeen(db: Database, id: string): void {
   db.prepare('UPDATE agents SET tls_seen = ? WHERE id = ? AND tls_seen IS NULL').run(Date.now(), id);
 }
 
+export const REPORT_REFRESH_MS = 60_000;
+
 /**
  * R-65 M6 — record one authenticated contact by an agent: scheme is the
  * listener's ('ws' | 'wss' | 'http' | 'https'), src_ip the socket's.
@@ -912,6 +914,15 @@ export function markTlsSeen(db: Database, id: string): void {
 export function recordAgentConnection(db: Database, id: string, scheme: string, srcIp: string | null): void {
   const now = Date.now();
   const plaintext = scheme === 'ws' || scheme === 'http';
+  // NOT A WRITE PER REQUEST. Every agent-token HTTP request lands here, and a
+  // SQLite write each time would be the cost of a report nobody reads at that
+  // rate. Written when something the report SAYS changes — scheme or source —
+  // or when last_auth_at is over REPORT_REFRESH_MS old; otherwise skipped, so
+  // the report is at most that stale.
+  const cur = db.prepare('SELECT last_scheme, last_src_ip, last_auth_at FROM agents WHERE id = ?').get(id) as
+    { last_scheme: string | null; last_src_ip: string | null; last_auth_at: number | null } | null;
+  if (cur !== null && cur.last_scheme === scheme && cur.last_src_ip === srcIp
+      && cur.last_auth_at !== null && now - cur.last_auth_at < REPORT_REFRESH_MS) return;
   db.prepare(`UPDATE agents SET last_scheme = ?, last_src_ip = ?, last_auth_at = ?${plaintext ? ', last_plaintext_at = ?' : ''} WHERE id = ?`)
     .run(...(plaintext ? [scheme, srcIp, now, now, id] : [scheme, srcIp, now, id]));
 }
