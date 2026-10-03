@@ -51,8 +51,8 @@ export function loadConfig(): Config {
   // rotation is not a flag day. Same rule as the admin token itself: set
   // means non-empty. Never logged; the boot line says only whether it is set.
   const prevRaw = process.env.MESH_ADMIN_TOKEN_PREV;
-  if (prevRaw !== undefined && prevRaw === '') {
-    process.stderr.write('MESH_ADMIN_TOKEN_PREV is set but empty; unset it, or set it to the previous admin token\n');
+  if (prevRaw !== undefined && prevRaw.trim() === '') {
+    process.stderr.write('MESH_ADMIN_TOKEN_PREV is set but empty or whitespace; unset it, or set it to the previous admin token\n');
     process.exit(1);
   }
   const adminTokenPrev = prevRaw ?? null;
@@ -101,6 +101,24 @@ export function loadConfig(): Config {
   };
   const wsPorts = portPair('MESH_WS_PORT', 'MESH_WS_TLS_PORT', 7384);
   const adminPorts = portPair('MESH_ADMIN_PORT', 'MESH_ADMIN_TLS_PORT', 7385);
+  // Any two of the (up to four) bound ports colliding — defaults included,
+  // e.g. MESH_WS_TLS_PORT=7385 beside a defaulted admin port — is refused
+  // here, naming both, rather than surfacing as EADDRINUSE from one listener.
+  const bound: [string, number][] = [];
+  for (const [name, p] of [
+    ['MESH_WS_PORT', wsPorts.plain], ['MESH_WS_TLS_PORT', wsPorts.tls],
+    ['MESH_ADMIN_PORT', adminPorts.plain], ['MESH_ADMIN_TLS_PORT', adminPorts.tls],
+  ] as const) {
+    if (typeof p === 'number') bound.push([name, p]);
+  }
+  for (let i = 0; i < bound.length; i++) {
+    for (let j = i + 1; j < bound.length; j++) {
+      if (bound[i]![1] === bound[j]![1]) {
+        process.stderr.write(`${bound[i]![0]} and ${bound[j]![0]} are both ${bound[i]![1]}; every listener needs its own port\n`);
+        process.exit(1);
+      }
+    }
+  }
   const wsPort = wsPorts.plain;
   const wsTlsPort = wsPorts.tls;
   const adminPort = adminPorts.plain;

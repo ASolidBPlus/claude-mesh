@@ -314,11 +314,10 @@ export function resolveRouteAuth(
   adminToken: string,
   mode: Route['auth'] | undefined,
   // R-65: the previous admin token (M7), and whether this request came in
-  // through a TLS listener — which the plaintext TLS latch needs. Defaults
-  // keep every existing caller's behaviour: no previous token; and `tls: true`
-  // so a caller that does not say is never subjected to a latch it cannot
-  // reason about.
-  ext: { adminTokenPrev?: string | null; tls?: boolean } = {},
+  // through a TLS listener. `tls` is REQUIRED: a caller that forgot to say
+  // would otherwise silently get no latch, which is the failure in the
+  // dangerous direction.
+  ext: { adminTokenPrev?: string | null; tls: boolean },
 ): AuthResult | null {
   const adminTokenPrev = ext.adminTokenPrev ?? null;
   if (mode === 'handler') {

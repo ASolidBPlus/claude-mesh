@@ -108,6 +108,8 @@ interface AuthCtx {
   observerIndex: Map<string, WebSocket>;
   presenceState: Map<string, PresenceState>;
   broadcastStatus: (agentId: string, online: boolean, lastSeen: number, excludeWs: WebSocket | null) => void;
+  /** R-65: true only when TLS runs BESIDE plaintext (side-by-side mode). */
+  latchOnTls: boolean;
 }
 
 /**
@@ -131,7 +133,7 @@ interface AuthCtx {
  * function that has no other reason to know about it.
  */
 function handleAuthFrame(ctx: AuthCtx): void {
-  const { ws, state, db, frame, parsed, agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus } = ctx;
+  const { ws, state, db, frame, parsed, agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus, latchOnTls } = ctx;
 
   if (typeof parsed !== 'object' || parsed === null || frame.type !== 'auth') {
     try {
@@ -335,7 +337,12 @@ function handleAuthFrame(ctx: AuthCtx): void {
     ws.close(1008, 'auth failed');
     return;
   }
-  if (state.tls) markTlsSeen(db, agentId);
+  // Recorded only where a plaintext WS listener exists BESIDE the TLS one.
+  // On a #215 single-listener bus every auth is TLS and the admin listener is
+  // plain, so latching there would refuse every agent's own /messages and
+  // /files on the only HTTP door it has — the latch means "this agent has a
+  // TLS path and must use it", which a compat bus cannot offer for HTTP.
+  if (state.tls && latchOnTls) markTlsSeen(db, agentId);
 
   const connectTime = Date.now();
   setOnline(db, agentId, true);
@@ -1306,6 +1313,7 @@ export function startWsServer(
             handleAuthFrame({
               ws, state, db, frame, parsed,
               agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus,
+              latchOnTls: sideBySide,
             });
             return;
           }

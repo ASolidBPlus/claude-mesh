@@ -271,8 +271,19 @@ describe('loadConfig', () => {
     expect(r.said).toContain('must differ');
   });
 
+  it('R-65: any two listeners on one port refuse — defaults included', async () => {
+    // MESH_WS_TLS_PORT on the DEFAULTED admin port 7385.
+    const r = await refused({ MESH_WS_PORT: 'off', MESH_WS_TLS_PORT: '7385' });
+    expect(r.exitCode).toBe(1);
+    expect(r.said).toContain('MESH_WS_TLS_PORT and MESH_ADMIN_PORT are both 7385');
+    const r2 = await refused({ MESH_WS_PORT: '9000', MESH_WS_TLS_PORT: '9001', MESH_ADMIN_PORT: '9002', MESH_ADMIN_TLS_PORT: '9001' });
+    expect(r2.exitCode).toBe(1);
+    expect(r2.said).toContain('every listener needs its own port');
+  });
+
   it('R-65: MESH_ADMIN_TOKEN_PREV set but empty refuses; set is read as-is', async () => {
     expect((await refused({ MESH_ADMIN_TOKEN_PREV: '' })).exitCode).toBe(1);
+    expect((await refused({ MESH_ADMIN_TOKEN_PREV: '   ' })).exitCode).toBe(1);
     const { config } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_ADMIN_TOKEN_PREV: 'old' });
     expect(config?.adminTokenPrev).toBe('old');
   });

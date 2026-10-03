@@ -120,6 +120,47 @@ describe('compat: cert/key with NO *_TLS_PORT is #215 exactly — one TLS listen
   });
 });
 
+describe('compat (#215 bus): a TLS auth does NOT latch — the plain admin listener still serves the agent', () => {
+  // Review B1. On a single-listener TLS bus every auth is TLS and the admin
+  // listener is plain, so latching there 401'd every agent's own /messages
+  // and /files — and plain admin via MESH_HTTP_URL is fetchFile's only door.
+  it('tls_seen stays null after a wss auth, and /messages with the agent token is 200 on plain admin', async () => {
+    freshDb();
+    const [p, , a] = ports();
+    await ws(p, TLS);
+    await admin(a);
+    const s = await rawAuth(`wss://127.0.0.1:${p}`, 'alice', 'alice-tok', CA); sockets.push(s.ws);
+    expect(s.frames[0]?.type).toBe('auth_ok');
+    expect(getAgentById(db!, 'alice')!.tls_seen ?? null).toBeNull();
+    const { v: res } = await quiet(() => fetch(`http://127.0.0.1:${a}/messages`, { headers: { Authorization: 'Bearer alice-tok' } }));
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('oversize frames: the same refusal on BOTH listeners (noServer path)', () => {
+  // WHAT THIS PINS, AND WHAT IT DOES NOT. maxPayload is passed to the
+  // WebSocketServer, but Bun's `ws` does not enforce it — measured on main
+  // e0d3793 BEFORE this change, with the identical result: a 1.2 MB frame is
+  // buffered and parsed, and the ROUTER refuses it (MESSAGE_TOO_LARGE). So
+  // F2b (c)'s "dropped before the parser" does not hold on Bun, on either code
+  // path; that is a separate, pre-existing finding. What this PR must not do
+  // is make either listener behave differently from the other or from main.
+  it('a frame above the payload cap is refused MESSAGE_TOO_LARGE on plaintext and TLS, nothing is stored, and the socket keeps working', async () => {
+    freshDb();
+    const [p, t] = ports();
+    await ws(p, TLS, t);
+    for (const [url, ca] of [[`ws://127.0.0.1:${p}`, undefined], [`wss://127.0.0.1:${t}`, CA]] as const) {
+      const s = await rawAuth(url, 'bob', 'bob-tok', ca); sockets.push(s.ws);
+      expect(s.frames[0]?.type).toBe('auth_ok');
+      s.ws.send(JSON.stringify({ type: 'send', msg_id: `big-${url}`, to: 'alice', payload: 'x'.repeat(1_200_000) }));
+      await wait(400);
+      expect({ url, refusal: s.frames.find(fr => fr.ref === `big-${url}`)?.code }).toEqual({ url, refusal: 'MESSAGE_TOO_LARGE' });
+      expect(s.closed()).toBe(false);
+    }
+    expect((db!.prepare("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n).toBe(0);
+  });
+});
+
 describe('Done-when: TLS auth works on the TLS port while plaintext still works', () => {
   it('both listeners up; an agent on each; ONE state — newer-wins displaces across ports', async () => {
     freshDb();
@@ -260,6 +301,8 @@ describe('Done-when: MESH_ADMIN_TOKEN_PREV is accepted until it is removed', () 
   });
 
   it('adminTokenMatches: current or previous, never the empty previous', () => {
+    expect(adminTokenMatches('', 'cur', '')).toBe(false);      // review N2
+    expect(adminTokenMatches('cur', 'cur', '')).toBe(true);
     expect(adminTokenMatches('cur', 'cur', null)).toBe(true);
     expect(adminTokenMatches('old', 'cur', 'old')).toBe(true);
     expect(adminTokenMatches('old', 'cur', null)).toBe(false);

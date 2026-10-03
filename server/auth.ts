@@ -58,9 +58,12 @@ export function timingSafeEqual(a: string, b: string): boolean {
  * answer is discarded). The one helper every admin-token door calls.
  */
 export function adminTokenMatches(presented: string, current: string, prev: string | null): boolean {
+  // An EMPTY previous token is no previous token: otherwise an empty
+  // presented credential would match it.
+  const usablePrev = prev !== null && prev !== '' ? prev : null;
   const viaCurrent = timingSafeEqual(presented, current);
-  const viaPrev = timingSafeEqual(presented, prev ?? current);
-  return viaCurrent || (prev !== null && viaPrev);
+  const viaPrev = timingSafeEqual(presented, usablePrev ?? current);
+  return viaCurrent || (usablePrev !== null && viaPrev);
 }
 
 /**
