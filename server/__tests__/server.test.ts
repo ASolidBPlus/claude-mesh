@@ -5,7 +5,7 @@ import type { Config } from '../server.ts';
 async function callLoadConfig(env: Record<string, string | undefined>): Promise<{ config?: Config; exitCode?: number }> {
   // Save original env
   const saved: Record<string, string | undefined> = {};
-  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS', 'MESH_PLAINTEXT_PEER_CIDRS', 'MESH_TLS_CERT', 'MESH_TLS_KEY', 'MESH_TLS_CA'];
+  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS', 'MESH_PLAINTEXT_PEER_CIDRS', 'MESH_TLS_CERT', 'MESH_TLS_KEY', 'MESH_TLS_CA', 'MESH_METRICS_TOKEN'];
   for (const key of keys) {
     saved[key] = process.env[key];
     if (env[key] !== undefined) {
@@ -65,7 +65,7 @@ describe('loadConfig', () => {
   it('returns defaults when only MESH_ADMIN_TOKEN is set', async () => {
     const { config, exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok' });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, adminToken: 'tok', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], tls: null, tlsCa: null });
+    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, adminToken: 'tok', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], tls: null, tlsCa: null, metricsToken: null });
   });
 
   it('returns correct values when all valid env vars are set', async () => {
@@ -75,7 +75,7 @@ describe('loadConfig', () => {
       MESH_WS_PORT: '8080',
     });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, adminToken: 'secret', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], tls: null, tlsCa: null });
+    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, adminToken: 'secret', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], tls: null, tlsCa: null, metricsToken: null });
   });
 
   it('MESH_MAX_FILE_BYTES: defaults to 10 MB when not set', async () => {
@@ -205,6 +205,31 @@ describe('loadConfig', () => {
     } finally { process.stderr.write = realWrite; }
     expect(exitCode).toBe(1);
     expect(writes.join('')).toContain('MESH_TLS_CERT is set but MESH_TLS_KEY is not');
+  });
+
+  it('MESH_METRICS_TOKEN: unset = null (/metrics open); a clean value is read as-is', async () => {
+    expect((await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok' })).config?.metricsToken).toBeNull();
+    const { config, exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_METRICS_TOKEN: 'm-3f9a.Token_x' });
+    expect(exitCode).toBeUndefined();
+    expect(config?.metricsToken).toBe('m-3f9a.Token_x');
+  });
+
+  it('MESH_METRICS_TOKEN: empty, whitespace or control characters REFUSE to start — never trimmed, value never shown', async () => {
+    const secret = 'S3CRETvalue';
+    for (const bad of ['', ` ${secret}`, `${secret}\n`, `${secret} x`, `${secret}\t`, `${secret}\u0007`]) {
+      const writes: string[] = [];
+      const realWrite = process.stderr.write.bind(process.stderr);
+      process.stderr.write = ((chunk: string) => { writes.push(String(chunk)); return true; }) as typeof process.stderr.write;
+      let exitCode: number | undefined;
+      try {
+        ({ exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_METRICS_TOKEN: bad }));
+      } finally { process.stderr.write = realWrite; }
+      const said = writes.join('');
+      expect({ bad, exitCode }).toEqual({ bad, exitCode: 1 });
+      expect(said).toContain('MESH_METRICS_TOKEN');
+      expect(said).not.toContain(secret);
+      expect(said).not.toContain(String(bad.length));
+    }
   });
 
   it('MESH_RETENTION_MS: exits with 1 when non-integer', async () => {

@@ -29,6 +29,7 @@ export interface Config {
   plaintextPeerCidrs: PlaintextCidr[];
   tls: ServerTls | null;
   tlsCa: string | null;
+  metricsToken: string | null;
 }
 
 export function loadConfig(): Config {
@@ -150,7 +151,28 @@ export function loadConfig(): Config {
   const tls = tlsLoad.server;
   const tlsCa = tlsLoad.ca;
 
-  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, tls, tlsCa };
+  // R-18: MESH_METRICS_TOKEN gates /metrics. UNSET keeps /metrics open, as it
+  // has always been — Prometheus scrapes with no credential until the token is
+  // configured on both sides. SET but unusable is REFUSED, not repaired:
+  //   - empty: an operator who meant to lock /metrics would get it silently
+  //     OPEN — the failure in the dangerous direction;
+  //   - whitespace or control characters (a pasted trailing newline, most
+  //     often): trimming would accept a different token than the one
+  //     configured, and left alone no HTTP header could ever carry it.
+  // The message names the variable and the condition, never the value or its
+  // length.
+  let metricsToken: string | null = null;
+  const metricsRaw = process.env.MESH_METRICS_TOKEN;
+  if (metricsRaw !== undefined) {
+    // eslint-disable-next-line no-control-regex -- the control set is the point
+    if (metricsRaw === '' || /[\s\x00-\x1f\x7f]/.test(metricsRaw)) {
+      process.stderr.write('MESH_METRICS_TOKEN is set but empty or contains whitespace/control characters; refused rather than trimmed (value not shown). Unset it to leave /metrics open.\n');
+      process.exit(1);
+    }
+    metricsToken = metricsRaw;
+  }
+
+  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, tls, tlsCa, metricsToken };
 }
 
 async function main() {
@@ -302,7 +324,7 @@ async function main() {
   applyPlaintextPeerCidrs(config.plaintextPeerCidrs);
   const border = startBorder(db, wsHandle.agentIndex, { ca: config.tlsCa });
 
-  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, observerIndex, peerIndex, border);
+  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, observerIndex, peerIndex, border, { metricsToken: config.metricsToken });
 
   let cleanupHandle: CleanupHandle | null = null;
   let reminderHandle: ReminderSchedulerHandle | null = null;

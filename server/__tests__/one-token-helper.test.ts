@@ -58,7 +58,11 @@ describe('#79 one token-comparison helper', () => {
     // covers a door dropping the helper, and adding a credential name here is
     // part of adding a door. Neither catches a NEW door with a NEW credential
     // name; that residual is accepted.
-    const CREDENTIAL = /(?:===|!==)\s*(?:`Bearer|adminToken|configured|token_hash|key_hash|storedHash)\b|\b(?:adminToken|storedHash|token_hash|key_hash)\s*(?:===|!==)/;
+    // `metricsToken` (R-18) is on the COMPARED-AGAINST side only: on the left
+    // it is a nullable config value, and `metricsToken !== null` is a guard,
+    // not a credential compare. `presented === metricsToken` is the hazard,
+    // and that side catches it.
+    const CREDENTIAL = /(?:===|!==)\s*(?:`Bearer|adminToken|metricsToken|configured|token_hash|key_hash|storedHash)\b|\b(?:adminToken|storedHash|token_hash|key_hash)\s*(?:===|!==)/;
     const offenders: string[] = [];
     for (const f of sourceFiles(SERVER_ROOT)) {
       for (const [i, line] of code(f).split('\n').entries()) {
@@ -80,7 +84,9 @@ describe('#79 one token-comparison helper', () => {
     // that compares the admin token — moved to admin-ctx.ts with the rest of
     // the shared request context. The SET is what this asserts, so the entry
     // moves rather than the assertion loosening.
-    expect(callers).toEqual(['admin-ctx.ts', 'auth.ts', 'db.ts', 'mcp-server.ts']);
+    // R-18 added a door: /metrics in http-admin.ts compares MESH_METRICS_TOKEN
+    // and the admin token through the helper.
+    expect(callers).toEqual(['admin-ctx.ts', 'auth.ts', 'db.ts', 'http-admin.ts', 'mcp-server.ts']);
   });
 
   // Behaviour is unchanged from the loop it replaces — the point was the
