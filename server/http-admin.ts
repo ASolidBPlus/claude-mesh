@@ -2,6 +2,7 @@ import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import { WebSocket } from 'ws';
 import { renderMetrics } from './metrics.ts';
+import { timingSafeEqual } from './auth.ts';
 import { handleAclDelete, handleAclGet, handleAclPost } from './admin-acl.ts';
 import { handleAgentById, handleAgentDelete, handleAgentGet, handleAgentPatch, handleAgentPost } from './admin-agents.ts';
 import type { AdminCtx, ForwarderRegistry, Route } from './admin-ctx.ts';
@@ -89,6 +90,16 @@ export const ROUTES: Route[] = [
   { method: 'DELETE', match: idMatch(/^\/reminders\/([^/]+)$/),      handler: handleReminderDelete },
 ];
 
+/** Bearer credential for /metrics: the metrics token or the admin token. */
+function metricsAuthorized(req: http.IncomingMessage, metricsToken: string, adminToken: string): boolean {
+  const auth = req.headers['authorization'];
+  if (typeof auth !== 'string' || !auth.startsWith('Bearer ')) return false;
+  const presented = auth.slice('Bearer '.length);
+  const viaMetrics = timingSafeEqual(presented, metricsToken);
+  const viaAdmin = timingSafeEqual(presented, adminToken);
+  return viaMetrics || viaAdmin;
+}
+
 /**
  * Run one matched route: the handler, the crash guard, and the #161 mutation
  * record. Extracted so the WS listener's door for /peers/register runs the
@@ -167,12 +178,26 @@ export function startHttpAdmin(
   // same positional convention. Defaulted to an EMPTY registry, so every
   // existing caller and test is unchanged AND gets the inert front half.
   forwarders: ForwarderRegistry = {},
+  // R-18: MESH_METRICS_TOKEN, parsed and validated by loadConfig. null (the
+  // default) = /metrics unauthenticated, exactly as before.
+  opts: { metricsToken?: string | null } = {},
 ): Promise<HttpAdminHandle> {
+  const metricsToken = opts.metricsToken ?? null;
   return new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
       // /metrics is unauthenticated by design — this listener binds to the admin port
       // which is internal-only (not exposed publicly). Read-only Prometheus exposition.
       if (req.method === 'GET' && new URL(req.url!, 'http://localhost').pathname === '/metrics') {
+        // With a metrics token configured, /metrics takes it OR the admin
+        // token, each compared in constant time — and BOTH comparisons always
+        // run, so the timing does not say which one matched. The refusal is
+        // byte-identical to every other admin 401. Nothing about the
+        // presented credential is logged.
+        if (metricsToken !== null && !metricsAuthorized(req, metricsToken, adminToken)) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'unauthorized' }));
+          return;
+        }
         try {
           const body = renderMetrics(db);
           res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
@@ -242,10 +267,18 @@ export function startHttpAdmin(
         evt: 'admin.listening',
         bind: bindHost ?? '(all interfaces)',
         bound,
-        metrics_unauthenticated: true,
-        note: bindHost === undefined
-          ? 'admin port bound to ALL interfaces; /metrics is unauthenticated on it — set MESH_ADMIN_BIND to restrict, or accept this as the deployment decision'
-          : '/metrics is unauthenticated on this bind',
+        // R-18: which mode /metrics is in, stated in both. The old flag stays
+        // in the unauthenticated case, where it is still true and existing
+        // readers look for it.
+        metrics_auth: metricsToken === null ? 'none' : 'token',
+        ...(metricsToken === null ? { metrics_unauthenticated: true } : {}),
+        note: metricsToken !== null
+          ? (bindHost === undefined
+            ? 'admin port bound to ALL interfaces; /metrics requires MESH_METRICS_TOKEN or the admin token'
+            : '/metrics requires MESH_METRICS_TOKEN or the admin token on this bind')
+          : bindHost === undefined
+            ? 'admin port bound to ALL interfaces; /metrics is unauthenticated on it — set MESH_METRICS_TOKEN to require a token, MESH_ADMIN_BIND to restrict, or accept this as the deployment decision'
+            : '/metrics is unauthenticated on this bind — set MESH_METRICS_TOKEN to require a token',
         at: Date.now(),
       }));
       const handle: HttpAdminHandle = {
