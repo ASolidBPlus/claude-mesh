@@ -21,7 +21,7 @@ describe('#22 GET /healthz', () => {
   beforeEach(async () => {
     db = openDb(':memory:');
     handle = await startWsServer(0, db, 10_485_760, mkdtempSync(join(tmpdir(), 'mesh-22-')));
-    port = (handle.wss.address() as { port: number }).port;
+    port = handle.address().port;
   });
   afterEach(async () => { await handle.shutdown().catch(() => {}); db?.close(); });
 

@@ -55,8 +55,10 @@ describe('startWsServer', () => {
 
   it('resolves and wss is listening on the given port', async () => {
     expect(handle.wss).toBeDefined();
-    expect(handle.wss.address()).toBeTruthy();
-    const addr = handle.wss.address() as { port: number };
+    // R-65: the WebSocketServer is fed by every listener (noServer), so the
+    // bound address is the handle's, not the wss's.
+    expect(handle.address()).toBeTruthy();
+    const addr = handle.address();
     expect(addr.port).toBe(port);
   });
 

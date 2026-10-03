@@ -5,7 +5,7 @@ import type { Config } from '../server.ts';
 async function callLoadConfig(env: Record<string, string | undefined>): Promise<{ config?: Config; exitCode?: number }> {
   // Save original env
   const saved: Record<string, string | undefined> = {};
-  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS', 'MESH_PLAINTEXT_PEER_CIDRS', 'MESH_TLS_CERT', 'MESH_TLS_KEY', 'MESH_TLS_CA', 'MESH_METRICS_TOKEN'];
+  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS', 'MESH_PLAINTEXT_PEER_CIDRS', 'MESH_TLS_CERT', 'MESH_TLS_KEY', 'MESH_TLS_CA', 'MESH_METRICS_TOKEN', 'MESH_ADMIN_PORT', 'MESH_WS_TLS_PORT', 'MESH_ADMIN_TLS_PORT', 'MESH_ADMIN_TOKEN_PREV'];
   for (const key of keys) {
     saved[key] = process.env[key];
     if (env[key] !== undefined) {
@@ -65,7 +65,7 @@ describe('loadConfig', () => {
   it('returns defaults when only MESH_ADMIN_TOKEN is set', async () => {
     const { config, exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok' });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, adminToken: 'tok', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], tls: null, tlsCa: null, metricsToken: null });
+    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'tok', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], tls: null, tlsCa: null, metricsToken: null });
   });
 
   it('returns correct values when all valid env vars are set', async () => {
@@ -75,7 +75,7 @@ describe('loadConfig', () => {
       MESH_WS_PORT: '8080',
     });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, adminToken: 'secret', cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], tls: null, tlsCa: null, metricsToken: null });
+    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'secret', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], tls: null, tlsCa: null, metricsToken: null });
   });
 
   it('MESH_MAX_FILE_BYTES: defaults to 10 MB when not set', async () => {
@@ -230,6 +230,62 @@ describe('loadConfig', () => {
       expect(said).not.toContain(secret);
       expect(said).not.toContain(String(bad.length));
     }
+  });
+
+  // R-65 — the port rules. Each refusal names what to do, and exits 1.
+  async function refused(env: Record<string, string>): Promise<{ exitCode: number | undefined; said: string }> {
+    const writes: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string) => { writes.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    try {
+      const { exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', ...env });
+      return { exitCode, said: writes.join('') };
+    } finally { process.stderr.write = realWrite; }
+  }
+
+  it('R-65: a TLS port with its plaintext sibling ABSENT refuses — no silent plaintext default', async () => {
+    for (const [tlsVar, plainVar] of [['MESH_WS_TLS_PORT', 'MESH_WS_PORT'], ['MESH_ADMIN_TLS_PORT', 'MESH_ADMIN_PORT']]) {
+      const r = await refused({ [tlsVar!]: '7432' });
+      expect({ tlsVar, exitCode: r.exitCode }).toEqual({ tlsVar, exitCode: 1 });
+      expect(r.said).toContain(`say ${plainVar}=off or give it a port`);
+    }
+  });
+
+  it("R-65: 'off' without its TLS sibling refuses", async () => {
+    for (const [plainVar, tlsVar] of [['MESH_WS_PORT', 'MESH_WS_TLS_PORT'], ['MESH_ADMIN_PORT', 'MESH_ADMIN_TLS_PORT']]) {
+      const r = await refused({ [plainVar!]: 'off' });
+      expect({ plainVar, exitCode: r.exitCode }).toEqual({ plainVar, exitCode: 1 });
+      expect(r.said).toContain(`${plainVar}=off needs ${tlsVar}`);
+    }
+  });
+
+  it('R-65: a TLS port without MESH_TLS_CERT/KEY refuses', async () => {
+    const r = await refused({ MESH_WS_PORT: 'off', MESH_WS_TLS_PORT: '7432' });
+    expect(r.exitCode).toBe(1);
+    expect(r.said).toContain('MESH_WS_TLS_PORT is set but MESH_TLS_CERT/MESH_TLS_KEY are not');
+  });
+
+  it('R-65: the same port for a plaintext/TLS pair refuses', async () => {
+    const r = await refused({ MESH_WS_PORT: '7432', MESH_WS_TLS_PORT: '7432' });
+    expect(r.exitCode).toBe(1);
+    expect(r.said).toContain('must differ');
+  });
+
+  it('R-65: any two listeners on one port refuse — defaults included', async () => {
+    // MESH_WS_TLS_PORT on the DEFAULTED admin port 7385.
+    const r = await refused({ MESH_WS_PORT: 'off', MESH_WS_TLS_PORT: '7385' });
+    expect(r.exitCode).toBe(1);
+    expect(r.said).toContain('MESH_WS_TLS_PORT and MESH_ADMIN_PORT are both 7385');
+    const r2 = await refused({ MESH_WS_PORT: '9000', MESH_WS_TLS_PORT: '9001', MESH_ADMIN_PORT: '9002', MESH_ADMIN_TLS_PORT: '9001' });
+    expect(r2.exitCode).toBe(1);
+    expect(r2.said).toContain('every listener needs its own port');
+  });
+
+  it('R-65: MESH_ADMIN_TOKEN_PREV set but empty refuses; set is read as-is', async () => {
+    expect((await refused({ MESH_ADMIN_TOKEN_PREV: '' })).exitCode).toBe(1);
+    expect((await refused({ MESH_ADMIN_TOKEN_PREV: '   ' })).exitCode).toBe(1);
+    const { config } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_ADMIN_TOKEN_PREV: 'old' });
+    expect(config?.adminTokenPrev).toBe('old');
   });
 
   it('MESH_RETENTION_MS: exits with 1 when non-integer', async () => {

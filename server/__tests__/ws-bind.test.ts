@@ -73,7 +73,7 @@ describe('MESH_WS_BIND', () => {
 
     process.env.MESH_WS_BIND = '127.0.0.1';
     handle = await start();
-    const port = (handle.wss.address() as { port: number }).port;
+    const port = handle.address().port;
 
     expect(await canConnect(`ws://127.0.0.1:${port}`)).toBe(true);
     expect(await canConnect(`ws://${external}:${port}`)).toBe(false);
@@ -97,7 +97,7 @@ describe('MESH_WS_BIND', () => {
 
     delete process.env.MESH_WS_BIND;
     handle = await start();
-    const port = (handle.wss.address() as { port: number }).port;
+    const port = handle.address().port;
 
     expect(await canConnect(`ws://${external}:${port}`)).toBe(true);
   }, 20_000);

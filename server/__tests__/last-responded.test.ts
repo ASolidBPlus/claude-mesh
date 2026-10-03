@@ -43,7 +43,7 @@ describe('#133 last_responded', () => {
     db = openDb(':memory:');
     registerAgent(db, { id: 'a-one', token_hash: hashToken('tok-a'), hostname: 'h' });
     handle = await startWsServer(0, db, 10_485_760, mkdtempSync(join(tmpdir(), 'mesh-133-')));
-    port = (handle.wss.address() as { port: number }).port;
+    port = handle.address().port;
   });
   afterEach(async () => { await handle?.shutdown().catch(() => {}); handle = undefined; db?.close(); });
 

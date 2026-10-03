@@ -16,9 +16,15 @@ import { mkdirSync } from 'fs';
 
 export interface Config {
   dbPath: string;
-  wsPort: number;
-  adminPort: number;
+  /** R-65: 'off' only beside a TLS sibling (see loadConfig). */
+  wsPort: number | 'off';
+  adminPort: number | 'off';
+  /** R-65 M1/M2: a TLS listener beside the plaintext one, or null. */
+  wsTlsPort: number | null;
+  adminTlsPort: number | null;
   adminToken: string;
+  /** R-65 M7: MESH_ADMIN_TOKEN_PREV, accepted beside the admin token. */
+  adminTokenPrev: string | null;
   cleanupIntervalMs: number;
   maxFileBytes: number;
   filesDir: string;
@@ -41,27 +47,82 @@ export function loadConfig(): Config {
 
   const dbPath = process.env.MESH_DB_PATH ?? '/data/mesh.db';
 
-  let wsPort = 7384;
-  const wsPortStr = process.env.MESH_WS_PORT;
-  if (wsPortStr !== undefined) {
-    const parsed = parseInt(wsPortStr, 10);
-    if (isNaN(parsed) || parsed < 1 || parsed > 65535 || String(parsed) !== wsPortStr.trim()) {
-      process.stderr.write(`MESH_WS_PORT must be an integer between 1 and 65535, got: ${wsPortStr}\n`);
-      process.exit(1);
-    }
-    wsPort = parsed;
+  // R-65 M7: the previous admin token, accepted beside the current one so a
+  // rotation is not a flag day. Same rule as the admin token itself: set
+  // means non-empty. Never logged; the boot line says only whether it is set.
+  const prevRaw = process.env.MESH_ADMIN_TOKEN_PREV;
+  if (prevRaw !== undefined && prevRaw.trim() === '') {
+    process.stderr.write('MESH_ADMIN_TOKEN_PREV is set but empty or whitespace; unset it, or set it to the previous admin token\n');
+    process.exit(1);
   }
+  const adminTokenPrev = prevRaw ?? null;
 
-  let adminPort = 7385;
-  const adminPortStr = process.env.MESH_ADMIN_PORT;
-  if (adminPortStr !== undefined) {
-    const parsed = parseInt(adminPortStr, 10);
-    if (isNaN(parsed) || parsed < 1 || parsed > 65535 || String(parsed) !== adminPortStr.trim()) {
-      process.stderr.write(`MESH_ADMIN_PORT must be an integer between 1 and 65535, got: ${adminPortStr}\n`);
+  // R-65 PORTS. Each listener pair is a plaintext port and an optional TLS
+  // port. The rules, all refusals at boot:
+  //   - a TLS port needs MESH_TLS_CERT + MESH_TLS_KEY (checked below, once TLS
+  //     is loaded);
+  //   - a plaintext port may be 'off' only when its TLS sibling is set;
+  //   - with a TLS port set, the plaintext port must be STATED — a number or
+  //     'off'. Absent is refused, never the plaintext default: an operator
+  //     adding TLS must decide about plaintext, not inherit it.
+  // With no TLS port the old rules hold exactly, default included.
+  const parsePort = (name: string, raw: string): number => {
+    const parsed = parseInt(raw, 10);
+    if (isNaN(parsed) || parsed < 1 || parsed > 65535 || String(parsed) !== raw.trim()) {
+      process.stderr.write(`${name} must be an integer between 1 and 65535, got: ${raw}\n`);
       process.exit(1);
     }
-    adminPort = parsed;
+    return parsed;
+  };
+  const portPair = (plainName: string, tlsName: string, plainDefault: number): { plain: number | 'off'; tls: number | null } => {
+    const tlsRaw = process.env[tlsName];
+    const tlsPort = tlsRaw === undefined ? null : parsePort(tlsName, tlsRaw);
+    const plainRaw = process.env[plainName];
+    if (plainRaw === undefined) {
+      if (tlsPort !== null) {
+        process.stderr.write(`${tlsName} is set but ${plainName} is not; say ${plainName}=off or give it a port — the plaintext default is not applied beside a TLS listener\n`);
+        process.exit(1);
+      }
+      return { plain: plainDefault, tls: null };
+    }
+    if (plainRaw.trim() === 'off') {
+      if (tlsPort === null) {
+        process.stderr.write(`${plainName}=off needs ${tlsName}: turning plaintext off with no TLS listener would leave nothing to connect to\n`);
+        process.exit(1);
+      }
+      return { plain: 'off', tls: tlsPort };
+    }
+    const plain = parsePort(plainName, plainRaw);
+    if (tlsPort !== null && tlsPort === plain) {
+      process.stderr.write(`${plainName} and ${tlsName} are both ${plain}; they must differ\n`);
+      process.exit(1);
+    }
+    return { plain, tls: tlsPort };
+  };
+  const wsPorts = portPair('MESH_WS_PORT', 'MESH_WS_TLS_PORT', 7384);
+  const adminPorts = portPair('MESH_ADMIN_PORT', 'MESH_ADMIN_TLS_PORT', 7385);
+  // Any two of the (up to four) bound ports colliding — defaults included,
+  // e.g. MESH_WS_TLS_PORT=7385 beside a defaulted admin port — is refused
+  // here, naming both, rather than surfacing as EADDRINUSE from one listener.
+  const bound: [string, number][] = [];
+  for (const [name, p] of [
+    ['MESH_WS_PORT', wsPorts.plain], ['MESH_WS_TLS_PORT', wsPorts.tls],
+    ['MESH_ADMIN_PORT', adminPorts.plain], ['MESH_ADMIN_TLS_PORT', adminPorts.tls],
+  ] as const) {
+    if (typeof p === 'number') bound.push([name, p]);
   }
+  for (let i = 0; i < bound.length; i++) {
+    for (let j = i + 1; j < bound.length; j++) {
+      if (bound[i]![1] === bound[j]![1]) {
+        process.stderr.write(`${bound[i]![0]} and ${bound[j]![0]} are both ${bound[i]![1]}; every listener needs its own port\n`);
+        process.exit(1);
+      }
+    }
+  }
+  const wsPort = wsPorts.plain;
+  const wsTlsPort = wsPorts.tls;
+  const adminPort = adminPorts.plain;
+  const adminTlsPort = adminPorts.tls;
 
   let cleanupIntervalMs = 60_000;
   const cleanupStr = process.env.MESH_CLEANUP_INTERVAL_MS;
@@ -150,6 +211,12 @@ export function loadConfig(): Config {
   }
   const tls = tlsLoad.server;
   const tlsCa = tlsLoad.ca;
+  for (const [name, p] of [['MESH_WS_TLS_PORT', wsTlsPort], ['MESH_ADMIN_TLS_PORT', adminTlsPort]] as const) {
+    if (p !== null && tls === null) {
+      process.stderr.write(`${name} is set but MESH_TLS_CERT/MESH_TLS_KEY are not; a TLS listener needs both\n`);
+      process.exit(1);
+    }
+  }
 
   // R-18: MESH_METRICS_TOKEN gates /metrics. UNSET keeps /metrics open, as it
   // has always been — Prometheus scrapes with no credential until the token is
@@ -172,7 +239,7 @@ export function loadConfig(): Config {
     metricsToken = metricsRaw;
   }
 
-  return { dbPath, wsPort, adminPort, adminToken, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, tls, tlsCa, metricsToken };
+  return { dbPath, wsPort, adminPort, wsTlsPort, adminTlsPort, adminToken, adminTokenPrev, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, tls, tlsCa, metricsToken };
 }
 
 async function main() {
@@ -288,7 +355,8 @@ async function main() {
       const warn = expiryWarning(config.tls.info, Date.now());
       if (warn !== null) console.error(JSON.stringify(warn));
     }
-    wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes, config.filesDir, config.presenceDebounceMs, observerIndex, config.tls);
+    wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes, config.filesDir, config.presenceDebounceMs, observerIndex, config.tls,
+      config.wsTlsPort === null ? {} : { tlsPort: config.wsTlsPort });
   } catch (err) {
     process.stderr.write(`Failed to start WebSocket server: ${err}\n`);
     process.exit(1);
@@ -324,7 +392,25 @@ async function main() {
   applyPlaintextPeerCidrs(config.plaintextPeerCidrs);
   const border = startBorder(db, wsHandle.agentIndex, { ca: config.tlsCa });
 
-  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, observerIndex, peerIndex, border, { metricsToken: config.metricsToken });
+  const httpHandle: HttpAdminHandle = await startHttpAdmin(config.adminPort, db, config.adminToken, config.maxFileBytes, config.filesDir, wsHandle.agentIndex, observerIndex, peerIndex, border, {
+    metricsToken: config.metricsToken,
+    adminTokenPrev: config.adminTokenPrev,
+    ...(config.adminTlsPort === null ? {} : { tls: config.tls, tlsPort: config.adminTlsPort }),
+  });
+
+  // R-65: EVERY listener, in one line — including the ones that are 'off', so
+  // a verifier can PROVE plaintext is closed rather than infer it from a line
+  // that is missing. Built from the config that was actually applied.
+  console.log(JSON.stringify({
+    evt: 'mesh.listeners',
+    listeners: [
+      { name: 'ws', port: config.wsPort, scheme: config.wsPort === 'off' ? 'off' : (config.wsTlsPort === null && config.tls !== null ? 'wss' : 'ws') },
+      ...(config.wsTlsPort === null ? [] : [{ name: 'ws_tls', port: config.wsTlsPort, scheme: 'wss' }]),
+      { name: 'admin', port: config.adminPort, scheme: config.adminPort === 'off' ? 'off' : 'http' },
+      ...(config.adminTlsPort === null ? [] : [{ name: 'admin_tls', port: config.adminTlsPort, scheme: 'https' }]),
+    ],
+    at: Date.now(),
+  }));
 
   let cleanupHandle: CleanupHandle | null = null;
   let reminderHandle: ReminderSchedulerHandle | null = null;
@@ -356,7 +442,7 @@ async function main() {
   // adminToken passed so the ACL tools can gate on it (#8) — without it the
   // stdio plane would keep writing ACL edges with no credential while the
   // equivalent HTTP routes require one.
-  const mcpHandle = await startMcpServer(db, agentIndex, observerIndex, config.adminToken);
+  const mcpHandle = await startMcpServer(db, agentIndex, observerIndex, config.adminToken, config.adminTokenPrev);
   const transport = new StdioServerTransport();
   await mcpHandle.server.connect(transport);
 

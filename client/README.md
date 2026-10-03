@@ -137,7 +137,9 @@ new MeshClient({ /* … */ pingIntervalMs: 25_000, pongDeadlineMs: 60_000, ackTi
 ### TLS: `wss://` and `ca`
 
 Pass `ca` (PEM text, one or more CA certificates) to verify a `wss://` server
-against a private CA:
+against a private CA, or set **`MESH_TLS_CA`** in the environment (the PEM, or a
+path to it). `fetchFile()` uses the same CA; on Node it cannot take a per-request
+CA, so use `NODE_EXTRA_CA_CERTS` there.
 
 ```ts
 new MeshClient({ serverUrl: 'wss://10.20.0.5:7384', /* … */ ca: process.env.MESH_TLS_CA_PEM });

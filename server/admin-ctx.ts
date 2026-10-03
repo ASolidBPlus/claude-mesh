@@ -11,10 +11,10 @@ import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import { WebSocket } from 'ws';
 import {
-  timingSafeEqual,
+  adminTokenMatches,
 } from './auth.ts';
 import {
-  Agent, OutboundPeer, getAgentByToken,
+  Agent, OutboundPeer, getAgentByToken, isTlsLatched,
 } from './db.ts';
 import {
   incAdminAuth,
@@ -51,7 +51,8 @@ export function readBody(req: http.IncomingMessage): Promise<string> {
 export function requireAdmin(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  adminToken: string
+  adminToken: string,
+  adminTokenPrev: string | null = null,
 ): boolean {
   // #79: the same helper every other door uses. This compared the WHOLE header
   // with `===` — a plain string comparison against a live credential, which is
@@ -59,7 +60,7 @@ export function requireAdmin(
   // is most likely to copy, because it looks like ordinary code.
   const auth = req.headers['authorization'];
   if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
-    if (timingSafeEqual(auth.slice('Bearer '.length), adminToken)) {
+    if (adminTokenMatches(auth.slice('Bearer '.length), adminToken, adminTokenPrev)) {
       return true;
     }
   }
@@ -196,12 +197,13 @@ export function resolveAuth(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   db: Database,
-  adminToken: string
+  adminToken: string,
+  adminTokenPrev: string | null = null,
 ): AuthResult | null {
   const header = req.headers['authorization'];
   if (typeof header === 'string' && header.startsWith('Bearer ')) {
     const token = header.slice('Bearer '.length);
-    if (timingSafeEqual(token, adminToken)) {
+    if (adminTokenMatches(token, adminToken, adminTokenPrev)) {
       return { mode: 'admin' };
     }
     const agent = getAgentByToken(db, token);
@@ -232,6 +234,9 @@ export function formatAgent(agent: Agent): Record<string, unknown> {
     status: agent.status ?? null,
     status_detail: agent.status_detail ?? null,
     status_at: agent.status_at ?? null,
+    // R-65: when the agent first authenticated over TLS, or null. Non-null =
+    // latched: a plaintext auth for it is refused until an admin clears it.
+    tls_seen: agent.tls_seen ?? null,
   };
 }
 
@@ -307,8 +312,14 @@ export function resolveRouteAuth(
   res: http.ServerResponse,
   db: Database,
   adminToken: string,
-  mode: Route['auth'] | undefined
+  mode: Route['auth'] | undefined,
+  // R-65: the previous admin token (M7), and whether this request came in
+  // through a TLS listener. `tls` is REQUIRED: a caller that forgot to say
+  // would otherwise silently get no latch, which is the failure in the
+  // dangerous direction.
+  ext: { adminTokenPrev?: string | null; tls: boolean },
 ): AuthResult | null {
+  const adminTokenPrev = ext.adminTokenPrev ?? null;
   if (mode === 'handler') {
     // No dispatcher-level credential BY DESIGN: this route's handler owns its
     // authentication and must refuse uniformly. The ctx says 'unauthenticated'
@@ -322,7 +333,19 @@ export function resolveRouteAuth(
     return { mode: 'unauthenticated' };
   }
   if (mode === 'agentOrAdmin') {
-    const result = resolveAuth(req, res, db, adminToken);
+    const result = resolveAuth(req, res, db, adminToken, adminTokenPrev);
+    // R-65 TLS LATCH, the HTTP half: an agent token presented over a
+    // PLAINTEXT listener, for an agent that has authenticated over TLS, is
+    // refused exactly as the WS auth is — the uniform 401, the reason in the
+    // log only. The admin credential is not latched (the latch is per agent).
+    if (result !== null && result.mode === 'agent' && ext.tls === false && isTlsLatched(db, result.agentId)) {
+      console.log(JSON.stringify({
+        evt: 'agent.http', agent_id: result.agentId, tls: false, refused: 'tls_latched', at: Date.now(),
+      }));
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+      return null;
+    }
     // Only an ADMIN outcome on this route is an admin authentication. An agent
     // succeeding is not, and is not counted here.
     if (result !== null && result.mode === 'admin') {
@@ -339,7 +362,7 @@ export function resolveRouteAuth(
   // 'admin' and the no-route case: unmatched paths still require the admin
   // token before the 404, so an unauthenticated caller cannot probe which
   // routes exist.
-  if (!requireAdmin(req, res, adminToken)) {
+  if (!requireAdmin(req, res, adminToken, adminTokenPrev)) {
     recordAdminAuth(req, 'failure', credentialReason(req), mode ?? 'admin');
     return null;
   }

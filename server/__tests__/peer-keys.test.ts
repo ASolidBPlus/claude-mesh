@@ -313,10 +313,10 @@ describe('F0b: the dispatcher never hands a handler-mode route a grant', () => {
 
   it("auth:'handler' yields unauthenticated, even when the ADMIN token is presented", () => {
     const db = openDb(':memory:');
-    expect(resolveRouteAuth(req(), fakeRes(), db, ADMIN, 'handler')).toEqual({ mode: 'unauthenticated' });
+    expect(resolveRouteAuth(req(), fakeRes(), db, ADMIN, 'handler', { tls: false })).toEqual({ mode: 'unauthenticated' });
     // Presenting a good credential must not upgrade a ctx the route never
     // consulted.
-    expect(resolveRouteAuth(req(`Bearer ${ADMIN}`), fakeRes(), db, ADMIN, 'handler'))
+    expect(resolveRouteAuth(req(`Bearer ${ADMIN}`), fakeRes(), db, ADMIN, 'handler', { tls: false }))
       .toEqual({ mode: 'unauthenticated' });
     db.close();
   });
