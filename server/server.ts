@@ -4,7 +4,7 @@ import { setPeerUpSource } from './metrics.ts';
 import { startBorder, forwarders } from './border.ts';
 import { parsePlaintextPeerCidrs, applyPlaintextPeerCidrs, type PlaintextCidr } from './plaintext-peers.ts';
 import { loadTls, expiryWarning, type ServerTls } from './tls-config.ts';
-import { startWsServer, WsServerHandle } from './ws-server.ts';
+import { startWsServer, WsServerHandle, PRE_AUTH_LIMITS } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
 import { startCleanup, CleanupHandle } from './cleanup.ts';
@@ -36,6 +36,8 @@ export interface Config {
   tls: ServerTls | null;
   tlsCa: string | null;
   metricsToken: string | null;
+  /** R-69: caps on concurrent unauthenticated WS sockets. */
+  preAuth: { global: number; perIp: number };
 }
 
 export function loadConfig(): Config {
@@ -211,6 +213,23 @@ export function loadConfig(): Config {
   }
   const tls = tlsLoad.server;
   const tlsCa = tlsLoad.ca;
+
+  // R-69: caps on concurrent UNAUTHENTICATED sockets. Bun buffers up to 16 MiB
+  // per socket before JS can see a frame, so these bound that memory; the
+  // right value depends on the host's memory, which is the deployer's to know.
+  // Positive integers only — a typo that silently disabled a cap is the
+  // failure this refuses.
+  const posInt = (name: string, def: number): number => {
+    const raw = process.env[name];
+    if (raw === undefined) return def;
+    const n = Number(raw.trim());
+    if (raw.trim() === '' || !Number.isInteger(n) || n < 1 || String(n) !== raw.trim()) {
+      process.stderr.write(`${name} must be a positive integer, got: ${raw}\n`);
+      process.exit(1);
+    }
+    return n;
+  };
+  const preAuth = { global: posInt('MESH_PREAUTH_MAX', PRE_AUTH_LIMITS.global), perIp: posInt('MESH_PREAUTH_PER_IP', PRE_AUTH_LIMITS.perIp) };
   for (const [name, p] of [['MESH_WS_TLS_PORT', wsTlsPort], ['MESH_ADMIN_TLS_PORT', adminTlsPort]] as const) {
     if (p !== null && tls === null) {
       process.stderr.write(`${name} is set but MESH_TLS_CERT/MESH_TLS_KEY are not; a TLS listener needs both\n`);
@@ -239,7 +258,7 @@ export function loadConfig(): Config {
     metricsToken = metricsRaw;
   }
 
-  return { dbPath, wsPort, adminPort, wsTlsPort, adminTlsPort, adminToken, adminTokenPrev, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, tls, tlsCa, metricsToken };
+  return { dbPath, wsPort, adminPort, wsTlsPort, adminTlsPort, adminToken, adminTokenPrev, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, tls, tlsCa, metricsToken, preAuth };
 }
 
 async function main() {
@@ -356,7 +375,7 @@ async function main() {
       if (warn !== null) console.error(JSON.stringify(warn));
     }
     wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes, config.filesDir, config.presenceDebounceMs, observerIndex, config.tls,
-      config.wsTlsPort === null ? {} : { tlsPort: config.wsTlsPort });
+      { preAuth: config.preAuth, ...(config.wsTlsPort === null ? {} : { tlsPort: config.wsTlsPort }) });
   } catch (err) {
     process.stderr.write(`Failed to start WebSocket server: ${err}\n`);
     process.exit(1);
@@ -408,7 +427,12 @@ async function main() {
     listeners,
     ...(config.adminTlsPort === null ? {} : { tls: config.tls, tlsPort: config.adminTlsPort }),
   });
-  console.log(JSON.stringify({ evt: 'mesh.listeners', listeners, at: Date.now() }));
+  console.log(JSON.stringify({
+    evt: 'mesh.listeners', listeners,
+    // R-69: the pre-auth caps in force, so a deployer can see the value applied.
+    preauth: { max: config.preAuth.global, per_ip: config.preAuth.perIp },
+    at: Date.now(),
+  }));
 
   let cleanupHandle: CleanupHandle | null = null;
   let reminderHandle: ReminderSchedulerHandle | null = null;
