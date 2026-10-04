@@ -8,7 +8,7 @@ import { randomBytes } from 'crypto';
 import { Database } from 'bun:sqlite';
 import { openDb, registerAgent, aclGrant, getAgentById } from '../db.ts';
 import { hashToken } from '../auth.ts';
-import { startWsServer, type WsServerHandle } from '../ws-server.ts';
+import { startWsServer, type WsServerHandle, POST_AUTH_FRAME_FLOOR } from '../ws-server.ts';
 import { loadTls, type ServerTls } from '../tls-config.ts';
 
 // R-69 — Bun's `ws` IGNORES maxPayload (measured: its shim stores the option
@@ -132,6 +132,20 @@ describe('pre-auth: an over-limit FIRST frame closes the socket without being pa
     });
   }
 
+  it('the limit is in BYTES: a multibyte frame over 16 KiB in bytes but under it in characters is refused', async () => {
+    // 6000 × '€' = 18 000 bytes, 6000 characters. Measuring characters
+    // (toString().length) would admit it — and it is a valid auth frame.
+    const { p } = await bus();
+    const c = await raw(p); raws.push(c);
+    const frameBody = Buffer.from(JSON.stringify({ type: 'auth', agent_id: 'alice', token: 'alice-tok', pad: '€'.repeat(6000) }));
+    expect(frameBody.length).toBeGreaterThan(16 * 1024);
+    expect(frameBody.toString().length).toBeLessThan(16 * 1024);
+    c.sendRaw(frameBody);
+    await wait(300);
+    expect(c.texts).toEqual([]);
+    expect(c.close()?.code).toBe(1009);
+  });
+
   it('an ordinary auth frame is unaffected (positive control)', async () => {
     const { p } = await bus();
     const c = await raw(p); raws.push(c);
@@ -143,7 +157,7 @@ describe('pre-auth: an over-limit FIRST frame closes the socket without being pa
 
 describe('post-auth: an over-limit frame closes the socket without being parsed', () => {
   it('above the post-auth limit → close 1009, no reply; under it → served as before', async () => {
-    // maxFileBytes 256 KiB → the post-auth limit is its floor, 1.1 MB.
+    // maxFileBytes 256 KiB → the post-auth limit is its floor (6 MiB + envelope).
     const { p, lines } = await bus({ maxFileBytes: 256 * 1024 });
     const c = await raw(p); raws.push(c);
     c.send({ type: 'auth', agent_id: 'alice', token: 'alice-tok' });
@@ -153,11 +167,27 @@ describe('post-auth: an over-limit frame closes the socket without being parsed'
     expect(c.texts.some(x => x.includes('"ref":"small"') && x.includes('"ok":true'))).toBe(true);   // control
 
     // On main: parsed, MESSAGE_TOO_LARGE, and the socket stays open.
-    c.send({ type: 'send', msg_id: 'big', to: 'bob', payload: 'x'.repeat(2 * 1024 * 1024), content_type: 'text/plain' });
+    c.send({ type: 'send', msg_id: 'big', to: 'bob', payload: 'x'.repeat(7 * 1024 * 1024), content_type: 'text/plain' });
     await wait(400);
     expect(c.texts.some(x => x.includes('"ref":"big"'))).toBe(false);
     expect(c.close()?.code).toBe(1009);
-    expect(evts(lines, 'ws.frame_too_large')).toMatchObject([{ authed: true, limit: 1_100_000, src_ip: '127.0.0.1', tls: false }]);
+    expect(evts(lines, 'ws.frame_too_large')).toMatchObject([{ authed: true, limit: POST_AUTH_FRAME_FLOOR, src_ip: '127.0.0.1', tls: false }]);
+  });
+
+  it('a LEGAL 1 MiB payload of control characters (≈6 MiB escaped on the wire) is delivered, not closed', async () => {
+    // Review: the router's 1 MiB cap counts the RAW payload; each control
+    // character is six bytes once JSON-escaped. A floor at 1.1 MB closed this
+    // legal message with 1009 — and on a peer socket, the resend would loop.
+    const { p } = await bus({ maxFileBytes: 256 * 1024 });
+    const c = await raw(p); raws.push(c);
+    c.send({ type: 'auth', agent_id: 'alice', token: 'alice-tok' });
+    await wait(200);
+    const payload = '\u0001'.repeat(1_048_576);
+    expect(Buffer.byteLength(JSON.stringify({ payload }))).toBeGreaterThan(6 * 1_048_576);   // it really is ~6 MiB on the wire
+    c.send({ type: 'send', msg_id: 'esc', to: 'bob', payload, content_type: 'text/plain' });
+    await wait(800);
+    expect(c.close()).toBeNull();
+    expect(c.texts.some(x => x.includes('"ref":"esc"') && x.includes('"ok":true'))).toBe(true);
   });
 
   it('a file_send at the configured maxFileBytes still fits (the limit follows the file cap)', async () => {
@@ -205,6 +235,20 @@ describe('the number of UNAUTHENTICATED sockets is capped — per source address
     // perIp is 1: if the aborted attempt still held its slot, this is refused.
     const ok = await raw(p, { from: '127.0.0.1' }); raws.push(ok);
     expect(ok.upgraded()).toBe(true);
+  });
+
+  it('a slot is released ONCE: authenticate, then close, must not free a second slot', async () => {
+    // Auth releases the slot; the later close fires the release again. Without
+    // the once-only guard the count goes to -1 and the cap admits one extra.
+    const { p } = await bus({ preAuth: { global: 1, perIp: 10 } });
+    const a = await raw(p, { from: '127.0.0.2' });
+    a.send({ type: 'auth', agent_id: 'alice', token: 'alice-tok' });
+    await wait(200);
+    expect(JSON.parse(a.texts[0]!).type).toBe('auth_ok');
+    a.end();
+    await wait(200);
+    const x = await raw(p, { from: '127.0.0.3' }); const y = await raw(p, { from: '127.0.0.4' }); raws.push(x, y);
+    expect([x.upgraded(), y.upgraded()]).toEqual([true, false]);
   });
 
   it('global cap: refused across addresses once the total is reached; a closed socket frees its slot', async () => {

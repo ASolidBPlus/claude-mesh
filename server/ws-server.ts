@@ -1055,11 +1055,19 @@ export const POST_AUTH_HANDLERS: Record<string, FrameHandler> = {
  * number), so the limit is small: an unauthenticated socket cannot make the bus
  * parse anything large. POST-AUTH, the largest legal frame is a `file_send`
  * carrying a base64 file of up to maxFileBytes, so the limit follows that
- * (with envelope headroom), never below the router's 1 MiB payload cap.
+ * (with envelope headroom) — and never below POST_AUTH_FRAME_FLOOR.
+ *
+ * THE FLOOR IS 6 × 1 MiB, NOT 1 MiB. The router's 1 MiB cap counts the RAW
+ * payload; on the wire it is JSON-escaped, and a control character becomes
+ * \u00XX — six bytes for one. A legal, heavily escaped 1 MiB payload is
+ * therefore a ~6 MiB frame, and a lower floor would close (1009) a sender that
+ * did nothing wrong — on a peer socket, the same row is resent on every
+ * reconnect, so that would be a close loop.
  */
+export const POST_AUTH_FRAME_FLOOR = 6 * 1_048_576 + 64 * 1024;
 export const PRE_AUTH_FRAME_MAX = 16 * 1024;
 export function postAuthFrameMax(maxFileBytes: number): number {
-  return Math.max(1_100_000, 4 * Math.ceil(maxFileBytes / 3) + 64 * 1024);
+  return Math.max(POST_AUTH_FRAME_FLOOR, 4 * Math.ceil(maxFileBytes / 3) + 64 * 1024);
 }
 
 /**

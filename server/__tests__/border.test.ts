@@ -1051,14 +1051,14 @@ describe('F2b (c): the frame-size option agrees with the enforced limit', () => 
     // the message handler, tested BEHAVIOURALLY in r69-frame-guard.test.ts.
     // What is left to pin here is that the option is not a different number:
     // on a runtime that honours it, 1.1 MB would refuse every file_send above
-    // ~800 KB.
+    // ~800 KB, and every heavily JSON-escaped 1 MiB message.
     const port = 23900 + Math.floor(Date.now() % 90);
     const d = openDb(':memory:');
     const h = await startWsServer(port, d, 10_485_760, mkdtempSync(join(tmpdir(), 'mesh-mp-')));
     try {
       expect((h.wss as unknown as { options: { maxPayload: number } }).options.maxPayload).toBe(postAuthFrameMax(10_485_760));
       expect(postAuthFrameMax(10_485_760)).toBeGreaterThan(4 * Math.ceil(10_485_760 / 3));   // a full base64 file fits
-      expect(postAuthFrameMax(1)).toBe(1_100_000);                                          // never below the router cap
+      expect(postAuthFrameMax(1)).toBe(6 * 1_048_576 + 64 * 1024);                          // never below an escaped 1 MiB payload
     } finally {
       await h.shutdown().catch(() => {});
       d.close();
