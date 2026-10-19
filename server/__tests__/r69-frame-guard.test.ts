@@ -286,6 +286,8 @@ describe('the caps come from the environment (end to end, the real server)', () 
       }
       const line = out.split('\n').find(l => l.includes('"mesh.listeners"'));
       expect(JSON.parse(line!).preauth).toEqual({ max: 5, per_ip: 1 });
+      // R-271: the download caps in force are on the same line (defaults here).
+      expect(JSON.parse(line!).downloads).toEqual({ max: 64, per_agent: 4 });
       const first = await raw(p); raws.push(first);
       const second = await raw(p); raws.push(second);
       expect([first.upgraded(), second.upgraded()]).toEqual([true, false]);

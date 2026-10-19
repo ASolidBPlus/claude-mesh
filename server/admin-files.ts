@@ -7,6 +7,7 @@ that decides who may read one.
  * behaviour change and no comment dropped — the reasoning that sat at each
  * site moved with it.
  */
+import { createReadStream, writeFileSync, openSync } from 'fs';
 import {
   aclCheck, getAgentById, getFile, insertFile, markFileDelivered,
 } from './db.ts';
@@ -57,6 +58,42 @@ export function contentDispositionFor(filename: string): string {
 // below saw an undefined identifier. Caught by the #68 tests going 500.
 import { safeContentType } from './file-hygiene.ts';
 
+/**
+ * R-271 — CONCURRENT DOWNLOADS ARE BOUNDED, per agent and in total. Since
+ * R-267 any authenticated agent can start downloads from anywhere that
+ * reaches the agent port, and each one holds a file descriptor and a socket
+ * for as long as the client takes to read it. Past a cap the answer is a
+ * typed 429 (`DOWNLOAD_BUSY`, Retry-After), not a queue. The admin token
+ * counts against the global cap only: it is one operator, not a fleet.
+ *
+ * Set once at boot from MESH_DOWNLOAD_MAX / MESH_DOWNLOAD_PER_AGENT
+ * (server.ts); tests set them directly.
+ */
+export const DOWNLOAD_LIMITS = { global: 64, perAgent: 4, stallMs: 60_000 };
+let downloadLimits = { ...DOWNLOAD_LIMITS };
+let downloadsInFlight = 0;
+const downloadsByAgent = new Map<string, number>();
+
+export function setDownloadLimits(l: { global: number; perAgent: number; stallMs?: number }): void {
+  downloadLimits = { ...DOWNLOAD_LIMITS, ...l };
+}
+
+/** A slot for one download, or null at a cap. Released exactly once, from the response's single 'close'. */
+function acquireDownload(agentId: string | null): (() => void) | null {
+  const mine = agentId === null ? 0 : downloadsByAgent.get(agentId) ?? 0;
+  if (downloadsInFlight >= downloadLimits.global) return null;
+  if (agentId !== null && mine >= downloadLimits.perAgent) return null;
+  downloadsInFlight++;
+  if (agentId !== null) downloadsByAgent.set(agentId, mine + 1);
+  return () => {
+    downloadsInFlight--;
+    if (agentId !== null) {
+      const left = (downloadsByAgent.get(agentId) ?? 1) - 1;
+      if (left <= 0) downloadsByAgent.delete(agentId); else downloadsByAgent.set(agentId, left);
+    }
+  };
+}
+
 export async function handleFileById(ctx: AdminCtx): Promise<void> {
   const { res, db, params, auth } = ctx;
   const id = params.id;
@@ -81,13 +118,65 @@ export async function handleFileById(ctx: AdminCtx): Promise<void> {
     return;
   }
 
-  const content = Buffer.from(await bunFile.arrayBuffer());
+  // The slot is taken only for a request that is authorised AND has bytes to
+  // send — a 404 holds nothing — and released when the response CLOSES: the
+  // one event that fires for completion, a client abort, an error and a stall.
+  //
+  // THE BOUND, stated because it is not zero: a client can have the whole body
+  // a few ms before the server's 'close' fires (measured, Bun 1.4.2 and 1.4.3),
+  // so a client that fires its next request in that instant is briefly counted
+  // twice. Releasing at end-of-file narrows the window but cannot close it (the
+  // next request can beat that event too), so it is not done. A client fetching
+  // one file at a time therefore holds at most TWO slots — under the default
+  // per-agent cap of 4 it is never refused.
+  const release = acquireDownload(auth.mode === 'agent' ? auth.agentId : null);
+  if (release === null) {
+    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+    res.end(JSON.stringify({ error: 'too many concurrent downloads; retry shortly', code: 'DOWNLOAD_BUSY' }));
+    return;
+  }
+  // OPENED BEFORE THE HEADERS. A file that exists but cannot be read (a
+  // permission or I/O error) must not become a 200: once headers are out, a
+  // destroyed response reads on the client as a COMPLETE, EMPTY body (measured
+  // with Bun's fetch) — an agent would store zero bytes as the file.
+  let fd: number;
+  try {
+    // A plain descriptor, owned by the stream below (autoClose). Not
+    // fs/promises open(): a FileHandle dropped after taking its .fd is closed
+    // by the garbage collector, which Bun now throws on (measured).
+    fd = openSync(file.file_path, 'r');
+  } catch {
+    release();
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'file could not be read', code: 'FILE_UNREADABLE' }));
+    return;
+  }
+  // STREAMED, not read into memory (it used to be arrayBuffer(): up to
+  // maxFileBytes resident per download). Same headers as before.
+  const stream = createReadStream(file.file_path, { fd, autoClose: true });
+  // NO PROGRESS, NO SLOT. A client that reads a chunk and then stops holds its
+  // slot through TCP backpressure for as long as it likes; the cap would then
+  // be a count of stalled clients. The timer restarts on every chunk read from
+  // disk — which stops when the client stops — and ends the response when it
+  // runs out.
+  let stall: ReturnType<typeof setTimeout> | null = null;
+  const arm = (): void => {
+    if (stall !== null) clearTimeout(stall);
+    stall = setTimeout(() => res.destroy(), downloadLimits.stallMs);
+  };
+  res.once('close', () => { if (stall !== null) clearTimeout(stall); stream.destroy(); release(); });
+  // A read error AFTER the headers are out (rare once the open succeeded)
+  // cannot become an error response; the connection is ended rather than left
+  // hanging. Without a listener an 'error' would be thrown at the process.
+  stream.once('error', () => { res.destroy(); });
+  stream.on('data', arm);
+  arm();
   res.writeHead(200, {
     'Content-Type': safeContentType(file.content_type),
     'Content-Disposition': contentDispositionFor(file.filename),
-    'Content-Length': String(content.byteLength),
+    'Content-Length': String(bunFile.size),
   });
-  res.end(content);
+  stream.pipe(res);
 }
 
 export async function handleFilePost(ctx: AdminCtx): Promise<void> {
@@ -180,7 +269,10 @@ export async function handleFilePost(ctx: AdminCtx): Promise<void> {
 
     const file_id = crypto.randomUUID();
     const filePath = `${filesDir}/${file_id}`;
-    await Bun.write(filePath, fileBlobObj);
+    // R-271: CREATED 0600 — an attachment is one party's data. Bun.write takes
+    // no mode, and narrowing afterwards leaves the file 0666 for a moment under
+    // a permissive umask; writing with the mode leaves no such window.
+    writeFileSync(filePath, Buffer.from(await fileBlobObj.arrayBuffer()), { mode: 0o600 });
 
     const ttl_ms_val = ttl_ms_str ? parseInt(ttl_ms_str as string, 10) : 300_000;
     const ttl = isNaN(ttl_ms_val) ? 300_000 : ttl_ms_val;

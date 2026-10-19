@@ -1501,7 +1501,9 @@ export function routeFile(
 
   // 8. Write file to disk
   const filePath = join(filesDir, file_id);
-  writeFileSync(filePath, decoded);
+  // R-271: created 0600 — an attachment is one party's data. A umask can only
+  // remove bits, so a permissive one (000) cannot widen this.
+  writeFileSync(filePath, decoded, { mode: 0o600 });
 
   // 9. Store metadata in DB
   insertFile(db, {
