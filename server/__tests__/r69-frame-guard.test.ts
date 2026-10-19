@@ -1,7 +1,6 @@
-import { describe, it, expect, beforeAll, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, readFileSync } from 'fs';
+import { describe, it, expect, beforeAll, afterEach, afterAll } from 'bun:test';
+import { writeFileSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
 import * as net from 'net';
 import * as tls from 'tls';
 import { randomBytes } from 'crypto';
@@ -10,6 +9,11 @@ import { openDb, registerAgent, aclGrant, getAgentById } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { startWsServer, type WsServerHandle, POST_AUTH_FRAME_FLOOR } from '../ws-server.ts';
 import { loadTls, type ServerTls } from '../tls-config.ts';
+import { tempDirs } from './helpers/temp-dirs.ts';
+
+// R-73: every temp dir this file makes is removed when it is done.
+const { tmp, cleanup: cleanupTempDirs } = tempDirs();
+afterAll(cleanupTempDirs);
 
 // R-69 — Bun's `ws` IGNORES maxPayload (measured: its shim stores the option
 // and never passes it to the native layer, whose own cap is 16 MiB per
@@ -20,7 +24,7 @@ import { loadTls, type ServerTls } from '../tls-config.ts';
 // Every test drives a RAW client (TCP or TLS) with hand-built frames, so
 // nothing on the client side limits or reshapes what reaches the server.
 
-const dir = mkdtempSync(join(tmpdir(), 'mesh-r69-'));
+const dir = tmp('mesh-r69-');
 const f = (n: string) => join(dir, n);
 let TLS: ServerTls;
 beforeAll(() => {
@@ -109,7 +113,7 @@ async function bus(opts: { maxFileBytes?: number; preAuth?: { global: number; pe
   // Captured for the WHOLE test (restored in afterEach): the guard's log
   // lines are part of what is asserted.
   console.log = (...a: unknown[]) => { lines.push(a.map(String).join(' ')); };
-  const h = await startWsServer(p, db, opts.maxFileBytes ?? 10_485_760, mkdtempSync(join(tmpdir(), 'r69-f-')), 0, new Map(), TLS,
+  const h = await startWsServer(p, db, opts.maxFileBytes ?? 10_485_760, tmp('r69-f-'), 0, new Map(), TLS,
     { tlsPort: t, ...(opts.preAuth ? { preAuth: opts.preAuth } : {}) });
   handles.push(h);
   return { p, t, lines };
@@ -266,7 +270,7 @@ describe('the number of UNAUTHENTICATED sockets is capped — per source address
 describe('the caps come from the environment (end to end, the real server)', () => {
   it('MESH_PREAUTH_PER_IP=1 is applied: the boot line says so, and a 2nd pre-auth socket from one address is refused', async () => {
     const [p] = ports();
-    const dataDir = mkdtempSync(join(tmpdir(), 'r69-e2e-'));
+    const dataDir = tmp('r69-e2e-');
     const proc = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'server.ts')], {
       env: { ...process.env, MESH_ADMIN_TOKEN: 'a', MESH_DB_PATH: join(dataDir, 'm.db'), MESH_FILES_DIR: join(dataDir, 'f'),
         MESH_WS_PORT: String(p), MESH_ADMIN_PORT: String(p + 1), MESH_PREAUTH_MAX: '5', MESH_PREAUTH_PER_IP: '1' },

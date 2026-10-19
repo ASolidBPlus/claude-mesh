@@ -148,12 +148,16 @@ jobs:
         working-directory: server
         run: |
           bun install --frozen-lockfile
+          touch "$RUNNER_TEMP/tmp-marker-server"
           bun test
+          ../.github/scripts/check-test-tmp.sh "$RUNNER_TEMP/tmp-marker-server"
       - name: Install + test (client SDK)
         working-directory: client
         run: |
           bun install --frozen-lockfile
+          touch "$RUNNER_TEMP/tmp-marker-client"
           bun test
+          ../.github/scripts/check-test-tmp.sh "$RUNNER_TEMP/tmp-marker-client"
 
   # #18 — tsc was unusable as a gate (every .ts import was TS5097). The config
   # fix makes its output meaningful; this job makes it BIND. A ratchet rather

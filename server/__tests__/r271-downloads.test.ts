@@ -1,7 +1,6 @@
-import { describe, it, expect, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, statSync, chmodSync } from 'fs';
+import { describe, it, expect, afterEach, afterAll } from 'bun:test';
+import { writeFileSync, statSync, chmodSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
 import * as net from 'net';
 import { randomBytes } from 'crypto';
 import { Database } from 'bun:sqlite';
@@ -11,6 +10,11 @@ import { routeFile } from '../router.ts';
 import { startWsServer, type WsServerHandle } from '../ws-server.ts';
 import { startHttpAdmin, type HttpAdminHandle } from '../http-admin.ts';
 import { setDownloadLimits, DOWNLOAD_LIMITS } from '../admin-files.ts';
+import { tempDirs } from './helpers/temp-dirs.ts';
+
+// R-73: every temp dir this file makes is removed when it is done.
+const { tmp, cleanup: cleanupTempDirs } = tempDirs();
+afterAll(cleanupTempDirs);
 
 // R-271 — file downloads are BOUNDED (concurrency per agent and globally, a
 // typed 429 past either), STREAMED rather than read into memory, and the WS
@@ -41,7 +45,7 @@ function fixture(): { filesDir: string; big: string; small: string; smallBytes: 
   db = openDb(':memory:');
   for (const id of ['alice', 'bob', 'carol']) registerAgent(db, { id, token_hash: hashToken(`${id}-tok`), hostname: 'h' });
   aclGrant(db, 'alice', 'bob', 'admin');
-  const filesDir = mkdtempSync(join(tmpdir(), 'r271-files-'));
+  const filesDir = tmp('r271-files-');
   const big = 'big-file-id';
   writeFileSync(join(filesDir, big), Buffer.alloc(BIG, 0x61));
   insertFile(db, { id: big, from_agent: 'alice', to_agent: 'bob', filename: 'big.bin', content_type: 'application/octet-stream',
@@ -276,7 +280,7 @@ describe('R-271: stored files are 0600 and the files directory 0700 — whatever
   });
 
   it('the server creates MESH_FILES_DIR 0700 under umask 000 (the real server)', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'r271-e2e-'));
+    const root = tmp('r271-e2e-');
     const filesDir = join(root, 'files', 'nested');
     const p = port();
     const old = process.umask(0o000);
