@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
-import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, markTlsSeen, recordAgentConnection, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
+import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, markTlsSeen, getAgentByToken, isTlsLatched, recordAgentConnection, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
 import { validateToken } from './auth.ts';
 import { PEER_PROTOCOL_VERSION } from './wire-version.ts';  // #131: via the tiny module, never cross-package from here
 import { parseDuration } from './duration.ts';
@@ -17,7 +17,8 @@ import {
 import { incMsgStatus, incReceived, incBytes } from './metrics.ts';
 import type { ServerTls } from './tls-config.ts';
 import { recordCaller, normaliseIp } from './connections.ts';
-import { PEER_REGISTER_ROUTE, serveRoute } from './http-admin.ts';
+import { PEER_REGISTER_ROUTE, FILE_ROUTE, serveRoute, noteTokenRequest } from './http-admin.ts';
+import { routeLabel } from './admin-ctx.ts';
 
 /** F1a (§5.1): the only inbound peer protocol this mesh speaks. A version is a
  *  property of a LIVE CONNECTION, never of a stored row (D7) — which is why it
@@ -1129,7 +1130,7 @@ export function startWsServer(
     // which is only a distinct question once there is a second instance to
     // shift traffic to (#23, parked). A /readyz that always agreed with
     // /healthz would be a promise the system cannot keep.
-    const onRequest = (req: http.IncomingMessage, res: http.ServerResponse): void => {
+    const onRequest = (req: http.IncomingMessage, res: http.ServerResponse, scheme: 'ws' | 'wss'): void => {
       if (req.method === 'GET' && (req.url === '/healthz' || req.url === '/healthz/')) {
         // db_ok is a real query, not a flag: an open handle to a corrupt or
         // closed database would answer `true` to anything cheaper, and the
@@ -1172,6 +1173,51 @@ export function startWsServer(
           return;
         }
       }
+      // R-267 — FILE DOWNLOAD, the one node operation that was admin-port-only.
+      // An agent that can reach only this port (a placed agent behind a TLS
+      // front) fetches its files here. Its rules, all pinned by
+      // r267-files-ws-port.test.ts:
+      //   - the AGENT token only. The admin token is never checked here, so it
+      //     never has to cross the network to fetch a file; it gets the same
+      //     401 as no token;
+      //   - the SAME route object and handler as the admin port — the same
+      //     node scoping (sender or recipient) and the same 404 for "not
+      //     yours" as for "missing";
+      //   - the R-65 latch: a TLS-latched agent is refused on plaintext;
+      //   - the same agent.http line and connection report, via the shared
+      //     noteTokenRequest.
+      // GET only, and this one path: nothing else from the admin table answers.
+      if (req.method === FILE_ROUTE.method) {
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        const params = FILE_ROUTE.match(url.pathname);
+        if (params !== null) {
+          const tls = scheme === 'wss';
+          const unauthorized = (): void => {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'unauthorized' }));
+          };
+          const header = req.headers['authorization'];
+          const agent = typeof header === 'string' && header.startsWith('Bearer ')
+            ? getAgentByToken(db, header.slice('Bearer '.length))
+            : null;
+          if (agent === null) { unauthorized(); return; }
+          if (!tls && isTlsLatched(db, agent.id)) {
+            console.log(JSON.stringify({
+              evt: 'agent.http', principal: 'agent', agent_id: agent.id, route: routeLabel(req.method, FILE_ROUTE),
+              src_ip: normaliseIp(req.socket.remoteAddress), tls, listener: 'ws', refused: 'tls_latched', at: Date.now(),
+            }));
+            unauthorized();
+            return;
+          }
+          const auth = { mode: 'agent' as const, agentId: agent.id };
+          noteTokenRequest(db, req, auth, routeLabel(req.method, FILE_ROUTE), tls, 'ws');
+          void serveRoute(FILE_ROUTE, {
+            req, res, db, url, params, agentIndex, observerIndex, peerIndex,
+            forwarders: {}, maxFileBytes, filesDir, auth,
+          }, 'ws');
+          return;
+        }
+      }
       // Everything else keeps the previous shape as closely as anything can:
       // a plain 404 rather than a hang. An unroutable request now gets an
       // answer, which is strictly better for a caller and reveals nothing.
@@ -1209,8 +1255,8 @@ export function startWsServer(
     const listeners = listenerSpecs.map(spec => ({
       spec,
       server: spec.scheme === 'wss'
-        ? https.createServer({ cert: tls!.cert, key: tls!.key }, onRequest)
-        : http.createServer(onRequest),
+        ? https.createServer({ cert: tls!.cert, key: tls!.key }, (req, res) => onRequest(req, res, spec.scheme))
+        : http.createServer((req, res) => onRequest(req, res, spec.scheme)),
     }));
     // (c) Drop oversize frames at the CONNECTION level, before JSON.parse.
     //
