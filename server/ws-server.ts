@@ -1130,6 +1130,30 @@ export function startWsServer(
     // which is only a distinct question once there is a second instance to
     // shift traffic to (#23, parked). A /readyz that always agreed with
     // /healthz would be a promise the system cannot keep.
+    // R-271: refused tokens on the file door are logged — at most ONE line per
+    // source address per interval, carrying how many were suppressed since that
+    // address's last line, so a scanner cannot turn the log into a flood. The
+    // map is keyed by an address an outsider chooses, so it is bounded: at the
+    // cap the entry logged longest ago is evicted. The token is never logged.
+    const FILE_REFUSAL_LOG_MS = 60_000;
+    const FILE_REFUSAL_KEYS_MAX = 1024;
+    const fileRefusals = new Map<string, { last: number; suppressed: number }>();
+    const logFileRefusal = (req: http.IncomingMessage, refused: 'no_token' | 'bad_token', tls: boolean): void => {
+      const ip = normaliseIp(req.socket.remoteAddress) ?? 'unknown';
+      const now = Date.now();
+      const seen = fileRefusals.get(ip);
+      if (seen !== undefined && now - seen.last < FILE_REFUSAL_LOG_MS) { seen.suppressed++; return; }
+      if (seen === undefined && fileRefusals.size >= FILE_REFUSAL_KEYS_MAX) {
+        let oldestKey: string | null = null; let oldest = Infinity;
+        for (const [k, v] of fileRefusals) if (v.last < oldest) { oldest = v.last; oldestKey = k; }
+        if (oldestKey !== null) fileRefusals.delete(oldestKey);
+      }
+      console.log(JSON.stringify({
+        evt: 'agent.http', refused, route: routeLabel(req.method, FILE_ROUTE), src_ip: ip, tls, listener: 'ws',
+        suppressed_since_last: seen?.suppressed ?? 0, at: now,
+      }));
+      fileRefusals.set(ip, { last: now, suppressed: 0 });
+    };
     const onRequest = (req: http.IncomingMessage, res: http.ServerResponse, scheme: 'ws' | 'wss'): void => {
       if (req.method === 'GET' && (req.url === '/healthz' || req.url === '/healthz/')) {
         // db_ok is a real query, not a flag: an open handle to a corrupt or
@@ -1200,7 +1224,11 @@ export function startWsServer(
           const agent = typeof header === 'string' && header.startsWith('Bearer ')
             ? getAgentByToken(db, header.slice('Bearer '.length))
             : null;
-          if (agent === null) { unauthorized(); return; }
+          if (agent === null) {
+            logFileRefusal(req, typeof header === 'string' && header.startsWith('Bearer ') ? 'bad_token' : 'no_token', tls);
+            unauthorized();
+            return;
+          }
           if (!tls && isTlsLatched(db, agent.id)) {
             console.log(JSON.stringify({
               evt: 'agent.http', principal: 'agent', agent_id: agent.id, route: routeLabel(req.method, FILE_ROUTE),

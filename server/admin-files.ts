@@ -7,6 +7,7 @@ that decides who may read one.
  * behaviour change and no comment dropped — the reasoning that sat at each
  * site moved with it.
  */
+import { createReadStream, chmodSync } from 'fs';
 import {
   aclCheck, getAgentById, getFile, insertFile, markFileDelivered,
 } from './db.ts';
@@ -57,6 +58,42 @@ export function contentDispositionFor(filename: string): string {
 // below saw an undefined identifier. Caught by the #68 tests going 500.
 import { safeContentType } from './file-hygiene.ts';
 
+/**
+ * R-271 — CONCURRENT DOWNLOADS ARE BOUNDED, per agent and in total. Since
+ * R-267 any authenticated agent can start downloads from anywhere that
+ * reaches the agent port, and each one holds a file descriptor and a socket
+ * for as long as the client takes to read it. Past a cap the answer is a
+ * typed 429 (`DOWNLOAD_BUSY`, Retry-After), not a queue. The admin token
+ * counts against the global cap only: it is one operator, not a fleet.
+ *
+ * Set once at boot from MESH_DOWNLOAD_MAX / MESH_DOWNLOAD_PER_AGENT
+ * (server.ts); tests set them directly.
+ */
+export const DOWNLOAD_LIMITS = { global: 64, perAgent: 4 };
+let downloadLimits = { ...DOWNLOAD_LIMITS };
+let downloadsInFlight = 0;
+const downloadsByAgent = new Map<string, number>();
+
+export function setDownloadLimits(l: { global: number; perAgent: number }): void {
+  downloadLimits = { ...l };
+}
+
+/** A slot for one download, or null at a cap. Released exactly once, from the response's single 'close'. */
+function acquireDownload(agentId: string | null): (() => void) | null {
+  const mine = agentId === null ? 0 : downloadsByAgent.get(agentId) ?? 0;
+  if (downloadsInFlight >= downloadLimits.global) return null;
+  if (agentId !== null && mine >= downloadLimits.perAgent) return null;
+  downloadsInFlight++;
+  if (agentId !== null) downloadsByAgent.set(agentId, mine + 1);
+  return () => {
+    downloadsInFlight--;
+    if (agentId !== null) {
+      const left = (downloadsByAgent.get(agentId) ?? 1) - 1;
+      if (left <= 0) downloadsByAgent.delete(agentId); else downloadsByAgent.set(agentId, left);
+    }
+  };
+}
+
 export async function handleFileById(ctx: AdminCtx): Promise<void> {
   const { res, db, params, auth } = ctx;
   const id = params.id;
@@ -81,13 +118,27 @@ export async function handleFileById(ctx: AdminCtx): Promise<void> {
     return;
   }
 
-  const content = Buffer.from(await bunFile.arrayBuffer());
+  // The slot is taken only for a request that is authorised AND has bytes to
+  // send — a 404 holds nothing — and released when the response CLOSES, which
+  // is the one event that fires for completion, a client abort, and an error
+  // alike.
+  const release = acquireDownload(auth.mode === 'agent' ? auth.agentId : null);
+  if (release === null) {
+    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+    res.end(JSON.stringify({ error: 'too many concurrent downloads; retry shortly', code: 'DOWNLOAD_BUSY' }));
+    return;
+  }
+  // STREAMED, not read into memory (it used to be arrayBuffer(): up to
+  // maxFileBytes resident per download). Same headers as before.
+  const stream = createReadStream(file.file_path);
+  res.once('close', () => { stream.destroy(); release(); });
+  stream.once('error', () => { res.destroy(); });
   res.writeHead(200, {
     'Content-Type': safeContentType(file.content_type),
     'Content-Disposition': contentDispositionFor(file.filename),
-    'Content-Length': String(content.byteLength),
+    'Content-Length': String(bunFile.size),
   });
-  res.end(content);
+  stream.pipe(res);
 }
 
 export async function handleFilePost(ctx: AdminCtx): Promise<void> {
@@ -181,6 +232,9 @@ export async function handleFilePost(ctx: AdminCtx): Promise<void> {
     const file_id = crypto.randomUUID();
     const filePath = `${filesDir}/${file_id}`;
     await Bun.write(filePath, fileBlobObj);
+    // R-271: 0600 — an attachment is one party's data. Bun.write takes no mode,
+    // so the umask's default (0644, or 0666 under umask 000) is narrowed here.
+    chmodSync(filePath, 0o600);
 
     const ttl_ms_val = ttl_ms_str ? parseInt(ttl_ms_str as string, 10) : 300_000;
     const ttl = isNaN(ttl_ms_val) ? 300_000 : ttl_ms_val;

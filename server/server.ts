@@ -12,7 +12,8 @@ import { startReminderScheduler, ReminderSchedulerHandle } from './reminder-sche
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
-import { mkdirSync } from 'fs';
+import { mkdirSync, existsSync } from 'fs';
+import { setDownloadLimits, DOWNLOAD_LIMITS } from './admin-files.ts';
 
 export interface Config {
   dbPath: string;
@@ -38,6 +39,8 @@ export interface Config {
   metricsToken: string | null;
   /** R-69: caps on concurrent unauthenticated WS sockets. */
   preAuth: { global: number; perIp: number };
+  /** R-271: caps on concurrent file downloads. */
+  downloads: { global: number; perAgent: number };
 }
 
 export function loadConfig(): Config {
@@ -230,6 +233,8 @@ export function loadConfig(): Config {
     return n;
   };
   const preAuth = { global: posInt('MESH_PREAUTH_MAX', PRE_AUTH_LIMITS.global), perIp: posInt('MESH_PREAUTH_PER_IP', PRE_AUTH_LIMITS.perIp) };
+  // R-271: concurrent file downloads, in total and per agent.
+  const downloads = { global: posInt('MESH_DOWNLOAD_MAX', DOWNLOAD_LIMITS.global), perAgent: posInt('MESH_DOWNLOAD_PER_AGENT', DOWNLOAD_LIMITS.perAgent) };
   for (const [name, p] of [['MESH_WS_TLS_PORT', wsTlsPort], ['MESH_ADMIN_TLS_PORT', adminTlsPort]] as const) {
     if (p !== null && tls === null) {
       process.stderr.write(`${name} is set but MESH_TLS_CERT/MESH_TLS_KEY are not; a TLS listener needs both\n`);
@@ -258,13 +263,17 @@ export function loadConfig(): Config {
     metricsToken = metricsRaw;
   }
 
-  return { dbPath, wsPort, adminPort, wsTlsPort, adminTlsPort, adminToken, adminTokenPrev, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, tls, tlsCa, metricsToken, preAuth };
+  return { dbPath, wsPort, adminPort, wsTlsPort, adminTlsPort, adminToken, adminTokenPrev, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, tls, tlsCa, metricsToken, preAuth, downloads };
 }
 
 async function main() {
   const config = loadConfig();
 
-  mkdirSync(config.filesDir, { recursive: true });
+  // R-271: a files directory the server CREATES is 0700.
+  // One that already exists keeps the mode the deployer gave it.
+  // (A umask can only remove bits, so a permissive one cannot widen it.)
+  if (!existsSync(config.filesDir)) mkdirSync(config.filesDir, { recursive: true, mode: 0o700 });
+  setDownloadLimits(config.downloads);
 
   let db: Database;
   try {
@@ -431,6 +440,8 @@ async function main() {
     evt: 'mesh.listeners', listeners,
     // R-69: the pre-auth caps in force, so a deployer can see the value applied.
     preauth: { max: config.preAuth.global, per_ip: config.preAuth.perIp },
+    // R-271: the download caps in force.
+    downloads: { max: config.downloads.global, per_agent: config.downloads.perAgent },
     at: Date.now(),
   }));
 

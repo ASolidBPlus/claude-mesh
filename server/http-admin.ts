@@ -212,6 +212,9 @@ export const PEER_REGISTER_ROUTE: Route = ROUTES.find(r => r.handler === handleP
  */
 export const FILE_ROUTE: Route = ROUTES.find(r => r.handler === handleFileById)!;
 
+/** R-271: how long shutdown lets in-flight responses finish before closing their sockets. */
+const SHUTDOWN_GRACE_MS = 1000;
+
 export function startHttpAdmin(
   port: number | 'off',
   db: Database,
@@ -410,6 +413,19 @@ export function startHttpAdmin(
               if (err) rej(err);
               else res();
             });
+            // R-271: close() alone can hang forever on Bun. A keep-alive
+            // connection whose STREAMED response is still finishing when
+            // close() is called is never released once it goes idle
+            // (measured; Node releases it). Idle connections are closed now,
+            // and anything still open — a download in flight, a client
+            // holding a socket — is closed after a short grace, so shutdown
+            // is bounded rather than at a client's mercy.
+            // Swept twice: a response finishing at close() becomes idle a few
+            // ms later, and the second sweep releases it without waiting out
+            // the grace.
+            server.closeIdleConnections();
+            setTimeout(() => server.closeIdleConnections(), 50).unref();
+            setTimeout(() => server.closeAllConnections(), SHUTDOWN_GRACE_MS).unref();
           }))).then(() => undefined);
         },
       };
