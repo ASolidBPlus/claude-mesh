@@ -115,6 +115,35 @@ function metricsAuthorized(req: http.IncomingMessage, metricsToken: string, admi
 }
 
 /**
+ * R-65 M4 + M6, in ONE place for every door that takes a token: the
+ * `agent.http` line (route PATTERN, never the raw URL — no ids, no query
+ * string; the socket's address, never X-Forwarded-For) and the connection
+ * report. The admin listener and the WS listener's file door (R-267) both
+ * call it, so the two cannot log differently.
+ *
+ * `principal` says WHAT authenticated; `agent_id` is only ever a real agent
+ * id. 'admin' and 'metrics' are legal agent ids, so putting them in agent_id
+ * would make an agent of that name look like the admin.
+ */
+export function noteTokenRequest(
+  db: Database, req: http.IncomingMessage, auth: { mode: 'admin' } | { mode: 'agent'; agentId: string },
+  route: string, tls: boolean, listener: 'admin' | 'ws',
+): void {
+  const scheme = tls ? 'https' : 'http';
+  const srcIp = normaliseIp(req.socket.remoteAddress);
+  console.log(JSON.stringify({
+    evt: 'agent.http',
+    principal: auth.mode === 'admin' ? 'admin' : 'agent',
+    agent_id: auth.mode === 'admin' ? null : auth.agentId,
+    route, src_ip: srcIp, tls, listener, at: Date.now(),
+  }));
+  try {
+    if (auth.mode === 'agent') recordAgentConnection(db, auth.agentId, scheme, srcIp);
+    else recordCaller(srcIp, 'admin', scheme);
+  } catch (_) { /* the report never breaks a request */ }
+}
+
+/**
  * Run one matched route: the handler, the crash guard, and the #161 mutation
  * record. Extracted so the WS listener's door for /peers/register runs the
  * SAME wrapper as this one — the handler alone is not the behaviour; the guard
@@ -175,6 +204,13 @@ export async function serveRoute(route: Route, ctx: AdminCtx, listener: 'admin' 
  * re-declared, so there is one route and two doors.
  */
 export const PEER_REGISTER_ROUTE: Route = ROUTES.find(r => r.handler === handlePeerRegister)!;
+
+/**
+ * R-267: the file-download route, as the SAME object the table holds, so the
+ * WS listener's file door runs the same handler and the same node scoping
+ * (sender or recipient; anything else the same 404 as a missing file).
+ */
+export const FILE_ROUTE: Route = ROUTES.find(r => r.handler === handleFileById)!;
 
 export function startHttpAdmin(
   port: number | 'off',
@@ -285,23 +321,7 @@ export function startHttpAdmin(
       // string), the socket's address and the listener's scheme, and recorded
       // in the connection report. `handler`-authenticated routes carry no
       // token the dispatcher checked, so they are not "token-authenticated".
-      if (auth.mode !== 'unauthenticated') {
-        const scheme = tls ? 'https' : 'http';
-        const srcIp = normaliseIp(req.socket.remoteAddress);
-        // `principal` says WHAT authenticated; `agent_id` is only ever a real
-        // agent id. 'admin' and 'metrics' are legal agent ids, so putting them
-        // in agent_id would make an agent of that name look like the admin.
-        console.log(JSON.stringify({
-          evt: 'agent.http',
-          principal: auth.mode === 'admin' ? 'admin' : 'agent',
-          agent_id: auth.mode === 'admin' ? null : auth.agentId,
-          route: routeLabel(method, matched), src_ip: srcIp, tls, at: Date.now(),
-        }));
-        try {
-          if (auth.mode === 'agent') recordAgentConnection(db, auth.agentId, scheme, srcIp);
-          else recordCaller(srcIp, 'admin', scheme);
-        } catch (_) { /* the report never breaks a request */ }
-      }
+      if (auth.mode !== 'unauthenticated') noteTokenRequest(db, req, auth, routeLabel(method, matched), tls, 'admin');
 
       if (matched) {
         await serveRoute(matched, { req, res, db, url, params, agentIndex, observerIndex, peerIndex, forwarders, maxFileBytes, filesDir, auth, listeners: opts.listeners ?? [] }, 'admin');

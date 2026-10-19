@@ -729,9 +729,11 @@ export class MeshClient {
       : { serverUrl, agentId, agentToken, ca };
   }
 
-  // Resolve the admin HTTP base for fetchFile(): explicit httpUrl / MESH_HTTP_URL,
-  // else derive from serverUrl by swapping ws→http / wss→https (same host+port —
-  // only correct when the admin API shares the ws port, which is NOT the default).
+  // Resolve the HTTP base for fetchFile(): explicit httpUrl / MESH_HTTP_URL,
+  // else derive from serverUrl by swapping ws→http / wss→https (same host and
+  // port). The derived URL works on any bus that serves GET /files/:id on its
+  // agent port (R-267), which is what an agent reaching only that port needs;
+  // an older bus serves it on the admin port only, so set MESH_HTTP_URL there.
   private resolveHttpUrl(serverUrl: string): string {
     const explicit = this.config.httpUrl ?? process.env.MESH_HTTP_URL;
     if (explicit !== undefined && explicit !== '') return explicit;

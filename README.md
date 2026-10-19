@@ -268,7 +268,7 @@ Every method returns a `Promise` that resolves when the server acks, and rejects
 ```
 `text` equals `payload` for text messages. For `kind: 'file'`, `payload` is `null` and the file fields are set: `fileId`, `filename`, `contentType`, `size` (bytes), `caption`, `replyToMsgId`, and `fetchUrl` (the relative `/files/:id` path to download the bytes).
 
-Worth knowing: reconnect is automatic (exponential backoff, re-auth, re-subscribe). Sending while disconnected rejects — the SDK does not queue outbound messages locally. File bytes download from `GET /files/:id` (node-scoped — the file's recipient/sender, or admin); the SDK surfaces file metadata on inbound. Full surface and limits: [`client/README.md`](client/README.md).
+Worth knowing: reconnect is automatic (exponential backoff, re-auth, re-subscribe). Sending while disconnected rejects — the SDK does not queue outbound messages locally. File bytes download from `GET /files/:id` (node-scoped — the file's recipient/sender, or admin), served on the admin port **and on the agent (WS) port**, where only the agent's own token is accepted; the SDK surfaces file metadata on inbound. Full surface and limits: [`client/README.md`](client/README.md).
 
 ### 4.2 From scratch (any language)
 
@@ -402,6 +402,8 @@ A second HTTP listener (admin port, default `7385`) handles administration. Ever
 
 **Auth precedence:** on the node-scoped routes (`GET /messages`, `GET /files/:id`) the `Authorization` bearer is matched against the admin token **first** (timing-safe); if it isn't the admin token it is looked up as an agent token. So the admin token always grants full access; every other route stays admin-only.
 
+**`GET /files/:id` on the agent port (R-267).** The same route is also served on the WS listener(s), plain and TLS, beside `/healthz` and `/peers/register`, so an agent that can reach only the agent port can fetch its files. On that port it takes the **agent token only**: the admin token gets the same `401` as no token, and the admin credential never has to cross the network to fetch a file. Scoping is identical (sender or recipient; anything else gets the same `404` as a missing file), a TLS-latched agent is refused on plaintext, and `agent.http` logs it with `listener: "ws"`. No other admin route answers on the agent port. The SDK needs nothing: `fetchFile` derives `http(s)://<ws host:port>` when `httpUrl` / `MESH_HTTP_URL` is unset.
+
 **Agents**
 - `POST /agents` `{ id, hostname, namespace? }` → `201` agent + `token` (raw, shown once). `namespace` is an optional string (identity label; null if omitted).
 - `GET /agents[?online=true]` → list. `GET /agents/:id` → one. `DELETE /agents/:id` → `{ ok: true }`. Agent objects include parsed `metadata` (object) and `namespace` (string or null).
@@ -412,7 +414,7 @@ A second HTTP listener (admin port, default `7385`) handles administration. Ever
   - **`agents`**: **persisted** per agent — `last_scheme`, `last_src_ip`, `last_auth_at`, and `last_plaintext_at`. The last one is set by any plaintext use, WS **or** HTTP, so an agent on TLS for WS but plaintext for files still shows.
   - **`callers`**: non-agent callers by source address, each with a `principal` (observer sockets, admin-token, metrics-token and unauthenticated `/metrics` callers). **In memory since `since_boot`** only, and **capped at 1024**: a new caller evicts the one seen longest ago.
   - Agent rows are rewritten only when the scheme or source changes, or when the last write is over 60s old, so the report can be up to 60s stale.
-- **Connection log lines.** `agent.auth` / `observer.auth` `{agent_id, src_ip, tls, displaced}` are emitted on every WS auth. Refusals carry `refused: unknown_agent | bad_token | tls_latched | malformed`; the wire answer stays uniform. `agent.http` `{principal: agent | admin | metrics, agent_id (agents only, else null), route, src_ip, tls}` is emitted on every token-authenticated HTTP request, where `route` is the **pattern** (`GET /files/:id`), never the raw URL, so no ids or query strings reach the log. `src_ip` is always the socket address (`::ffff:a.b.c.d` normalised to `a.b.c.d`), never `X-Forwarded-For`.
+- **Connection log lines.** `agent.auth` / `observer.auth` `{agent_id, src_ip, tls, displaced}` are emitted on every WS auth. Refusals carry `refused: unknown_agent | bad_token | tls_latched | malformed`; the wire answer stays uniform. `agent.http` `{principal: agent | admin | metrics, agent_id (agents only, else null), route, src_ip, tls, listener: admin | ws}` is emitted on every token-authenticated HTTP request, where `route` is the **pattern** (`GET /files/:id`), never the raw URL, so no ids or query strings reach the log. `src_ip` is always the socket address (`::ffff:a.b.c.d` normalised to `a.b.c.d`), never `X-Forwarded-For`.
 
 **ACL**
 - `POST /acl` `{ from_agent, to_agent, granted_by? }` → `201`. `DELETE /acl` `{ from_agent, to_agent }`.
