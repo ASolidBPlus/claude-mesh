@@ -1,5 +1,6 @@
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
+import * as net from 'net';
 import { WebSocket } from 'ws';
 import { renderMetrics } from './metrics.ts';
 import { timingSafeEqual, adminTokenMatches } from './auth.ts';
@@ -348,6 +349,13 @@ export function startHttpAdmin(
         : http.createServer((req, res) => { void handleRequest(req, res, false); }),
     }));
     for (const { server } of servers) server.on('error', reject);
+    // R-271: every socket, so shutdown can end the ones a stalled client holds
+    // — on Bun 1.4.2 closeAllConnections() does not end a response stalled
+    // mid-stream (measured), and that is the runtime production pins.
+    const sockets = new Set<net.Socket>();
+    for (const { server } of servers) {
+      server.on('connection', (sock: net.Socket) => { sockets.add(sock); sock.once('close', () => sockets.delete(sock)); });
+    }
 
     // #127: MESH_ADMIN_BIND — the bind address for the ADMIN listener.
     //
@@ -425,7 +433,10 @@ export function startHttpAdmin(
             // the grace.
             server.closeIdleConnections();
             setTimeout(() => server.closeIdleConnections(), 50).unref();
-            setTimeout(() => server.closeAllConnections(), SHUTDOWN_GRACE_MS).unref();
+            setTimeout(() => {
+              server.closeAllConnections();
+              for (const sock of sockets) sock.destroy();
+            }, SHUTDOWN_GRACE_MS).unref();
           }))).then(() => undefined);
         },
       };

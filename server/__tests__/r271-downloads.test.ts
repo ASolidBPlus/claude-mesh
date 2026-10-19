@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, statSync } from 'fs';
+import { mkdtempSync, writeFileSync, statSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import * as net from 'net';
@@ -117,18 +117,22 @@ describe('R-271: concurrent downloads are capped — per agent, and globally', (
     expect((await get(base, `/files/${small}`, ADMIN)).status).toBe(200);
   }, 30_000);
 
-  it('completion releases the slot: many sequential downloads at a per-agent cap of 1', async () => {
+  it('completion releases the slot: forty back-to-back downloads at a per-agent cap of 2 all succeed', async () => {
+    // The stated bound: the client can have a whole body a few ms before the
+    // server's 'close' fires (measured), so a back-to-back client is briefly
+    // counted twice — never more. At a cap of 2 it is never refused; at a cap
+    // of 1 it would be, now and then, which is why the default is 4.
     const { filesDir, small } = fixture();
-    setDownloadLimits({ global: 1, perAgent: 1 });
+    setDownloadLimits({ global: 2, perAgent: 2 });
     const base = await adminServer(filesDir);
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 40; i++) {
       const res = await get(base, `/files/${small}`, 'bob-tok');
       expect({ i, s: res.status }).toEqual({ i, s: 200 });
       await res.arrayBuffer();
     }
   });
 
-  it('an ERROR releases the slot: a file whose bytes are missing on disk 404s and does not leak', async () => {
+  it('a file whose bytes are missing on disk 404s and takes no slot (it fails before one is taken)', async () => {
     const { filesDir } = fixture();
     insertFile(db!, { id: 'ghost', from_agent: 'alice', to_agent: 'bob', filename: 'g', content_type: 'text/plain',
       size_bytes: 3, file_path: join(filesDir, 'ghost-missing-on-disk'), sent_at: Date.now(), expires_at: null });
@@ -139,6 +143,66 @@ describe('R-271: concurrent downloads are capped — per agent, and globally', (
     const { small } = { small: (db!.prepare("SELECT id FROM files WHERE id != 'ghost' AND id != 'big-file-id'").get() as { id: string }).id };
     expect((await get(base, `/files/${small}`, 'bob-tok')).status).toBe(200);
   });
+
+  // Root reads a mode-000 file, so the case cannot be built as root; CI and
+  // production do not run as root.
+  it.skipIf(process.getuid?.() === 0)('an UNREADABLE file (exists, has a size, cannot be read) gets a typed 500 — not a fake empty 200 — and releases its slot', async () => {
+    // Review: the 404 test above never reaches a read error, so deleting the
+    // error handling left every test green. This file passes the existence
+    // check and takes the slot; opening it fails. Measured: had the headers
+    // already gone out, Bun's fetch would report a complete, EMPTY 200 body.
+    const { filesDir, small } = fixture();
+    const locked = join(filesDir, 'locked');
+    writeFileSync(locked, Buffer.alloc(4096, 0x62));
+    chmodSync(locked, 0o000);
+    insertFile(db!, { id: 'locked', from_agent: 'alice', to_agent: 'bob', filename: 'l', content_type: 'application/octet-stream',
+      size_bytes: 4096, file_path: locked, sent_at: Date.now(), expires_at: null });
+    setDownloadLimits({ global: 1, perAgent: 1 });
+    const base = await adminServer(filesDir);
+    const res = await get(base, '/files/locked', 'bob-tok');
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: 'file could not be read', code: 'FILE_UNREADABLE' });
+    expect((await get(base, `/files/${small}`, 'bob-tok')).status).toBe(200);   // the slot is free
+  });
+
+  it('a SLOW but progressing reader is not cut off — the timer is about no progress, not total time', async () => {
+    // Reads a chunk, pauses 60 ms, reads the next: far longer in total than the
+    // 300 ms stall timeout, never 300 ms without progress. Every byte arrives.
+    const { filesDir, big } = fixture();
+    setDownloadLimits({ global: 10, perAgent: 2, stallMs: 300 });
+    const base = new URL(await adminServer(filesDir));
+    const s = net.connect({ host: base.hostname, port: Number(base.port) });
+    await new Promise<void>(r => s.once('connect', () => r()));
+    let total = 0; let closed = false; const started = Date.now();
+    s.on('close', () => { closed = true; }); s.on('error', () => {});
+    s.on('data', (d: Buffer) => { total += d.length; s.pause(); setTimeout(() => s.resume(), 60); });
+    s.write(`GET /files/${big} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer bob-tok\r\nConnection: close\r\n\r\n`);
+    while (!closed && Date.now() - started < 25_000) await wait(50);
+    expect(Date.now() - started).toBeGreaterThan(300);      // it really did outlast the timeout in total
+    expect(total).toBeGreaterThan(BIG);                     // body + headers: nothing was cut
+  }, 30_000);
+
+  it('a STALLED reader loses its slot after the no-progress timeout', async () => {
+    const { filesDir, big, small } = fixture();
+    setDownloadLimits({ global: 10, perAgent: 1, stallMs: 400 });
+    const base = await adminServer(filesDir);
+    const h = await hold(base, big, 'bob-tok');
+    expect(h.status()).toBe('HTTP/1.1 200 OK');
+    expect((await get(base, `/files/${small}`, 'bob-tok')).status).toBe(429);   // held: the cap is full
+    await wait(900);
+    expect((await get(base, `/files/${small}`, 'bob-tok')).status).toBe(200);   // stalled past the timeout: freed
+  }, 20_000);
+
+  it('a completed download frees exactly its own slot — the cap does not grow', async () => {
+    const { filesDir, big, small } = fixture();
+    setDownloadLimits({ global: 10, perAgent: 1 });
+    const base = await adminServer(filesDir);
+    await (await get(base, `/files/${small}`, 'bob-tok')).arrayBuffer();
+    await wait(100);                                   // both triggers have fired
+    const h = await hold(base, big, 'bob-tok');
+    expect(h.status()).toBe('HTTP/1.1 200 OK');
+    expect((await get(base, `/files/${small}`, 'bob-tok')).status).toBe(429);
+  }, 20_000);
 
   it('a refused or unauthorised request takes no slot (404 for another agent leaves the cap free)', async () => {
     const { filesDir, small } = fixture();
