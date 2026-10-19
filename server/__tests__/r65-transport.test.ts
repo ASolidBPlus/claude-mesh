@@ -1,7 +1,6 @@
-import { describe, it, expect, beforeAll, afterEach } from 'bun:test';
-import { mkdtempSync, readFileSync, writeFileSync } from 'fs';
+import { describe, it, expect, beforeAll, afterEach, afterAll } from 'bun:test';
+import { readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
 import * as net from 'net';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
@@ -11,6 +10,11 @@ import { startWsServer, type WsServerHandle } from '../ws-server.ts';
 import { startHttpAdmin, type HttpAdminHandle } from '../http-admin.ts';
 import { loadTls, type ServerTls } from '../tls-config.ts';
 import { MeshClient } from '../../client/src/client.ts';
+import { tempDirs } from './helpers/temp-dirs.ts';
+
+// R-73: every temp dir this file makes is removed when it is done.
+const { tmp, cleanup: cleanupTempDirs } = tempDirs();
+afterAll(cleanupTempDirs);
 
 // R-65 PR-A — TLS listeners BESIDE plaintext, explicit `off`, the TLS latch,
 // and MESH_ADMIN_TOKEN_PREV. One describe per Done-when item in scope, plus
@@ -21,7 +25,7 @@ import { MeshClient } from '../../client/src/client.ts';
 // CA tests dial the DNS NAME, so a "wrong CA refused" cannot pass on the
 // runtime's IP-identity behaviour instead (measured on #215).
 
-const dir = mkdtempSync(join(tmpdir(), 'mesh-r65-'));
+const dir = tmp('mesh-r65-');
 const f = (n: string) => join(dir, n);
 function openssl(...args: string[]): void {
   const r = Bun.spawnSync(['openssl', ...args], { cwd: dir, stderr: 'pipe' });
@@ -91,13 +95,13 @@ function freshDb(): Database {
 }
 
 async function ws(port: number | 'off', tls: ServerTls | null, tlsPort?: number) {
-  const { v, lines } = await quiet(() => startWsServer(port, db!, 10_485_760, mkdtempSync(join(tmpdir(), 'mesh-r65f-')), 0, new Map(), tls,
+  const { v, lines } = await quiet(() => startWsServer(port, db!, 10_485_760, tmp('mesh-r65f-'), 0, new Map(), tls,
     tlsPort === undefined ? {} : { tlsPort }));
   handles.push(v);
   return { h: v as WsServerHandle, lines };
 }
 async function admin(port: number | 'off', opts: Parameters<typeof startHttpAdmin>[9] = {}) {
-  const { v, lines } = await quiet(() => startHttpAdmin(port, db!, ADMIN, 10_485_760, mkdtempSync(join(tmpdir(), 'mesh-r65a-')),
+  const { v, lines } = await quiet(() => startHttpAdmin(port, db!, ADMIN, 10_485_760, tmp('mesh-r65a-'),
     new Map(), new Map(), new Map(), {}, opts));
   handles.push(v);
   return { h: v as HttpAdminHandle, lines };
@@ -314,7 +318,7 @@ describe('Done-when: MESH_ADMIN_TOKEN_PREV is accepted until it is removed', () 
 
 describe('the ALTER is idempotent on an existing database', () => {
   it('a database that predates tls_seen gains it, keeps its rows, and reopens without error', () => {
-    const file = join(mkdtempSync(join(tmpdir(), 'mesh-r65db-')), 'mesh.db');
+    const file = join(tmp('mesh-r65db-'), 'mesh.db');
     const d1 = openDb(file);
     registerAgent(d1, { id: 'old-agent', token_hash: hashToken('t'), hostname: 'h' });
     d1.exec('ALTER TABLE agents DROP COLUMN tls_seen');        // as it was before R-65
@@ -381,7 +385,7 @@ describe('M3: the client CA — WS connect AND fetchFile, from config AND env', 
 describe('end to end: the real server, both plaintext ports off', () => {
   it('boots, names every listener in mesh.listeners (off included), and only the TLS ports accept TCP', async () => {
     const [p, t, a, at] = ports();
-    const dataDir = mkdtempSync(join(tmpdir(), 'mesh-r65e2e-'));
+    const dataDir = tmp('mesh-r65e2e-');
     const proc = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'server.ts')], {
       env: {
         ...process.env, MESH_ADMIN_TOKEN: ADMIN, MESH_DB_PATH: join(dataDir, 'mesh.db'), MESH_FILES_DIR: join(dataDir, 'files'),

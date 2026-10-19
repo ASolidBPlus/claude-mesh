@@ -1,7 +1,6 @@
-import { describe, it, expect, beforeAll, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, readFileSync } from 'fs';
+import { describe, it, expect, beforeAll, afterEach, afterAll } from 'bun:test';
+import { writeFileSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
 import { Database } from 'bun:sqlite';
 import { openDb, registerAgent, aclGrant, markTlsSeen } from '../db.ts';
 import { hashToken } from '../auth.ts';
@@ -9,6 +8,11 @@ import { routeFile } from '../router.ts';
 import { startWsServer, type WsServerHandle } from '../ws-server.ts';
 import { loadTls, type ServerTls } from '../tls-config.ts';
 import { MeshClient } from '../../client/src/client.ts';
+import { tempDirs } from './helpers/temp-dirs.ts';
+
+// R-73: every temp dir this file makes is removed when it is done.
+const { tmp, cleanup: cleanupTempDirs } = tempDirs();
+afterAll(cleanupTempDirs);
 
 // R-267 — GET /files/:id on the WS (agent) port, beside /healthz and
 // /peers/register, so an agent that can reach only the agent port can fetch
@@ -20,7 +24,7 @@ import { MeshClient } from '../../client/src/client.ts';
 //   - the R-65 TLS latch and the agent.http line carry over;
 //   - nothing else from the admin table is reachable on this port.
 
-const dir = mkdtempSync(join(tmpdir(), 'mesh-r267-'));
+const dir = tmp('mesh-r267-');
 const f = (n: string) => join(dir, n);
 let TLS: ServerTls;
 let CA = '';
@@ -58,7 +62,7 @@ async function bus(): Promise<{ p: number; t: number; fileId: string; lines: str
   db = openDb(':memory:');
   for (const id of ['alice', 'bob', 'carol']) registerAgent(db, { id, token_hash: hashToken(`${id}-tok`), hostname: 'h' });
   aclGrant(db, 'alice', 'bob', 'admin');
-  const filesDir = mkdtempSync(join(tmpdir(), 'r267-files-'));
+  const filesDir = tmp('r267-files-');
   const r = routeFile(db, new Map(), 'alice', { type: 'file_send', msg_id: 'f1', to: 'bob', filename: 'a.bin', data: BYTES.toString('base64') } as never, 10_485_760, filesDir);
   if (!r.ok || r.fileId === undefined) throw new Error('fixture file not stored');
   const [p, t] = ports();

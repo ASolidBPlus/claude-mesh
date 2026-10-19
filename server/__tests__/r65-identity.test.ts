@@ -1,7 +1,6 @@
-import { describe, it, expect, beforeAll, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync } from 'fs';
+import { describe, it, expect, beforeAll, afterEach, afterAll } from 'bun:test';
+import { writeFileSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import { openDb, registerAgent, getAgentById, aclGrant, aclCheck, grantObserver, markTlsSeen, updateAgent } from '../db.ts';
@@ -12,6 +11,11 @@ import { loadTls, type ServerTls } from '../tls-config.ts';
 import { __resetCallersForTest, recordCaller, listCallers, CALLER_CAP } from '../connections.ts';
 import * as net from 'net';
 import { randomBytes } from 'crypto';
+import { tempDirs } from './helpers/temp-dirs.ts';
+
+// R-73: every temp dir this file makes is removed when it is done.
+const { tmp, cleanup: cleanupTempDirs } = tempDirs();
+afterAll(cleanupTempDirs);
 
 // R-65 PR-B — identity and visibility.
 //   M4  agent.auth / observer.auth / agent.http log lines, with src_ip and tls
@@ -19,7 +23,7 @@ import { randomBytes } from 'crypto';
 //   M6  GET /connections
 // Written BEFORE the implementation; each describe maps to a Done-when item.
 
-const dir = mkdtempSync(join(tmpdir(), 'mesh-r65b-'));
+const dir = tmp('mesh-r65b-');
 const f = (n: string) => join(dir, n);
 function openssl(...args: string[]): void {
   const r = Bun.spawnSync(['openssl', ...args], { cwd: dir, stderr: 'pipe' });
@@ -84,13 +88,13 @@ function freshDb(): Database {
   return db;
 }
 async function startWs(port: number | 'off', tlsPort?: number) {
-  const { v } = await capture(() => startWsServer(port, db!, 10_485_760, mkdtempSync(join(tmpdir(), 'r65b-f-')), 0, new Map(), TLS,
+  const { v } = await capture(() => startWsServer(port, db!, 10_485_760, tmp('r65b-f-'), 0, new Map(), TLS,
     tlsPort === undefined ? {} : { tlsPort }));
   handles.push(v);
   return v as WsServerHandle;
 }
 async function startAdmin(port: number | 'off', wsh: WsServerHandle | null, tlsPort?: number, extra: Record<string, unknown> = {}) {
-  const { v } = await capture(() => startHttpAdmin(port, db!, ADMIN, 10_485_760, mkdtempSync(join(tmpdir(), 'r65b-a-')),
+  const { v } = await capture(() => startHttpAdmin(port, db!, ADMIN, 10_485_760, tmp('r65b-a-'),
     wsh?.agentIndex ?? new Map(), wsh?.observerIndex ?? new Map(), new Map(), {},
     { ...(tlsPort === undefined ? {} : { tls: TLS, tlsPort }), ...extra }));
   handles.push(v);
@@ -329,7 +333,7 @@ describe('M6: GET /connections', () => {
 describe('M6 end to end: both plaintext ports off → /connections lists no plaintext listener', () => {
   it('the listeners in /connections match the boot line, and none is plaintext', async () => {
     const [, t, , at] = ports();
-    const dataDir = mkdtempSync(join(tmpdir(), 'r65b-e2e-'));
+    const dataDir = tmp('r65b-e2e-');
     const proc = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'server.ts')], {
       env: {
         ...process.env, MESH_ADMIN_TOKEN: ADMIN, MESH_DB_PATH: join(dataDir, 'mesh.db'), MESH_FILES_DIR: join(dataDir, 'files'),
@@ -365,7 +369,7 @@ describe('M6 end to end: both plaintext ports off → /connections lists no plai
 
 describe('the ALTER is idempotent on an existing database', () => {
   it('a database without the M6 columns gains them, keeps its rows, and reopens without error', () => {
-    const file = join(mkdtempSync(join(tmpdir(), 'r65b-db-')), 'mesh.db');
+    const file = join(tmp('r65b-db-'), 'mesh.db');
     const d1 = openDb(file);
     registerAgent(d1, { id: 'old-agent', token_hash: hashToken('t'), hostname: 'h' });
     for (const c of ['last_scheme', 'last_src_ip', 'last_auth_at', 'last_plaintext_at']) d1.exec(`ALTER TABLE agents DROP COLUMN ${c}`);
