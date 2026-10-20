@@ -1,6 +1,7 @@
 import { openDb, findPeerAliasCollisions, findInvalidTopicNames, findTopicPrefixAgents, listPeers, listOutboundPeers,
   findUngrammaticalAgentIds, findUngrammaticalTopicNames } from './db.ts';
-import { setPeerUpSource } from './metrics.ts';
+import { setPeerUpSource, applyTrafficClasses } from './metrics.ts';
+import { parseTrafficClasses, type ClassRule } from './traffic-classes.ts';
 import { startBorder, forwarders } from './border.ts';
 import { parsePlaintextPeerCidrs, applyPlaintextPeerCidrs, type PlaintextCidr } from './plaintext-peers.ts';
 import { loadTls, expiryWarning, type ServerTls } from './tls-config.ts';
@@ -34,6 +35,7 @@ export interface Config {
   mcpMode: boolean;
   retentionMs: number | null;
   plaintextPeerCidrs: PlaintextCidr[];
+  trafficClasses: ClassRule[];
   tls: ServerTls | null;
   tlsCa: string | null;
   metricsToken: string | null;
@@ -206,6 +208,16 @@ export function loadConfig(): Config {
   }
   const plaintextPeerCidrs = plaintext.cidrs;
 
+  // R-311: the class label on the sent/received counters. Unset or empty is
+  // no rules and no label; a rule that can't be read refuses to start rather
+  // than being dropped, which would move its traffic into another class.
+  const classes = parseTrafficClasses(process.env.MESH_METRICS_CLASSES);
+  if (!classes.ok) {
+    process.stderr.write(`MESH_METRICS_CLASSES: ${classes.error}\n`);
+    process.exit(1);
+  }
+  const trafficClasses = classes.rules;
+
   // Native TLS (tls-config.ts): a half configuration, an unreadable file or a
   // key that does not match its certificate refuses to start. Falling back to
   // plain HTTP instead would be a silent downgrade the operator cannot see.
@@ -263,7 +275,7 @@ export function loadConfig(): Config {
     metricsToken = metricsRaw;
   }
 
-  return { dbPath, wsPort, adminPort, wsTlsPort, adminTlsPort, adminToken, adminTokenPrev, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, tls, tlsCa, metricsToken, preAuth, downloads };
+  return { dbPath, wsPort, adminPort, wsTlsPort, adminTlsPort, adminToken, adminTokenPrev, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, trafficClasses, tls, tlsCa, metricsToken, preAuth, downloads };
 }
 
 async function main() {
@@ -418,6 +430,7 @@ async function main() {
   // Before the border: every forwarder startBorder starts re-checks its URL
   // against this list, so it must be the operator's list and not the default.
   applyPlaintextPeerCidrs(config.plaintextPeerCidrs);
+  applyTrafficClasses(config.trafficClasses);
   const border = startBorder(db, wsHandle.agentIndex, { ca: config.tlsCa });
 
   // R-65: EVERY listener, built ONCE from the config that was actually applied

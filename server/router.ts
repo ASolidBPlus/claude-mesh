@@ -31,7 +31,7 @@ import {
   listCrossBorderObservers,
   LOCAL_ID_RE, principalKnown,
 } from './db.ts';
-import { incMsgStatus, incSent, incReceived, topicTrafficKind, trafficKind, incAclDenied, incTopicFanout, incError, incBytes, incFile, observePayloadBytes, incPeerRelay } from './metrics.ts';
+import { incMsgStatus, incSent, incReceived, trafficKind, incAclDenied, incTopicFanout, incError, incBytes, incFile, observePayloadBytes, incPeerRelay } from './metrics.ts';
 import { emitTap, LOCAL_ONLY, type TapAudience } from './tap.ts';
 import { borderEvents } from './border.ts';
 
@@ -133,7 +133,7 @@ export function deliverOrQueue(
     }));
     if (!msg.ephemeral) markDelivered(db, msg.id);
     incMsgStatus('direct', 'delivered');
-    incReceived(msg.to_agent, 'direct');
+    incReceived({ kind: 'direct', from: msg.from_agent, to: msg.to_agent, topic: null });
     incBytes('out', msg.payloadBytes);
     return;
   }
@@ -389,7 +389,7 @@ export function fanOutTopicLocal(
       }));
       if (!m.ephemeral) markDelivered(db, msgId);
       incMsgStatus('topic', 'delivered');
-      incReceived(subscriber_id, topicTrafficKind(m.topic));
+      incReceived({ kind: 'topic', from: m.from_agent, to: subscriber_id, topic: m.topic });
       incBytes('out', m.payloadBytes);
     } else {
       // 5d. Offline
@@ -991,7 +991,7 @@ export function routeDirect(
         return { ok: false, error_code: 'DUPLICATE_MSG_ID', error_message: `msg_id already used: ${frame.msg_id}` };
       }
 
-      incSent(from_agent, 'direct');
+      incSent({ kind: 'direct', from: from_agent, to: frame.to, topic: null });
       incBytes('in', payloadBytes);
       observePayloadBytes(payloadBytes);
 
@@ -1097,7 +1097,7 @@ export function routeDirect(
   }
 
   // accepted+routed
-  incSent(from_agent, 'direct');
+  incSent({ kind: 'direct', from: from_agent, to: frame.to, topic: null });
   incBytes('in', payloadBytes);
   observePayloadBytes(payloadBytes);
 
@@ -1144,7 +1144,7 @@ export function drainQueue(
     ws.send(buildDeliverFrame(msg));
     markDelivered(db, msg.id);
     incMsgStatus(msg.kind, 'delivered');
-    incReceived(agentId, trafficKind(msg.kind, msg.topic));
+    incReceived({ kind: trafficKind(msg.kind), from: msg.from_agent, to: agentId, topic: msg.topic });
     incBytes('out', Buffer.byteLength(msg.payload, 'utf8'));
   }
   return pending.length;
@@ -1194,7 +1194,7 @@ export function routePublish(
       return { ok: false, error_code: 'KIND_NOT_ALLOWED', error_message: `kind not permitted to ${alias}` };
     }
 
-    incSent(from_agent, topicTrafficKind(frame.topic));
+    incSent({ kind: 'topic', from: from_agent, to: null, topic: frame.topic });
     incBytes('in', payloadBytes);
     observePayloadBytes(payloadBytes);
 
@@ -1230,7 +1230,7 @@ export function routePublish(
     return { ok: true, msg_id: frame.msg_id };
   }
 
-  incSent(from_agent, topicTrafficKind(frame.topic));
+  incSent({ kind: 'topic', from: from_agent, to: null, topic: frame.topic });
   incBytes('in', payloadBytes);
   observePayloadBytes(payloadBytes);
 
@@ -1521,7 +1521,7 @@ export function routeFile(
     group_id: frame.group_id ?? null,
   });
   incFile();
-  incSent(from_agent, 'file');
+  incSent({ kind: 'file', from: from_agent, to: frame.to, topic: null });
 
   // 9. Deliver if recipient online
   if (recipientWs !== undefined) {
@@ -1542,7 +1542,7 @@ export function routeFile(
     recipientWs.send(deliverFrame);
     markFileDelivered(db, file_id);
     incMsgStatus('file', 'delivered');
-    incReceived(frame.to, 'file');
+    incReceived({ kind: 'file', from: from_agent, to: frame.to, topic: null });
   }
   if (recipientWs === undefined) {
     incMsgStatus('file', 'queued');
