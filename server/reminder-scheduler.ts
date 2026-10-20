@@ -46,7 +46,7 @@ export function startReminderScheduler(
 
       const rbytes = Buffer.byteLength(reminder.payload, 'utf8');
       incReminderFired();
-      incSent('mesh');
+      incSent('mesh', 'reminder');
       incBytes('in', rbytes);
       observePayloadBytes(rbytes);
 
@@ -59,7 +59,7 @@ export function startReminderScheduler(
         } catch (_) { /* ignore */ }
         markDelivered(db, m.id);
         incMsgStatus('reminder', 'delivered');
-        incReceived(reminder.agent_id);
+        incReceived(reminder.agent_id, 'reminder');
         incBytes('out', rbytes);
       } else {
         incMsgStatus('reminder', 'queued');
