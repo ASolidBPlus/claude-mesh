@@ -1,5 +1,11 @@
 import { Database } from 'bun:sqlite';
 import { countTopics, countSubscriptions, countAgentsOnline, countPendingMessages } from './db.ts';
+import {
+  TRAFFIC_KINDS, compileTrafficClasses, classifyTraffic, classNames,
+  type Traffic, type TrafficKind, type ClassRule, type CompiledClassRule,
+} from './traffic-classes.ts';
+
+export { TRAFFIC_KINDS, type Traffic, type TrafficKind };
 
 // ──────────────────────────────────────────────
 // Internal state (module-level)
@@ -11,8 +17,8 @@ type LabeledCounter = Map<string, number>;
 const msgStatus: LabeledCounter   = new Map(); // key = `${kind}\0${status}`
 const topicFanout: LabeledCounter = new Map(); // #136: key = outcome. NO topic label — see incTopicFanout.
 const adminAuth: LabeledCounter   = new Map(); // #161: key = outcome. NO identity label — see incAdminAuth.
-const sent: LabeledCounter        = new Map(); // key = `${from_agent}\0${kind}`
-const received: LabeledCounter    = new Map(); // key = `${to_agent}\0${kind}`
+const sent: LabeledCounter        = new Map(); // key = `${from_agent}\0${kind}\0${class}` (class '' with no rules)
+const received: LabeledCounter    = new Map(); // key = `${to_agent}\0${kind}\0${class}`
 const aclDenied: LabeledCounter   = new Map(); // key = from_agent
 const errors: LabeledCounter      = new Map(); // key = error_code
 const bytes: LabeledCounter       = new Map(); // key = direction ("in"|"out")
@@ -147,36 +153,89 @@ export function incMsgStatus(kind: string, status: string): void {
 }
 /**
  * The `kind` label on mesh_messages_sent_total / mesh_messages_received_total
- * (R-307). A closed set so the label stays party-free: callers pass one of
- * these constants or derive it with trafficKind, never a raw string.
- * `system` splits the `sys.*` feeds (turn status, presence, alerts) out of
- * `topic`, since they dwarf agent-to-agent traffic.
+ * (R-307): neutral facts only, a closed set so the label stays party-free.
+ * Callers pass a constant, or derive it from a stored row with trafficKind.
+ *
+ * The `class` label (R-311) comes from the deployment's MESH_METRICS_CLASSES
+ * rules, applied once at boot by applyTrafficClasses. With no rules there is
+ * no `class` label at all.
  */
-export type TrafficKind = 'direct' | 'topic' | 'system' | 'file' | 'reminder';
-export const TRAFFIC_KINDS: readonly TrafficKind[] = ['direct', 'topic', 'system', 'file', 'reminder'];
+let classRules: CompiledClassRule[] = [];
+let classLabelValues: string[] = [];
 
-/** A remote topic (`alias:sys.x`) is another mesh's system feed relayed
- *  here, so the part after the alias is checked too. */
-export function topicTrafficKind(topic: string): TrafficKind {
-  const colon = topic.indexOf(':');
-  const name = colon > 0 ? topic.slice(colon + 1) : topic;
-  return topic.startsWith('sys.') || name.startsWith('sys.') ? 'system' : 'topic';
+export function applyTrafficClasses(rules: readonly ClassRule[]): void {
+  classRules = compileTrafficClasses(rules);
+  classLabelValues = classNames(rules);
+  console.log(JSON.stringify({
+    evt: 'metrics.classes',
+    classes: classLabelValues,
+    rules,
+    note: rules.length === 0
+      ? 'MESH_METRICS_CLASSES has no rules: mesh_messages_sent_total/mesh_messages_received_total carry no class label'
+      : 'each counted message gets the class of the first matching rule, else "other"',
+    at: Date.now(),
+  }));
 }
 
 /** For a stored messages row (drainQueue). Anything that is not a topic,
  *  file or reminder row was addressed to one recipient, so it is `direct`. */
-export function trafficKind(kind: string, topic: string | null): TrafficKind {
-  if (kind === 'topic') return topicTrafficKind(topic ?? '');
-  if (kind === 'file' || kind === 'reminder') return kind;
+export function trafficKind(kind: string): TrafficKind {
+  if (kind === 'topic' || kind === 'file' || kind === 'reminder') return kind;
   return 'direct';
 }
 
-export function incSent(from: string, kind: TrafficKind): void {
-  try { bump(sent, `${s(from)}\0${kind}`); } catch (_) { /* metrics must never affect delivery */ }
+function trafficKey(agent: string, t: Traffic): string {
+  const cls = classRules.length === 0 ? '' : classifyTraffic(classRules, t);
+  return `${s(agent)}\0${t.kind}\0${cls}`;
 }
-export function incReceived(to: string, kind: TrafficKind): void {
-  try { bump(received, `${s(to)}\0${kind}`); } catch (_) { /* metrics must never affect delivery */ }
+
+export function incSent(t: Traffic): void {
+  try { bump(sent, trafficKey(t.from, t)); } catch (_) { /* metrics must never affect delivery */ }
 }
+/** `recipient` is the to_agent label. It is separate from `t.to`, the
+ *  message's own recipient that rules match on, because a topic receipt has a
+ *  recipient but its message has none: `to` is null for a topic on both the
+ *  send and the receive side, so a `to` rule classifies both the same. */
+export function incReceived(recipient: string, t: Traffic): void {
+  try { bump(received, trafficKey(recipient, t)); } catch (_) { /* metrics must never affect delivery */ }
+}
+
+/** Split a sent/received key at its LAST two NULs, so an agent id is never
+ *  assumed free of them. */
+function splitTrafficKey(key: string): { agent: string; kind: string; cls: string } {
+  const c = key.lastIndexOf('\0');
+  const k = key.lastIndexOf('\0', c - 1);
+  return { agent: key.slice(0, k), kind: key.slice(k + 1, c), cls: key.slice(c + 1) };
+}
+
+function trafficLabels(kind: string, cls: string): string {
+  return cls === '' ? `kind="${kind}"` : `kind="${kind}",class="${cls}"`;
+}
+
+function trafficHelp(): string {
+  const kinds = `kind = ${TRAFFIC_KINDS.join('|')}`;
+  if (classLabelValues.length === 0) return `${kinds}; no class label: MESH_METRICS_CLASSES has no rules`;
+  return `${kinds}; class = the first matching MESH_METRICS_CLASSES rule (${classLabelValues.join('|')})`;
+}
+
+/** Identity labels off: totals by kind and class, every combination emitted
+ *  from 0 so a series exists before its first message. Bounded by the rules
+ *  limit: 4 kinds x (32 classes + other). */
+function renderByKindAndClass(name: string, counter: LabeledCounter, lines: string[]): void {
+  const classes = classLabelValues.length === 0 ? [''] : classLabelValues;
+  const totals = new Map<string, number>();
+  for (const k of TRAFFIC_KINDS) for (const c of classes) totals.set(`${k}\0${c}`, 0);
+  for (const [key, v] of counter) {
+    const { kind, cls } = splitTrafficKey(key);
+    const k = `${kind}\0${cls}`;
+    totals.set(k, (totals.get(k) ?? 0) + v);
+  }
+  for (const [k, v] of totals) {
+    const [kind, cls] = k.split('\0');
+    lines.push(`${name}{${trafficLabels(kind ?? '', cls ?? '')}} ${v}`);
+  }
+}
+
 export function incAclDenied(from: string): void {
   try { bump(aclDenied, s(from)); } catch (_) { /* metrics must never affect delivery */ }
 }
@@ -276,6 +335,8 @@ export function setPeerUpSource(fn: () => Iterable<{ alias: string; up: boolean 
  *   direction   'in' | 'outbound'                              (router.ts, border.ts)
  *   error_code  the ERR_* code constants                        (errors.ts)
  *   kind        the message-kind constants                      (protocol.ts)
+ *               or a TrafficKind                                (traffic-classes.ts)
+ *   class       a MESH_METRICS_CLASSES class name, or 'other'   (traffic-classes.ts)
  *               or a TrafficKind                                (metrics.ts)
  *   le          a histogram bucket boundary — a number
  *   outcome     'delivered'|'refused'|'rate_limited'|'duplicate'|'transient'
@@ -283,7 +344,7 @@ export function setPeerUpSource(fn: () => Iterable<{ alias: string; up: boolean 
  *   status      'delivered'|'queued'|'dropped'|'expired'
  */
 export const PARTY_FREE_LABELS: ReadonlySet<string> = new Set([
-  'direction', 'error_code', 'kind', 'le', 'outcome', 'state', 'status',
+  'class', 'direction', 'error_code', 'kind', 'le', 'outcome', 'state', 'status',
 ]);
 
 export function renderMetrics(db: Database): string {
@@ -319,44 +380,30 @@ export function renderMetrics(db: Database): string {
 
   // mesh_messages_sent_total — identity label, gated.
   if (identityLabelsEnabled()) {
-    lines.push(`# HELP mesh_messages_sent_total Messages accepted and routed, by sender and kind (${TRAFFIC_KINDS.join('|')}; system = topics named sys.* or alias:sys.*).`);
+    lines.push(`# HELP mesh_messages_sent_total Messages accepted and routed, by sender, kind and class (${trafficHelp()}).`);
     lines.push('# TYPE mesh_messages_sent_total counter');
     for (const [key, v] of sent) {
-      const [agent, kind] = key.split('\0');
-      lines.push(`mesh_messages_sent_total{from_agent="${escapeLabelValue(agent ?? '')}",kind="${kind}"} ${v}`);
+      const { agent, kind, cls } = splitTrafficKey(key);
+      lines.push(`mesh_messages_sent_total{from_agent="${escapeLabelValue(agent)}",${trafficLabels(kind, cls)}} ${v}`);
     }
   } else {
-    // Every kind is emitted, 0 included, so a kind's series exists before its
-    // first message and sum() over kinds is the old unlabelled total.
-    const byKind = new Map<string, number>(TRAFFIC_KINDS.map((k) => [k, 0]));
-    for (const [key, v] of sent) {
-      const kind = key.slice(key.lastIndexOf('\0') + 1);
-      byKind.set(kind, (byKind.get(kind) ?? 0) + v);
-    }
-    lines.push(`# HELP mesh_messages_sent_total Messages accepted and routed, by sender and kind (${TRAFFIC_KINDS.join('|')}; system = topics named sys.* or alias:sys.*). (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)`);
+    lines.push(`# HELP mesh_messages_sent_total Messages accepted and routed, by kind and class (${trafficHelp()}). (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)`);
     lines.push('# TYPE mesh_messages_sent_total counter');
-    for (const [kind, v] of byKind) lines.push(`mesh_messages_sent_total{kind="${kind}"} ${v}`);
+    renderByKindAndClass('mesh_messages_sent_total', sent, lines);
   }
 
   // mesh_messages_received_total — identity label, gated.
   if (identityLabelsEnabled()) {
-    lines.push(`# HELP mesh_messages_received_total Messages delivered, by recipient and kind (${TRAFFIC_KINDS.join('|')}; system = topics named sys.* or alias:sys.*).`);
+    lines.push(`# HELP mesh_messages_received_total Messages delivered, by recipient, kind and class (${trafficHelp()}).`);
     lines.push('# TYPE mesh_messages_received_total counter');
     for (const [key, v] of received) {
-      const [agent, kind] = key.split('\0');
-      lines.push(`mesh_messages_received_total{to_agent="${escapeLabelValue(agent ?? '')}",kind="${kind}"} ${v}`);
+      const { agent, kind, cls } = splitTrafficKey(key);
+      lines.push(`mesh_messages_received_total{to_agent="${escapeLabelValue(agent)}",${trafficLabels(kind, cls)}} ${v}`);
     }
   } else {
-    // Every kind is emitted, 0 included, so a kind's series exists before its
-    // first message and sum() over kinds is the old unlabelled total.
-    const byKind = new Map<string, number>(TRAFFIC_KINDS.map((k) => [k, 0]));
-    for (const [key, v] of received) {
-      const kind = key.slice(key.lastIndexOf('\0') + 1);
-      byKind.set(kind, (byKind.get(kind) ?? 0) + v);
-    }
-    lines.push(`# HELP mesh_messages_received_total Messages delivered, by recipient and kind (${TRAFFIC_KINDS.join('|')}; system = topics named sys.* or alias:sys.*). (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)`);
+    lines.push(`# HELP mesh_messages_received_total Messages delivered, by kind and class (${trafficHelp()}). (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)`);
     lines.push('# TYPE mesh_messages_received_total counter');
-    for (const [kind, v] of byKind) lines.push(`mesh_messages_received_total{kind="${kind}"} ${v}`);
+    renderByKindAndClass('mesh_messages_received_total', received, lines);
   }
 
   // mesh_acl_denied_total — identity label, gated.

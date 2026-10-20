@@ -1,13 +1,16 @@
 // R-307 — mesh_messages_sent_total / mesh_messages_received_total carry a
-// `kind` label: direct | topic | system | file | reminder, where system is a
-// topic named sys.* or, relayed from another mesh, alias:sys.*. Each kind is driven through its real routing path, not by
-// calling incSent directly, so a call site passing the wrong kind goes red here.
+// neutral `kind` label: direct | topic | file | reminder. Telling the sys.*
+// heartbeat feeds apart is now a deployment rule (R-311), so these tests set
+// production's MESH_METRICS_CLASSES and pin the R-307 behaviour as kind plus
+// class. Each kind is driven through its real routing path, not by calling
+// incSent directly, so a call site passing the wrong facts goes red here.
 import { describe, it, expect, beforeEach, afterEach, afterAll } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import { openDb, registerAgent, aclGrant, subscribe, getOrCreateTopic, insertReminder, upsertPeer } from '../db.ts';
 import { hashToken } from '../auth.ts';
-import { renderMetrics, topicTrafficKind, trafficKind, TRAFFIC_KINDS, __resetMetricsForTest } from '../metrics.ts';
+import { renderMetrics, trafficKind, applyTrafficClasses, TRAFFIC_KINDS, __resetMetricsForTest } from '../metrics.ts';
+import { parseTrafficClasses } from '../traffic-classes.ts';
 import { routeDirect, routePublish, routeFile, drainQueue } from '../router.ts';
 import { startReminderScheduler } from '../reminder-scheduler.ts';
 import { tempDirs } from './helpers/temp-dirs.ts';
@@ -38,6 +41,16 @@ function samples(out: string, metric: string): Map<string, number> {
 
 let db: Database;
 
+// Production's value (R-311). Set in the env and applied through the boot
+// parser, as server.ts does.
+const PROD_CLASSES = '[{"class":"system","topic":"sys.*"}]';
+function configureClasses(raw: string | undefined): void {
+  if (raw === undefined) delete process.env.MESH_METRICS_CLASSES; else process.env.MESH_METRICS_CLASSES = raw;
+  const parsed = parseTrafficClasses(process.env.MESH_METRICS_CLASSES);
+  if (!parsed.ok) throw new Error(parsed.error);
+  applyTrafficClasses(parsed.rules);
+}
+
 // One message of every kind, each through its own path, every recipient online.
 function driveOneOfEachKind(): void {
   for (const id of ['a', 'b', 'pub', 'sub']) {
@@ -65,37 +78,39 @@ function driveOneOfEachKind(): void {
 beforeEach(() => {
   __resetMetricsForTest();
   db = openDb(':memory:');
+  configureClasses(PROD_CLASSES);
 });
 
 afterEach(() => {
   __resetMetricsForTest();
+  configureClasses(undefined);
   delete process.env.MESH_METRICS_IDENTITY_LABELS;
 });
 
-describe('kind label, identity labels on', () => {
+describe('kind + class, identity labels on', () => {
   beforeEach(() => { process.env.MESH_METRICS_IDENTITY_LABELS = '1'; });
 
-  it('a direct send, a topic post, a sys.* post, a file and a reminder each land under their kind', () => {
+  it('a direct send, a topic post, a sys.* post, a file and a reminder each land under their kind and class', () => {
     driveOneOfEachKind();
     const out = renderMetrics(db);
 
     expect(samples(out, 'mesh_messages_sent_total')).toEqual(new Map([
-      ['mesh_messages_sent_total{from_agent="a",kind="direct"}', 1],
-      ['mesh_messages_sent_total{from_agent="pub",kind="topic"}', 1],
-      ['mesh_messages_sent_total{from_agent="pub",kind="system"}', 1],
-      ['mesh_messages_sent_total{from_agent="a",kind="file"}', 1],
-      ['mesh_messages_sent_total{from_agent="mesh",kind="reminder"}', 1],
+      ['mesh_messages_sent_total{from_agent="a",kind="direct",class="other"}', 1],
+      ['mesh_messages_sent_total{from_agent="pub",kind="topic",class="other"}', 1],
+      ['mesh_messages_sent_total{from_agent="pub",kind="topic",class="system"}', 1],
+      ['mesh_messages_sent_total{from_agent="a",kind="file",class="other"}', 1],
+      ['mesh_messages_sent_total{from_agent="mesh",kind="reminder",class="other"}', 1],
     ]));
     expect(samples(out, 'mesh_messages_received_total')).toEqual(new Map([
-      ['mesh_messages_received_total{to_agent="b",kind="direct"}', 1],
-      ['mesh_messages_received_total{to_agent="sub",kind="topic"}', 1],
-      ['mesh_messages_received_total{to_agent="sub",kind="system"}', 1],
-      ['mesh_messages_received_total{to_agent="b",kind="file"}', 1],
-      ['mesh_messages_received_total{to_agent="b",kind="reminder"}', 1],
+      ['mesh_messages_received_total{to_agent="b",kind="direct",class="other"}', 1],
+      ['mesh_messages_received_total{to_agent="sub",kind="topic",class="other"}', 1],
+      ['mesh_messages_received_total{to_agent="sub",kind="topic",class="system"}', 1],
+      ['mesh_messages_received_total{to_agent="b",kind="file",class="other"}', 1],
+      ['mesh_messages_received_total{to_agent="b",kind="reminder",class="other"}', 1],
     ]));
   });
 
-  it('a drained queue keeps each row\'s kind: sys.* topic → system, reminder → reminder, direct → direct', () => {
+  it('a drained queue keeps each row\'s kind and topic: sys.alerts → topic/system, news → topic/other', () => {
     for (const id of ['a', 'b']) registerAgent(db, { id, token_hash: id.padEnd(64, '0'), hostname: 'h' });
     aclGrant(db, 'a', 'b', 'system');
     getOrCreateTopic(db, 'sys.alerts', 'a');
@@ -115,33 +130,29 @@ describe('kind label, identity labels on', () => {
     expect(drainQueue(db, 'b', mockWsOpen())).toBe(4);
 
     expect(samples(renderMetrics(db), 'mesh_messages_received_total')).toEqual(new Map([
-      ['mesh_messages_received_total{to_agent="b",kind="direct"}', 1],
-      ['mesh_messages_received_total{to_agent="b",kind="system"}', 1],
-      ['mesh_messages_received_total{to_agent="b",kind="topic"}', 1],
-      ['mesh_messages_received_total{to_agent="b",kind="reminder"}', 1],
+      ['mesh_messages_received_total{to_agent="b",kind="direct",class="other"}', 1],
+      ['mesh_messages_received_total{to_agent="b",kind="topic",class="system"}', 1],
+      ['mesh_messages_received_total{to_agent="b",kind="topic",class="other"}', 1],
+      ['mesh_messages_received_total{to_agent="b",kind="reminder",class="other"}', 1],
     ]));
   });
 });
 
-describe('the sys. prefix boundary', () => {
-  it('only a name starting with "sys." is system', () => {
-    expect(topicTrafficKind('sys.x')).toBe('system');
-    expect(topicTrafficKind('sys.presence.turn')).toBe('system');
-    expect(topicTrafficKind('sysfoo')).toBe('topic');
-    expect(topicTrafficKind('sys')).toBe('topic');
-    expect(topicTrafficKind('news.sys.x')).toBe('topic');
-    expect(topicTrafficKind('SYS.x')).toBe('topic');
+describe('the sys.* rule boundary', () => {
+  beforeEach(() => { process.env.MESH_METRICS_IDENTITY_LABELS = '1'; });
+
+  it('through routePublish: sysfoo is other, sys.x is system', () => {
+    registerAgent(db, { id: 'pub', token_hash: 'p'.repeat(64), hostname: 'h' });
+    getOrCreateTopic(db, 'sysfoo', 'pub');
+    getOrCreateTopic(db, 'sys.x', 'pub');
+    expect(routePublish(db, new Map(), 'pub', { type: 'publish', msg_id: crypto.randomUUID(), topic: 'sysfoo', payload: '1' }).ok).toBe(true);
+    expect(routePublish(db, new Map(), 'pub', { type: 'publish', msg_id: crypto.randomUUID(), topic: 'sys.x', payload: '2' }).ok).toBe(true);
+    const out = renderMetrics(db);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="pub",kind="topic",class="other"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="pub",kind="topic",class="system"}')).toBe(1);
   });
 
-  it('a remote topic is system when the part after its alias starts with "sys."', () => {
-    expect(topicTrafficKind('pod1:sys.x')).toBe('system');
-    expect(topicTrafficKind('pod1:sysfoo')).toBe('topic');
-    expect(topicTrafficKind('pod1:news')).toBe('topic');
-    expect(topicTrafficKind('pod1:news.sys.x')).toBe('topic');
-  });
-
-  it('through a remote routePublish: pod1:sys.x counts as system, pod1:sysfoo as topic', () => {
-    process.env.MESH_METRICS_IDENTITY_LABELS = '1';
+  it('through a remote routePublish: pod1:sys.x is system, pod1:sysfoo is other', () => {
     registerAgent(db, { id: 'pub', token_hash: 'p'.repeat(64), hostname: 'h' });
     upsertPeer(db, { alias: 'pod1', token_hash: hashToken('pod1'), minted_by_key: 'k', kinds: '["topic-publish"]', rate_per_min: 600 });
     db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
@@ -151,51 +162,40 @@ describe('the sys. prefix boundary', () => {
     expect(routePublish(db, new Map(), 'pub', { type: 'publish', msg_id: crypto.randomUUID(), topic: 'pod1:sys.x', payload: '1' }).ok).toBe(true);
     expect(routePublish(db, new Map(), 'pub', { type: 'publish', msg_id: crypto.randomUUID(), topic: 'pod1:sysfoo', payload: '2' }).ok).toBe(true);
     const out = renderMetrics(db);
-    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="pub",kind="system"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="pub",kind="topic"}')).toBe(1);
-  });
-
-  it('through routePublish: sysfoo counts as topic, sys.x as system', () => {
-    process.env.MESH_METRICS_IDENTITY_LABELS = '1';
-    registerAgent(db, { id: 'pub', token_hash: 'p'.repeat(64), hostname: 'h' });
-    getOrCreateTopic(db, 'sysfoo', 'pub');
-    getOrCreateTopic(db, 'sys.x', 'pub');
-    expect(routePublish(db, new Map(), 'pub', { type: 'publish', msg_id: crypto.randomUUID(), topic: 'sysfoo', payload: '1' }).ok).toBe(true);
-    expect(routePublish(db, new Map(), 'pub', { type: 'publish', msg_id: crypto.randomUUID(), topic: 'sys.x', payload: '2' }).ok).toBe(true);
-    const out = renderMetrics(db);
-    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="pub",kind="topic"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="pub",kind="system"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="pub",kind="topic",class="system"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="pub",kind="topic",class="other"}')).toBe(1);
   });
 
   it('a stored row\'s kind maps through trafficKind', () => {
-    expect(trafficKind('topic', 'sys.alerts')).toBe('system');
-    expect(trafficKind('topic', 'sysalerts')).toBe('topic');
-    expect(trafficKind('topic', null)).toBe('topic');
-    expect(trafficKind('topic', 'pod1:sys.x')).toBe('system');
-    expect(trafficKind('direct', null)).toBe('direct');
-    expect(trafficKind('reminder', null)).toBe('reminder');
-    expect(trafficKind('file', null)).toBe('file');
+    expect(trafficKind('topic')).toBe('topic');
+    expect(trafficKind('direct')).toBe('direct');
+    expect(trafficKind('reminder')).toBe('reminder');
+    expect(trafficKind('file')).toBe('file');
+    expect(trafficKind('response')).toBe('direct');
   });
 });
 
-describe('kind label, identity labels off', () => {
-  it('aggregates by kind only, names nobody, and every kind is present from zero', () => {
+describe('kind + class, identity labels off', () => {
+  it('aggregates by kind and class only, names nobody, and every pair is present from zero', () => {
+    const pairs = TRAFFIC_KINDS.flatMap(k => ['system', 'other'].map(c => `kind="${k}",class="${c}"`));
     const before = renderMetrics(db);
     for (const metric of ['mesh_messages_sent_total', 'mesh_messages_received_total']) {
-      expect(samples(before, metric)).toEqual(new Map(TRAFFIC_KINDS.map(k => [`${metric}{kind="${k}"}`, 0])));
+      expect(samples(before, metric)).toEqual(new Map(pairs.map(p => [`${metric}{${p}}`, 0])));
     }
 
     driveOneOfEachKind();
     const out = renderMetrics(db);
+    const want = new Map(pairs.map(p => [p, 0]));
+    for (const p of ['kind="direct",class="other"', 'kind="topic",class="other"', 'kind="topic",class="system"', 'kind="file",class="other"', 'kind="reminder",class="other"']) want.set(p, 1);
     for (const metric of ['mesh_messages_sent_total', 'mesh_messages_received_total']) {
-      expect(samples(out, metric)).toEqual(new Map(TRAFFIC_KINDS.map(k => [`${metric}{kind="${k}"}`, 1])));
+      expect(samples(out, metric)).toEqual(new Map([...want].map(([p, v]) => [`${metric}{${p}}`, v])));
     }
     for (const id of ['"a"', '"b"', '"pub"', '"sub"', '"mesh"']) {
       expect(out.split('\n').filter(l => l.startsWith('mesh_messages_') && l.includes(id))).toEqual([]);
     }
   });
 
-  it('sum over kinds equals the old unlabelled total (one per accepted send, one per delivery)', () => {
+  it('sum over kind and class equals the old unlabelled total (one per accepted send, one per delivery)', () => {
     driveOneOfEachKind();
     // Five sends accepted (direct, topic, sys topic, file, reminder) and five
     // deliveries (one subscriber per topic, every recipient online): the
@@ -206,12 +206,12 @@ describe('kind label, identity labels off', () => {
     expect(sum('mesh_messages_received_total')).toBe(5);
   });
 
-  it('HELP lists the kinds', () => {
+  it('HELP lists the kinds and the classes', () => {
     const out = renderMetrics(db);
     for (const metric of ['mesh_messages_sent_total', 'mesh_messages_received_total']) {
       const help = out.split('\n').find(l => l.startsWith(`# HELP ${metric} `))!;
-      for (const k of TRAFFIC_KINDS) expect(help).toContain(k);
-      expect(help).toContain('sys.*');
+      expect(help).toContain(`kind = ${TRAFFIC_KINDS.join('|')}`);
+      expect(help).toContain('(system|other)');
     }
   });
 });

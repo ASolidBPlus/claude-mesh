@@ -12,6 +12,7 @@ import {
   aclCheck, getAgentById, getFile, insertFile, markFileDelivered,
 } from './db.ts';
 import type { AuthResult, AdminCtx } from './admin-ctx.ts';
+import { incReceived } from './metrics.ts';
 
 /**
  * RFC 6266/5987 Content-Disposition for an untrusted filename.
@@ -313,6 +314,7 @@ export async function handleFilePost(ctx: AdminCtx): Promise<void> {
       });
       recipientWs.send(deliverFrame);
       markFileDelivered(db, file_id);
+      incReceived(to_agent, { kind: 'file', from: from_agent, to: to_agent, topic: null });
     }
 
     res.writeHead(201, { 'Content-Type': 'application/json' });
