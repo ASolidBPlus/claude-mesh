@@ -1,11 +1,12 @@
 // R-307 — mesh_messages_sent_total / mesh_messages_received_total carry a
 // `kind` label: direct | topic | system | file | reminder, where system is a
-// topic named sys.*. Each kind is driven through its real routing path, not by
+// topic named sys.* or, relayed from another mesh, alias:sys.*. Each kind is driven through its real routing path, not by
 // calling incSent directly, so a call site passing the wrong kind goes red here.
 import { describe, it, expect, beforeEach, afterEach, afterAll } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
-import { openDb, registerAgent, aclGrant, subscribe, getOrCreateTopic, insertReminder } from '../db.ts';
+import { openDb, registerAgent, aclGrant, subscribe, getOrCreateTopic, insertReminder, upsertPeer } from '../db.ts';
+import { hashToken } from '../auth.ts';
 import { renderMetrics, topicTrafficKind, trafficKind, TRAFFIC_KINDS, __resetMetricsForTest } from '../metrics.ts';
 import { routeDirect, routePublish, routeFile, drainQueue } from '../router.ts';
 import { startReminderScheduler } from '../reminder-scheduler.ts';
@@ -132,6 +133,28 @@ describe('the sys. prefix boundary', () => {
     expect(topicTrafficKind('SYS.x')).toBe('topic');
   });
 
+  it('a remote topic is system when the part after its alias starts with "sys."', () => {
+    expect(topicTrafficKind('pod1:sys.x')).toBe('system');
+    expect(topicTrafficKind('pod1:sysfoo')).toBe('topic');
+    expect(topicTrafficKind('pod1:news')).toBe('topic');
+    expect(topicTrafficKind('pod1:news.sys.x')).toBe('topic');
+  });
+
+  it('through a remote routePublish: pod1:sys.x counts as system, pod1:sysfoo as topic', () => {
+    process.env.MESH_METRICS_IDENTITY_LABELS = '1';
+    registerAgent(db, { id: 'pub', token_hash: 'p'.repeat(64), hostname: 'h' });
+    upsertPeer(db, { alias: 'pod1', token_hash: hashToken('pod1'), minted_by_key: 'k', kinds: '["topic-publish"]', rate_per_min: 600 });
+    db.prepare(`INSERT INTO outbound_peers (alias, url, token, assigned_alias, kinds, rate_per_min, created_at)
+                VALUES ('pod1', 'wss://pod1.example', 'tok', 'orch', '["topic-publish"]', 600, ?)`).run(Date.now());
+    aclGrant(db, 'pub', 'pod1:sys.x', 'admin');
+    aclGrant(db, 'pub', 'pod1:sysfoo', 'admin');
+    expect(routePublish(db, new Map(), 'pub', { type: 'publish', msg_id: crypto.randomUUID(), topic: 'pod1:sys.x', payload: '1' }).ok).toBe(true);
+    expect(routePublish(db, new Map(), 'pub', { type: 'publish', msg_id: crypto.randomUUID(), topic: 'pod1:sysfoo', payload: '2' }).ok).toBe(true);
+    const out = renderMetrics(db);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="pub",kind="system"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="pub",kind="topic"}')).toBe(1);
+  });
+
   it('through routePublish: sysfoo counts as topic, sys.x as system', () => {
     process.env.MESH_METRICS_IDENTITY_LABELS = '1';
     registerAgent(db, { id: 'pub', token_hash: 'p'.repeat(64), hostname: 'h' });
@@ -148,6 +171,7 @@ describe('the sys. prefix boundary', () => {
     expect(trafficKind('topic', 'sys.alerts')).toBe('system');
     expect(trafficKind('topic', 'sysalerts')).toBe('topic');
     expect(trafficKind('topic', null)).toBe('topic');
+    expect(trafficKind('topic', 'pod1:sys.x')).toBe('system');
     expect(trafficKind('direct', null)).toBe('direct');
     expect(trafficKind('reminder', null)).toBe('reminder');
     expect(trafficKind('file', null)).toBe('file');

@@ -155,8 +155,12 @@ export function incMsgStatus(kind: string, status: string): void {
 export type TrafficKind = 'direct' | 'topic' | 'system' | 'file' | 'reminder';
 export const TRAFFIC_KINDS: readonly TrafficKind[] = ['direct', 'topic', 'system', 'file', 'reminder'];
 
+/** A remote topic (`alias:sys.x`) is another mesh's system feed relayed
+ *  here, so the part after the alias is checked too. */
 export function topicTrafficKind(topic: string): TrafficKind {
-  return topic.startsWith('sys.') ? 'system' : 'topic';
+  const colon = topic.indexOf(':');
+  const name = colon > 0 ? topic.slice(colon + 1) : topic;
+  return topic.startsWith('sys.') || name.startsWith('sys.') ? 'system' : 'topic';
 }
 
 /** For a stored messages row (drainQueue). Anything that is not a topic,
@@ -315,7 +319,7 @@ export function renderMetrics(db: Database): string {
 
   // mesh_messages_sent_total — identity label, gated.
   if (identityLabelsEnabled()) {
-    lines.push(`# HELP mesh_messages_sent_total Messages accepted and routed, by sender and kind (${TRAFFIC_KINDS.join('|')}; system = topics named sys.*).`);
+    lines.push(`# HELP mesh_messages_sent_total Messages accepted and routed, by sender and kind (${TRAFFIC_KINDS.join('|')}; system = topics named sys.* or alias:sys.*).`);
     lines.push('# TYPE mesh_messages_sent_total counter');
     for (const [key, v] of sent) {
       const [agent, kind] = key.split('\0');
@@ -329,14 +333,14 @@ export function renderMetrics(db: Database): string {
       const kind = key.slice(key.lastIndexOf('\0') + 1);
       byKind.set(kind, (byKind.get(kind) ?? 0) + v);
     }
-    lines.push(`# HELP mesh_messages_sent_total Messages accepted and routed, by sender and kind (${TRAFFIC_KINDS.join('|')}; system = topics named sys.*). (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)`);
+    lines.push(`# HELP mesh_messages_sent_total Messages accepted and routed, by sender and kind (${TRAFFIC_KINDS.join('|')}; system = topics named sys.* or alias:sys.*). (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)`);
     lines.push('# TYPE mesh_messages_sent_total counter');
     for (const [kind, v] of byKind) lines.push(`mesh_messages_sent_total{kind="${kind}"} ${v}`);
   }
 
   // mesh_messages_received_total — identity label, gated.
   if (identityLabelsEnabled()) {
-    lines.push(`# HELP mesh_messages_received_total Messages delivered, by recipient and kind (${TRAFFIC_KINDS.join('|')}; system = topics named sys.*).`);
+    lines.push(`# HELP mesh_messages_received_total Messages delivered, by recipient and kind (${TRAFFIC_KINDS.join('|')}; system = topics named sys.* or alias:sys.*).`);
     lines.push('# TYPE mesh_messages_received_total counter');
     for (const [key, v] of received) {
       const [agent, kind] = key.split('\0');
@@ -350,7 +354,7 @@ export function renderMetrics(db: Database): string {
       const kind = key.slice(key.lastIndexOf('\0') + 1);
       byKind.set(kind, (byKind.get(kind) ?? 0) + v);
     }
-    lines.push(`# HELP mesh_messages_received_total Messages delivered, by recipient and kind (${TRAFFIC_KINDS.join('|')}; system = topics named sys.*). (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)`);
+    lines.push(`# HELP mesh_messages_received_total Messages delivered, by recipient and kind (${TRAFFIC_KINDS.join('|')}; system = topics named sys.* or alias:sys.*). (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)`);
     lines.push('# TYPE mesh_messages_received_total counter');
     for (const [kind, v] of byKind) lines.push(`mesh_messages_received_total{kind="${kind}"} ${v}`);
   }
