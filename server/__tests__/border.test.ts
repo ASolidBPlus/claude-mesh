@@ -272,7 +272,7 @@ describe('F2b: mesh_peer_up (#108) and the peer-label flag', () => {
     registerAgent(db, { id: 'secret-agent', token_hash: 'd'.repeat(64), hostname: 'h' });
     setPeerUpSource(() => listOutboundPeers(db).map(r => ({ alias: r.alias, up: false })));
     incPeerRelay('secret-partner', 'outbound', 'delivered');
-    incSent('secret-agent'); incReceived('secret-agent'); incAclDenied('secret-agent');
+    incSent('secret-agent', 'direct'); incReceived('secret-agent', 'direct'); incAclDenied('secret-agent');
     // A NON-identity label, counted so the control below is real: it only
     // emits a series once something has been counted.
     incError('ACL_DENIED');
@@ -342,7 +342,7 @@ describe('F2b: mesh_peer_up (#108) and the peer-label flag', () => {
     registerAgent(db, { id: 'a-one', token_hash: 'e'.repeat(64), hostname: 'h' });
     setPeerUpSource(() => listOutboundPeers(db).map(r => ({ alias: r.alias, up: true })));
     incPeerRelay('p-one', 'outbound', 'delivered');
-    incSent('a-one'); incReceived('a-one'); incAclDenied('a-one'); incError('ACL_DENIED');
+    incSent('a-one', 'direct'); incReceived('a-one', 'direct'); incAclDenied('a-one'); incError('ACL_DENIED');
     // #136's series. The walk's blind-spot arm reds on a declared-but-unexercised
     // metric, which is how this line came to exist rather than being remembered.
     incTopicFanout('filtered');

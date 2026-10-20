@@ -94,11 +94,11 @@ describe('metrics counters', () => {
   });
 
   it('T3 incSent / incReceived', () => {
-    incSent('a');
-    incReceived('b');
+    incSent('a', 'direct');
+    incReceived('b', 'direct');
     const out = renderMetrics(db);
-    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="a"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_received_total{to_agent="b"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="a",kind="direct"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_received_total{to_agent="b",kind="direct"}')).toBe(1);
   });
 
   it('T4 incAclDenied', () => {
@@ -135,10 +135,10 @@ describe('metrics counters', () => {
   });
 
   it('T9 label-value escaping', () => {
-    incSent('a"b\\c\nd');
+    incSent('a"b\\c\nd', 'direct');
     const out = renderMetrics(db);
     // " -> \" ; \ -> \\ ; newline -> \n
-    expect(out).toContain('mesh_messages_sent_total{from_agent="a\\"b\\\\c\\nd"} 1');
+    expect(out).toContain('mesh_messages_sent_total{from_agent="a\\"b\\\\c\\nd",kind="direct"} 1');
   });
 
   it('T10 observePayloadBytes histogram', () => {
@@ -222,8 +222,8 @@ describe('metrics E2E routing', () => {
     const out = renderMetrics(db);
     const len = Buffer.byteLength(payload, 'utf8');
     expect(lineValue(out, 'mesh_messages_total{kind="direct",status="delivered"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="a"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_received_total{to_agent="b"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="a",kind="direct"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_received_total{to_agent="b",kind="direct"}')).toBe(1);
     expect(lineValue(out, 'mesh_bytes_total{direction="in"}')).toBe(len);
     expect(lineValue(out, 'mesh_bytes_total{direction="out"}')).toBe(len);
     expect(lineValue(out, 'mesh_message_payload_bytes_count')).toBe(1);
@@ -237,10 +237,10 @@ describe('metrics E2E routing', () => {
     expect(r.ok).toBe(true);
     const out = renderMetrics(db);
     expect(lineValue(out, 'mesh_messages_total{kind="direct",status="queued"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="a"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="a",kind="direct"}')).toBe(1);
     expect(lineValue(out, 'mesh_bytes_total{direction="in"}')).toBeGreaterThan(0);
     expect(hasLine(out, 'mesh_messages_total{kind="direct",status="delivered"}')).toBe(false);
-    expect(hasLine(out, 'mesh_messages_received_total{to_agent="b"}')).toBe(false);
+    expect(hasLine(out, 'mesh_messages_received_total{to_agent="b",kind="direct"}')).toBe(false);
   });
 
   it('T20 routeDirect dropped (ttl0 offline)', () => {
@@ -251,7 +251,7 @@ describe('metrics E2E routing', () => {
     expect(r.ok).toBe(true);
     const out = renderMetrics(db);
     expect(lineValue(out, 'mesh_messages_total{kind="direct",status="dropped"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="a"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="a",kind="direct"}')).toBe(1);
     expect(hasLine(out, 'mesh_messages_total{kind="direct",status="delivered"}')).toBe(false);
     expect(hasLine(out, 'mesh_messages_total{kind="direct",status="queued"}')).toBe(false);
   });
@@ -264,7 +264,7 @@ describe('metrics E2E routing', () => {
     const out = renderMetrics(db);
     expect(lineValue(out, 'mesh_errors_total{error_code="ACL_DENIED"}')).toBe(1);
     expect(lineValue(out, 'mesh_acl_denied_total{from_agent="a"}')).toBe(1);
-    expect(hasLine(out, 'mesh_messages_sent_total{from_agent="a"}')).toBe(false);
+    expect(hasLine(out, 'mesh_messages_sent_total{from_agent="a",kind="direct"}')).toBe(false);
     expect(hasLine(out, 'mesh_messages_total{kind="direct",status="delivered"}')).toBe(false);
   });
 
@@ -292,9 +292,9 @@ describe('metrics E2E routing', () => {
     expect(r.ok).toBe(true);
     const out = renderMetrics(db);
     expect(lineValue(out, 'mesh_messages_total{kind="topic",status="delivered"}')).toBe(2);
-    expect(lineValue(out, 'mesh_messages_received_total{to_agent="sub1"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_received_total{to_agent="sub2"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="alice"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_received_total{to_agent="sub1",kind="topic"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_received_total{to_agent="sub2",kind="topic"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="alice",kind="topic"}')).toBe(1);
   });
 
   it('T25 file routed online', () => {
@@ -311,8 +311,8 @@ describe('metrics E2E routing', () => {
     const out = renderMetrics(db);
     expect(lineValue(out, 'mesh_files_total')).toBe(1);
     expect(lineValue(out, 'mesh_messages_total{kind="file",status="delivered"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_received_total{to_agent="b"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="a"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_received_total{to_agent="b",kind="file"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="a",kind="file"}')).toBe(1);
   });
 
   it('T26 cleanup expired per-kind', () => {
@@ -338,8 +338,8 @@ describe('metrics E2E routing', () => {
     const out = renderMetrics(db);
     expect(lineValue(out, 'mesh_reminders_fired_total')).toBe(1);
     expect(lineValue(out, 'mesh_messages_total{kind="reminder",status="delivered"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_received_total{to_agent="alice"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="mesh"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_received_total{to_agent="alice",kind="reminder"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="mesh",kind="reminder"}')).toBe(1);
   });
 
   it('T28 drainQueue on reconnect', async () => {
@@ -355,10 +355,10 @@ describe('metrics E2E routing', () => {
     expect(n).toBe(1);
     const out = renderMetrics(db);
     expect(lineValue(out, 'mesh_messages_total{kind="direct",status="delivered"}')).toBe(1);
-    expect(lineValue(out, 'mesh_messages_received_total{to_agent="b"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_received_total{to_agent="b",kind="direct"}')).toBe(1);
     expect(lineValue(out, 'mesh_bytes_total{direction="out"}')).toBeGreaterThan(0);
     // no double incSent — still 1 from enqueue
-    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="a"}')).toBe(1);
+    expect(lineValue(out, 'mesh_messages_sent_total{from_agent="a",kind="direct"}')).toBe(1);
   });
 });
 
@@ -548,7 +548,7 @@ describe('#200 __resetMetricsForTest clears everything a render can see', () => 
     incAdminAuth('success');
     incReminderFired();
     incMsgStatus('direct', 'queued');
-    incSent('a'); incReceived('b'); incAclDenied('c');
+    incSent('a', 'direct'); incReceived('b', 'direct'); incAclDenied('c');
     incError('ACL_DENIED');
     incBytes('out', 512);
     incFile();

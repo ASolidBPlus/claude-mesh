@@ -39,7 +39,7 @@ function sentCountFor(db: Database, agentId: string): number {
   delete process.env.MESH_METRICS_IDENTITY_LABELS;
   const line = rendered
     .split('\n')
-    .find(l => l.startsWith(`mesh_messages_sent_total{from_agent="${agentId}"}`));
+    .find(l => l.startsWith(`mesh_messages_sent_total{from_agent="${agentId}",kind="direct"}`));
   return line === undefined ? 0 : Number(line.split(' ').pop());
 }
 
