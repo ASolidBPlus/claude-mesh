@@ -8,12 +8,14 @@ import { WebSocket } from 'ws';
 import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { openDb, registerAgent, aclGrant, subscribe, getOrCreateTopic } from '../db.ts';
-import { renderMetrics, applyTrafficClasses, __resetMetricsForTest } from '../metrics.ts';
+import { renderMetrics, applyTrafficClasses, incSent, __resetMetricsForTest } from '../metrics.ts';
 import {
   parseTrafficClasses, compileTrafficClasses, classifyTraffic, classNames,
   MAX_CLASS_RULES, MAX_GLOB_LENGTH, type ClassRule, type Traffic,
 } from '../traffic-classes.ts';
-import { routeDirect, routePublish } from '../router.ts';
+import { routeDirect, routePublish, routeFile, drainQueue, drainFileQueue } from '../router.ts';
+import { startHttpAdmin } from '../http-admin.ts';
+import * as net from 'net';
 import { tempDirs } from './helpers/temp-dirs.ts';
 
 const { tmp, cleanup: cleanupTempDirs } = tempDirs();
@@ -106,6 +108,15 @@ describe('parsing MESH_METRICS_CLASSES', () => {
       expect(err).toStartWith('rule 2 ');
       expect(err).toContain(reason);
     }
+  });
+
+  it('a catch-all rule (no kind, topic, from or to) is refused anywhere but last, naming it', () => {
+    const err = refusal('[{"class":"a","topic":"x"},{"class":"everything"},{"class":"b","topic":"y"}]');
+    expect(err).toStartWith('rule 2 ');
+    expect(err).toContain('make it the last rule');
+    expect(refusal('[{"class":"everything"},{"class":"b","topic":"y"}]')).toStartWith('rule 1 ');
+    expect(rulesOf('[{"class":"a","topic":"x"},{"class":"everything"}]')).toHaveLength(2);
+    expect(rulesOf('[{"class":"everything"}]')).toHaveLength(1);
   });
 
   it('boundary values are accepted', () => {
@@ -278,5 +289,80 @@ describe('the class label on the counters', () => {
     expect(withRules.classes).toEqual(['system', 'other']);
     expect(withRules.rules).toEqual([{ class: 'system', topic: 'sys.*' }]);
     expect(without.classes).toEqual([]);
+  });
+});
+
+describe('review round', () => {
+  let db: Database;
+  beforeEach(() => {
+    __resetMetricsForTest();
+    db = openDb(':memory:');
+    process.env.MESH_METRICS_IDENTITY_LABELS = '1';
+  });
+  afterEach(() => {
+    __resetMetricsForTest();
+    applyTrafficClasses([]);
+    delete process.env.MESH_METRICS_IDENTITY_LABELS;
+  });
+
+  it('a `to` rule classifies a topic post the same on the send and the receive side, live and drained', () => {
+    applyTrafficClasses(rulesOf('[{"class":"mon","to":"monitor*"}]'));
+    for (const id of ['pub', 'monitor-1', 'monitor-2']) registerAgent(db, { id, token_hash: id.padEnd(64, '0').slice(0, 64), hostname: 'h' });
+    aclGrant(db, 'pub', 'monitor-1', 'system');
+    aclGrant(db, 'pub', 'monitor-2', 'system');
+    getOrCreateTopic(db, 'news', 'pub');
+    subscribe(db, 'monitor-1', 'news');
+    subscribe(db, 'monitor-2', 'news');
+    // monitor-1 online (live fan-out), monitor-2 offline (queued, then drained).
+    expect(routePublish(db, new Map([['monitor-1', mockWsOpen()]]), 'pub', { type: 'publish', msg_id: crypto.randomUUID(), topic: 'news', payload: 't' }).ok).toBe(true);
+    expect(drainQueue(db, 'monitor-2', mockWsOpen())).toBe(1);
+    // Positive control: a direct send to the same recipient does match.
+    expect(routeDirect(db, new Map([['monitor-1', mockWsOpen()]]), 'pub', { type: 'send', msg_id: crypto.randomUUID(), to: 'monitor-1', payload: 'd' }).ok).toBe(true);
+
+    expect(seriesLines(renderMetrics(db)).sort()).toEqual([
+      'mesh_messages_received_total{to_agent="monitor-1",kind="direct",class="mon"} 1',
+      'mesh_messages_received_total{to_agent="monitor-1",kind="topic",class="other"} 1',
+      'mesh_messages_received_total{to_agent="monitor-2",kind="topic",class="other"} 1',
+      'mesh_messages_sent_total{from_agent="pub",kind="direct",class="mon"} 1',
+      'mesh_messages_sent_total{from_agent="pub",kind="topic",class="other"} 1',
+    ]);
+  });
+
+  it('an agent id containing NUL can\'t shift the kind or class it is counted under', () => {
+    applyTrafficClasses(rulesOf('[{"class":"system","topic":"sys.*"}]'));
+    incSent({ kind: 'topic', from: 'x\0direct\0system', to: null, topic: 'news' });
+    delete process.env.MESH_METRICS_IDENTITY_LABELS;
+    const lines = seriesLines(renderMetrics(db));
+    expect(lines).toContain('mesh_messages_sent_total{kind="topic",class="other"} 1');
+    expect(lines.filter(l => l.endsWith(' 1'))).toHaveLength(1);
+    process.env.MESH_METRICS_IDENTITY_LABELS = '1';
+    expect(seriesLines(renderMetrics(db))).toContain('mesh_messages_sent_total{from_agent="x\0direct\0system",kind="topic",class="other"} 1');
+  });
+
+  it('a queued file is counted as received when it is drained', () => {
+    for (const id of ['a', 'b']) registerAgent(db, { id, token_hash: id.padEnd(64, '0'), hostname: 'h' });
+    aclGrant(db, 'a', 'b', 'system');
+    const data = Buffer.from('queued-file').toString('base64');
+    expect(routeFile(db, new Map(), 'a', { type: 'file_send', msg_id: crypto.randomUUID(), to: 'b', filename: 'f.txt', data }, 10_485_760, tmp('r311-files-')).ok).toBe(true);
+    expect(seriesLines(renderMetrics(db)).filter(l => l.startsWith('mesh_messages_received_total'))).toEqual([]);
+    expect(drainFileQueue(db, 'b', mockWsOpen())).toBe(1);
+    expect(seriesLines(renderMetrics(db))).toContain('mesh_messages_received_total{to_agent="b",kind="file"} 1');
+  });
+
+  it('a file uploaded on the admin API to an online agent is counted as received', async () => {
+    for (const id of ['alice', 'bob']) registerAgent(db, { id, token_hash: id.padEnd(64, '0'), hostname: 'h' });
+    aclGrant(db, 'alice', 'bob', 'system');
+    const handle = await startHttpAdmin(0, db, 'tok', 10_485_760, tmp('r311-admin-files-'), new Map([['bob', mockWsOpen()]]));
+    try {
+      const form = new FormData();
+      form.append('file', new File(['hello'], 'h.txt', { type: 'text/plain' }));
+      form.append('from_agent', 'alice');
+      form.append('to_agent', 'bob');
+      const res = await fetch(`http://127.0.0.1:${(handle.server.address() as net.AddressInfo).port}/files`, {
+        method: 'POST', headers: { Authorization: 'Bearer tok' }, body: form,
+      });
+      expect(res.status).toBe(201);
+    } finally { await handle.shutdown().catch(() => {}); }
+    expect(seriesLines(renderMetrics(db))).toContain('mesh_messages_received_total{to_agent="bob",kind="file"} 1');
   });
 });

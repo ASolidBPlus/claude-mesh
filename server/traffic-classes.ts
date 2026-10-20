@@ -98,6 +98,11 @@ export function parseTrafficClasses(
       if (/[\x00-\x1f\x7f]/.test(g)) return refuse(`"${field}" contains a control character`);
       rule[field] = g;
     }
+    // A rule with no match fields matches everything, so anywhere but last it
+    // would silently shadow every rule after it.
+    if (i < doc.length - 1 && rule.kind === undefined && rule.topic === undefined && rule.from === undefined && rule.to === undefined) {
+      return refuse('has no kind, topic, from or to, so it matches everything and every later rule would never apply; make it the last rule');
+    }
     rules.push(rule);
   }
   return { ok: true, rules };

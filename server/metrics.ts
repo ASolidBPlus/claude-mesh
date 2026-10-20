@@ -192,8 +192,20 @@ function trafficKey(agent: string, t: Traffic): string {
 export function incSent(t: Traffic): void {
   try { bump(sent, trafficKey(t.from, t)); } catch (_) { /* metrics must never affect delivery */ }
 }
-export function incReceived(t: Traffic & { to: string }): void {
-  try { bump(received, trafficKey(t.to, t)); } catch (_) { /* metrics must never affect delivery */ }
+/** `recipient` is the to_agent label. It is separate from `t.to`, the
+ *  message's own recipient that rules match on, because a topic receipt has a
+ *  recipient but its message has none: `to` is null for a topic on both the
+ *  send and the receive side, so a `to` rule classifies both the same. */
+export function incReceived(recipient: string, t: Traffic): void {
+  try { bump(received, trafficKey(recipient, t)); } catch (_) { /* metrics must never affect delivery */ }
+}
+
+/** Split a sent/received key at its LAST two NULs, so an agent id is never
+ *  assumed free of them. */
+function splitTrafficKey(key: string): { agent: string; kind: string; cls: string } {
+  const c = key.lastIndexOf('\0');
+  const k = key.lastIndexOf('\0', c - 1);
+  return { agent: key.slice(0, k), kind: key.slice(k + 1, c), cls: key.slice(c + 1) };
 }
 
 function trafficLabels(kind: string, cls: string): string {
@@ -214,7 +226,8 @@ function renderByKindAndClass(name: string, counter: LabeledCounter, lines: stri
   const totals = new Map<string, number>();
   for (const k of TRAFFIC_KINDS) for (const c of classes) totals.set(`${k}\0${c}`, 0);
   for (const [key, v] of counter) {
-    const k = key.slice(key.indexOf('\0') + 1);
+    const { kind, cls } = splitTrafficKey(key);
+    const k = `${kind}\0${cls}`;
     totals.set(k, (totals.get(k) ?? 0) + v);
   }
   for (const [k, v] of totals) {
@@ -370,8 +383,8 @@ export function renderMetrics(db: Database): string {
     lines.push(`# HELP mesh_messages_sent_total Messages accepted and routed, by sender, kind and class (${trafficHelp()}).`);
     lines.push('# TYPE mesh_messages_sent_total counter');
     for (const [key, v] of sent) {
-      const [agent, kind, cls] = key.split('\0');
-      lines.push(`mesh_messages_sent_total{from_agent="${escapeLabelValue(agent ?? '')}",${trafficLabels(kind ?? '', cls ?? '')}} ${v}`);
+      const { agent, kind, cls } = splitTrafficKey(key);
+      lines.push(`mesh_messages_sent_total{from_agent="${escapeLabelValue(agent)}",${trafficLabels(kind, cls)}} ${v}`);
     }
   } else {
     lines.push(`# HELP mesh_messages_sent_total Messages accepted and routed, by kind and class (${trafficHelp()}). (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)`);
@@ -384,8 +397,8 @@ export function renderMetrics(db: Database): string {
     lines.push(`# HELP mesh_messages_received_total Messages delivered, by recipient, kind and class (${trafficHelp()}).`);
     lines.push('# TYPE mesh_messages_received_total counter');
     for (const [key, v] of received) {
-      const [agent, kind, cls] = key.split('\0');
-      lines.push(`mesh_messages_received_total{to_agent="${escapeLabelValue(agent ?? '')}",${trafficLabels(kind ?? '', cls ?? '')}} ${v}`);
+      const { agent, kind, cls } = splitTrafficKey(key);
+      lines.push(`mesh_messages_received_total{to_agent="${escapeLabelValue(agent)}",${trafficLabels(kind, cls)}} ${v}`);
     }
   } else {
     lines.push(`# HELP mesh_messages_received_total Messages delivered, by kind and class (${trafficHelp()}). (identities hidden; set MESH_METRICS_IDENTITY_LABELS=1)`);

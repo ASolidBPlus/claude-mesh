@@ -59,7 +59,7 @@ export function startReminderScheduler(
         } catch (_) { /* ignore */ }
         markDelivered(db, m.id);
         incMsgStatus('reminder', 'delivered');
-        incReceived({ kind: 'reminder', from: 'mesh', to: reminder.agent_id, topic: null });
+        incReceived(reminder.agent_id, { kind: 'reminder', from: 'mesh', to: reminder.agent_id, topic: null });
         incBytes('out', rbytes);
       } else {
         incMsgStatus('reminder', 'queued');

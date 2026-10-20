@@ -95,7 +95,7 @@ describe('metrics counters', () => {
 
   it('T3 incSent / incReceived', () => {
     incSent({ kind: 'direct', from: 'a', to: 'x', topic: null });
-    incReceived({ kind: 'direct', from: 'x', to: 'b', topic: null });
+    incReceived('b', { kind: 'direct', from: 'x', to: 'b', topic: null });
     const out = renderMetrics(db);
     expect(lineValue(out, 'mesh_messages_sent_total{from_agent="a",kind="direct"}')).toBe(1);
     expect(lineValue(out, 'mesh_messages_received_total{to_agent="b",kind="direct"}')).toBe(1);
@@ -548,7 +548,7 @@ describe('#200 __resetMetricsForTest clears everything a render can see', () => 
     incAdminAuth('success');
     incReminderFired();
     incMsgStatus('direct', 'queued');
-    incSent({ kind: 'direct', from: 'a', to: 'x', topic: null }); incReceived({ kind: 'direct', from: 'x', to: 'b', topic: null }); incAclDenied('c');
+    incSent({ kind: 'direct', from: 'a', to: 'x', topic: null }); incReceived('b', { kind: 'direct', from: 'x', to: 'b', topic: null }); incAclDenied('c');
     incError('ACL_DENIED');
     incBytes('out', 512);
     incFile();

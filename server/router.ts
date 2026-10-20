@@ -133,7 +133,7 @@ export function deliverOrQueue(
     }));
     if (!msg.ephemeral) markDelivered(db, msg.id);
     incMsgStatus('direct', 'delivered');
-    incReceived({ kind: 'direct', from: msg.from_agent, to: msg.to_agent, topic: null });
+    incReceived(msg.to_agent, { kind: 'direct', from: msg.from_agent, to: msg.to_agent, topic: null });
     incBytes('out', msg.payloadBytes);
     return;
   }
@@ -389,7 +389,7 @@ export function fanOutTopicLocal(
       }));
       if (!m.ephemeral) markDelivered(db, msgId);
       incMsgStatus('topic', 'delivered');
-      incReceived({ kind: 'topic', from: m.from_agent, to: subscriber_id, topic: m.topic });
+      incReceived(subscriber_id, { kind: 'topic', from: m.from_agent, to: null, topic: m.topic });
       incBytes('out', m.payloadBytes);
     } else {
       // 5d. Offline
@@ -1144,7 +1144,8 @@ export function drainQueue(
     ws.send(buildDeliverFrame(msg));
     markDelivered(db, msg.id);
     incMsgStatus(msg.kind, 'delivered');
-    incReceived({ kind: trafficKind(msg.kind), from: msg.from_agent, to: agentId, topic: msg.topic });
+    const kind = trafficKind(msg.kind);
+    incReceived(agentId, { kind, from: msg.from_agent, to: kind === 'topic' ? null : agentId, topic: msg.topic });
     incBytes('out', Buffer.byteLength(msg.payload, 'utf8'));
   }
   return pending.length;
@@ -1542,7 +1543,7 @@ export function routeFile(
     recipientWs.send(deliverFrame);
     markFileDelivered(db, file_id);
     incMsgStatus('file', 'delivered');
-    incReceived({ kind: 'file', from: from_agent, to: frame.to, topic: null });
+    incReceived(frame.to, { kind: 'file', from: from_agent, to: frame.to, topic: null });
   }
   if (recipientWs === undefined) {
     incMsgStatus('file', 'queued');
@@ -1589,6 +1590,7 @@ export function drainFileQueue(
     });
     ws.send(deliverFrame);
     markFileDelivered(db, file.id);
+    incReceived(file.to_agent, { kind: 'file', from: file.from_agent, to: file.to_agent, topic: null });
   }
 
   return pendingFiles.length;
