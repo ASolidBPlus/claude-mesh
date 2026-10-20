@@ -1,4 +1,4 @@
-import { Database } from 'bun:sqlite';
+import { Database, type SQLQueryBindings } from 'bun:sqlite';
 import { safeFilename, safeContentType } from './file-hygiene.ts';
 import { hashToken, timingSafeEqual } from './auth.ts';
 
@@ -604,6 +604,20 @@ export function openDb(path: string): Database {
   // an assumed-unindexed query is an index whose benefit nobody can show.
   // ADDITIVE and idempotent: pure acceleration, no behaviour depends on it.
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_acl_reverse ON acl(to_agent, from_agent)'); } catch {}
+
+  // R-313 migration: the pair index behind queryPairMessages (GET /messages
+  // ?with=). Partial on `topic IS NULL` because only non-topic rows are ever
+  // read through it, which also keeps it, and its build, smaller. ADDITIVE and
+  // idempotent. Built once, at the first boot after the upgrade, and that
+  // build blocks boot for as long as it takes on a large table, so the boot
+  // line reports the time.
+  const hasPairIndex = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_pair'").get() !== null;
+  if (!hasPairIndex) {
+    const hadRows = db.prepare('SELECT 1 FROM messages LIMIT 1').get() !== null;
+    const t0 = performance.now();
+    db.exec('CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages(from_agent, to_agent, sent_at) WHERE topic IS NULL');
+    if (hadRows) console.log(JSON.stringify({ evt: 'db.index_built', index: 'idx_messages_pair', ms: Math.round(performance.now() - t0), at: Date.now() }));
+  }
 
   // Sprint 12 migration: drop the deprecated `data` column (base64 blob in
   // SQLite) if it still exists from pre-Sprint-12 databases. It was declared
@@ -2062,6 +2076,70 @@ export function queryMessages(
   params.push(limit);
 
   return db.prepare(sql).all(...params) as Message[];
+}
+
+/**
+ * R-313 — the non-topic rows between two parties, both directions, newest
+ * first: `(from=a AND to=b) OR (from=b AND to=a)` with `topic IS NULL`.
+ * Same filters, order and paging as queryMessages.
+ *
+ * Written as two arms, one per direction, each an index range on
+ * idx_messages_pair (from_agent, to_agent, sent_at) cut off at `limit`, then
+ * merged by sent_at. The OR form would be planned as a scan of either party's
+ * whole history; two equality-prefixed ranges read at most `limit` rows each.
+ * The index is partial (`WHERE topic IS NULL`), so a pair whose traffic is
+ * mostly topic copies doesn't make the range walk past them.
+ */
+export function queryPairMessages(
+  db: Database,
+  a: string,
+  b: string,
+  opts: PairQueryOpts
+): Message[] {
+  const { sql, params } = pairMessagesQuery(a, b, opts);
+  return db.prepare(sql).all(...params) as Message[];
+}
+
+type PairQueryOpts = {
+  since?: number | undefined;
+  limit?: number | undefined;
+  before?: { sentAt: number; id: string } | undefined;
+  kinds?: string[] | undefined;
+};
+
+/** The SQL and bindings behind queryPairMessages, separate so a test can
+ *  EXPLAIN the exact statement that runs. */
+export function pairMessagesQuery(a: string, b: string, opts: PairQueryOpts): { sql: string; params: SQLQueryBindings[] } {
+  const clauses: string[] = ['topic IS NULL'];
+  const params: SQLQueryBindings[] = [];
+  if (opts.kinds && opts.kinds.length > 0) {
+    clauses.push(`kind IN (${opts.kinds.map(() => '?').join(',')})`);
+    params.push(...opts.kinds);
+  }
+  if (opts.since !== undefined) {
+    clauses.push('sent_at >= ?');
+    params.push(opts.since);
+  }
+  if (opts.before !== undefined) {
+    // The plain `sent_at <= ?` is redundant with the tie-break beside it; it
+    // is there so the planner can bound the index range from above.
+    clauses.push('sent_at <= ?', '(sent_at < ? OR (sent_at = ? AND id < ?))');
+    params.push(opts.before.sentAt, opts.before.sentAt, opts.before.sentAt, opts.before.id);
+  }
+
+  let limit = opts.limit ?? 100;
+  if (limit > 1000) limit = 1000;
+
+  const arm = `SELECT * FROM (SELECT * FROM messages WHERE from_agent = ? AND to_agent = ? AND ${clauses.join(' AND ')} ORDER BY sent_at DESC, id DESC LIMIT ?)`;
+  // A party paired with itself has one direction, and two arms would return
+  // every row twice.
+  if (a === b) {
+    return { sql: `${arm} ORDER BY sent_at DESC, id DESC LIMIT ?`, params: [a, a, ...params, limit, limit] };
+  }
+  return {
+    sql: `${arm} UNION ALL ${arm} ORDER BY sent_at DESC, id DESC LIMIT ?`,
+    params: [a, b, ...params, limit, b, a, ...params, limit, limit],
+  };
 }
 
 // Delivery TTL and retention are DIFFERENT lifecycles (#34):

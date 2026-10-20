@@ -7,14 +7,25 @@
  * site moved with it.
  */
 import {
-  queryMessages,
+  queryMessages, queryPairMessages, LOCAL_ID_RE, PEER_ALIAS_RE,
 } from './db.ts';
 import type { AdminCtx } from './admin-ctx.ts';
+
+/** R-313: a `with` value is a local agent id or a remote `alias:agent`.
+ *  Grammar only: an id nobody has used is well-formed and simply has no rows,
+ *  so the answer never says whether an agent exists. */
+function counterpartRefusal(id: string): string | null {
+  if (LOCAL_ID_RE.test(id)) return null;
+  const colon = id.indexOf(':');
+  if (colon > 0 && PEER_ALIAS_RE.test(id.slice(0, colon)) && LOCAL_ID_RE.test(id.slice(colon + 1))) return null;
+  return 'invalid with (expected an agent id, or alias:agent for a remote one)';
+}
 
 export function handleMessagesGet(ctx: AdminCtx): void {
   const { res, db, url, auth } = ctx;
   const agentParam = url.searchParams.get('agent') || undefined;
   const topicParam = url.searchParams.get('topic') || undefined;
+  const withParam = url.searchParams.get('with');
   const sinceRaw = url.searchParams.get('since');
   const limitRaw = url.searchParams.get('limit');
   // Optional kind filter (#38-family): `kinds=direct,request,response,file` lets
@@ -70,6 +81,31 @@ export function handleMessagesGet(ctx: AdminCtx): void {
       return;
     }
     effectiveAgent = auth.agentId;
+  }
+
+  // R-313: the rows between the caller and one counterpart. The caller is the
+  // authenticated agent (already pinned above), or, for the admin token, the
+  // `agent=` it names: an admin has no side of its own to be the caller.
+  if (withParam !== null) {
+    const fail = (error: string) => {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error }));
+    };
+    const refusal = counterpartRefusal(withParam);
+    if (refusal !== null) return fail(refusal);
+    if (effectiveAgent === undefined) return fail('with needs agent=<id> when called with the admin token');
+    // `with` reads only non-topic rows, so a topic filter beside it could
+    // only ever return nothing; refused rather than silently empty.
+    if (topicParam !== undefined) return fail('with and topic cannot be combined');
+    const pair = queryPairMessages(db, effectiveAgent, withParam, {
+      since: Number.isNaN(since) ? undefined : since,
+      limit: Number.isNaN(limit) ? undefined : limit,
+      before,
+      kinds,
+    });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(pair));
+    return;
   }
 
   const messages = queryMessages(db, {
