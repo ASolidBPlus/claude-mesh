@@ -7,7 +7,7 @@
  * site moved with it.
  */
 import {
-  identityOf, queryMessages, queryPairMessages, pairCounterparts, ownsAddress, LOCAL_ID_RE, PEER_ALIAS_RE, ALIAS_SUFFIX_RE,
+  addressSet, identityOf, queryMessages, queryPairMessages, ownsAddress, LOCAL_ID_RE, PEER_ALIAS_RE, ALIAS_SUFFIX_RE,
 } from './db.ts';
 import type { AdminCtx } from './admin-ctx.ts';
 
@@ -108,9 +108,10 @@ export function handleMessagesGet(ctx: AdminCtx): void {
     // `with` reads only non-topic rows, so a topic filter beside it could
     // only ever return nothing; refused rather than silently empty.
     if (topicParam !== undefined) return fail('with and topic cannot be combined');
-    const counterparts = pairCounterparts(effectiveAgent, withParam);
-    const pair = queryPairMessages(db, effectiveAgent, counterparts.exact, {
-      aliasesOf: counterparts.aliasesOf,
+    // R-382: both sides are identities with all their aliases. The caller's
+    // side is the identity it authenticated as, unless it asked for one alias
+    // exactly (`agent=fred+x`); the counterpart's is always the whole set.
+    const pair = queryPairMessages(db, addressSet(effectiveAgent, false), addressSet(withParam, true), {
       since: Number.isNaN(since) ? undefined : since,
       limit: Number.isNaN(limit) ? undefined : limit,
       before,
@@ -121,8 +122,12 @@ export function handleMessagesGet(ctx: AdminCtx): void {
     return;
   }
 
+  // R-382: the scan widens the same way: `fred` (or no agent=, with fred's
+  // token) is fred and every fred+*; `agent=fred+x` is that alias alone.
+  const scope = effectiveAgent === undefined ? undefined : addressSet(effectiveAgent, false);
   const messages = queryMessages(db, {
-    agent: effectiveAgent,
+    agent: scope?.exact[0],
+    agentAliasesOf: scope?.aliasesOf ?? null,
     topic: topicParam,
     since: Number.isNaN(since) ? undefined : since,
     limit: Number.isNaN(limit) ? undefined : limit,
