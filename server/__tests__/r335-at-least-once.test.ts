@@ -9,7 +9,7 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
-import { openDb, registerAgent, aclGrant, insertMessage } from '../db.ts';
+import { openDb, registerAgent, aclGrant, insertMessage, deleteAgent } from '../db.ts';
 import { generateToken, hashToken } from '../auth.ts';
 import { startWsServer, WsServerHandle } from '../ws-server.ts';
 import { routeDirect } from '../router.ts';
@@ -200,6 +200,24 @@ describe('R-335 at-least-once delivery', () => {
     const a = await login(port, 'A', tokA, ['ack']);
     expect(delivers(a.frames).map(f => f.msg_id)).toEqual(['in-window', 'in-window-ttl']);
     await logout(a.ws);
+  });
+
+  it('a deleted agent\'s unacked rows are not redelivered to a new agent recreated under the same id', async () => {
+    // A name reused for a short-lived identity (PowerOUT does this) must not
+    // inherit the old identity's redeliveries.
+    await start();
+    queueForA(2);
+    const old = await login(port, 'A', tokA, ['ack']);
+    expect(delivers(old.frames)).toHaveLength(2);
+    await logout(old.ws);
+    deleteAgent(db, 'A');
+    expect((db.prepare("SELECT COUNT(*) AS n FROM messages WHERE to_agent = 'A' AND acked_at IS NULL").get() as { n: number }).n).toBe(0);
+    const tokNew = generateToken();
+    registerAgent(db, { id: 'A', token_hash: hashToken(tokNew), hostname: 'hA2' });
+    const fresh = await login(port, 'A', tokNew, ['ack']);
+    expect(fresh.authReply.type).toBe('auth_ok');
+    expect(delivers(fresh.frames)).toEqual([]);
+    await logout(fresh.ws);
   });
 
   it('a malformed capabilities field is refused at auth; the shape is checked, not the names', async () => {

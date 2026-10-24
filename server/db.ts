@@ -1127,6 +1127,10 @@ export function deleteAgent(db: Database, id: string): string[] {
     ).all(id) as { file_path: string }[];
 
     db.prepare('DELETE FROM messages WHERE to_agent = ? AND delivered_at IS NULL').run(id);
+    // R-335: close out what was delivered but never acked, so a new agent
+    // registered under the same id (short-lived identities reuse names) isn't
+    // sent the old identity's messages as redeliveries on its first login.
+    db.prepare('UPDATE messages SET acked_at = ? WHERE to_agent = ? AND acked_at IS NULL').run(Date.now(), id);
 
     // F4: the subscriptions cascade on agent_id is GONE (the column is FK-less
     // so a remote id can be stored), so the deletion is explicit here — the
