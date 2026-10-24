@@ -12,6 +12,11 @@ export interface TapFrame {
   msg_id: string;
   kind: string;                       // direct | topic | file
   from: string;
+  /** R-377: the identity behind `from` (identityOf), stamped by the mesh. */
+  identity: string;
+  /** R-377: the alias session a default send came from (`from` is then the
+   *  identity). Absent otherwise. */
+  alias?: string;
   to: string | null;
   topic: string | null;
   correlation_id: string | null;

@@ -7,7 +7,7 @@
  * site moved with it.
  */
 import {
-  queryMessages, queryPairMessages, LOCAL_ID_RE, PEER_ALIAS_RE,
+  queryMessages, queryPairMessages, pairCounterparts, ownsAddress, LOCAL_ID_RE, PEER_ALIAS_RE, ALIAS_SUFFIX_RE,
 } from './db.ts';
 import type { AdminCtx } from './admin-ctx.ts';
 
@@ -16,9 +16,12 @@ import type { AdminCtx } from './admin-ctx.ts';
  *  so the answer never says whether an agent exists. */
 function counterpartRefusal(id: string): string | null {
   if (LOCAL_ID_RE.test(id)) return null;
+  // R-377: an alias, fred+<suffix>.
+  const plus = id.indexOf('+');
+  if (plus > 0 && LOCAL_ID_RE.test(id.slice(0, plus)) && ALIAS_SUFFIX_RE.test(id.slice(plus + 1))) return null;
   const colon = id.indexOf(':');
   if (colon > 0 && PEER_ALIAS_RE.test(id.slice(0, colon)) && LOCAL_ID_RE.test(id.slice(colon + 1))) return null;
-  return 'invalid with (expected an agent id, or alias:agent for a remote one)';
+  return 'invalid with (expected an agent id, agent+alias, or alias:agent for a remote one)';
 }
 
 export function handleMessagesGet(ctx: AdminCtx): void {
@@ -75,12 +78,13 @@ export function handleMessagesGet(ctx: AdminCtx): void {
 
   let effectiveAgent = agentParam;
   if (auth.mode === 'agent') {
-    if (agentParam !== undefined && agentParam !== auth.agentId) {
+    // R-377: `agent=fred+x` is fred's own alias, read with fred's token.
+    if (agentParam !== undefined && !ownsAddress(auth.agentId, agentParam)) {
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'forbidden: cannot query another agent' }));
       return;
     }
-    effectiveAgent = auth.agentId;
+    effectiveAgent = agentParam ?? auth.agentId;
   }
 
   // R-313: the rows between the caller and one counterpart. The caller is the
@@ -97,7 +101,7 @@ export function handleMessagesGet(ctx: AdminCtx): void {
     // `with` reads only non-topic rows, so a topic filter beside it could
     // only ever return nothing; refused rather than silently empty.
     if (topicParam !== undefined) return fail('with and topic cannot be combined');
-    const pair = queryPairMessages(db, effectiveAgent, withParam, {
+    const pair = queryPairMessages(db, effectiveAgent, pairCounterparts(effectiveAgent, withParam), {
       since: Number.isNaN(since) ? undefined : since,
       limit: Number.isNaN(limit) ? undefined : limit,
       before,

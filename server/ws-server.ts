@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
-import { getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, markTlsSeen, getAgentByToken, isTlsLatched, recordAgentConnection, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
+import { ALIAS_SUFFIX_RE, getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, markTlsSeen, getAgentByToken, isTlsLatched, recordAgentConnection, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
 import { validateToken } from './auth.ts';
 import { PEER_PROTOCOL_VERSION } from './wire-version.ts';  // #131: via the tiny module, never cross-package from here
 import { parseDuration } from './duration.ts';
@@ -65,6 +65,12 @@ interface ConnState {
    *  each deliver frame after handling it and gets unacked rows again on its
    *  next login. Set at auth, never changed. */
   ackCapable: boolean;
+  /** R-377: the agent row this session authenticated as (its token's owner).
+   *  For a plain session it equals agentId; for an alias session agentId is
+   *  the alias address `identity+suffix`. */
+  identity: string | null;
+  /** R-377: the alias address, or null for a plain session. */
+  alias: string | null;
 }
 
 /** R-335: how long after its first delivery an unacked row may be sent again
@@ -223,6 +229,19 @@ function handleAuthFrame(ctx: AuthCtx): void {
     ws.close(1008, 'auth failed');
     return;
   }
+
+  // R-377: an alias session, `<agent_id>+<alias>`, logged in with agent_id's
+  // own token. Checked here as an own-input refusal, like the two above.
+  const aliasRaw = frame.alias;
+  if (aliasRaw !== undefined && (typeof aliasRaw !== 'string' || !ALIAS_SUFFIX_RE.test(aliasRaw))) {
+    logAuth(db, state, agentId, { refused: 'malformed_alias' });
+    try {
+      ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'malformed alias (expected 1-64 characters of A-Z a-z 0-9 _ . -)' }));
+    } catch (_) { /* ignore */ }
+    ws.close(1008, 'auth failed');
+    return;
+  }
+  const aliasSuffix: string | null = aliasRaw === undefined ? null : aliasRaw;
 
   // ── F1a (§5.1): PEER AUTH ──────────────────────────────────
   //
@@ -413,11 +432,19 @@ function handleAuthFrame(ctx: AuthCtx): void {
   // TLS path and must use it", which a compat bus cannot offer for HTTP.
   if (state.tls && latchOnTls) markTlsSeen(db, agentId);
 
+  // R-377: the session's ADDRESS. Everything per-session below keys on it —
+  // newer-wins, the queue, acks, the drain — so fred and fred+x hold separate
+  // sessions and mailboxes, and a second login on the same alias displaces the
+  // first. The credential, latch and connection report stay the row's
+  // (`agentId`). Presence is the plain session's alone.
+  const address = aliasSuffix === null ? agentId : `${agentId}+${aliasSuffix}`;
   const connectTime = Date.now();
-  setOnline(db, agentId, true);
+  if (aliasSuffix === null) setOnline(db, agentId, true);
 
   state.authed = true;
-  state.agentId = agentId;
+  state.agentId = address;
+  state.identity = agentId;
+  state.alias = aliasSuffix === null ? null : address;
   state.ackCapable = capabilities.includes('ack');
 
   // #92 — NEWER WINS. A second successful auth for the same agent id
@@ -442,8 +469,8 @@ function handleAuthFrame(ctx: AuthCtx): void {
   // agentIndex only if the entry is still ITS socket — so setting the
   // new entry first is what stops the displaced socket's teardown
   // evicting the live one. Same shape as the peer path's D11.
-  const displaced = agentIndex.get(agentId);
-  agentIndex.set(agentId, ws);
+  const displaced = agentIndex.get(address);
+  agentIndex.set(address, ws);
   if (displaced !== undefined && displaced !== ws) {
     try {
       displaced.send(JSON.stringify({
@@ -455,7 +482,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
     // than dropped, and does not reconnect into a fight with itself.
     try { displaced.close(1008, 'displaced by a newer connection'); } catch (_) { /* ignore */ }
   }
-  logAuth(db, state, agentId, { displaced: displaced !== undefined && displaced !== ws });
+  logAuth(db, state, agentId, { displaced: displaced !== undefined && displaced !== ws, ...(state.alias !== null ? { alias: state.alias } : {}) });
   // R-65 M6: the persisted per-agent report, and — for an observer — the
   // in-memory caller list too, which is where the operator looks for
   // non-agent callers.
@@ -465,7 +492,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
     if (isObserver(db, agentId)) recordCaller(state.srcIp, 'observer', scheme);
   } catch (_) { /* the report never breaks auth */ }
 
-  const pending = getPendingMessages(db, agentId);
+  const pending = getPendingMessages(db, address);
   const queued = pending.length;
 
   // Count pending files without delivering yet (for auth_ok payload)
@@ -475,14 +502,18 @@ function handleAuthFrame(ctx: AuthCtx): void {
     WHERE to_agent = ?
       AND delivered_at IS NULL
       AND (expires_at IS NULL OR expires_at >= ?)
-  `).get(agentId, now) as { cnt: number };
+  `).get(address, now) as { cnt: number };
   const queued_files = pendingFileRows.cnt;
 
   try {
-    ws.send(JSON.stringify({ type: 'auth_ok', agent_id: agentId, queued, queued_files }));
+    ws.send(JSON.stringify({ type: 'auth_ok', agent_id: address, queued, queued_files }));
   } catch (_) { /* ignore */ }
-  drainQueue(db, agentId, ws, state.ackCapable ? Date.now() - redeliveryWindowMs : null);
-  drainFileQueue(db, agentId, ws);
+  drainQueue(db, address, ws, state.ackCapable ? Date.now() - redeliveryWindowMs : null);
+  drainFileQueue(db, address, ws);
+
+  // R-377: an alias session stops here. It neither announces nor changes
+  // presence (fred online = the plain session), and it is never an observer.
+  if (state.alias !== null) return;
 
   // Presence-debounce-aware online broadcast. Keys purely off
   // presenceState (NOT the ws object): `close` removes the old ws from
@@ -767,10 +798,25 @@ function handleStatus(ctx: FrameCtx): void {
   reply({ type: 'ack', ok: true });
 }
 
+/**
+ * R-377 — who a send from this session is from. A plain session sends as
+ * itself. An alias session sends as its IDENTITY by default (`from: fred`,
+ * with the alias shown beside it on live delivery, so replies reach the plain
+ * session), or as the alias with `as: 'alias'` (`from: fred+x`, so replies come
+ * back to it). Only for a local target: aliases don't cross a border. Nothing
+ * the client puts in `from`, `identity` or `alias` is read.
+ */
+function sendOrigin(state: ConnState, f: { as?: unknown }, target: unknown): { from: string; viaAlias: string | null } {
+  if (state.alias === null) return { from: state.agentId!, viaAlias: null };
+  if (f.as === 'alias' && typeof target === 'string' && !target.includes(':')) return { from: state.alias, viaAlias: null };
+  return { from: state.identity!, viaAlias: state.alias };
+}
+
 function handleSend(ctx: FrameCtx): void {
   const { ws, state, db, parsed, agentIndex, observerIndex } = ctx;
   const f = parsed as SendFrame;
-  const result = routeDirect(db, agentIndex, state.agentId!, f, observerIndex);
+  const origin = sendOrigin(state, f, f.to);
+  const result = routeDirect(db, agentIndex, origin.from, f, observerIndex, origin.viaAlias);
   if (result.ok) {
     try {
       ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
@@ -799,7 +845,8 @@ function handleAck(ctx: FrameCtx): void {
 function handlePublish(ctx: FrameCtx): void {
   const { ws, state, db, parsed, agentIndex, observerIndex } = ctx;
   const f = parsed as PublishFrame;
-  const result = routePublish(db, agentIndex, state.agentId!, f, observerIndex);
+  const origin = sendOrigin(state, f, f.topic);
+  const result = routePublish(db, agentIndex, origin.from, f, observerIndex, origin.viaAlias);
   if (result.ok) {
     try {
       ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true }));
@@ -870,7 +917,8 @@ function handleFileSend(ctx: FrameCtx): void {
     }));
     return;
   }
-  const result = routeFile(db, agentIndex, state.agentId!, f, maxFileBytes, filesDir, observerIndex);
+  const origin = sendOrigin(state, f, f.to);
+  const result = routeFile(db, agentIndex, origin.from, f, maxFileBytes, filesDir, observerIndex, origin.viaAlias);
   if (result.ok) {
     // #60: echo the stored file's id so the sender learns it (absent if dropped).
     ws.send(JSON.stringify({ type: 'ack', ref: f.msg_id, ok: true, file_id: result.fileId }));
@@ -1068,19 +1116,31 @@ function handleListPresence(ctx: FrameCtx): void {
 // crash guard (#94) can only be proven by making a handler throw, and a guard
 // that is never made to fail is not a guard. Production code must not mutate
 // this map.
+/** R-377: a frame only the plain session may send. Status is presence, which
+ *  is the plain session's; reminders belong to the agent row. */
+function plainSessionOnly(handler: FrameHandler): FrameHandler {
+  return (ctx) => {
+    if (ctx.state.alias === null) return handler(ctx);
+    const ref = typeof ctx.frame.msg_id === 'string' && ctx.frame.msg_id.length > 0 ? { ref: ctx.frame.msg_id } : {};
+    try {
+      ctx.ws.send(JSON.stringify({ type: 'error', ...ref, code: 'NOT_ALLOWED', message: `${String(ctx.frame.type)} belongs to the plain session; log in without an alias for it` }));
+    } catch (_) { /* ignore */ }
+  };
+}
+
 export const POST_AUTH_HANDLERS: Record<string, FrameHandler> = {
   ping: handlePing,
   loop_alive: handleLoopAlive,   // #133
-  status: handleStatus,
+  status: plainSessionOnly(handleStatus),
   send: handleSend,
   ack: handleAck,
   publish: handlePublish,
   subscribe: handleSubscribe,
   unsubscribe: handleUnsubscribe,
   file_send: handleFileSend,
-  remind: handleRemind,
-  list_reminders: handleListReminders,
-  cancel_reminder: handleCancelReminder,
+  remind: plainSessionOnly(handleRemind),
+  list_reminders: plainSessionOnly(handleListReminders),
+  cancel_reminder: plainSessionOnly(handleCancelReminder),
   list_presence: handleListPresence,
 };
 
@@ -1505,7 +1565,7 @@ export function startWsServer(
 
         const state: ConnState = {
           ws, agentId: null, peerAlias: null, authed: false, tls: scheme === 'wss',
-          srcIp: normaliseIp(req.socket.remoteAddress), ackCapable: false,
+          srcIp: normaliseIp(req.socket.remoteAddress), ackCapable: false, identity: null, alias: null,
         };
         registry.set(ws, state);
 

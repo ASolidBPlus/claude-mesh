@@ -55,7 +55,7 @@ export function startReminderScheduler(
       const ws = agentIndex.get(reminder.agent_id);
       if (ws !== undefined && ws.readyState === WebSocket.OPEN) {
         try {
-          ws.send(buildDeliverFrame(m));
+          ws.send(buildDeliverFrame(m, 'mesh'));   // R-377: the bus itself, which no address can be
         } catch (_) { /* ignore */ }
         markDelivered(db, m.id);
         incMsgStatus('reminder', 'delivered');

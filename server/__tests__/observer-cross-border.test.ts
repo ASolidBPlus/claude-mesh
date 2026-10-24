@@ -75,7 +75,7 @@ describe('F3: observer cross_border scope', () => {
     const narrow = fakeSocket(); const wide = fakeSocket();
     const idx = new Map<string, WebSocket>([['watcher', narrow.ws], ['wide-watcher', wide.ws]]);
     emitTap(idx, {
-      type: 'tap', msg_id: 'm1', kind: 'direct', from: 'local-a', to: 'local-b',
+      type: 'tap', msg_id: 'm1', kind: 'direct', from: 'local-a', identity: 'local-a', to: 'local-b',
       topic: null, correlation_id: null, sent_at: 1, size: 1, payload: 'x',
     }, LOCAL_ONLY);
     expect(narrow.got.length).toBe(1);
@@ -86,7 +86,7 @@ describe('F3: observer cross_border scope', () => {
     const narrow = fakeSocket(); const wide = fakeSocket();
     const idx = new Map<string, WebSocket>([['watcher', narrow.ws], ['wide-watcher', wide.ws]]);
     emitTap(idx, {
-      type: 'tap', msg_id: 'm2', kind: 'direct', from: 'far:someone', to: 'local-b',
+      type: 'tap', msg_id: 'm2', kind: 'direct', from: 'far:someone', identity: 'far:someone', to: 'local-b',
       topic: null, correlation_id: null, sent_at: 1, size: 1, payload: 'x',
     }, { crossBorder: true, scoped: new Set(['wide-watcher']) });
     expect(narrow.got.length).toBe(0);
@@ -97,7 +97,7 @@ describe('F3: observer cross_border scope', () => {
     const narrow = fakeSocket();
     const idx = new Map<string, WebSocket>([['watcher', narrow.ws]]);
     emitTap(idx, {
-      type: 'tap', msg_id: 'm3', kind: 'direct', from: 'far:x', to: 'local-b',
+      type: 'tap', msg_id: 'm3', kind: 'direct', from: 'far:x', identity: 'far:x', to: 'local-b',
       topic: null, correlation_id: null, sent_at: 1, size: 1, payload: 'p',
     }, { crossBorder: true, scoped: new Set() });
     expect(narrow.got.length).toBe(0);

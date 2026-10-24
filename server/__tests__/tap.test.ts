@@ -557,7 +557,7 @@ describe('tap — emitTap unit safety/backpressure', () => {
     map.set('ok', { bufferedAmount: 0, send() { healthySends++; } } as unknown as WebSocket);
 
     const frame: TapFrame = {
-      type: 'tap', msg_id: 'm', kind: 'direct', from: 'a', to: 'b',
+      type: 'tap', msg_id: 'm', kind: 'direct', from: 'a', identity: 'a', to: 'b',
       topic: null, correlation_id: null, sent_at: Date.now(), size: 1, payload: 'x',
     };
     emitTap(map, frame, LOCAL_ONLY);

@@ -239,7 +239,7 @@ describe('buildDeliverFrame', () => {
       origin: null,
     };
 
-    const result = buildDeliverFrame(sample);
+    const result = buildDeliverFrame(sample, 'agent-a');
     const frame = JSON.parse(result);
 
     expect(frame.type).toBe('deliver');

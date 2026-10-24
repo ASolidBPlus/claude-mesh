@@ -166,7 +166,7 @@ describe('F1a: peer authentication', () => {
   // new `if` block in production code with no test file in the diff. Pin the
   // count: adding a refusal cause at this door without adding it to the set
   // tests fails HERE. Update the literal only together with the set tests.
-  it('the auth door emits AUTH_FAILED from exactly 6 sites (literal pin; grow the set tests first)', () => {
+  it('the auth door emits AUTH_FAILED from exactly 7 sites (literal pin; grow the set tests first)', () => {
     const src = readFileSync(join(import.meta.dir, '..', 'ws-server.ts'), 'utf8');
     // Quote-agnostic on purpose: nothing in this repo enforces quote style, and
     // a pin defeated by a spelling variant is the class of defect it exists to catch.
@@ -182,7 +182,9 @@ describe('F1a: peer authentication', () => {
     // agent_id or token' it refuses what the caller SENT, before any lookup,
     // so it is not a "may this caller in?" cause and stays out of the set
     // tests; r335-at-least-once.test.ts pins it.
-    expect(emits.length).toBe(6);
+    // R-377 added the seventh: a malformed `alias`, the same kind of own-input
+    // refusal; r377-mesh-aliases.test.ts pins it.
+    expect(emits.length).toBe(7);
   });
 
   // C9 SET TEST — the agent door. Every reachable cause of the one question
