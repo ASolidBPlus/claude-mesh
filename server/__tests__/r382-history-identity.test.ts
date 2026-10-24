@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach, afterAll } from 'bun:test'
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import * as net from 'net';
-import { openDb, registerAgent, aclGrant, insertMessage, pairMessagesQuery, pairCounterparts } from '../db.ts';
+import { openDb, registerAgent, aclGrant, insertMessage, pairMessagesQuery, addressSet } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { startWsServer, WsServerHandle } from '../ws-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
@@ -99,10 +99,10 @@ describe('R-382 with=<identity> covers its aliases', () => {
   });
 
   it('every arm is an index search on idx_messages_pair, with no table scan', () => {
-    const { exact, aliasesOf } = pairCounterparts('bob', 'fred');
-    expect({ exact, aliasesOf }).toEqual({ exact: ['fred'], aliasesOf: 'fred' });
-    for (const opts of [{ aliasesOf }, { aliasesOf, since: 5, before: { sentAt: 100, id: 'x' }, kinds: ['direct'], limit: 20 }]) {
-      const { sql, params } = pairMessagesQuery('bob', exact, opts);
+    const peer = addressSet('fred', true);
+    expect(peer).toEqual({ exact: ['fred'], aliasesOf: 'fred' });
+    for (const opts of [{}, { since: 5, before: { sentAt: 100, id: 'x' }, kinds: ['direct'], limit: 20 }]) {
+      const { sql, params } = pairMessagesQuery('bob', peer, opts);
       const detail = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as { detail: string }[]).map(r => r.detail);
       expect(detail.filter(d => d.startsWith('SEARCH messages USING INDEX idx_messages_pair'))).toHaveLength(4);
       expect(detail.filter(d => /^SCAN messages\b/.test(d))).toEqual([]);
@@ -152,5 +152,70 @@ describe('R-382 history rows carry the identity live delivery stamps', () => {
       expect(rows.filter(r => live.has(r.id)).length).toBe(q.includes('with=fred') ? 2 : 3);
     }
     for (const c of [bob, alias, carol]) c.sock.close();
+  });
+});
+
+describe('R-382 follow-up: the caller side is its identity and all its aliases', () => {
+  beforeEach(() => {
+    for (const r of [
+      ['f-b', 'fred', 'bob', 10], ['fx-b', 'fred+x', 'bob', 20], ['b-fy', 'bob', 'fred+y', 30], ['f-bz', 'fred', 'bob+z', 40],
+      ['bz-fx', 'bob+z', 'fred+x', 50], ['fx-c', 'fred+x', 'carol', 60], ['c-b', 'carol', 'bob', 70],
+      ['fdx-b', 'freddy+x', 'bob', 80], ['b-fd', 'bob', 'freddy', 90], ['fx-fy', 'fred+x', 'fred+y', 100],
+    ] as const) row(r[0], r[1], r[2], r[3]);
+  });
+
+  it('with=bob from fred\'s token pairs {fred, fred+*} with {bob, bob+*}', async () => {
+    expect(ids(await get('/messages?with=bob', 'fred-tok'))).toEqual(['bz-fx', 'f-bz', 'b-fy', 'fx-b', 'f-b']);
+    expect(ids(await get('/messages?agent=fred&with=bob%2Bz', 'fred-tok'))).toEqual(['bz-fx', 'f-bz', 'b-fy', 'fx-b', 'f-b']);
+  });
+
+  it('the scan, with or without agent=fred, is all of fred\'s addresses; agent=fred+x is that alias alone', async () => {
+    const all = ['fx-fy', 'fx-c', 'bz-fx', 'f-bz', 'b-fy', 'fx-b', 'f-b'];
+    expect(ids(await get('/messages', 'fred-tok'))).toEqual(all);
+    expect(ids(await get('/messages?agent=fred', 'fred-tok'))).toEqual(all);
+    expect(ids(await get('/messages?agent=fred%2Bx', 'fred-tok'))).toEqual(['fx-fy', 'fx-c', 'bz-fx', 'fx-b']);
+  });
+
+  it('GUARD: nothing from another identity, and no freddy+*, in either mode', async () => {
+    for (const q of ['/messages', '/messages?with=bob', '/messages?with=carol', '/messages?with=freddy']) {
+      const got = ids(await get(q, 'fred-tok'));
+      for (const foreign of ['c-b', 'fdx-b', 'b-fd']) expect({ q, has: got.includes(foreign) }).toEqual({ q, has: false });
+    }
+    expect(ids(await get('/messages?with=freddy', 'fred-tok'))).toEqual([]);
+  });
+
+  it('GUARD: agent=<another identity> is still 403', async () => {
+    for (const other of ['bob', 'bob%2Bz', 'freddy', 'freddy%2Bx']) {
+      const res = await fetch(`${base}/messages?agent=${other}`, { headers: { Authorization: 'Bearer fred-tok' } });
+      expect({ other, s: res.status }).toEqual({ other, s: 403 });
+    }
+  });
+
+  it('with=<self> returns fred\'s traffic between its own addresses once', async () => {
+    expect(ids(await get('/messages?with=fred', 'fred-tok'))).toEqual(['fx-fy']);
+  });
+
+  it('overlapping sides (agent=fred+x, with=fred): a row on both sides comes back once', async () => {
+    row('fx-note', 'fred+x', 'fred+x', 110);
+    expect(ids(await get('/messages?agent=fred%2Bx&with=fred', 'fred-tok'))).toEqual(['fx-note', 'fx-fy']);
+  });
+
+  it('both sides widened: eight index searches, no table scan', () => {
+    const { sql, params } = pairMessagesQuery(addressSet('fred', false), addressSet('bob', true), { since: 1, kinds: ['direct'] });
+    const detail = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as { detail: string }[]).map(r => r.detail);
+    expect(detail.filter(d => d.startsWith('SEARCH messages USING INDEX idx_messages_pair'))).toHaveLength(8);
+    expect(detail.filter(d => /^SCAN messages\b/.test(d))).toEqual([]);
+  });
+
+  it('the agent port answers the same', async () => {
+    const port = nextPort();
+    const wsh = await startWsServer(port, db, 10_485_760, tmp('r382-wsport-'), 0, new Map());
+    try {
+      for (const q of ['/messages', '/messages?with=bob', '/messages?agent=fred%2Bx']) {
+        const viaWs = await (await fetch(`http://127.0.0.1:${port}${q}`, { headers: { Authorization: 'Bearer fred-tok' } })).text();
+        const viaAdmin = await (await fetch(`${base}${q}`, { headers: { Authorization: 'Bearer fred-tok' } })).text();
+        expect({ q, b: viaWs }).toEqual({ q, b: viaAdmin });
+      }
+    } finally { await wsh.shutdown().catch(() => {}); }
   });
 });

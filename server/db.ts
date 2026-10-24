@@ -2129,26 +2129,35 @@ export function getMessage(db: Database, id: string): Message | null {
 export function queryMessages(
   db: Database,
   opts: {
-    agent?: string;
-    topic?: string;
-    since?: number;
-    limit?: number;
+    agent?: string | undefined;
+    /** R-382: also every alias `<agentAliasesOf>+*` of the agent, as a key range. */
+    agentAliasesOf?: string | null;
+    topic?: string | undefined;
+    since?: number | undefined;
+    limit?: number | undefined;
     // Backward-pagination cursor (#36): return only rows strictly OLDER than
     // (sentAt, id) under the `sent_at DESC, id DESC` order. The (sent_at, id)
     // composite gives a stable tie-break across rows sharing one sent_at.
-    before?: { sentAt: number; id: string };
+    before?: { sentAt: number; id: string } | undefined;
     // Restrict to these message kinds (e.g. ['direct','file']) so a DM/
     // scrollback scan can skip high-volume 'topic' beat rows and not exhaust
     // its row budget on them. Empty/undefined = all kinds.
-    kinds?: string[];
+    kinds?: string[] | undefined;
   }
 ): Message[] {
   const clauses: string[] = [];
   const params: unknown[] = [];
 
   if (opts.agent) {
-    clauses.push('(from_agent = ? OR to_agent = ?)');
-    params.push(opts.agent, opts.agent);
+    if (opts.agentAliasesOf) {
+      const lo = `${opts.agentAliasesOf}+`;
+      const hi = `${opts.agentAliasesOf},`;
+      clauses.push('(from_agent = ? OR to_agent = ? OR (from_agent >= ? AND from_agent < ?) OR (to_agent >= ? AND to_agent < ?))');
+      params.push(opts.agent, opts.agent, lo, hi, lo, hi);
+    } else {
+      clauses.push('(from_agent = ? OR to_agent = ?)');
+      params.push(opts.agent, opts.agent);
+    }
   }
   if (opts.topic) {
     clauses.push('topic = ?');
@@ -2191,8 +2200,8 @@ export function queryMessages(
  */
 export function queryPairMessages(
   db: Database,
-  a: string,
-  b: string | readonly string[],
+  a: string | { exact: readonly string[]; aliasesOf: string | null },
+  b: string | readonly string[] | { exact: readonly string[]; aliasesOf: string | null },
   opts: PairQueryOpts
 ): Message[] {
   const { sql, params } = pairMessagesQuery(a, b, opts);
@@ -2210,7 +2219,11 @@ type PairQueryOpts = {
 
 /** The SQL and bindings behind queryPairMessages, separate so a test can
  *  EXPLAIN the exact statement that runs. */
-export function pairMessagesQuery(a: string, b: string | readonly string[], opts: PairQueryOpts): { sql: string; params: SQLQueryBindings[] } {
+export function pairMessagesQuery(
+  a: string | { exact: readonly string[]; aliasesOf: string | null },
+  b: string | readonly string[] | { exact: readonly string[]; aliasesOf: string | null },
+  opts: PairQueryOpts,
+): { sql: string; params: SQLQueryBindings[] } {
   const clauses: string[] = ['topic IS NULL'];
   const params: SQLQueryBindings[] = [];
   if (opts.kinds && opts.kinds.length > 0) {
@@ -2231,34 +2244,43 @@ export function pairMessagesQuery(a: string, b: string | readonly string[], opts
   let limit = opts.limit ?? 100;
   if (limit > 1000) limit = 1000;
 
-  // R-377: the counterpart may be several addresses (every address of one
-  // identity). Each arm stays an index range: equality on one column, IN on
-  // the other.
-  const others = typeof b === 'string' ? [b] : [...b];
-  const marks = (n: number) => Array(n).fill('?').join(', ');
+  // R-377/R-382: each side is a set of addresses — some exact ids, plus
+  // optionally every alias `<identity>+*` of one identity, read as the key
+  // RANGE ['id+', 'id,') (`+` sorts just before `,`), never a pattern. One
+  // arm per (caller part × counterpart part × direction), each pinned to the
+  // pair index, so every arm is an index search: equality or IN on one
+  // column, equality, IN or a range on the other.
+  const A = pairSide(a, null);
+  const B = pairSide(b, opts.aliasesOf ?? null);
   const tail = `${clauses.join(' AND ')} ORDER BY sent_at DESC, id DESC LIMIT ?)`;
   const arms: { sql: string; params: SQLQueryBindings[] }[] = [];
-  if (others.length > 0) {
-    arms.push({ sql: `SELECT * FROM (SELECT * FROM messages WHERE from_agent = ? AND to_agent IN (${marks(others.length)}) AND ${tail}`, params: [a, ...others, ...params, limit] });
-  }
-  // A party paired with itself has one direction, so the caller is left out
-  // of the inbound arm, or its notes to itself would come back twice.
-  const back = others.filter((x) => x !== a);
-  if (back.length > 0) {
-    arms.push({ sql: `SELECT * FROM (SELECT * FROM messages WHERE from_agent IN (${marks(back.length)}) AND to_agent = ? AND ${tail}`, params: [...back, a, ...params, limit] });
-  }
-  // R-382: every alias `<id>+*` of an identity, as a key RANGE rather than a
-  // pattern, so each arm is still an index search: `+` sorts just before `,`,
-  // so ['id+', 'id,') is exactly the ids starting `id+`. The caller is left
-  // out, for the same reason as above.
-  if (opts.aliasesOf != null) {
-    const lo = `${opts.aliasesOf}+`;
-    const hi = `${opts.aliasesOf},`;
-    arms.push({ sql: `SELECT * FROM (SELECT * FROM messages WHERE from_agent = ? AND to_agent >= ? AND to_agent < ? AND to_agent <> ? AND ${tail}`, params: [a, lo, hi, a, ...params, limit] });
-    // Pinned to the pair index: left alone the planner picks the to_agent
-    // index, which reads every row the caller ever received (topic copies
-    // included) to find these; the pair index reads only the aliases' sends.
-    arms.push({ sql: `SELECT * FROM (SELECT * FROM messages INDEXED BY idx_messages_pair WHERE from_agent >= ? AND from_agent < ? AND from_agent <> ? AND to_agent = ? AND ${tail}`, params: [lo, hi, a, a, ...params, limit] });
+  const parts = (side: PairSide) => [
+    ...(side.exact.length > 0 ? [{ sql: (col: string) => `${col} IN (${side.exact.map(() => '?').join(', ')})`, params: side.exact }] : []),
+    ...(side.range !== null ? [{ sql: (col: string) => `${col} >= ? AND ${col} < ?`, params: [side.range[0], side.range[1]] }] : []),
+  ];
+  const member = (col: string, side: PairSide) => {
+    const p = parts(side);
+    return { sql: `(${p.map((x) => `(${x.sql(col)})`).join(' OR ') || '0'})`, params: p.flatMap((x) => x.params) };
+  };
+  // Caller → counterpart, then counterpart → caller. A row in both (an address
+  // on both sides, e.g. with=<self>) is kept by the first direction only.
+  // When both sides are the same set (with=<self>), the reverse direction
+  // would only ever be excluded, so it isn't queried at all.
+  const sameSet = JSON.stringify(A) === JSON.stringify(B);
+  for (const [from, to, skipBoth] of (sameSet ? [[A, B, false]] : [[A, B, false], [B, A, true]]) as readonly (readonly [PairSide, PairSide, boolean])[]) {
+    const notFirst = skipBoth ? (() => {
+      const f = member('from_agent', A);
+      const t = member('to_agent', B);
+      return { sql: ` AND NOT (${f.sql} AND ${t.sql})`, params: [...f.params, ...t.params] };
+    })() : { sql: '', params: [] as SQLQueryBindings[] };
+    for (const fp of parts(from)) {
+      for (const tp of parts(to)) {
+        arms.push({
+          sql: `SELECT * FROM (SELECT * FROM messages INDEXED BY idx_messages_pair WHERE ${fp.sql('from_agent')} AND ${tp.sql('to_agent')}${notFirst.sql} AND ${tail}`,
+          params: [...fp.params, ...tp.params, ...notFirst.params, ...params, limit],
+        });
+      }
+    }
   }
   if (arms.length === 0) return { sql: 'SELECT * FROM messages WHERE 0', params: [] };
   return {
@@ -2267,21 +2289,29 @@ export function pairMessagesQuery(a: string, b: string | readonly string[], opts
   };
 }
 
+/** One side of a pair query: exact addresses, and optionally every alias of
+ *  one identity as a key range. */
+export interface PairSide { exact: string[]; range: [string, string] | null }
+
+function pairSide(x: string | readonly string[] | { exact: readonly string[]; aliasesOf: string | null }, aliasesOf: string | null): PairSide {
+  if (typeof x === 'string') return { exact: [x], range: null };
+  if (Array.isArray(x)) return { exact: [...(x as readonly string[])], range: aliasesOf === null ? null : [`${aliasesOf}+`, `${aliasesOf},`] };
+  const side = x as { exact: readonly string[]; aliasesOf: string | null };
+  return { exact: [...side.exact], range: side.aliasesOf === null ? null : [`${side.aliasesOf}+`, `${side.aliasesOf},`] };
+}
+
 /**
- * R-377/R-382 — who `with=<counterpart>` means for `caller`: the counterpart's
- * identity (identityOf, the same rule as delivery and aclCheck) and every
- * alias `<identity>+*` of it, so `with=fred` and `with=fred+x` both read the
- * whole conversation with fred, however fred's sessions sent it. A remote id
- * stands for itself. The CALLER side is not widened: an address reads only
- * its own traffic, so the caller is left out unless it is what was asked for.
+ * R-377/R-382 — the addresses one side of `with=` (or the scan) stands for.
+ * A plain local address stands for its identity and every alias of it,
+ * `{fred} ∪ fred+*`; an alias given exactly (`fred+x`) stands for itself
+ * when `widen` is false (the caller's `agent=fred+x`) or for its identity's
+ * whole set when true (a counterpart). A remote id stands for itself.
  */
-export function pairCounterparts(caller: string, counterpart: string): { exact: string[]; aliasesOf: string | null } {
-  const identity = identityOf(counterpart);
-  const local = !counterpart.includes(':');
-  const exact = new Set([local ? identity : counterpart]);
-  if (counterpart === caller) exact.add(caller);
-  else exact.delete(caller);
-  return { exact: [...exact].sort(), aliasesOf: local ? identity : null };
+export function addressSet(address: string, widen: boolean): { exact: string[]; aliasesOf: string | null } {
+  if (address.includes(':')) return { exact: [address], aliasesOf: null };
+  if (!widen && address.includes('+')) return { exact: [address], aliasesOf: null };
+  const identity = identityOf(address);
+  return { exact: [identity], aliasesOf: identity };
 }
 
 // Delivery TTL and retention are DIFFERENT lifecycles (#34):

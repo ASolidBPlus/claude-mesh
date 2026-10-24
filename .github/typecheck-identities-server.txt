@@ -85,7 +85,6 @@ admin-agents.ts:TS2345:Argument of type 'string | undefined' is not assignable t
 admin-agents.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#2
 admin-agents.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#3
 admin-files.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
-admin-messages.ts:TS2379:Argument of type '{ agent: string | undefined; topic: string | undefined; since: number | undefined; limit: number | undefined; before: { sentAt: number; id: string; } | undefined; kinds: string[] | undefined; }' is not assignable to parameter of type '{ agent?: string; topic?: string; since?: number; limit?: number; before?: { sentAt: number; id: string; }; kinds?: string[]; }' with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' to the types of the target's properties.
 admin-observers.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
 admin-observers.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.#2
 admin-reminders.ts:TS2345:Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
