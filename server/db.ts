@@ -2200,6 +2200,8 @@ export function queryPairMessages(
 }
 
 type PairQueryOpts = {
+  /** R-382: also pair with every alias `<aliasesOf>+*` (pairCounterparts). */
+  aliasesOf?: string | null | undefined;
   since?: number | undefined;
   limit?: number | undefined;
   before?: { sentAt: number; id: string } | undefined;
@@ -2235,31 +2237,51 @@ export function pairMessagesQuery(a: string, b: string | readonly string[], opts
   const others = typeof b === 'string' ? [b] : [...b];
   const marks = (n: number) => Array(n).fill('?').join(', ');
   const tail = `${clauses.join(' AND ')} ORDER BY sent_at DESC, id DESC LIMIT ?)`;
-  const out = `SELECT * FROM (SELECT * FROM messages WHERE from_agent = ? AND to_agent IN (${marks(others.length)}) AND ${tail}`;
+  const arms: { sql: string; params: SQLQueryBindings[] }[] = [];
+  if (others.length > 0) {
+    arms.push({ sql: `SELECT * FROM (SELECT * FROM messages WHERE from_agent = ? AND to_agent IN (${marks(others.length)}) AND ${tail}`, params: [a, ...others, ...params, limit] });
+  }
   // A party paired with itself has one direction, so the caller is left out
   // of the inbound arm, or its notes to itself would come back twice.
   const back = others.filter((x) => x !== a);
-  if (back.length === 0) {
-    return { sql: `${out} ORDER BY sent_at DESC, id DESC LIMIT ?`, params: [a, ...others, ...params, limit, limit] };
+  if (back.length > 0) {
+    arms.push({ sql: `SELECT * FROM (SELECT * FROM messages WHERE from_agent IN (${marks(back.length)}) AND to_agent = ? AND ${tail}`, params: [...back, a, ...params, limit] });
   }
-  const inbound = `SELECT * FROM (SELECT * FROM messages WHERE from_agent IN (${marks(back.length)}) AND to_agent = ? AND ${tail}`;
+  // R-382: every alias `<id>+*` of an identity, as a key RANGE rather than a
+  // pattern, so each arm is still an index search: `+` sorts just before `,`,
+  // so ['id+', 'id,') is exactly the ids starting `id+`. The caller is left
+  // out, for the same reason as above.
+  if (opts.aliasesOf != null) {
+    const lo = `${opts.aliasesOf}+`;
+    const hi = `${opts.aliasesOf},`;
+    arms.push({ sql: `SELECT * FROM (SELECT * FROM messages WHERE from_agent = ? AND to_agent >= ? AND to_agent < ? AND to_agent <> ? AND ${tail}`, params: [a, lo, hi, a, ...params, limit] });
+    // Pinned to the pair index: left alone the planner picks the to_agent
+    // index, which reads every row the caller ever received (topic copies
+    // included) to find these; the pair index reads only the aliases' sends.
+    arms.push({ sql: `SELECT * FROM (SELECT * FROM messages INDEXED BY idx_messages_pair WHERE from_agent >= ? AND from_agent < ? AND from_agent <> ? AND to_agent = ? AND ${tail}`, params: [lo, hi, a, a, ...params, limit] });
+  }
+  if (arms.length === 0) return { sql: 'SELECT * FROM messages WHERE 0', params: [] };
   return {
-    sql: `${out} UNION ALL ${inbound} ORDER BY sent_at DESC, id DESC LIMIT ?`,
-    params: [a, ...others, ...params, limit, ...back, a, ...params, limit, limit],
+    sql: `${arms.map((x) => x.sql).join(' UNION ALL ')} ORDER BY sent_at DESC, id DESC LIMIT ?`,
+    params: [...arms.flatMap((x) => x.params), limit],
   };
 }
 
 /**
- * R-377 — who `with=<counterpart>` means for `caller`: the counterpart and its
- * identity, by the same rule as aclCheck, so `with=fred+x` also finds what
- * fred sent as itself. Aliases have no registry, so `with=fred` can't
- * enumerate them; an alias's own traffic is read with `with=fred+x`. The
- * CALLER side is not widened: an address reads only its own traffic.
+ * R-377/R-382 — who `with=<counterpart>` means for `caller`: the counterpart's
+ * identity (identityOf, the same rule as delivery and aclCheck) and every
+ * alias `<identity>+*` of it, so `with=fred` and `with=fred+x` both read the
+ * whole conversation with fred, however fred's sessions sent it. A remote id
+ * stands for itself. The CALLER side is not widened: an address reads only
+ * its own traffic, so the caller is left out unless it is what was asked for.
  */
-export function pairCounterparts(caller: string, counterpart: string): string[] {
-  const set = new Set([counterpart, identityOf(counterpart)]);
-  if (counterpart !== caller) set.delete(caller);
-  return [...set].sort();
+export function pairCounterparts(caller: string, counterpart: string): { exact: string[]; aliasesOf: string | null } {
+  const identity = identityOf(counterpart);
+  const local = !counterpart.includes(':');
+  const exact = new Set([local ? identity : counterpart]);
+  if (counterpart === caller) exact.add(caller);
+  else exact.delete(caller);
+  return { exact: [...exact].sort(), aliasesOf: local ? identity : null };
 }
 
 // Delivery TTL and retention are DIFFERENT lifecycles (#34):
