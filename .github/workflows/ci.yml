@@ -143,7 +143,10 @@ jobs:
           fi
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Pinned to what production runs (spawner-mesh's oven/bun 1.4.2 image).
+          # `latest` moved to 1.4.4 under an unchanged main and turned it red;
+          # adopt a new Bun here and in the Dockerfile together, deliberately.
+          bun-version: 1.4.2
       - name: Install + test (server)
         working-directory: server
         run: |
@@ -213,7 +216,10 @@ jobs:
           fi
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Pinned to what production runs (spawner-mesh's oven/bun 1.4.2 image).
+          # `latest` moved to 1.4.4 under an unchanged main and turned it red;
+          # adopt a new Bun here and in the Dockerfile together, deliberately.
+          bun-version: 1.4.2
       - name: Install (server)
         working-directory: server
         run: bun install --frozen-lockfile
