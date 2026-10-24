@@ -5,7 +5,7 @@ import { parseTrafficClasses, type ClassRule } from './traffic-classes.ts';
 import { startBorder, forwarders } from './border.ts';
 import { parsePlaintextPeerCidrs, applyPlaintextPeerCidrs, type PlaintextCidr } from './plaintext-peers.ts';
 import { loadTls, expiryWarning, type ServerTls } from './tls-config.ts';
-import { startWsServer, WsServerHandle, PRE_AUTH_LIMITS } from './ws-server.ts';
+import { startWsServer, WsServerHandle, PRE_AUTH_LIMITS, DEFAULT_REDELIVERY_WINDOW_MS } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
 import { startCleanup, CleanupHandle } from './cleanup.ts';
@@ -41,6 +41,7 @@ export interface Config {
   metricsToken: string | null;
   /** R-69: caps on concurrent unauthenticated WS sockets. */
   preAuth: { global: number; perIp: number };
+  redeliveryWindowMs: number;
   /** R-271: caps on concurrent file downloads. */
   downloads: { global: number; perAgent: number };
 }
@@ -247,6 +248,8 @@ export function loadConfig(): Config {
   const preAuth = { global: posInt('MESH_PREAUTH_MAX', PRE_AUTH_LIMITS.global), perIp: posInt('MESH_PREAUTH_PER_IP', PRE_AUTH_LIMITS.perIp) };
   // R-271: concurrent file downloads, in total and per agent.
   const downloads = { global: posInt('MESH_DOWNLOAD_MAX', DOWNLOAD_LIMITS.global), perAgent: posInt('MESH_DOWNLOAD_PER_AGENT', DOWNLOAD_LIMITS.perAgent) };
+  // R-335: how long an unacked row may be redelivered to an ack-capable login.
+  const redeliveryWindowMs = posInt('MESH_REDELIVERY_WINDOW_MS', DEFAULT_REDELIVERY_WINDOW_MS);
   for (const [name, p] of [['MESH_WS_TLS_PORT', wsTlsPort], ['MESH_ADMIN_TLS_PORT', adminTlsPort]] as const) {
     if (p !== null && tls === null) {
       process.stderr.write(`${name} is set but MESH_TLS_CERT/MESH_TLS_KEY are not; a TLS listener needs both\n`);
@@ -275,7 +278,7 @@ export function loadConfig(): Config {
     metricsToken = metricsRaw;
   }
 
-  return { dbPath, wsPort, adminPort, wsTlsPort, adminTlsPort, adminToken, adminTokenPrev, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, trafficClasses, tls, tlsCa, metricsToken, preAuth, downloads };
+  return { dbPath, wsPort, adminPort, wsTlsPort, adminTlsPort, adminToken, adminTokenPrev, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, trafficClasses, tls, tlsCa, metricsToken, preAuth, downloads, redeliveryWindowMs };
 }
 
 async function main() {
@@ -396,7 +399,7 @@ async function main() {
       if (warn !== null) console.error(JSON.stringify(warn));
     }
     wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes, config.filesDir, config.presenceDebounceMs, observerIndex, config.tls,
-      { preAuth: config.preAuth, ...(config.wsTlsPort === null ? {} : { tlsPort: config.wsTlsPort }) });
+      { preAuth: config.preAuth, redeliveryWindowMs: config.redeliveryWindowMs, ...(config.wsTlsPort === null ? {} : { tlsPort: config.wsTlsPort }) });
   } catch (err) {
     process.stderr.write(`Failed to start WebSocket server: ${err}\n`);
     process.exit(1);
@@ -455,6 +458,8 @@ async function main() {
     preauth: { max: config.preAuth.global, per_ip: config.preAuth.perIp },
     // R-271: the download caps in force.
     downloads: { max: config.downloads.global, per_agent: config.downloads.perAgent },
+    // R-335: the redelivery window for ack-capable clients.
+    redelivery_window_ms: config.redeliveryWindowMs,
     at: Date.now(),
   }));
 

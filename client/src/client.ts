@@ -16,6 +16,7 @@ import type {
   DeliverFrame,
   FileDeliverFrame,
   AckFrame,
+  AckClientFrame,
   ErrorFrame,
   RemindersListFrame,
   AgentStatusFrame,
@@ -78,6 +79,23 @@ export interface MeshClientConfig {
    * assertRuntimeVerifiesIpIdentity); Node verifies correctly.
    */
   ca?: string;
+
+  /**
+   * R-335 — at-least-once delivery. On by default; `false` opts out.
+   *
+   * On, the client tells the server it acks (auth `capabilities: ['ack']`) and
+   * sends `{type:'ack', msg_id}` for each delivered message once the
+   * `onMessage` handler has returned, or its promise has resolved. A handler
+   * that throws or rejects sends no ack, so the server sends that message
+   * again on the next login, marked `redelivered`, for up to the server's
+   * redelivery window (default 1 h after first delivery) and within its TTL.
+   * A message lost longer ago than that is still lost.
+   *
+   * The client drops a message whose id it has already handled (the last
+   * 1000), re-acking it so a lost ack doesn't bring it back every login.
+   * Files (`kind: 'file'`) are not acked or redelivered.
+   */
+  ack?: boolean;
 }
 
 /**
@@ -172,6 +190,9 @@ export interface Inbound {
    *  (`pod1:alice`). `null` for everything that did not cross a border.
    *  DISPLAY ONLY — the sending mesh chooses it. */
   origin?: string | null;
+  /** R-335 — true when the server is sending this again because the client
+   *  never acked it (the earlier copy may or may not have been handled). */
+  redelivered?: boolean;
 }
 
 export interface SendFileOpts {
@@ -306,7 +327,14 @@ export class MeshClient {
   private config: MeshClientConfig;
   private ws: WebSocket | null = null;
 
-  private messageHandler: ((m: Inbound) => void) | null = null;
+  private messageHandler: ((m: Inbound) => unknown) | null = null;
+  // R-335: ids of deliver frames whose handler completed, oldest first,
+  // bounded to SEEN_LIMIT. A Set keeps insertion order, so the first entry is
+  // the one to evict.
+  private seen = new Set<string>();
+  // R-335: ids whose (async) handler is still running. A redelivery of one of
+  // these is dropped without an ack; the running handler acks when it ends.
+  private inFlight = new Set<string>();
   private listeners: {
     connect: ((...args: any[]) => void)[];
     disconnect: ((...args: any[]) => void)[];
@@ -395,6 +423,7 @@ export class MeshClient {
     const KNOWN_KEYS: Record<keyof MeshClientConfig, true> = {
       serverUrl: true, agentId: true, agentToken: true, httpUrl: true,
       pingIntervalMs: true, pongDeadlineMs: true, ackTimeoutMs: true, ca: true,
+      ack: true,
     };
     const KNOWN = Object.keys(KNOWN_KEYS);
     const unknown = Object.keys(config).filter(k => !KNOWN.includes(k));
@@ -427,7 +456,13 @@ export class MeshClient {
     });
   }
 
-  onMessage(handler: (m: Inbound) => void): void {
+  /**
+   * The handler for every delivered message. With `ack` on (the default), a
+   * message is acked when this returns, or when the promise it returns
+   * resolves; throwing or rejecting leaves it unacked, to be redelivered on
+   * the next login (see MeshClientConfig.ack).
+   */
+  onMessage(handler: (m: Inbound) => unknown): void {
     this.messageHandler = handler;
   }
 
@@ -1094,7 +1129,55 @@ export class MeshClient {
   }
 
   private onDeliver(frame: DeliverFrame): void {
-    this.messageHandler?.(this.normalizeDeliver(frame));
+    if (this.config.ack === false) {
+      this.messageHandler?.(this.normalizeDeliver(frame));
+      return;
+    }
+    // A redelivery of something already handled: skip the handler, but ack
+    // again, since the server only redelivers when it never saw the ack.
+    if (this.seen.has(frame.msg_id)) {
+      this.sendAck(frame.msg_id);
+      return;
+    }
+    if (this.inFlight.has(frame.msg_id)) return;
+    const msgId = frame.msg_id;
+    const handled = () => {
+      this.inFlight.delete(msgId);
+      this.markSeen(msgId);
+      this.sendAck(msgId);
+    };
+    const failed = () => { this.inFlight.delete(msgId); };   // no ack: redelivered on the next login
+    let result: unknown;
+    try {
+      result = this.messageHandler?.(this.normalizeDeliver(frame));
+    } catch {
+      return;
+    }
+    if (result instanceof Promise) {
+      this.inFlight.add(msgId);
+      result.then(handled, failed);
+    } else {
+      handled();
+    }
+  }
+
+  private static readonly SEEN_LIMIT = 1000;
+
+  private markSeen(msgId: string): void {
+    this.seen.add(msgId);
+    if (this.seen.size > MeshClient.SEEN_LIMIT) {
+      const oldest = this.seen.values().next().value;
+      if (oldest !== undefined) this.seen.delete(oldest);
+    }
+  }
+
+  private sendAck(msgId: string): void {
+    const frame: AckClientFrame = { type: 'ack', msg_id: msgId };
+    try {
+      this.ws?.send(JSON.stringify(frame));
+    } catch {
+      // the socket is gone; the server redelivers on the next login
+    }
   }
 
   private onFileDeliver(frame: FileDeliverFrame): void {
@@ -1171,12 +1254,13 @@ export class MeshClient {
     );
   }
 
-  /** F0c (§7): extra fields merged into the auth frame. Default {} so an
-   *  ordinary MeshClient's auth frame is byte-identical to today's — pinned by
-   *  a test, because a silently widened auth frame would change what every
-   *  existing agent sends to every existing server. */
+  /** F0c (§7): extra fields merged into the auth frame. An ordinary
+   *  MeshClient adds only R-335's `capabilities: ['ack']`, and nothing with
+   *  `ack: false` — pinned by a test, because a silently widened auth frame
+   *  would change what every existing agent sends to every existing server.
+   *  A server that predates R-335 ignores the field. */
   protected authExtras(): Record<string, unknown> {
-    return {};
+    return this.config.ack === false ? {} : { capabilities: ['ack'] };
   }
 
   /** F0c (§7): which error frames stop the client for good. Default is today's
@@ -1282,6 +1366,7 @@ export class MeshClient {
       // Leaving it `undefined` would make a consumer's `'origin' in m` check
       // disagree with its `m.origin === null` check.
       origin: f.origin ?? null,
+      redelivered: f.redelivered === true,
     };
   }
 

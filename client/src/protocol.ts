@@ -86,9 +86,20 @@ export interface AuthFrame {
   agent_id: string;
   token: string;
   /** F0c (§7): protocol version, sent only by a peer connection. Absent on an
-   *  ordinary agent auth frame, which must stay byte-identical to today's —
-   *  an added field would change what every existing client sends. */
+   *  ordinary agent auth frame, so its presence is what marks a peer. */
   protocol?: number;
+  /** R-335: what this agent client does beyond the base protocol. `ack` = it
+   *  sends an `ack` frame after handling each `deliver`, and wants its
+   *  delivered-but-unacked rows again on its next login. A server ignores
+   *  names it doesn't know. Never sent by a peer connection. */
+  capabilities?: string[];
+}
+
+/** R-335: sent by an ack-capable client once its handler for a `deliver` frame
+ *  has returned. Only the row's recipient can ack it. */
+export interface AckClientFrame {
+  type: 'ack';
+  msg_id: string;
 }
 
 // ──────────────────────────────────────────────
@@ -129,6 +140,9 @@ export interface DeliverFrame {
  *  this into a language model's prompt must STILL flatten it: the grammar is
  *  the producer's promise, and this client may be talking to an older mesh. */
   origin?: string | null;
+  /** R-335: present (true) only when an ack-capable client is being sent a row
+   *  it was sent before and never acked. */
+  redelivered?: true;
 }
 
 export interface AckFrame {
@@ -245,7 +259,8 @@ export type OutboundFrame =
   | CancelReminderFrame
   | ListPresenceFrame
   | StatusFrame
-  | AuthFrame;
+  | AuthFrame
+  | AckClientFrame;
 
 /**
  * An OBSERVER's copy of an accepted message (server/tap.ts `TapFrame`),

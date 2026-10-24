@@ -12,6 +12,7 @@ import {
   getMessage,
   markDelivered,
   getPendingMessages,
+  getUnackedDeliveredMessages,
   getOrCreateTopic,
   getTopicSubscribers,
   isRemoteEndpoint,
@@ -71,7 +72,7 @@ export function buildDeliverFrame(msg: {
    *  no origin that looks exactly like a local one. The callers that pass a
    *  whole `Message` get it from the row for free. */
   origin: string | null;
-}): string {
+}, redelivered = false): string {
   return JSON.stringify({
     type: 'deliver',
     msg_id: msg.id,
@@ -84,6 +85,9 @@ export function buildDeliverFrame(msg: {
     content_type: msg.content_type,
     sent_at: msg.sent_at,
     origin: msg.origin,
+    // R-335: only on a redelivery, so a client without the ack capability
+    // never sees the key at all.
+    ...(redelivered ? { redelivered: true } : {}),
   });
 }
 
@@ -1134,13 +1138,32 @@ export function routeDirect(
   return { ok: true, msg_id: frame.msg_id };
 }
 
+/**
+ * Send an agent's queued rows on login. `redeliverSince` is set only for an
+ * ack-capable session (R-335): rows already written to an earlier socket but
+ * never acked, delivered at or after that time, go out again flagged
+ * `redelivered`, merged with the new rows in sent_at order. A redelivery
+ * leaves delivered_at where it was, so the window runs from the first
+ * delivery and a message whose handler always fails stops coming back.
+ * Returns the number of NEW rows delivered.
+ */
 export function drainQueue(
   db: Database,
   agentId: string,
-  ws: WebSocket
+  ws: WebSocket,
+  redeliverSince: number | null = null
 ): number {
   const pending = getPendingMessages(db, agentId);
-  for (const msg of pending) {
+  const again = redeliverSince === null ? [] : getUnackedDeliveredMessages(db, agentId, redeliverSince);
+  const redeliver = new Set(again.map((m) => m.id));
+  const rows = again.length === 0 ? pending : [...pending, ...again].sort((x, y) => x.sent_at - y.sent_at);
+  for (const msg of rows) {
+    if (redeliver.has(msg.id)) {
+      ws.send(buildDeliverFrame(msg, true));
+      incMsgStatus(msg.kind, 'redelivered');
+      incBytes('out', Buffer.byteLength(msg.payload, 'utf8'));
+      continue;
+    }
     ws.send(buildDeliverFrame(msg));
     markDelivered(db, msg.id);
     incMsgStatus(msg.kind, 'delivered');
