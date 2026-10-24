@@ -1996,8 +1996,11 @@ export function markDelivered(db: Database, id: string): void {
   db.prepare('UPDATE messages SET delivered_at = ? WHERE id = ?').run(Date.now(), id);
 }
 
-export function markAcked(db: Database, id: string): void {
-  db.prepare('UPDATE messages SET acked_at = ? WHERE id = ?').run(Date.now(), id);
+/** R-335: only the row's recipient may ack it. An ack is what stops a row
+ *  being redelivered, so an ack from anyone else would let one agent suppress
+ *  another's redelivery. First ack wins; a repeat is a no-op. */
+export function markAcked(db: Database, id: string, recipient: string): void {
+  db.prepare('UPDATE messages SET acked_at = ? WHERE id = ? AND to_agent = ? AND acked_at IS NULL').run(Date.now(), id, recipient);
 }
 
 export function getPendingMessages(db: Database, agentId: string): Message[] {
@@ -2009,6 +2012,22 @@ export function getPendingMessages(db: Database, agentId: string): Message[] {
       AND (expires_at IS NULL OR expires_at >= ?)
     ORDER BY sent_at ASC
   `).all(agentId, now) as Message[];
+}
+
+/** R-335: rows already written to this agent's socket but never acked, still
+ *  inside their TTL, and delivered at or after `deliveredSince` (the
+ *  redelivery window). Only an ack-capable login asks for these. */
+export function getUnackedDeliveredMessages(db: Database, agentId: string, deliveredSince: number): Message[] {
+  const now = Date.now();
+  return db.prepare(`
+    SELECT * FROM messages
+    WHERE to_agent = ?
+      AND delivered_at IS NOT NULL
+      AND delivered_at >= ?
+      AND acked_at IS NULL
+      AND (expires_at IS NULL OR expires_at >= ?)
+    ORDER BY sent_at ASC
+  `).all(agentId, deliveredSince, now) as Message[];
 }
 
 export function getPendingTopicMessages(db: Database, topicName: string): Message[] {

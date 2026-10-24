@@ -341,7 +341,7 @@ export function setPeerUpSource(fn: () => Iterable<{ alias: string; up: boolean 
  *   le          a histogram bucket boundary — a number
  *   outcome     'delivered'|'refused'|'rate_limited'|'duplicate'|'transient'
  *   state       'online'|'offline' / 'up'|'down'
- *   status      'delivered'|'queued'|'dropped'|'expired'
+ *   status      'delivered'|'queued'|'dropped'|'expired'|'redelivered'
  */
 export const PARTY_FREE_LABELS: ReadonlySet<string> = new Set([
   'class', 'direction', 'error_code', 'kind', 'le', 'outcome', 'state', 'status',

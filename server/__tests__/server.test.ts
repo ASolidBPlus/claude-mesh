@@ -5,7 +5,7 @@ import type { Config } from '../server.ts';
 async function callLoadConfig(env: Record<string, string | undefined>): Promise<{ config?: Config; exitCode?: number }> {
   // Save original env
   const saved: Record<string, string | undefined> = {};
-  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS', 'MESH_PLAINTEXT_PEER_CIDRS', 'MESH_METRICS_CLASSES', 'MESH_TLS_CERT', 'MESH_TLS_KEY', 'MESH_TLS_CA', 'MESH_METRICS_TOKEN', 'MESH_ADMIN_PORT', 'MESH_WS_TLS_PORT', 'MESH_ADMIN_TLS_PORT', 'MESH_ADMIN_TOKEN_PREV', 'MESH_PREAUTH_MAX', 'MESH_PREAUTH_PER_IP', 'MESH_DOWNLOAD_MAX', 'MESH_DOWNLOAD_PER_AGENT'];
+  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS', 'MESH_PLAINTEXT_PEER_CIDRS', 'MESH_METRICS_CLASSES', 'MESH_TLS_CERT', 'MESH_TLS_KEY', 'MESH_TLS_CA', 'MESH_METRICS_TOKEN', 'MESH_ADMIN_PORT', 'MESH_WS_TLS_PORT', 'MESH_ADMIN_TLS_PORT', 'MESH_ADMIN_TOKEN_PREV', 'MESH_PREAUTH_MAX', 'MESH_PREAUTH_PER_IP', 'MESH_DOWNLOAD_MAX', 'MESH_DOWNLOAD_PER_AGENT', 'MESH_REDELIVERY_WINDOW_MS'];
   for (const key of keys) {
     saved[key] = process.env[key];
     if (env[key] !== undefined) {
@@ -65,7 +65,7 @@ describe('loadConfig', () => {
   it('returns defaults when only MESH_ADMIN_TOKEN is set', async () => {
     const { config, exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok' });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'tok', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], trafficClasses: [], tls: null, tlsCa: null, metricsToken: null, preAuth: { global: 64, perIp: 8 }, downloads: { global: 64, perAgent: 4 } });
+    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'tok', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], trafficClasses: [], tls: null, tlsCa: null, metricsToken: null, preAuth: { global: 64, perIp: 8 }, downloads: { global: 64, perAgent: 4 }, redeliveryWindowMs: 3_600_000 });
   });
 
   it('returns correct values when all valid env vars are set', async () => {
@@ -75,7 +75,7 @@ describe('loadConfig', () => {
       MESH_WS_PORT: '8080',
     });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'secret', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], trafficClasses: [], tls: null, tlsCa: null, metricsToken: null, preAuth: { global: 64, perIp: 8 }, downloads: { global: 64, perAgent: 4 } });
+    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'secret', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], trafficClasses: [], tls: null, tlsCa: null, metricsToken: null, preAuth: { global: 64, perIp: 8 }, downloads: { global: 64, perAgent: 4 }, redeliveryWindowMs: 3_600_000 });
   });
 
   it('MESH_MAX_FILE_BYTES: defaults to 10 MB when not set', async () => {
@@ -225,6 +225,19 @@ describe('loadConfig', () => {
       expect(exitCode).toBe(1);
       expect(writes.join('')).toContain('MESH_METRICS_CLASSES: ');
       expect(writes.join('')).toContain(said);
+    }
+  });
+
+  // R-335
+  it('MESH_REDELIVERY_WINDOW_MS: defaults to 1 h, reads a positive integer, refuses anything else', async () => {
+    expect((await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok' })).config?.redeliveryWindowMs).toBe(3_600_000);
+    expect((await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_REDELIVERY_WINDOW_MS: '600000' })).config?.redeliveryWindowMs).toBe(600_000);
+    for (const bad of ['0', '-1', '1h', '', '1.5']) {
+      const realWrite = process.stderr.write.bind(process.stderr);
+      process.stderr.write = (() => true) as typeof process.stderr.write;
+      try {
+        expect((await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_REDELIVERY_WINDOW_MS: bad })).exitCode).toBe(1);
+      } finally { process.stderr.write = realWrite; }
     }
   });
 

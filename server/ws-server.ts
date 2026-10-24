@@ -61,6 +61,28 @@ interface ConnState {
   /** R-65 M4: the TCP peer address, from the socket — never a header. Behind a
    *  proxy this is the proxy, which is the honest answer. */
   srcIp: string | null;
+  /** R-335: the auth frame listed the `ack` capability, so this client acks
+   *  each deliver frame after handling it and gets unacked rows again on its
+   *  next login. Set at auth, never changed. */
+  ackCapable: boolean;
+}
+
+/** R-335: how long after its first delivery an unacked row may be sent again
+ *  to an ack-capable login. The bound for rows with no TTL (reminders, ttl:null
+ *  sends), which would otherwise be redelivered forever. */
+export const DEFAULT_REDELIVERY_WINDOW_MS = 3_600_000;
+
+/** R-335: the auth frame's optional `capabilities`. The SHAPE is checked (an
+ *  array of at most 16 non-empty strings of at most 64 characters) and names
+ *  are not: a name this server doesn't know is ignored, so a newer client can
+ *  list capabilities an older server lacks. Absent = no capabilities. */
+function parseCapabilities(raw: unknown): string[] | null {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || raw.length > 16) return null;
+  for (const c of raw) {
+    if (typeof c !== 'string' || c.length === 0 || c.length > 64) return null;
+  }
+  return raw as string[];
 }
 
 interface PresenceState {
@@ -115,6 +137,7 @@ interface AuthCtx {
   broadcastStatus: (agentId: string, online: boolean, lastSeen: number, excludeWs: WebSocket | null) => void;
   /** R-65: true only when TLS runs BESIDE plaintext (side-by-side mode). */
   latchOnTls: boolean;
+  redeliveryWindowMs: number;
 }
 
 /**
@@ -160,7 +183,7 @@ function logAuth(db: Database, state: ConnState, agentId: string | null, fields:
 }
 
 function handleAuthFrame(ctx: AuthCtx): void {
-  const { ws, state, db, frame, parsed, agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus, latchOnTls } = ctx;
+  const { ws, state, db, frame, parsed, agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus, latchOnTls, redeliveryWindowMs } = ctx;
 
   if (typeof parsed !== 'object' || parsed === null || frame.type !== 'auth') {
     try {
@@ -179,6 +202,18 @@ function handleAuthFrame(ctx: AuthCtx): void {
     logAuth(db, state, typeof agentId === 'string' ? agentId : null, { refused: 'malformed' });
     try {
       ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'missing agent_id or token' }));
+    } catch (_) { /* ignore */ }
+    ws.close(1008, 'auth failed');
+    return;
+  }
+
+  // R-335: an own-input refusal like the one above, so it says what was wrong
+  // with what the caller sent and nothing about what exists here.
+  const capabilities = parseCapabilities(frame.capabilities);
+  if (capabilities === null) {
+    logAuth(db, state, agentId, { refused: 'malformed_capabilities' });
+    try {
+      ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'malformed capabilities (expected an array of up to 16 short strings)' }));
     } catch (_) { /* ignore */ }
     ws.close(1008, 'auth failed');
     return;
@@ -378,6 +413,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
 
   state.authed = true;
   state.agentId = agentId;
+  state.ackCapable = capabilities.includes('ack');
 
   // #92 — NEWER WINS. A second successful auth for the same agent id
   // DISPLACES the first socket.
@@ -440,7 +476,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
   try {
     ws.send(JSON.stringify({ type: 'auth_ok', agent_id: agentId, queued, queued_files }));
   } catch (_) { /* ignore */ }
-  drainQueue(db, agentId, ws);
+  drainQueue(db, agentId, ws, state.ackCapable ? Date.now() - redeliveryWindowMs : null);
   drainFileQueue(db, agentId, ws);
 
   // Presence-debounce-aware online broadcast. Keys purely off
@@ -747,10 +783,11 @@ function handleSend(ctx: FrameCtx): void {
 }
 
 function handleAck(ctx: FrameCtx): void {
-  const { db, parsed } = ctx;
+  const { db, parsed, state } = ctx;
   const msgId = (parsed as Record<string, unknown>).msg_id;
   if (typeof msgId === 'string') {
-    markAcked(db, msgId);
+    // R-335: scoped to the authenticated agent's own rows (see markAcked).
+    markAcked(db, msgId, state.agentId!);
   }
 }
 
@@ -1096,7 +1133,7 @@ export function startWsServer(
   // `port` is the PLAINTEXT listener (or 'off') and `tlsPort` serves TLS with
   // the same certificate. server.ts enforces the pairing rules; this function
   // trusts them and refuses only what it cannot serve.
-  opts: { tlsPort?: number; preAuth?: { global: number; perIp: number } } = {},
+  opts: { tlsPort?: number; preAuth?: { global: number; perIp: number }; redeliveryWindowMs?: number } = {},
 ): Promise<WsServerHandle> {
   return new Promise((resolve, reject) => {
     // #87: reconcile the durable `online` flag with reality BEFORE binding the
@@ -1458,7 +1495,7 @@ export function startWsServer(
 
         const state: ConnState = {
           ws, agentId: null, peerAlias: null, authed: false, tls: scheme === 'wss',
-          srcIp: normaliseIp(req.socket.remoteAddress),
+          srcIp: normaliseIp(req.socket.remoteAddress), ackCapable: false,
         };
         registry.set(ws, state);
 
@@ -1541,6 +1578,7 @@ export function startWsServer(
               ws, state, db, frame, parsed,
               agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus,
               latchOnTls: sideBySide,
+              redeliveryWindowMs: opts.redeliveryWindowMs ?? DEFAULT_REDELIVERY_WINDOW_MS,
             });
             // Authenticated (agent or peer): no longer an unauthenticated socket.
             if (state.authed) releasePreAuth();

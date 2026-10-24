@@ -550,9 +550,9 @@ describe('markDelivered / markAcked', () => {
 
   it('markAcked sets acked_at to a recent unix ms; getMessage reflects the change', () => {
     const db = freshDb();
-    insertMessage(db, { id: 'm2', kind: 'direct', from_agent: 'x', payload: 'p', sent_at: Date.now() });
+    insertMessage(db, { id: 'm2', kind: 'direct', from_agent: 'x', to_agent: 'y', payload: 'p', sent_at: Date.now() });
     const before = Date.now();
-    markAcked(db, 'm2');
+    markAcked(db, 'm2', 'y');
     const msg = getMessage(db, 'm2')!;
     expect(msg.acked_at).not.toBeNull();
     expect(msg.acked_at!).toBeGreaterThanOrEqual(before);
@@ -565,7 +565,7 @@ describe('markDelivered / markAcked', () => {
 
   it('markAcked with a non-existent id does not throw', () => {
     const db = freshDb();
-    expect(() => markAcked(db, 'no-such')).not.toThrow();
+    expect(() => markAcked(db, 'no-such', 'y')).not.toThrow();
   });
 });
 

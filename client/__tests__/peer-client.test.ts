@@ -81,25 +81,35 @@ function stubMesh(opts: { authOk?: boolean } = {}): Promise<Harness> {
   });
 }
 
-describe('F0c: the agent auth frame is UNCHANGED', () => {
-  // The load-bearing test of this PR. authExtras() is merged into the auth
-  // frame for every client, so a default that was not exactly {} would change
-  // what every existing agent sends to every existing server.
-  it('MeshClient sends exactly {type, agent_id, token} — no protocol field', async () => {
+describe('F0c: the agent auth frame is exactly what it should be', () => {
+  // authExtras() is merged into the auth frame for every client, so anything
+  // it adds changes what every existing agent sends to every existing server.
+  // R-335 deliberately adds `capabilities: ['ack']` (on by default); `ack:
+  // false` must send the pre-R-335 frame byte for byte.
+  const authOf = async (config: { ack?: boolean }) => {
     const mesh = await stubMesh();
-    const client = new MeshClient({ serverUrl: `ws://127.0.0.1:${mesh.port}`, agentId: 'A', agentToken: 'tok' });
+    const client = new MeshClient({ serverUrl: `ws://127.0.0.1:${mesh.port}`, agentId: 'A', agentToken: 'tok', ...config });
     try {
       await client.connect();
       await wait(50);
       expect(mesh.authFrames.length).toBe(1);
-      // Exact shape, not a subset check: an ADDED field is precisely the
-      // regression, and a "has these keys" assertion cannot see one.
-      expect(Object.keys(mesh.authFrames[0]!).sort()).toEqual(['agent_id', 'token', 'type']);
-      expect(mesh.authFrames[0]).toEqual({ type: 'auth', agent_id: 'A', token: 'tok' });
+      return mesh.authFrames[0]!;
     } finally {
       try { client.close(); } catch { /* ignore */ }
       await mesh.close();
     }
+  };
+
+  it('MeshClient sends exactly {type, agent_id, token, capabilities: [ack]} — no protocol field', async () => {
+    // Exact shape, not a subset check: an ADDED field is precisely the
+    // regression, and a "has these keys" assertion cannot see one.
+    expect(await authOf({})).toEqual({ type: 'auth', agent_id: 'A', token: 'tok', capabilities: ['ack'] });
+  }, 15_000);
+
+  it('with ack: false it sends exactly {type, agent_id, token}', async () => {
+    const frame = await authOf({ ack: false });
+    expect(Object.keys(frame).sort()).toEqual(['agent_id', 'token', 'type']);
+    expect(frame).toEqual({ type: 'auth', agent_id: 'A', token: 'tok' });
   }, 15_000);
 });
 
