@@ -10,8 +10,9 @@ import { describe, it, expect, beforeEach, afterEach, afterAll } from 'bun:test'
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import * as net from 'net';
+import { join } from 'path';
 import {
-  openDb, registerAgent, aclGrant, aclCheck, aclRelated, listAclPeers, identityOf, ownsAddress,
+  openDb, countPlusAgentIds, registerAgent, aclGrant, aclCheck, aclRelated, listAclPeers, identityOf, ownsAddress,
   deleteAgent, insertMessage, subscribe, grantObserver, getOrCreateTopic,
 } from '../db.ts';
 import { hashToken } from '../auth.ts';
@@ -119,6 +120,18 @@ describe('R-377 identity and the ACL', () => {
     expect((db.prepare("SELECT acked_at FROM messages WHERE id = 'd'").get() as { acked_at: number | null }).acked_at).not.toBeNull();
     expect(db.prepare("SELECT 1 FROM subscriptions WHERE agent_id = 'fred+x'").get()).toBeNull();
     expect(db.prepare("SELECT id FROM messages WHERE id = 'other'").get()).not.toBeNull();   // a look-alike is untouched
+  });
+
+  it('SECURITY: deleting fred removes grants naming its aliases, so a recreated fred\'s fred+chat inherits none', () => {
+    for (const id of ['fred', 'freddy', 'bob']) reg(id);
+    aclGrant(db, 'bob', 'fred+chat', 'admin');
+    aclGrant(db, 'fred+chat', 'bob', 'admin');
+    aclGrant(db, 'bob', 'freddy+chat', 'admin');   // a look-alike's grant stays
+    deleteAgent(db, 'fred');
+    reg('fred');
+    expect(aclCheck(db, 'bob', 'fred+chat')).toBe(false);
+    expect(aclCheck(db, 'fred+chat', 'bob')).toBe(false);
+    expect(aclCheck(db, 'bob', 'freddy+chat')).toBe(true);
   });
 });
 
@@ -360,4 +373,46 @@ describe('R-377 HTTP: fred\'s token reads its aliases, and only its own', () => 
     // bob's history with the alias also finds what fred sent as itself.
     expect(await ids(await get('/messages?with=fred%2Bx', 'bob-tok'))).toEqual(['as-fred', 'as-alias', 'to-alias']);
   });
+});
+
+describe('R-377 boot refuses an existing agent id containing +', () => {
+  // A row from before the grammar refused `+` would now read as an alias of its
+  // prefix. Planted directly (registerAgent would refuse it), then the real
+  // server is started against the file.
+  const plant = (path: string, id: string | null) => {
+    const d = openDb(path);
+    registerAgent(d, { id: 'fred', token_hash: hashToken('fred-tok'), hostname: 'h' });
+    if (id !== null) {
+      d.prepare(`INSERT INTO agents (id, token_hash, hostname, capabilities, metadata, registered_at, last_seen, online)
+                 VALUES (?, ?, 'h', '[]', '{}', 1, 1, 0)`).run(id, hashToken('legacy-tok'));
+    }
+    expect(countPlusAgentIds(d)).toBe(id === null ? 0 : 1);
+    d.close();
+  };
+  const boot = async (path: string, ws: number, adminPort: number) => {
+    const proc = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'server.ts')], {
+      env: { ...process.env, MESH_ADMIN_TOKEN: 'adm', MESH_DB_PATH: path, MESH_FILES_DIR: join(path, '..', 'files'), MESH_WS_PORT: String(ws), MESH_ADMIN_PORT: String(adminPort) },
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    const exited = await Promise.race([proc.exited, delay(8000).then(() => null)]);
+    const stderr = exited === null ? '' : await new Response(proc.stderr).text();
+    if (exited === null) proc.kill();
+    return { exited, stderr };
+  };
+
+  it('a + id refuses to start, naming the count and never the id', async () => {
+    const path = join(tmp('r377-boot-'), 'mesh.db');
+    plant(path, 'old+agent-sentinel');
+    const r = await boot(path, nextPort(), nextPort());
+    expect(r.exited).toBe(1);
+    expect(r.stderr).toContain("1 agent id(s) contain '+'");
+    expect(r.stderr).not.toContain('old+agent-sentinel');
+  }, 15_000);
+
+  it('CONTROL: the same database without it starts', async () => {
+    const path = join(tmp('r377-boot-'), 'mesh.db');
+    plant(path, null);
+    const r = await boot(path, nextPort(), nextPort());
+    expect(r.exited).toBeNull();   // still running at the deadline: it started
+  }, 15_000);
 });

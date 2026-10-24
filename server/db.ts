@@ -1156,7 +1156,9 @@ export function deleteAgent(db: Database, id: string): string[] {
     // the table is FK-less (see the acl DDL) — and because a cascade performed
     // this deletion invisibly, in DDL, where nobody reviewing what deleting an
     // agent destroys would think to look.
-    db.prepare('DELETE FROM acl WHERE from_agent = ? OR to_agent = ?').run(id, id);
+    // R-377: and every grant naming one of its aliases, or a re-registered
+    // agent under the same name would inherit them through `fred+x`.
+    db.prepare('DELETE FROM acl WHERE from_agent = ? OR to_agent = ? OR from_agent GLOB ? OR to_agent GLOB ?').run(id, id, aliases, aliases);
     db.prepare('DELETE FROM agents WHERE id = ?').run(id);
 
     return purged.map(r => r.file_path);
@@ -1368,6 +1370,14 @@ export function identityOf(address: string): string {
   if (address.includes(':')) return address;
   const plus = address.indexOf('+');
   return plus > 0 ? address.slice(0, plus) : address;
+}
+
+/** R-377: how many agent rows have a `+` in their id. The grammar has refused
+ *  `+` since #187, but a row from before it would now read as an alias of its
+ *  prefix (and hand that agent's reach to whoever holds the prefix's token),
+ *  so server.ts refuses to start while any exists. A count, never the ids. */
+export function countPlusAgentIds(db: Database): number {
+  return (db.prepare("SELECT COUNT(*) AS n FROM agents WHERE instr(id, '+') > 0").get() as { n: number }).n;
 }
 
 /** R-377: is `address` someone a message can be addressed to here — an
