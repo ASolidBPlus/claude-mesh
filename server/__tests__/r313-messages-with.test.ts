@@ -131,16 +131,21 @@ describe('GET /messages?with= (R-313)', () => {
     const all = await ids(await get('/messages?with=B&limit=1000', TOK_A));
     expect(all).toHaveLength(12);
     const paged: string[] = [];
+    const sizes: number[] = [];
     let cursor = '';
     for (let page = 0; page < 10; page++) {
       const res = await get(`/messages?with=B&limit=4${cursor}`, TOK_A);
       const rows = (await res.json()) as { id: string; sent_at: number }[];
+      sizes.push(rows.length);
       if (rows.length === 0) break;
       paged.push(...rows.map(r => r.id));
       const last = rows[rows.length - 1]!;
       cursor = `&before=${last.sent_at}:${last.id}`;
     }
     expect(paged).toEqual(all);
+    // Each page is exactly `limit` rows: both arms read `limit` each, so a lost
+    // outer LIMIT would still tile correctly but hand back up to twice the page (R-318).
+    expect(sizes).toEqual([4, 4, 4, 0]);
     expect(paged.slice(0, 7)).toEqual(['p9', 'p8', 'p7', 'p6', 'p5', 'p4', 'p3']);
   });
 

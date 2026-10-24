@@ -213,6 +213,13 @@ export const PEER_REGISTER_ROUTE: Route = ROUTES.find(r => r.handler === handleP
  */
 export const FILE_ROUTE: Route = ROUTES.find(r => r.handler === handleFileById)!;
 
+/**
+ * R-318: message history, likewise the SAME object, so the WS listener's
+ * history door runs the same handler with the same node scoping (an agent sees
+ * only traffic it is a party to; `agent=<another>` is 403; R-313's `with=`).
+ */
+export const MESSAGES_ROUTE: Route = ROUTES.find(r => r.handler === handleMessagesGet)!;
+
 /** R-271: how long shutdown lets in-flight responses finish before closing their sockets. */
 const SHUTDOWN_GRACE_MS = 1000;
 

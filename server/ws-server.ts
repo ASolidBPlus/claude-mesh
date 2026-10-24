@@ -17,7 +17,7 @@ import {
 import { incMsgStatus, incReceived, incBytes } from './metrics.ts';
 import type { ServerTls } from './tls-config.ts';
 import { recordCaller, normaliseIp } from './connections.ts';
-import { PEER_REGISTER_ROUTE, FILE_ROUTE, serveRoute, noteTokenRequest } from './http-admin.ts';
+import { PEER_REGISTER_ROUTE, FILE_ROUTE, MESSAGES_ROUTE, serveRoute, noteTokenRequest } from './http-admin.ts';
 import { routeLabel } from './admin-ctx.ts';
 
 /** F1a (§5.1): the only inbound peer protocol this mesh speaks. A version is a
@@ -62,6 +62,11 @@ interface ConnState {
    *  proxy this is the proxy, which is the honest answer. */
   srcIp: string | null;
 }
+
+/** The admin routes the WS listener also serves to an agent holding its own
+ *  token (R-267 files, R-318 message history). The admin token is never
+ *  accepted on this door. */
+const AGENT_DOOR_ROUTES = [FILE_ROUTE, MESSAGES_ROUTE] as const;
 
 interface PresenceState {
   pendingOfflineTimer: ReturnType<typeof setTimeout> | null; // armed offline-broadcast timer, or null
@@ -1130,7 +1135,7 @@ export function startWsServer(
     // which is only a distinct question once there is a second instance to
     // shift traffic to (#23, parked). A /readyz that always agreed with
     // /healthz would be a promise the system cannot keep.
-    // R-271: refused tokens on the file door are logged — at most ONE line per
+    // R-271: refused tokens on the agent door are logged — at most ONE line per
     // source address per interval, carrying how many were suppressed since that
     // address's last line, so a scanner cannot turn the log into a flood. The
     // map is keyed by an address an outsider chooses, so it is bounded: at the
@@ -1138,7 +1143,7 @@ export function startWsServer(
     const FILE_REFUSAL_LOG_MS = 60_000;
     const FILE_REFUSAL_KEYS_MAX = 1024;
     const fileRefusals = new Map<string, { last: number; suppressed: number }>();
-    const logFileRefusal = (req: http.IncomingMessage, refused: 'no_token' | 'bad_token', tls: boolean): void => {
+    const logFileRefusal = (req: http.IncomingMessage, refused: 'no_token' | 'bad_token', tls: boolean, route: typeof FILE_ROUTE): void => {
       const ip = normaliseIp(req.socket.remoteAddress) ?? 'unknown';
       const now = Date.now();
       const seen = fileRefusals.get(ip);
@@ -1149,7 +1154,7 @@ export function startWsServer(
         if (oldestKey !== null) fileRefusals.delete(oldestKey);
       }
       console.log(JSON.stringify({
-        evt: 'agent.http', refused, route: routeLabel(req.method, FILE_ROUTE), src_ip: ip, tls, listener: 'ws',
+        evt: 'agent.http', refused, route: routeLabel(req.method, route), src_ip: ip, tls, listener: 'ws',
         suppressed_since_last: seen?.suppressed ?? 0, at: now,
       }));
       fileRefusals.set(ip, { last: now, suppressed: 0 });
@@ -1210,10 +1215,15 @@ export function startWsServer(
       //   - the R-65 latch: a TLS-latched agent is refused on plaintext;
       //   - the same agent.http line and connection report, via the shared
       //     noteTokenRequest.
-      // GET only, and this one path: nothing else from the admin table answers.
-      if (req.method === FILE_ROUTE.method) {
-        const url = new URL(req.url ?? '/', 'http://localhost');
-        const params = FILE_ROUTE.match(url.pathname);
+      //
+      // R-318 — MESSAGE HISTORY through the same door and the same rules, so a
+      // chat stack can read `GET /messages` here instead of on the admin port.
+      // GET only, and these two routes are the whole door (AGENT_DOOR_ROUTES):
+      // nothing else from the admin table answers here.
+      const url = new URL(req.url ?? '/', 'http://localhost');
+      for (const route of AGENT_DOOR_ROUTES) {
+        if (req.method !== route.method) continue;
+        const params = route.match(url.pathname);
         if (params !== null) {
           const tls = scheme === 'wss';
           const unauthorized = (): void => {
@@ -1225,21 +1235,21 @@ export function startWsServer(
             ? getAgentByToken(db, header.slice('Bearer '.length))
             : null;
           if (agent === null) {
-            logFileRefusal(req, typeof header === 'string' && header.startsWith('Bearer ') ? 'bad_token' : 'no_token', tls);
+            logFileRefusal(req, typeof header === 'string' && header.startsWith('Bearer ') ? 'bad_token' : 'no_token', tls, route);
             unauthorized();
             return;
           }
           if (!tls && isTlsLatched(db, agent.id)) {
             console.log(JSON.stringify({
-              evt: 'agent.http', principal: 'agent', agent_id: agent.id, route: routeLabel(req.method, FILE_ROUTE),
+              evt: 'agent.http', principal: 'agent', agent_id: agent.id, route: routeLabel(req.method, route),
               src_ip: normaliseIp(req.socket.remoteAddress), tls, listener: 'ws', refused: 'tls_latched', at: Date.now(),
             }));
             unauthorized();
             return;
           }
           const auth = { mode: 'agent' as const, agentId: agent.id };
-          noteTokenRequest(db, req, auth, routeLabel(req.method, FILE_ROUTE), tls, 'ws');
-          void serveRoute(FILE_ROUTE, {
+          noteTokenRequest(db, req, auth, routeLabel(req.method, route), tls, 'ws');
+          void serveRoute(route, {
             req, res, db, url, params, agentIndex, observerIndex, peerIndex,
             forwarders: {}, maxFileBytes, filesDir, auth,
           }, 'ws');

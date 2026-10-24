@@ -122,9 +122,10 @@ describe('R-267: the credential on this door is the AGENT token, and only it', (
     expect({ s: res.status, b: await res.text() }).toEqual({ s: 401, b: '{"error":"unauthorized"}' });
   });
 
-  it('another admin route on the WS port is still 404 — this opens ONE route', async () => {
+  it('another admin route on the WS port is still 404 — the door is files plus R-318\'s /messages', async () => {
     const { p, fileId } = await bus();
-    for (const path of ['/agents', '/messages', '/connections', '/files']) {
+    // `/messages` left this list deliberately in R-318 (r318-messages-agent-port.test.ts).
+    for (const path of ['/agents', '/connections', '/files', '/topics', '/acl', '/metrics']) {
       const res = await get(`http://127.0.0.1:${p}${path}`, 'bob-tok');
       expect({ path, s: res.status }).toEqual({ path, s: 404 });
     }
