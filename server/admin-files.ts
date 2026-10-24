@@ -9,7 +9,7 @@ that decides who may read one.
  */
 import { createReadStream, writeFileSync, openSync } from 'fs';
 import {
-  aclCheck, getAgentById, getFile, insertFile, markFileDelivered,
+  aclCheck, addressExists, getAgentById, getFile, identityOf, insertFile, markFileDelivered, ownsAddress,
 } from './db.ts';
 import type { AuthResult, AdminCtx } from './admin-ctx.ts';
 import { incReceived } from './metrics.ts';
@@ -242,7 +242,7 @@ export async function handleFilePost(ctx: AdminCtx): Promise<void> {
       return;
     }
 
-    if (getAgentById(db, to_agent) === null) {
+    if (!addressExists(db, to_agent)) {   // R-377: an agent or an alias of one
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'to_agent not found' }));
       return;
@@ -303,6 +303,7 @@ export async function handleFilePost(ctx: AdminCtx): Promise<void> {
         type: 'file_deliver',
         file_id,
         from: from_agent,
+        identity: identityOf(from_agent),   // R-377
         to: to_agent,
         filename,
         content_type,
@@ -352,7 +353,8 @@ export function fileAccessAuthorized(
     case 'admin':
       return true;
     case 'agent':
-      return file.from_agent === auth.agentId || file.to_agent === auth.agentId;
+      // R-377: and its aliases' files, which the same token logs in as.
+      return ownsAddress(auth.agentId, file.from_agent) || ownsAddress(auth.agentId, file.to_agent);
     case 'unauthenticated':
       return false; // the dispatcher checked no credential. Never a grant.
     default: {

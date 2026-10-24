@@ -572,6 +572,8 @@ export function openDb(path: string): Database {
   try { db.exec('ALTER TABLE agents ADD COLUMN last_auth_at INTEGER'); } catch {}
   try { db.exec('ALTER TABLE agents ADD COLUMN last_plaintext_at INTEGER'); } catch {}
 
+
+
   // F3 migration: observer grants made before federation existed are LOCAL-ONLY.
   // The default is 0 rather than 1 on purpose — an operator who granted "see
   // everything" in a mesh with no borders did not consent to cross-border
@@ -660,6 +662,11 @@ export function openDb(path: string): Database {
  * admit U+0085, U+2028/U+2029, a tab, and a right-to-left override.
  */
 export const LOCAL_ID_RE = /^[A-Za-z0-9._@-]+$/;
+
+/** R-377: the alias part of `fred+<suffix>`, as named in an auth frame's
+ *  `alias`. No `+` (one level, and `+` is the separator) and no ':' (an alias
+ *  is local), so an alias address can't parse as anything else. */
+export const ALIAS_SUFFIX_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 
 /** The refusal reason for an agent id, or null. One rule; three doors read it
  *  (`registerAgent` below, `handleAgentPost`, and the CLI) so each can report
@@ -1120,17 +1127,21 @@ export function deleteAgent(db: Database, id: string): string[] {
   const tx = db.transaction(() => {
     // Files first, so the paths are captured inside the same transaction that
     // removes the rows.
+    // R-377: what was addressed to the agent's aliases (`id+*`) goes too, so an
+    // agent recreated under the name inherits none of it. GLOB, not LIKE: the
+    // id grammar has none of GLOB's metacharacters, while `_` is LIKE's.
+    const aliases = `${id}+*`;
     const purged = db.prepare(
       `DELETE FROM files
-       WHERE to_agent = ? AND delivered_at IS NULL
+       WHERE (to_agent = ? OR to_agent GLOB ?) AND delivered_at IS NULL
        RETURNING file_path`
-    ).all(id) as { file_path: string }[];
+    ).all(id, aliases) as { file_path: string }[];
 
-    db.prepare('DELETE FROM messages WHERE to_agent = ? AND delivered_at IS NULL').run(id);
+    db.prepare('DELETE FROM messages WHERE (to_agent = ? OR to_agent GLOB ?) AND delivered_at IS NULL').run(id, aliases);
     // R-335: close out what was delivered but never acked, so a new agent
     // registered under the same id (short-lived identities reuse names) isn't
     // sent the old identity's messages as redeliveries on its first login.
-    db.prepare('UPDATE messages SET acked_at = ? WHERE to_agent = ? AND acked_at IS NULL').run(Date.now(), id);
+    db.prepare('UPDATE messages SET acked_at = ? WHERE (to_agent = ? OR to_agent GLOB ?) AND acked_at IS NULL').run(Date.now(), id, aliases);
 
     // F4: the subscriptions cascade on agent_id is GONE (the column is FK-less
     // so a remote id can be stored), so the deletion is explicit here — the
@@ -1138,14 +1149,16 @@ export function deleteAgent(db: Database, id: string): string[] {
     // delete, because that one cascades to subscriptions by TOPIC and the two
     // are different predicates: this removes what the agent subscribed TO, that
     // removes who subscribed to what the agent CREATED.
-    db.prepare('DELETE FROM subscriptions WHERE agent_id = ?').run(id);
+    db.prepare('DELETE FROM subscriptions WHERE agent_id = ? OR agent_id GLOB ?').run(id, aliases);
 
     db.prepare('DELETE FROM topics WHERE created_by = ?').run(id);
     // F0a: was an ON DELETE CASCADE on acl's foreign keys. Now explicit, because
     // the table is FK-less (see the acl DDL) — and because a cascade performed
     // this deletion invisibly, in DDL, where nobody reviewing what deleting an
     // agent destroys would think to look.
-    db.prepare('DELETE FROM acl WHERE from_agent = ? OR to_agent = ?').run(id, id);
+    // R-377: and every grant naming one of its aliases, or a re-registered
+    // agent under the same name would inherit them through `fred+x`.
+    db.prepare('DELETE FROM acl WHERE from_agent = ? OR to_agent = ? OR from_agent GLOB ? OR to_agent GLOB ?').run(id, id, aliases, aliases);
     db.prepare('DELETE FROM agents WHERE id = ?').run(id);
 
     return purged.map(r => r.file_path);
@@ -1175,6 +1188,10 @@ export function deleteAgent(db: Database, id: string): string[] {
 function assertLocalEndpointExists(db: Database, endpoint: string): void {
   if (endpoint.includes(':')) return; // remote id — see above
   if (getAgentById(db, endpoint) !== null) return;
+  // R-377: an alias `fred+x` is a principal a grant may name once `fred` exists
+  // and the suffix is well-formed (ALIAS_SUFFIX_RE).
+  const plus = endpoint.indexOf('+');
+  if (plus > 0 && getAgentById(db, endpoint.slice(0, plus)) !== null && ALIAS_SUFFIX_RE.test(endpoint.slice(plus + 1))) return;
   const err = new Error(`unknown agent: ${endpoint}`) as Error & { code?: string };
   err.code = 'AGENT_NOT_FOUND';
   throw err;
@@ -1321,10 +1338,66 @@ export function aclRevoke(db: Database, from_agent: string, to_agent: string): n
     .run(from_agent, to_agent).changes;
 }
 
+/**
+ * R-377 — may `from_agent` reach `to_agent`? An edge passes if it names either
+ * party by its address or by its identity (identityOf: the part before `+`):
+ * from→to, identity(from)→to, from→identity(to), identity(from)→identity(to).
+ * So a grant to `fred` covers every alias `fred+x`, including one first used
+ * after the grant (the operator's ruling: "you grant fred you grant all its
+ * aliases"). For an address with no `+` its identity is itself, so the IN
+ * lists collapse to one value and this is exactly the old single-edge check.
+ *
+ * Every ACL decision goes through here: direct sends (routeDirect, relays,
+ * admin file upload), topic fan-out including R-218's topic edges, remote
+ * publish. Presence uses listAclPeers, which applies the same rule.
+ */
 export function aclCheck(db: Database, from_agent: string, to_agent: string): boolean {
-  const row = db.prepare('SELECT 1 FROM acl WHERE from_agent = ? AND to_agent = ?')
-    .get(from_agent, to_agent);
+  const row = db.prepare(`
+    SELECT 1 FROM acl WHERE from_agent IN (?, ?) AND to_agent IN (?, ?) LIMIT 1
+  `).get(from_agent, identityOf(from_agent), to_agent, identityOf(to_agent));
   return row !== null;
+}
+
+/**
+ * R-377 — the identity behind an address: the part before `+` (Gmail-style
+ * aliases: `fred+chat` is an alias of `fred`, logged in with fred's own
+ * token). A plain address is its own identity. An id with a ':' (a remote
+ * `alias:agent`, a `topic:` principal) stands for itself: aliases are local
+ * only. `+` can't appear in an agent id (agentIdRefusal), so a `+` in a local
+ * address always means an alias. Pure: nothing a client sends feeds it.
+ */
+export function identityOf(address: string): string {
+  if (address.includes(':')) return address;
+  const plus = address.indexOf('+');
+  return plus > 0 ? address.slice(0, plus) : address;
+}
+
+/** R-377: how many agent rows have a `+` in their id. The grammar has refused
+ *  `+` since #187, but a row from before it would now read as an alias of its
+ *  prefix (and hand that agent's reach to whoever holds the prefix's token),
+ *  so server.ts refuses to start while any exists. A count, never the ids. */
+export function countPlusAgentIds(db: Database): number {
+  return (db.prepare("SELECT COUNT(*) AS n FROM agents WHERE instr(id, '+') > 0").get() as { n: number }).n;
+}
+
+/** R-377: is `address` someone a message can be addressed to here — an
+ *  agent row, or a well-formed alias (`fred+x`) of one? Aliases aren't
+ *  registered, so a message to an alias nobody has logged in as yet is queued
+ *  for it, exactly as for an offline agent. */
+export function addressExists(db: Database, address: string): boolean {
+  if (getAgentById(db, address) !== null) return true;
+  const plus = address.indexOf('+');
+  return plus > 0 && !address.includes(':') && ALIAS_SUFFIX_RE.test(address.slice(plus + 1)) && getAgentById(db, address.slice(0, plus)) !== null;
+}
+
+/** R-377: does the holder of agent `agentId`'s token own `address`? It owns
+ *  its own address and every well-formed alias of it, since an alias logs in
+ *  with that same token. Used by the agent-token HTTP routes, so fred's token
+ *  reads fred+x's history and files and nobody else's. */
+export function ownsAddress(agentId: string, address: string): boolean {
+  if (address === agentId) return true;
+  const plus = address.indexOf('+');
+  return plus > 0 && !address.includes(':') && address.slice(0, plus) === agentId && ALIAS_SUFFIX_RE.test(address.slice(plus + 1));
 }
 
 /**
@@ -1342,10 +1415,9 @@ export function aclCheck(db: Database, from_agent: string, to_agent: string): bo
  * same answer a different way.
  */
 export function aclRelated(db: Database, agentA: string, agentB: string): boolean {
-  const row = db.prepare(
-    'SELECT 1 FROM acl WHERE (from_agent = ? AND to_agent = ?) OR (from_agent = ? AND to_agent = ?)'
-  ).get(agentA, agentB, agentB, agentA);
-  return row !== null;
+  // R-377: identity-aware through aclCheck, so the oracle and listAclPeers
+  // answer the same question.
+  return aclCheck(db, agentA, agentB) || aclCheck(db, agentB, agentA);
 }
 
 /**
@@ -1380,11 +1452,15 @@ export function aclRelated(db: Database, agentA: string, agentB: string): boolea
  * self-referential acl row lives.
  */
 export function listAclPeers(db: Database, agentId: string): Set<string> {
+  // R-377: edges naming this address or its identity (an alias `fred+x` is
+  // related to whatever `fred` is). Presence is per plain address — alias
+  // sessions neither broadcast nor receive it — so no alias appears here.
+  const me = identityOf(agentId);
   const rows = db.prepare(
-    `SELECT to_agent AS peer FROM acl WHERE from_agent = ?
+    `SELECT to_agent AS peer FROM acl WHERE from_agent IN (?, ?)
      UNION
-     SELECT from_agent AS peer FROM acl WHERE to_agent = ?`
-  ).all(agentId, agentId) as { peer: string }[];
+     SELECT from_agent AS peer FROM acl WHERE to_agent IN (?, ?)`
+  ).all(agentId, me, agentId, me) as { peer: string }[];
   const peers = new Set<string>();
   for (const r of rows) if (r.peer !== agentId) peers.add(r.peer);
   return peers;
@@ -2116,7 +2192,7 @@ export function queryMessages(
 export function queryPairMessages(
   db: Database,
   a: string,
-  b: string,
+  b: string | readonly string[],
   opts: PairQueryOpts
 ): Message[] {
   const { sql, params } = pairMessagesQuery(a, b, opts);
@@ -2132,7 +2208,7 @@ type PairQueryOpts = {
 
 /** The SQL and bindings behind queryPairMessages, separate so a test can
  *  EXPLAIN the exact statement that runs. */
-export function pairMessagesQuery(a: string, b: string, opts: PairQueryOpts): { sql: string; params: SQLQueryBindings[] } {
+export function pairMessagesQuery(a: string, b: string | readonly string[], opts: PairQueryOpts): { sql: string; params: SQLQueryBindings[] } {
   const clauses: string[] = ['topic IS NULL'];
   const params: SQLQueryBindings[] = [];
   if (opts.kinds && opts.kinds.length > 0) {
@@ -2153,16 +2229,37 @@ export function pairMessagesQuery(a: string, b: string, opts: PairQueryOpts): { 
   let limit = opts.limit ?? 100;
   if (limit > 1000) limit = 1000;
 
-  const arm = `SELECT * FROM (SELECT * FROM messages WHERE from_agent = ? AND to_agent = ? AND ${clauses.join(' AND ')} ORDER BY sent_at DESC, id DESC LIMIT ?)`;
-  // A party paired with itself has one direction, and two arms would return
-  // every row twice.
-  if (a === b) {
-    return { sql: `${arm} ORDER BY sent_at DESC, id DESC LIMIT ?`, params: [a, a, ...params, limit, limit] };
+  // R-377: the counterpart may be several addresses (every address of one
+  // identity). Each arm stays an index range: equality on one column, IN on
+  // the other.
+  const others = typeof b === 'string' ? [b] : [...b];
+  const marks = (n: number) => Array(n).fill('?').join(', ');
+  const tail = `${clauses.join(' AND ')} ORDER BY sent_at DESC, id DESC LIMIT ?)`;
+  const out = `SELECT * FROM (SELECT * FROM messages WHERE from_agent = ? AND to_agent IN (${marks(others.length)}) AND ${tail}`;
+  // A party paired with itself has one direction, so the caller is left out
+  // of the inbound arm, or its notes to itself would come back twice.
+  const back = others.filter((x) => x !== a);
+  if (back.length === 0) {
+    return { sql: `${out} ORDER BY sent_at DESC, id DESC LIMIT ?`, params: [a, ...others, ...params, limit, limit] };
   }
+  const inbound = `SELECT * FROM (SELECT * FROM messages WHERE from_agent IN (${marks(back.length)}) AND to_agent = ? AND ${tail}`;
   return {
-    sql: `${arm} UNION ALL ${arm} ORDER BY sent_at DESC, id DESC LIMIT ?`,
-    params: [a, b, ...params, limit, b, a, ...params, limit, limit],
+    sql: `${out} UNION ALL ${inbound} ORDER BY sent_at DESC, id DESC LIMIT ?`,
+    params: [a, ...others, ...params, limit, ...back, a, ...params, limit, limit],
   };
+}
+
+/**
+ * R-377 — who `with=<counterpart>` means for `caller`: the counterpart and its
+ * identity, by the same rule as aclCheck, so `with=fred+x` also finds what
+ * fred sent as itself. Aliases have no registry, so `with=fred` can't
+ * enumerate them; an alias's own traffic is read with `with=fred+x`. The
+ * CALLER side is not widened: an address reads only its own traffic.
+ */
+export function pairCounterparts(caller: string, counterpart: string): string[] {
+  const set = new Set([counterpart, identityOf(counterpart)]);
+  if (counterpart !== caller) set.delete(caller);
+  return [...set].sort();
 }
 
 // Delivery TTL and retention are DIFFERENT lifecycles (#34):
@@ -2254,10 +2351,12 @@ export function getOrCreateTopic(
   const desc = description ?? '';
   const meta = metadata ?? '{}';
 
+  // R-377: a topic first used by an alias session (`fred+x`) is fred's: the
+  // column names an agent row, and the identity is the row.
   db.prepare(`
     INSERT INTO topics (name, created_at, created_by, description, metadata)
     VALUES (?, ?, ?, ?, ?)
-  `).run(name, now, created_by, desc, meta);
+  `).run(name, now, identityOf(created_by), desc, meta);
 
   return db.prepare('SELECT * FROM topics WHERE name = ?').get(name) as Topic;
 }

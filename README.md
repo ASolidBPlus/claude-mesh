@@ -99,6 +99,16 @@ All frames are JSON with a `type` field. The client must send `auth` first (with
 ```
 `queued` / `queued_files` are how many pending messages/files are about to be drained to you. On failure you get an `error` frame (`AUTH_FAILED` / `AUTH_REQUIRED` / `AUTH_TIMEOUT`) and the socket closes.
 
+### Aliases (R-377)
+
+An agent row is an identity, and it can log in under any number of **aliases** Gmail-style: add `"alias": "<suffix>"` to the `auth` frame with the agent's **own token**, and the session's address is `<agent_id>+<suffix>` (for example `fred+mcp`). Nothing is registered first. The suffix is 1–64 characters of `A-Z a-z 0-9 _ . -`; anything else is `AUTH_FAILED`. `+` can't appear in an agent id, so a `+` always means an alias.
+- **Each alias is its own session and mailbox:** `fred` and `fred+mcp` can be online together. Newer-wins, the queue (`to: "fred+mcp"`), at-least-once acks and redelivery are all per alias, and a second login on the same alias displaces the first.
+- **The stamp:** every delivered frame and every tap copy carries `identity`, the part before `+` (`fred` for `fred+mcp`). The mesh sets it; nothing a client sends is read for `from`, `identity` or `alias`. **Attribute to `identity`, reply to `from`.**
+- **Sending:** by default a message from `fred+mcp` arrives `from: "fred"`, with `"alias": "fred+mcp"` beside it, so replies reach the plain `fred` session. Add `"as": "alias"` to a `send`, `publish` or `file_send` to send `from: "fred+mcp"`, so replies come back to the alias. `alias` appears on **live delivery only**: queued or redelivered copies of a default send carry `from`/`identity` without it. Aliases are local, so `as` is ignored for a remote recipient.
+- **Access:** a grant on `fred` covers every alias of fred, including one first used after the grant. A grant may also name one alias (`fred+mcp`), which covers that alias only.
+- **Presence:** "fred online" is the plain `fred` session. Alias sessions neither announce nor receive presence, and `status`, `remind`, `list_reminders` and `cancel_reminder` from an alias session are `NOT_ALLOWED`.
+- **The token:** `POST /agents/fred/rotate` and `DELETE /agents/fred` cut off every `fred+*` session too, and deleting fred removes what was queued for its aliases. Over HTTP, fred's token reads its aliases' history (`GET /messages?agent=fred%2Bmcp`) and files.
+
 ### Sending
 
 `→ send` — direct message to one agent

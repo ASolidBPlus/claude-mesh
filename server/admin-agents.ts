@@ -21,6 +21,12 @@ import type { AdminCtx } from './admin-ctx.ts';
 import { readBody, formatAgent } from './admin-ctx.ts';
 import { listCallers } from './connections.ts';
 
+/** R-377: the live alias sessions (`id+*`) of agent `id`. */
+function aliasSessions(agentIndex: AdminCtx['agentIndex'], id: string) {
+  const prefix = `${id}+`;
+  return [...agentIndex].filter(([address]) => address.startsWith(prefix)).map(([, ws]) => ws);
+}
+
 export async function handleAgentPost(ctx: AdminCtx): Promise<void> {
   const { req, res, db } = ctx;
   const raw = await readBody(req);
@@ -201,7 +207,8 @@ export function handleAgentRotate(ctx: AdminCtx): void {
     res.end(JSON.stringify({ error: 'agent not found' }));
     return;
   }
-  const sockets = new Set([agentIndex.get(id), observerIndex.get(id)].filter((s): s is NonNullable<typeof s> => s !== undefined));
+  // R-377: and every alias session, fred+*, which logged in with this token.
+  const sockets = new Set([agentIndex.get(id), observerIndex.get(id), ...aliasSessions(agentIndex, id)].filter((s): s is NonNullable<typeof s> => s !== undefined));
   for (const sock of sockets) {
     try { sock.send(JSON.stringify({ type: 'error', code: 'TOKEN_ROTATED', message: 'token rotated' })); } catch { /* ignore */ }
     try { sock.close(1008, 'token rotated'); } catch { /* ignore */ }
@@ -258,6 +265,12 @@ export function handleAgentDelete(ctx: AdminCtx): void {
   // unlink failure is logged, never fatal: leaked bytes are recoverable, a
   // half-finished delete reported as a 409 is not (the identity is already
   // gone by the time we get here).
+  // R-377: an alias session logged in with the deleted agent's token; it goes
+  // with the agent.
+  for (const sock of aliasSessions(ctx.agentIndex, id as string)) {
+    try { sock.send(JSON.stringify({ type: 'error', code: 'AGENT_DELETED', message: 'agent deleted' })); } catch { /* ignore */ }
+    try { sock.terminate(); } catch { /* ignore */ }
+  }
   let unlinked = 0;
   for (const p of purgedPaths) {
     try { unlinkSync(p); unlinked++; } catch (err) {

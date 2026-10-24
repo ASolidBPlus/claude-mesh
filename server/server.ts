@@ -1,4 +1,4 @@
-import { openDb, findPeerAliasCollisions, findInvalidTopicNames, findTopicPrefixAgents, listPeers, listOutboundPeers,
+import { openDb, countPlusAgentIds, findPeerAliasCollisions, findInvalidTopicNames, findTopicPrefixAgents, listPeers, listOutboundPeers,
   findUngrammaticalAgentIds, findUngrammaticalTopicNames } from './db.ts';
 import { setPeerUpSource, applyTrafficClasses } from './metrics.ts';
 import { parseTrafficClasses, type ClassRule } from './traffic-classes.ts';
@@ -295,6 +295,16 @@ async function main() {
     db = openDb(config.dbPath);
   } catch (err) {
     process.stderr.write(`Failed to open database: ${err}\n`);
+    process.exit(1);
+  }
+
+  // R-377: `+` now separates an agent from its alias, so an id containing one
+  // would be read as an alias of its prefix. Refused rather than reported (unlike
+  // F0b's ':' ids below): that reading would widen another agent's reach.
+  // The count only; ids go to nobody's log.
+  const plusIds = countPlusAgentIds(db);
+  if (plusIds > 0) {
+    process.stderr.write(`${plusIds} agent id(s) contain '+', which is the alias separator (R-377). Rename or delete them before starting; ids not shown.\n`);
     process.exit(1);
   }
 

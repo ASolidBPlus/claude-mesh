@@ -96,6 +96,14 @@ export interface MeshClientConfig {
    * Files (`kind: 'file'`) are not acked or redelivered.
    */
   ack?: boolean;
+
+  /**
+   * R-377 — connect as the alias `<agentId>+<alias>`, with agentId's own token
+   * (1–64 characters of A-Z a-z 0-9 _ . -). The alias has its own connection,
+   * mailbox and acks beside the plain agentId's, and doesn't count toward its
+   * presence. What it sends is `from` the identity by default; see `as`.
+   */
+  alias?: string;
 }
 
 /**
@@ -118,6 +126,11 @@ export interface SendOpts {
   /** MIME type for the payload (default `text/plain`). Surfaced to the
    *  recipient as `Inbound.contentType`. */
   contentType?: string;
+  /** R-377: on a client connected with `alias`, send from the alias address
+   *  (`from: fred+x`, so replies come back to this connection) instead of the
+   *  identity (`from: fred`, the default, so replies reach the plain session).
+   *  Ignored without an alias, and for a remote recipient. */
+  as?: 'alias';
 }
 
 export interface PublishOpts {
@@ -125,6 +138,11 @@ export interface PublishOpts {
   contentType?: string;
   /** Delivery TTL in ms (default 5 min; `0` = drop for offline subscribers). */
   ttlMs?: number;
+  /** R-377: on a client connected with `alias`, send from the alias address
+   *  (`from: fred+x`, so replies come back to this connection) instead of the
+   *  identity (`from: fred`, the default, so replies reach the plain session).
+   *  Ignored without an alias, and for a remote recipient. */
+  as?: 'alias';
 }
 
 /** A presence snapshot entry (from `listPresence()`), or the payload of a
@@ -172,6 +190,14 @@ export interface Inbound {
   msgId: string;
   kind: 'direct' | 'topic' | 'file' | 'reminder';
   from: string;
+  /** R-377: who is behind `from` — the identity its address belongs to, or the
+   *  address itself. Stamped by the mesh, so it can be trusted for access
+   *  decisions; equals `from` when the server predates R-377. */
+  identity: string;
+  /** R-377: the alias connection a message came from when `from` is its
+   *  identity (a default send from `fred+x` arrives as from fred, alias
+   *  fred+x). Live delivery only; absent on queued or redelivered copies. */
+  alias?: string;
   to?: string | null;
   topic?: string | null;
   text?: string | null; // = payload for non-file; null for file
@@ -203,6 +229,11 @@ export interface SendFileOpts {
   ttlMs?: number;       // delivery TTL; omit for the 5-min server default
   replyToMsgId?: string;
   groupId?: string;     // group N files from one send under a shared tag (passthrough)
+  /** R-377: on a client connected with `alias`, send from the alias address
+   *  (`from: fred+x`, so replies come back to this connection) instead of the
+   *  identity (`from: fred`, the default, so replies reach the plain session).
+   *  Ignored without an alias, and for a remote recipient. */
+  as?: 'alias';
 }
 
 interface ResolvedConfig {
@@ -423,7 +454,7 @@ export class MeshClient {
     const KNOWN_KEYS: Record<keyof MeshClientConfig, true> = {
       serverUrl: true, agentId: true, agentToken: true, httpUrl: true,
       pingIntervalMs: true, pongDeadlineMs: true, ackTimeoutMs: true, ca: true,
-      ack: true,
+      ack: true, alias: true,
     };
     const KNOWN = Object.keys(KNOWN_KEYS);
     const unknown = Object.keys(config).filter(k => !KNOWN.includes(k));
@@ -475,6 +506,7 @@ export class MeshClient {
     const frame: SendFrame = { type: 'send', msg_id: msgId, to, payload: text };
     if (opts.ttlMs !== undefined) frame.ttl_ms = opts.ttlMs;
     if (opts.contentType !== undefined) frame.content_type = opts.contentType;
+    if (opts.as !== undefined) frame.as = opts.as;
     return this.sendWithAck(msgId, frame);
   }
 
@@ -488,6 +520,7 @@ export class MeshClient {
     };
     if (opts.contentType !== undefined) frame.content_type = opts.contentType;
     if (opts.ttlMs !== undefined) frame.ttl_ms = opts.ttlMs;
+    if (opts.as !== undefined) frame.as = opts.as;
     return this.sendWithAck(msgId, frame);
   }
 
@@ -520,6 +553,7 @@ export class MeshClient {
     if (opts.caption !== undefined) frame.caption = opts.caption;
     if (opts.replyToMsgId !== undefined) frame.reply_to_msg_id = opts.replyToMsgId;
     if (opts.groupId !== undefined) frame.group_id = opts.groupId;
+    if (opts.as !== undefined) frame.as = opts.as;
     return new Promise<{ fileId: string | null }>((resolve, reject) => {
       this.armWaiter(this.pendingFileSends, msgId, { resolve, reject });
       try {
@@ -1260,7 +1294,10 @@ export class MeshClient {
    *  would change what every existing agent sends to every existing server.
    *  A server that predates R-335 ignores the field. */
   protected authExtras(): Record<string, unknown> {
-    return this.config.ack === false ? {} : { capabilities: ['ack'] };
+    return {
+      ...(this.config.ack === false ? {} : { capabilities: ['ack'] }),
+      ...(this.config.alias === undefined ? {} : { alias: this.config.alias }),
+    };
   }
 
   /** F0c (§7): which error frames stop the client for good. Default is today's
@@ -1355,6 +1392,8 @@ export class MeshClient {
       msgId: f.msg_id,
       kind: f.kind,
       from: f.from,
+      identity: f.identity ?? f.from,
+      ...(f.alias !== undefined ? { alias: f.alias } : {}),
       to: f.to,
       topic: f.topic,
       text: f.payload,
@@ -1375,6 +1414,8 @@ export class MeshClient {
       msgId: f.file_id,
       kind: 'file',
       from: f.from,
+      identity: f.identity ?? f.from,
+      ...(f.alias !== undefined ? { alias: f.alias } : {}),
       to: f.to,
       text: null,
       payload: null,

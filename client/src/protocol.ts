@@ -15,6 +15,12 @@
 // Client → server frames (the server accepts these)
 // ──────────────────────────────────────────────
 
+/** R-377: on a send from an alias session, `as: 'alias'` sends from the
+ *  alias address (`from: fred+x`, so replies come back to the alias). Omitted,
+ *  the message is from the identity (`from: fred`). Ignored on a plain session,
+ *  and for a remote recipient (aliases are local). */
+export type SendAs = 'alias';
+
 export interface SendFrame {
   type: 'send';
   msg_id: string;
@@ -22,6 +28,7 @@ export interface SendFrame {
   payload: string;
   content_type?: string;
   ttl_ms?: number;
+  as?: SendAs;
 }
 
 export interface PublishFrame {
@@ -31,6 +38,7 @@ export interface PublishFrame {
   payload: string;
   content_type?: string;
   ttl_ms?: number;
+  as?: SendAs;
 }
 
 export interface SubscribeFrame {
@@ -54,6 +62,7 @@ export interface FileSendFrame {
   caption?: string;
   reply_to_msg_id?: string;
   group_id?: string; // #60: optional grouping tag for a multi-file send (passthrough)
+  as?: SendAs;
 }
 
 export interface RemindFrame {
@@ -93,6 +102,10 @@ export interface AuthFrame {
    *  delivered-but-unacked rows again on its next login. A server ignores
    *  names it doesn't know. Never sent by a peer connection. */
   capabilities?: string[];
+  /** R-377: log in as the alias `<agent_id>+<alias>` with agent_id's own
+   *  token: 1–64 characters of A-Z a-z 0-9 _ . - (no `+`). The session gets its
+   *  own address, queue and acks; it doesn't count toward presence. */
+  alias?: string;
 }
 
 /** R-335: sent by an ack-capable client once its handler for a `deliver` frame
@@ -120,6 +133,14 @@ export interface DeliverFrame {
   msg_id: string;
   kind: 'direct' | 'topic' | 'reminder';
   from: string;
+  /** R-377: the identity behind `from`: the part before `+` (fred for
+   *  fred+chat), or `from` itself. Set by the mesh, never by the sender.
+   *  Attribute to `identity`; reply to `from`. Absent from a server that
+   *  predates R-377. */
+  identity?: string;
+  /** R-377: the alias session a default send came from, when `from` is the
+   *  identity. On live delivery only; a queued or redelivered copy lacks it. */
+  alias?: string;
   to: string | null;
   topic: string | null;
   // Inert since the request/response strip: only req/resp frames ever set this;
@@ -233,6 +254,9 @@ export interface FileDeliverFrame {
   type: 'file_deliver';
   file_id: string;
   from: string;
+  /** R-377: as on DeliverFrame. */
+  identity?: string;
+  alias?: string;
   to: string | null;
   filename: string;
   content_type: string;
@@ -274,6 +298,11 @@ export interface TapFrame {
   msg_id: string;
   kind: string;                       // direct | topic | file
   from: string;
+  /** R-377: as on DeliverFrame. Required to mirror the server's TapFrame
+   *  exactly (tap-event.test.ts); a server that predates R-377 omits it. */
+  identity: string;
+  /** R-377: as on DeliverFrame. */
+  alias?: string;
   to: string | null;
   topic: string | null;
   correlation_id: string | null;

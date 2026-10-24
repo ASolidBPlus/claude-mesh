@@ -10,6 +10,8 @@ import {
   type Peer,
   insertMessage,
   getMessage,
+  identityOf,
+  addressExists,
   markDelivered,
   getPendingMessages,
   getUnackedDeliveredMessages,
@@ -72,12 +74,22 @@ export function buildDeliverFrame(msg: {
    *  no origin that looks exactly like a local one. The callers that pass a
    *  whole `Message` get it from the row for free. */
   origin: string | null;
-}, redelivered = false): string {
+},
+/** R-377: the identity behind msg.from_agent (identityOf), REQUIRED so every
+ *  delivery path states it. Always from the mesh's own records; a client's
+ *  frame never supplies it. */
+identity: string,
+redelivered = false,
+/** R-377: the alias session a DEFAULT send came from (`from` is then the
+ *  identity, so replies go to the plain session). Live delivery only: a row
+ *  read back from the queue doesn't keep it. */
+alias: string | null = null): string {
   return JSON.stringify({
     type: 'deliver',
     msg_id: msg.id,
     kind: msg.kind,
     from: msg.from_agent,
+    identity,
     to: msg.to_agent,
     topic: msg.topic,
     correlation_id: msg.correlation_id,
@@ -88,6 +100,7 @@ export function buildDeliverFrame(msg: {
     // R-335: only on a redelivery, so a client without the ack capability
     // never sees the key at all.
     ...(redelivered ? { redelivered: true } : {}),
+    ...(alias !== null ? { alias } : {}),
   });
 }
 
@@ -104,6 +117,8 @@ export interface DeliverableMessage {
    *  delivered). Offline + ephemeral is dropped, not queued. */
   ephemeral: boolean;
   payloadBytes: number;
+  /** R-377: see buildDeliverFrame's `alias`. */
+  alias?: string | null;
 }
 
 /**
@@ -134,7 +149,7 @@ export function deliverOrQueue(
       topic: null, correlation_id: null, payload: msg.payload,
       content_type: msg.content_type, sent_at: msg.sent_at,
       origin: null,   // a direct message has no cross-mesh provenance
-    }));
+    }, identityOf(msg.from_agent), false, msg.alias ?? null));
     if (!msg.ephemeral) markDelivered(db, msg.id);
     incMsgStatus('direct', 'delivered');
     incReceived(msg.to_agent, { kind: 'direct', from: msg.from_agent, to: msg.to_agent, topic: null });
@@ -311,6 +326,8 @@ export function fanOutTopicLocal(
      *  Absent on the hub re-origination and spoke delivery callers, which stay
      *  exactly as they were — there the principal already IS the topic. */
     viaTopicEdges?: true;
+    /** R-377: see buildDeliverFrame's `alias`. */
+    alias?: string | null;
   },
 ): void {
   // ONE LOOKUP for the poster's half of the topic shape; the subscriber's half
@@ -324,6 +341,8 @@ export function fanOutTopicLocal(
     .filter(id => id !== m.from_agent)
     .filter(id => !isRemoteEndpoint(db, id));
 
+  // R-377: looked up once per post, not once per subscriber.
+  const senderIdentity = identityOf(m.from_agent);
   for (const subscriber_id of subscribers) {
 
     // 5a. ACL check.
@@ -390,7 +409,7 @@ export function fanOutTopicLocal(
         content_type: m.content_type,
         sent_at: m.sent_at,
         origin: m.origin,
-      }));
+      }, senderIdentity, false, m.alias ?? null));
       if (!m.ephemeral) markDelivered(db, msgId);
       incMsgStatus('topic', 'delivered');
       incReceived(subscriber_id, { kind: 'topic', from: m.from_agent, to: null, topic: m.topic });
@@ -822,7 +841,7 @@ export function routeRelay(
 
     emitTap(observerIndex, {
       type: 'tap', msg_id, kind: 'topic',
-      from: `${alias}:${from}`, to: null, topic: topicName, correlation_id: null,
+      from: `${alias}:${from}`, identity: identityOf(`${alias}:${from}`), to: null, topic: topicName, correlation_id: null,
       sent_at: now, size: payloadBytes, payload: payload as string,
     }, crossBorderAudience(db, observerIndex));
 
@@ -865,7 +884,7 @@ export function routeRelay(
     // see this mesh's subscriber count leak into the cross-border stream.
     emitTap(observerIndex, {
       type: 'tap', msg_id: localTopicId, kind: 'topic',
-      from: stampedFrom, to: null, topic: stampedFrom, correlation_id: null,
+      from: stampedFrom, identity: identityOf(stampedFrom), to: null, topic: stampedFrom, correlation_id: null,
       sent_at: now, size: payloadBytes, payload: payload as string,
     }, crossBorderAudience(db, observerIndex));
 
@@ -902,7 +921,7 @@ export function routeRelay(
   // CROSS-BORDER (inbound): `from` is a remote id stamped with the peer alias.
   emitTap(observerIndex, {
     type: 'tap', msg_id: localId, kind: 'direct',
-    from: stampedFrom, to: to as string, topic: null, correlation_id: null,
+    from: stampedFrom, identity: identityOf(stampedFrom), to: to as string, topic: null, correlation_id: null,
     sent_at: now, size: payloadBytes, payload: payload as string,
   }, crossBorderAudience(db, observerIndex));
 
@@ -915,7 +934,10 @@ export function routeDirect(
   agentIndex: Map<string, WebSocket>,
   from_agent: string,
   frame: SendFrame,
-  observerIndex: Map<string, WebSocket> = new Map()
+  observerIndex: Map<string, WebSocket> = new Map(),
+  /** R-377: the alias session this DEFAULT send came from, shown beside
+   *  `from` (the identity) on live delivery and on the tap. Null otherwise. */
+  viaAlias: string | null = null,
 ): RouterResult {
   // 1. Payload size check
   const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
@@ -1034,7 +1056,7 @@ export function routeDirect(
       // CROSS-BORDER (outbound): `to` is a remote id (alias:agent).
       emitTap(observerIndex, {
         type: 'tap', msg_id: frame.msg_id, kind: 'direct',
-        from: from_agent, to: frame.to, topic: null, correlation_id: null,
+        from: from_agent, identity: identityOf(from_agent), ...(viaAlias !== null ? { alias: viaAlias } : {}), to: frame.to, topic: null, correlation_id: null,
         sent_at: sentAtRemote, size: payloadBytes, payload: frame.payload,
       }, crossBorderAudience(db, observerIndex));
 
@@ -1055,7 +1077,7 @@ export function routeDirect(
   }
 
   // 2. Recipient exists check
-  if (getAgentById(db, frame.to) === null) {
+  if (!addressExists(db, frame.to)) {   // R-377: an agent or an alias of one
     incError('AGENT_NOT_FOUND');
     return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
   }
@@ -1127,11 +1149,12 @@ export function routeDirect(
     expires_at,
     ephemeral: ttl === 0,
     payloadBytes,
+    alias: viaAlias,
   });
 
   emitTap(observerIndex, {
     type: 'tap', msg_id: frame.msg_id, kind: 'direct',
-    from: from_agent, to: frame.to, topic: null, correlation_id: null,
+    from: from_agent, identity: identityOf(from_agent), ...(viaAlias !== null ? { alias: viaAlias } : {}), to: frame.to, topic: null, correlation_id: null,
     sent_at, size: payloadBytes, payload: frame.payload,
   }, LOCAL_ONLY);
 
@@ -1159,12 +1182,12 @@ export function drainQueue(
   const rows = again.length === 0 ? pending : [...pending, ...again].sort((x, y) => x.sent_at - y.sent_at);
   for (const msg of rows) {
     if (redeliver.has(msg.id)) {
-      ws.send(buildDeliverFrame(msg, true));
+      ws.send(buildDeliverFrame(msg, identityOf(msg.from_agent), true));
       incMsgStatus(msg.kind, 'redelivered');
       incBytes('out', Buffer.byteLength(msg.payload, 'utf8'));
       continue;
     }
-    ws.send(buildDeliverFrame(msg));
+    ws.send(buildDeliverFrame(msg, identityOf(msg.from_agent)));
     markDelivered(db, msg.id);
     incMsgStatus(msg.kind, 'delivered');
     const kind = trafficKind(msg.kind);
@@ -1179,7 +1202,10 @@ export function routePublish(
   agentIndex: Map<string, WebSocket>,
   from_agent: string,
   frame: PublishFrame,
-  observerIndex: Map<string, WebSocket> = new Map()
+  observerIndex: Map<string, WebSocket> = new Map(),
+  /** R-377: the alias session this DEFAULT send came from, shown beside
+   *  `from` (the identity) on live delivery and on the tap. Null otherwise. */
+  viaAlias: string | null = null,
 ): RouterResult {
   // 1. Payload size check
   const payloadBytes = Buffer.byteLength(frame.payload, 'utf8');
@@ -1241,7 +1267,7 @@ export function routePublish(
 
     emitTap(observerIndex, {
       type: 'tap', msg_id: postId, kind: 'topic',
-      from: from_agent, to: null, topic: frame.topic, correlation_id: null,
+      from: from_agent, identity: identityOf(from_agent), ...(viaAlias !== null ? { alias: viaAlias } : {}), to: null, topic: frame.topic, correlation_id: null,
       sent_at: nowRemote, size: payloadBytes, payload: frame.payload,
     }, crossBorderAudience(db, observerIndex));
 
@@ -1296,6 +1322,7 @@ export function routePublish(
     expires_at,
     ephemeral: ttl === 0,
     payloadBytes,
+    alias: viaAlias,
   });
 
   // One CROSS-BORDER tap per outbound row, beside the LOCAL_ONLY tap below.
@@ -1304,14 +1331,14 @@ export function routePublish(
   for (const row of outbound) {
     emitTap(observerIndex, {
       type: 'tap', msg_id: row.id, kind: 'topic',
-      from: `${TOPIC_PRINCIPAL_PREFIX}${frame.topic}`, to: null,
+      from: `${TOPIC_PRINCIPAL_PREFIX}${frame.topic}`, identity: identityOf(`${TOPIC_PRINCIPAL_PREFIX}${frame.topic}`), to: null,
       topic: frame.topic, correlation_id: null,
       sent_at, size: payloadBytes, payload: frame.payload,
     }, crossBorderAudience(db, observerIndex));
   }
   emitTap(observerIndex, {
     type: 'tap', msg_id: frame.msg_id, kind: 'topic',
-    from: from_agent, to: null, topic: frame.topic, correlation_id: null,
+    from: from_agent, identity: identityOf(from_agent), ...(viaAlias !== null ? { alias: viaAlias } : {}), to: null, topic: frame.topic, correlation_id: null,
     sent_at, size: payloadBytes, payload: frame.payload,
   }, LOCAL_ONLY);
 
@@ -1464,7 +1491,9 @@ export function routeFile(
   frame: FileSendFrame,
   maxFileBytes: number,
   filesDir: string,
-  observerIndex: Map<string, WebSocket> = new Map()
+  observerIndex: Map<string, WebSocket> = new Map(),
+  /** R-377: as routeDirect's `viaAlias`. */
+  viaAlias: string | null = null,
 ): RouterResult {
   // 1. Validate base64 — attempt decode and check round-trip
   let decoded: Buffer;
@@ -1487,7 +1516,7 @@ export function routeFile(
   }
 
   // 3. Recipient exists check
-  if (getAgentById(db, frame.to) === null) {
+  if (!addressExists(db, frame.to)) {   // R-377: an agent or an alias of one
     incError('AGENT_NOT_FOUND');
     return { ok: false, error_code: 'AGENT_NOT_FOUND', error_message: `unknown agent: ${frame.to}` };
   }
@@ -1553,6 +1582,8 @@ export function routeFile(
       type: 'file_deliver',
       file_id,
       from: from_agent,
+      identity: identityOf(from_agent),   // R-377
+      ...(viaAlias !== null ? { alias: viaAlias } : {}),
       to: frame.to,
       filename: frame.filename,
       content_type,
@@ -1574,7 +1605,7 @@ export function routeFile(
 
   emitTap(observerIndex, {
     type: 'tap', msg_id: frame.msg_id, kind: 'file',
-    from: from_agent, to: frame.to, topic: null, correlation_id: null,
+    from: from_agent, identity: identityOf(from_agent), ...(viaAlias !== null ? { alias: viaAlias } : {}), to: frame.to, topic: null, correlation_id: null,
     sent_at, size: size_bytes, payload: null,
     file_id, filename: frame.filename, content_type,
   }, LOCAL_ONLY);
@@ -1601,6 +1632,7 @@ export function drainFileQueue(
       type: 'file_deliver',
       file_id: file.id,
       from: file.from_agent,
+      identity: identityOf(file.from_agent),   // R-377
       to: file.to_agent,
       filename: file.filename,
       content_type: file.content_type,
