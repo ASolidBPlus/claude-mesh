@@ -149,7 +149,7 @@ describe('the WS listener serves exactly the admin routes it is meant to, and no
     return [...exacts, ...ids];
   }
 
-  it('every route in the admin table 404s on the WS listener — even with the admin token — except /peers/register and GET /files/:id', async () => {
+  it('every route in the admin table 404s on the WS listener — even with the admin token — except /peers/register, GET /files/:id and GET /messages', async () => {
     const paths = samplePaths();
     const probes = ROUTES.map(r => ({ method: r.method, path: paths.find(p => r.match(p) !== null), route: r }));
     // Parser control: every route has a path its own matcher accepts.
@@ -172,8 +172,10 @@ describe('the WS listener serves exactly the admin routes it is meant to, and no
     // R-267 added the second: GET /files/:id, the agent's own file download.
     // It answers the ADMIN token with 401 — that door takes the agent token
     // only, which r267-files-ws-port.test.ts pins in full. The set stays exact,
-    // so a third admin route reaching this port is still a failure here.
-    expect(served).toEqual(['POST /peers/register -> 403', 'GET /files/x -> 401']);
+    // so another admin route reaching this port is still a failure here.
+    // R-318 added the third: GET /messages, the agent's own history, on the
+    // same agent-token-only door (r318-messages-agent-port.test.ts).
+    expect(served).toEqual(['POST /peers/register -> 403', 'GET /messages -> 401', 'GET /files/x -> 401']);
     expect(PEER_REGISTER_ROUTE.auth).toBe('handler');
 
     // And /metrics — not in the table, special-cased on the admin port — is
