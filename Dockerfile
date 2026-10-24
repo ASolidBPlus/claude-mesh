@@ -3,7 +3,12 @@
 # for any IP), and the border dials peers by IP. The property is proven by
 # server/__tests__/native-tls.test.ts; this line keeps a rebuild from landing
 # on a runtime where that test would fail.
-FROM oven/bun:1.4-alpine AS base
+#
+# PINNED to the exact version CI tests and production runs, not the floating
+# 1.4 tag: 1.4.4 changes behaviour two tests pin (native-tls's link-down
+# reason, and R-69's over-limit close code). Move this and CI's bun-version
+# together.
+FROM oven/bun:1.4.2-alpine AS base
 WORKDIR /app
 
 # Install deps separately for layer caching.
