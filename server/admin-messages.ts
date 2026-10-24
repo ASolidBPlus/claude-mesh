@@ -7,7 +7,7 @@
  * site moved with it.
  */
 import {
-  queryMessages, queryPairMessages, pairCounterparts, ownsAddress, LOCAL_ID_RE, PEER_ALIAS_RE, ALIAS_SUFFIX_RE,
+  identityOf, queryMessages, queryPairMessages, pairCounterparts, ownsAddress, LOCAL_ID_RE, PEER_ALIAS_RE, ALIAS_SUFFIX_RE,
 } from './db.ts';
 import type { AdminCtx } from './admin-ctx.ts';
 
@@ -22,6 +22,13 @@ function counterpartRefusal(id: string): string | null {
   const colon = id.indexOf(':');
   if (colon > 0 && PEER_ALIAS_RE.test(id.slice(0, colon)) && LOCAL_ID_RE.test(id.slice(colon + 1))) return null;
   return 'invalid with (expected an agent id, agent+alias, or alias:agent for a remote one)';
+}
+
+/** R-382: each history row carries the identity behind its sender, computed
+ *  the same way live delivery stamps it (identityOf), so a reloaded
+ *  conversation attributes a message exactly as it did when it arrived. */
+function withIdentity<T extends { from_agent: string }>(rows: T[]): (T & { identity: string })[] {
+  return rows.map((r) => ({ ...r, identity: identityOf(r.from_agent) }));
 }
 
 export function handleMessagesGet(ctx: AdminCtx): void {
@@ -101,14 +108,16 @@ export function handleMessagesGet(ctx: AdminCtx): void {
     // `with` reads only non-topic rows, so a topic filter beside it could
     // only ever return nothing; refused rather than silently empty.
     if (topicParam !== undefined) return fail('with and topic cannot be combined');
-    const pair = queryPairMessages(db, effectiveAgent, pairCounterparts(effectiveAgent, withParam), {
+    const counterparts = pairCounterparts(effectiveAgent, withParam);
+    const pair = queryPairMessages(db, effectiveAgent, counterparts.exact, {
+      aliasesOf: counterparts.aliasesOf,
       since: Number.isNaN(since) ? undefined : since,
       limit: Number.isNaN(limit) ? undefined : limit,
       before,
       kinds,
     });
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(pair));
+    res.end(JSON.stringify(withIdentity(pair)));
     return;
   }
 
@@ -122,6 +131,6 @@ export function handleMessagesGet(ctx: AdminCtx): void {
   });
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(messages));
+  res.end(JSON.stringify(withIdentity(messages)));
 }
 
