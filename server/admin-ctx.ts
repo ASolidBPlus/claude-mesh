@@ -74,11 +74,11 @@ export function requireAdmin(
 
 /**
  * R-406: what an admin access token must carry in `scope` to reach a route.
- * Declared per route in the ROUTES table (http-admin.ts); a route with none
- * takes no access token at all, only the static admin token. There is no
- * catch-all scope.
+ * Declared per route in the ROUTES table (http-admin.ts); every admin route
+ * has one, and an unknown path (no route) takes no access token. There is no
+ * catch-all scope. mesh:metrics also opens GET /metrics (http-admin.ts).
  */
-export type AdminScope = 'mesh:agents' | 'mesh:acl' | 'mesh:reminders';
+export type AdminScope = 'mesh:agents' | 'mesh:acl' | 'mesh:reminders' | 'mesh:topics' | 'mesh:files' | 'mesh:peers' | 'mesh:metrics';
 
 /**
  * #161 — WHERE THE REQUEST CAME FROM, and how much that is worth.
@@ -322,8 +322,9 @@ export interface Route {
   //   dispatcher does. One route in F0b: POST /peers/register, by peer key,
   //   which is neither the admin token nor an agent token.
   auth?: 'admin' | 'agentOrAdmin' | 'handler';
-  // R-406: the scope an admin access token needs here. Absent = no access
-  // token reaches this route (the static admin token still may).
+  // R-406: the scope an admin access token needs here. Required in practice
+  // for every 'admin' route (route-scopes.test.ts); absent on agentOrAdmin and
+  // handler routes, which no admin access token reaches.
   scope?: AdminScope;
 }
 

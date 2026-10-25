@@ -61,34 +61,35 @@ export interface HttpAdminHandle {
   shutdown(): Promise<void>;
 }
 
-// R-406: `scope` is what an admin ACCESS token must carry to reach a route
-// (mesh:agents, mesh:acl, mesh:reminders). A route without one is reached by
-// the static admin token only, never by an access token.
+// R-406: `scope` is what an admin ACCESS token must carry to reach a route.
+// Every admin route declares one (route-scopes.test.ts walks this table), so
+// none is stranded once MESH_ADMIN_STATIC_TOKEN=off; only an unknown path has
+// no scope, and no access token reaches it.
 export const ROUTES: Route[] = [
-  { method: 'POST',   match: exact('/outbound-peers'),               handler: handleOutboundPeerPost },
-  { method: 'GET',    match: exact('/outbound-peers'),               handler: handleOutboundPeerGet },
-  { method: 'DELETE', match: idMatch(/^\/outbound-peers\/([^/]+)$/), handler: handleOutboundPeerDelete },
-  { method: 'PATCH',  match: idMatch(/^\/outbound-peers\/([^/]+)$/), handler: handleOutboundPeerPatch },
-  { method: 'POST',   match: exact('/peer-keys'),                    handler: handlePeerKeyPost },
-  { method: 'GET',    match: exact('/peer-keys'),                    handler: handlePeerKeyGet },
-  { method: 'DELETE', match: idMatch(/^\/peer-keys\/([^/]+)$/),      handler: handlePeerKeyDelete },
+  { method: 'POST',   match: exact('/outbound-peers'),               handler: handleOutboundPeerPost, scope: 'mesh:peers' },
+  { method: 'GET',    match: exact('/outbound-peers'),               handler: handleOutboundPeerGet, scope: 'mesh:peers' },
+  { method: 'DELETE', match: idMatch(/^\/outbound-peers\/([^/]+)$/), handler: handleOutboundPeerDelete, scope: 'mesh:peers' },
+  { method: 'PATCH',  match: idMatch(/^\/outbound-peers\/([^/]+)$/), handler: handleOutboundPeerPatch, scope: 'mesh:peers' },
+  { method: 'POST',   match: exact('/peer-keys'),                    handler: handlePeerKeyPost, scope: 'mesh:peers' },
+  { method: 'GET',    match: exact('/peer-keys'),                    handler: handlePeerKeyGet, scope: 'mesh:peers' },
+  { method: 'DELETE', match: idMatch(/^\/peer-keys\/([^/]+)$/),      handler: handlePeerKeyDelete, scope: 'mesh:peers' },
   // #153: the inbound listing. `exact`, so it cannot swallow /peers/register —
   // and that route is POST regardless, so the two never contend.
-  { method: 'GET',    match: exact('/peers'),                        handler: handlePeerGet },
+  { method: 'GET',    match: exact('/peers'),                        handler: handlePeerGet, scope: 'mesh:peers' },
   // F4: after exact('/peers'), which cannot swallow it — an exact matcher and
   // a two-segment pattern can never contend.
-  { method: 'GET',    match: idMatch(/^\/peers\/([^/]+)\/subscriptions$/), handler: handlePeerSubscriptionsGet },
+  { method: 'GET',    match: idMatch(/^\/peers\/([^/]+)\/subscriptions$/), handler: handlePeerSubscriptionsGet, scope: 'mesh:peers' },
   // The ONLY handler-authenticated route: a peer presents a key, which is
   // neither the admin token nor an agent token.
   { method: 'POST',   match: exact('/peers/register'),               handler: handlePeerRegister, auth: 'handler' },
   { method: 'POST',   match: exact('/acl'),                          handler: handleAclPost, scope: 'mesh:acl' },
   { method: 'DELETE', match: exact('/acl'),                          handler: handleAclDelete, scope: 'mesh:acl' },
   { method: 'GET',    match: exact('/acl'),                          handler: handleAclGet, scope: 'mesh:acl' },
-  { method: 'POST',   match: exact('/observers'),                    handler: handleObserverPost },
-  { method: 'DELETE', match: idMatch(/^\/observers\/([^/]+)$/),      handler: handleObserverDelete },
-  { method: 'GET',    match: exact('/observers'),                    handler: handleObserverGet },
-  { method: 'POST',   match: exact('/topics'),                       handler: handleTopicPost },
-  { method: 'GET',    match: exact('/topics'),                       handler: handleTopicGet },
+  { method: 'POST',   match: exact('/observers'),                    handler: handleObserverPost, scope: 'mesh:agents' },
+  { method: 'DELETE', match: idMatch(/^\/observers\/([^/]+)$/),      handler: handleObserverDelete, scope: 'mesh:agents' },
+  { method: 'GET',    match: exact('/observers'),                    handler: handleObserverGet, scope: 'mesh:agents' },
+  { method: 'POST',   match: exact('/topics'),                       handler: handleTopicPost, scope: 'mesh:topics' },
+  { method: 'GET',    match: exact('/topics'),                       handler: handleTopicGet, scope: 'mesh:topics' },
   { method: 'POST',   match: exact('/agents'),                       handler: handleAgentPost, scope: 'mesh:agents' },
   { method: 'GET',    match: exact('/agents'),                       handler: handleAgentGet, scope: 'mesh:agents' },
   { method: 'GET',    match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentById, scope: 'mesh:agents' },
@@ -96,14 +97,14 @@ export const ROUTES: Route[] = [
   { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentDelete, scope: 'mesh:agents' },
   // R-65: clears the TLS latch. Two segments, so it cannot contend with the
   // one-segment DELETE above.
-  { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)\/tls-latch$/), handler: handleAgentTlsLatchDelete },
+  { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)\/tls-latch$/), handler: handleAgentTlsLatchDelete, scope: 'mesh:agents' },
   // R-65 M5: a new token for the id; every socket held under the old one closes.
   { method: 'POST',   match: idMatch(/^\/agents\/([^/]+)\/rotate$/), handler: handleAgentRotate, scope: 'mesh:agents' },
   // R-65 M6: who connects, by what scheme — the gate for closing plaintext.
-  { method: 'GET',    match: exact('/connections'),                  handler: handleConnectionsGet },
+  { method: 'GET',    match: exact('/connections'),                  handler: handleConnectionsGet, scope: 'mesh:metrics' },
   { method: 'GET',    match: exact('/messages'),                     handler: handleMessagesGet, auth: 'agentOrAdmin' },
   { method: 'GET',    match: idMatch(/^\/files\/([^/]+)$/),          handler: handleFileById, auth: 'agentOrAdmin' },
-  { method: 'POST',   match: exact('/files'),                        handler: handleFilePost },
+  { method: 'POST',   match: exact('/files'),                        handler: handleFilePost, scope: 'mesh:files' },
   { method: 'POST',   match: exact('/reminders'),                    handler: handleReminderPost, scope: 'mesh:reminders' },
   { method: 'GET',    match: exact('/reminders'),                    handler: handleReminderGet, scope: 'mesh:reminders' },
   { method: 'PATCH',  match: idMatch(/^\/reminders\/([^/]+)$/),      handler: handleReminderPatch, scope: 'mesh:reminders' },

@@ -116,14 +116,17 @@ With `MESH_OIDC_ADMIN_AUDIENCE` set (beside `MESH_OIDC_ISSUER`, and different fr
 
 | Scope | Routes |
 |---|---|
-| `mesh:agents` | `POST /agents`, `GET /agents`, `GET /agents/:id`, `PATCH /agents/:id`, `DELETE /agents/:id`, `POST /agents/:id/rotate` |
+| `mesh:agents` | `POST /agents`, `GET /agents`, `GET /agents/:id`, `PATCH /agents/:id`, `DELETE /agents/:id`, `POST /agents/:id/rotate`, `DELETE /agents/:id/tls-latch`, `POST /observers`, `GET /observers`, `DELETE /observers/:id` |
 | `mesh:acl` | `POST /acl`, `GET /acl`, `DELETE /acl` |
 | `mesh:reminders` | `POST /reminders`, `GET /reminders`, `PATCH /reminders/:id`, `DELETE /reminders/:id` |
-| `mesh:metrics` | `GET /metrics` |
+| `mesh:topics` | `POST /topics`, `GET /topics` |
+| `mesh:files` | `POST /files` |
+| `mesh:peers` | `GET /peers`, `GET /peers/:id/subscriptions`, `POST /peer-keys`, `GET /peer-keys`, `DELETE /peer-keys/:id`, `POST /outbound-peers`, `GET /outbound-peers`, `PATCH /outbound-peers/:id`, `DELETE /outbound-peers/:id` |
+| `mesh:metrics` | `GET /metrics`, `GET /connections` |
 
-- **Any route not in the table takes no access token,** whatever its scope (the static admin token still reaches it while it is on). There is no catch-all scope, and an empty or missing `scope` grants nothing. Refusals are the usual `401 {"error":"unauthorized"}`.
+- **Every admin route has a scope,** so none is stranded when the static token is switched off; a test walks the route table to keep it so. An unknown path takes no access token. There is no catch-all scope, and an empty or missing `scope` grants nothing. Refusals are the usual `401 {"error":"unauthorized"}`. (`GET /messages` and `GET /files/:id` take agent credentials, and `POST /peers/register` a peer key, as before.)
 - **An agent's login token is never an admin credential,** nor an admin token an agent login: the audiences differ.
-- **Who did it:** the token's `sub` is logged as `sub` on `admin.auth`, `agent.http` and `admin.mutation` (null for the static token). A refused token logs the reason (`scope_missing`, `route_unmapped`, `oidc_<code>`) and the `sub`. The token is never logged.
+- **Who did it:** the token's `sub` is logged as `sub` on `admin.auth`, `agent.http` and `admin.mutation` (null for the static token). A refused token logs the reason (`scope_missing`, `route_unmapped` for an unknown path, `oidc_<code>`) and the `sub`. The token is never logged.
 - **`MESH_ADMIN_STATIC_TOKEN=off`** refuses `MESH_ADMIN_TOKEN` and `MESH_ADMIN_TOKEN_PREV` everywhere: every admin route, `/metrics` and the MCP admin tools. `MESH_ADMIN_TOKEN` is still required at boot until the static token is removed.
 - **`MESH_METRICS_STATIC_TOKEN=off`** refuses `MESH_METRICS_TOKEN` (which is then neither checked nor kept), and `/metrics` is never open: it takes an access token with `mesh:metrics`, or the admin token while that is on.
 - Either switch `off` without `MESH_OIDC_ADMIN_AUDIENCE` **refuses to start**: nobody could get in.

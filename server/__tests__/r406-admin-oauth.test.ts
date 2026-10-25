@@ -203,13 +203,33 @@ describe('R-406 admin API on the wire', () => {
     }
   });
 
-  it('GUARD: a route not in the map takes no access token, whatever its scope; the static admin token still reaches it', async () => {
+  it('GUARD: every other admin route takes its own scope, and no other', async () => {
     await up();
-    const all = await adminTok('mesh:agents mesh:acl mesh:reminders mesh:metrics');
-    for (const [method, path] of [['GET', '/topics'], ['GET', '/connections'], ['GET', '/observers'], ['GET', '/peer-keys'], ['GET', '/outbound-peers'], ['DELETE', '/agents/fred/tls-latch'], ['GET', '/no-such-route']] as const) {
+    const cases: [string, string, string][] = [
+      ['GET', '/observers', 'mesh:agents'],
+      ['DELETE', '/agents/fred/tls-latch', 'mesh:agents'],
+      ['GET', '/connections', 'mesh:metrics'],
+      ['GET', '/topics', 'mesh:topics'],
+      ['POST', '/files', 'mesh:files'],
+      ['GET', '/peers', 'mesh:peers'],
+      ['GET', '/peer-keys', 'mesh:peers'],
+      ['GET', '/outbound-peers', 'mesh:peers'],
+    ];
+    const allScopes = ['mesh:agents', 'mesh:acl', 'mesh:reminders', 'mesh:topics', 'mesh:files', 'mesh:peers', 'mesh:metrics'];
+    for (const [method, path, scope] of cases) {
+      // Reached (the handler may still refuse the request itself, e.g. no body).
+      expect(await call(method, path, await adminTok(scope))).not.toBe(401);
+      expect(await call(method, path, await adminTok(allScopes.filter(x => x !== scope).join(' ')))).toBe(401);
+    }
+  });
+
+  it('GUARD: an unknown path takes no access token, whatever its scope; the static admin token gets the 404', async () => {
+    await up();
+    const all = await adminTok('mesh:agents mesh:acl mesh:reminders mesh:topics mesh:files mesh:peers mesh:metrics');
+    for (const [method, path] of [['GET', '/no-such-route'], ['PUT', '/agents'], ['GET', '/agents/fred/nope']] as const) {
       expect(await call(method, path, all)).toBe(401);
     }
-    expect(await call('GET', '/topics', 'adm')).toBe(200);
+    expect(await call('GET', '/no-such-route', 'adm')).toBe(404);
     expect(lines.some(l => l.includes('"evt":"admin.auth"') && l.includes('"reason":"route_unmapped"') && l.includes('"sub":"svc-ops"'))).toBe(true);
   });
 
@@ -231,6 +251,7 @@ describe('R-406 admin API on the wire', () => {
     for (const tok of ['adm', 'adm-prev']) {
       expect(await call('GET', '/agents', tok)).toBe(401);
       expect(await call('GET', '/topics', tok)).toBe(401);
+      expect(await call('GET', '/no-such-route', tok)).toBe(401);
       expect(await call('GET', '/messages', tok)).toBe(401);
       expect(await call('GET', '/metrics', tok)).toBe(401);
     }
