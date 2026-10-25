@@ -89,7 +89,11 @@ describe('#79 one token-comparison helper', () => {
     // moves rather than the assertion loosening.
     // R-18 added a door: /metrics in http-admin.ts compares MESH_METRICS_TOKEN
     // and the admin token through the helper.
-    expect(callers).toEqual(['admin-ctx.ts', 'auth.ts', 'db.ts', 'http-admin.ts', 'mcp-server.ts']);
+    // R-393: fleet-bridge's vendored declaration library. Its bearerCallers
+    // compares its own configured bearer tokens, never the admin token, and
+    // this server doesn't use it (the bridge door uses bridgeCallers). It is
+    // pinned byte for byte by SHA256SUMS, so it is listed rather than edited.
+    expect(callers).toEqual(['admin-ctx.ts', 'auth.ts', 'db.ts', 'http-admin.ts', 'mcp-server.ts', 'vendor/fleet-bridge-declare/callers.ts']);
   });
 
   // Behaviour is unchanged from the loop it replaces — the point was the

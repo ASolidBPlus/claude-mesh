@@ -39,6 +39,8 @@ RUN bun install --frozen-lockfile --production
 # resolves to /client/src. The paths in the imports are relative to the
 # REPOSITORY layout, so the image has to keep that layout.
 COPY server/*.ts ./server/
+# R-393: fleet-bridge's declaration library, vendored with its SHA256SUMS.
+COPY server/vendor ./server/vendor/
 COPY client/src/*.ts ./client/src/
 
 # THE IMAGE MUST PROVE IT CAN RESOLVE WHAT IT RUNS.

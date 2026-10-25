@@ -5,7 +5,7 @@ import type { Config } from '../server.ts';
 async function callLoadConfig(env: Record<string, string | undefined>): Promise<{ config?: Config; exitCode?: number }> {
   // Save original env
   const saved: Record<string, string | undefined> = {};
-  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS', 'MESH_PLAINTEXT_PEER_CIDRS', 'MESH_METRICS_CLASSES', 'MESH_TLS_CERT', 'MESH_TLS_KEY', 'MESH_TLS_CA', 'MESH_METRICS_TOKEN', 'MESH_ADMIN_PORT', 'MESH_WS_TLS_PORT', 'MESH_ADMIN_TLS_PORT', 'MESH_ADMIN_TOKEN_PREV', 'MESH_PREAUTH_MAX', 'MESH_PREAUTH_PER_IP', 'MESH_DOWNLOAD_MAX', 'MESH_DOWNLOAD_PER_AGENT', 'MESH_REDELIVERY_WINDOW_MS'];
+  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS', 'MESH_PLAINTEXT_PEER_CIDRS', 'MESH_METRICS_CLASSES', 'MESH_TLS_CERT', 'MESH_TLS_KEY', 'MESH_TLS_CA', 'MESH_METRICS_TOKEN', 'MESH_ADMIN_PORT', 'MESH_WS_TLS_PORT', 'MESH_ADMIN_TLS_PORT', 'MESH_ADMIN_TOKEN_PREV', 'MESH_PREAUTH_MAX', 'MESH_PREAUTH_PER_IP', 'MESH_DOWNLOAD_MAX', 'MESH_DOWNLOAD_PER_AGENT', 'MESH_REDELIVERY_WINDOW_MS', 'MESH_BRIDGE_KEYS', 'MESH_BRIDGE_URL', 'MESH_BRIDGE_EDGE_CALLERS'];
   for (const key of keys) {
     saved[key] = process.env[key];
     if (env[key] !== undefined) {
@@ -65,7 +65,7 @@ describe('loadConfig', () => {
   it('returns defaults when only MESH_ADMIN_TOKEN is set', async () => {
     const { config, exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok' });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'tok', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], trafficClasses: [], tls: null, tlsCa: null, metricsToken: null, preAuth: { global: 64, perIp: 8 }, downloads: { global: 64, perAgent: 4 }, redeliveryWindowMs: 3_600_000 });
+    expect(config).toEqual({ dbPath: '/data/mesh.db', wsPort: 7384, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'tok', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], trafficClasses: [], tls: null, tlsCa: null, metricsToken: null, preAuth: { global: 64, perIp: 8 }, downloads: { global: 64, perAgent: 4 }, redeliveryWindowMs: 3_600_000, bridgeDoor: null });
   });
 
   it('returns correct values when all valid env vars are set', async () => {
@@ -75,7 +75,7 @@ describe('loadConfig', () => {
       MESH_WS_PORT: '8080',
     });
     expect(exitCode).toBeUndefined();
-    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'secret', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], trafficClasses: [], tls: null, tlsCa: null, metricsToken: null, preAuth: { global: 64, perIp: 8 }, downloads: { global: 64, perAgent: 4 }, redeliveryWindowMs: 3_600_000 });
+    expect(config).toEqual({ dbPath: '/tmp/test.db', wsPort: 8080, adminPort: 7385, wsTlsPort: null, adminTlsPort: null, adminToken: 'secret', adminTokenPrev: null, cleanupIntervalMs: 60000, maxFileBytes: 10_485_760, filesDir: '/data/files', reminderIntervalMs: 10000, presenceDebounceMs: 12000, mcpMode: false, retentionMs: null, plaintextPeerCidrs: [], trafficClasses: [], tls: null, tlsCa: null, metricsToken: null, preAuth: { global: 64, perIp: 8 }, downloads: { global: 64, perAgent: 4 }, redeliveryWindowMs: 3_600_000, bridgeDoor: null });
   });
 
   it('MESH_MAX_FILE_BYTES: defaults to 10 MB when not set', async () => {
@@ -238,6 +238,25 @@ describe('loadConfig', () => {
       try {
         expect((await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_REDELIVERY_WINDOW_MS: bad })).exitCode).toBe(1);
       } finally { process.stderr.write = realWrite; }
+    }
+  });
+
+  // R-393
+  it('MESH_BRIDGE_*: unset is no door; a whole config loads; half or bad config REFUSES TO START', async () => {
+    const { generateKeyPairSync } = await import('node:crypto');
+    const { bridgeKeyText } = await import('../vendor/fleet-bridge-declare/index.ts');
+    const key = bridgeKeyText(generateKeyPairSync('ed25519').publicKey);
+    expect((await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok' })).config?.bridgeDoor).toBeNull();
+    expect((await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_BRIDGE_KEYS: key, MESH_BRIDGE_URL: 'http://127.0.0.1:7433', MESH_BRIDGE_EDGE_CALLERS: 'fleet-access' })).config?.bridgeDoor)
+      .toEqual({ keys: [key], url: 'http://127.0.0.1:7433', edgeCallers: ['fleet-access'] });
+    for (const bad of [{ MESH_BRIDGE_URL: 'http://127.0.0.1:7433' }, { MESH_BRIDGE_KEYS: key }, { MESH_BRIDGE_KEYS: 'nope', MESH_BRIDGE_URL: 'http://127.0.0.1:7433' }]) {
+      const realWrite = process.stderr.write.bind(process.stderr);
+      const writes: string[] = [];
+      process.stderr.write = ((c: string) => { writes.push(String(c)); return true; }) as typeof process.stderr.write;
+      let exitCode: number | undefined;
+      try { ({ exitCode } = await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', ...bad })); } finally { process.stderr.write = realWrite; }
+      expect(exitCode).toBe(1);
+      expect(writes.join('')).toContain('bridge door: ');
     }
   });
 

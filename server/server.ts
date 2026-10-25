@@ -5,6 +5,7 @@ import { parseTrafficClasses, type ClassRule } from './traffic-classes.ts';
 import { startBorder, forwarders } from './border.ts';
 import { parsePlaintextPeerCidrs, applyPlaintextPeerCidrs, type PlaintextCidr } from './plaintext-peers.ts';
 import { loadTls, expiryWarning, type ServerTls } from './tls-config.ts';
+import { parseBridgeDoorConfig, bridgeDoor, type BridgeDoorConfig } from './bridge-door.ts';
 import { startWsServer, WsServerHandle, PRE_AUTH_LIMITS, DEFAULT_REDELIVERY_WINDOW_MS } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
@@ -42,6 +43,7 @@ export interface Config {
   /** R-69: caps on concurrent unauthenticated WS sockets. */
   preAuth: { global: number; perIp: number };
   redeliveryWindowMs: number;
+  bridgeDoor: BridgeDoorConfig | null;
   /** R-271: caps on concurrent file downloads. */
   downloads: { global: number; perAgent: number };
 }
@@ -250,6 +252,14 @@ export function loadConfig(): Config {
   const downloads = { global: posInt('MESH_DOWNLOAD_MAX', DOWNLOAD_LIMITS.global), perAgent: posInt('MESH_DOWNLOAD_PER_AGENT', DOWNLOAD_LIMITS.perAgent) };
   // R-335: how long an unacked row may be redelivered to an ack-capable login.
   const redeliveryWindowMs = posInt('MESH_REDELIVERY_WINDOW_MS', DEFAULT_REDELIVERY_WINDOW_MS);
+
+  // R-393: the bridge's declared-actions door. No MESH_BRIDGE_KEYS = no door;
+  // a half or unreadable configuration refuses to start.
+  const bridge = parseBridgeDoorConfig(process.env);
+  if (!bridge.ok) {
+    process.stderr.write(`bridge door: ${bridge.error}\n`);
+    process.exit(1);
+  }
   for (const [name, p] of [['MESH_WS_TLS_PORT', wsTlsPort], ['MESH_ADMIN_TLS_PORT', adminTlsPort]] as const) {
     if (p !== null && tls === null) {
       process.stderr.write(`${name} is set but MESH_TLS_CERT/MESH_TLS_KEY are not; a TLS listener needs both\n`);
@@ -278,7 +288,7 @@ export function loadConfig(): Config {
     metricsToken = metricsRaw;
   }
 
-  return { dbPath, wsPort, adminPort, wsTlsPort, adminTlsPort, adminToken, adminTokenPrev, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, trafficClasses, tls, tlsCa, metricsToken, preAuth, downloads, redeliveryWindowMs };
+  return { dbPath, wsPort, adminPort, wsTlsPort, adminTlsPort, adminToken, adminTokenPrev, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, trafficClasses, tls, tlsCa, metricsToken, preAuth, downloads, redeliveryWindowMs, bridgeDoor: bridge.config };
 }
 
 async function main() {
@@ -460,6 +470,7 @@ async function main() {
     metricsToken: config.metricsToken,
     adminTokenPrev: config.adminTokenPrev,
     listeners,
+    bridgeDoor: config.bridgeDoor === null ? null : bridgeDoor(db, config.bridgeDoor),
     ...(config.adminTlsPort === null ? {} : { tls: config.tls, tlsPort: config.adminTlsPort }),
   });
   console.log(JSON.stringify({

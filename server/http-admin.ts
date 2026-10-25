@@ -223,6 +223,59 @@ export const MESSAGES_ROUTE: Route = ROUTES.find(r => r.handler === handleMessag
 /** R-271: how long shutdown lets in-flight responses finish before closing their sockets. */
 const SHUTDOWN_GRACE_MS = 1000;
 
+/** R-393: where the bridge door is served (the library's route prefix). */
+const BRIDGE_DOOR_PREFIX = '/actions/v1';
+/** The library's body cap; read no further than one byte past it. */
+const BRIDGE_DOOR_MAX_BODY = 64 * 1024;
+
+/**
+ * R-393: hand one admin-listener request to the bridge door's fetch handler.
+ * The body is read up to one byte past the door's cap, so an oversized one is
+ * refused without being buffered whole. Every answer is `no-store`: one of
+ * them carries a token.
+ */
+async function serveBridgeDoor(door: (req: Request) => Promise<Response>, req: http.IncomingMessage, res: http.ServerResponse, tls: boolean): Promise<void> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  let over = false;
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    for await (const chunk of req) {
+      const b = chunk as Buffer;
+      size += b.length;
+      if (size > BRIDGE_DOOR_MAX_BODY) { over = true; break; }
+      chunks.push(b);
+    }
+  }
+  const send = (status: number, body: string) => {
+    res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(body);
+  };
+  if (over) {
+    send(413, JSON.stringify({ ok: false, error: { code: 'BAD_INPUT', message: `the body is over ${BRIDGE_DOOR_MAX_BODY} bytes` } }));
+    req.destroy();
+    return;
+  }
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (typeof v === 'string') headers.set(k, v);
+    else if (Array.isArray(v)) headers.set(k, v.join(', '));
+  }
+  const url = `${tls ? 'https' : 'http'}://${req.headers.host ?? 'localhost'}${req.url ?? '/'}`;
+  let answer: Response;
+  try {
+    answer = await door(new Request(url, {
+      method: req.method ?? 'GET',
+      headers,
+      ...(req.method !== 'GET' && req.method !== 'HEAD' ? { body: Buffer.concat(chunks) } : {}),
+    }));
+  } catch (err) {
+    console.log(JSON.stringify({ evt: 'bridge.refused', line: `door threw: ${(err as Error).message}`, at: Date.now() }));
+    send(500, JSON.stringify({ ok: false, error: { code: 'INTERNAL', message: 'internal error' } }));
+    return;
+  }
+  send(answer.status, await answer.text());
+}
+
 export function startHttpAdmin(
   port: number | 'off',
   db: Database,
@@ -253,6 +306,9 @@ export function startHttpAdmin(
     adminTokenPrev?: string | null;
     /** R-65 M6: every listener the bus runs (server.ts builds it), for GET /connections. */
     listeners?: { name: string; port: number | 'off'; scheme: string }[];
+    /** R-393: the bridge door's fetch handler (bridge-door.ts), or absent/null
+     *  for no door: then `/actions/v1` is just an unknown admin path. */
+    bridgeDoor?: ((req: Request) => Promise<Response>) | null;
   } = {},
 ): Promise<HttpAdminHandle> {
   const metricsToken = opts.metricsToken ?? null;
@@ -269,7 +325,18 @@ export function startHttpAdmin(
     }
     // `tls` is fixed per LISTENER, never read from the request: it is which
     // door the request came through.
+    const bridgeDoor = opts.bridgeDoor ?? null;
     const handleRequest = async (req: http.IncomingMessage, res: http.ServerResponse, tls: boolean): Promise<void> => {
+      // R-393: the bridge door, ahead of the admin routes because it has its
+      // own credential (the bridge's vouch, checked by the door) and must
+      // never fall through to the admin token's.
+      if (bridgeDoor !== null) {
+        const doorPath = new URL(req.url!, 'http://localhost').pathname;
+        if (doorPath === BRIDGE_DOOR_PREFIX || doorPath.startsWith(`${BRIDGE_DOOR_PREFIX}/`)) {
+          await serveBridgeDoor(bridgeDoor, req, res, tls);
+          return;
+        }
+      }
       // /metrics is unauthenticated by design — this listener binds to the admin port
       // which is internal-only (not exposed publicly). Read-only Prometheus exposition.
       if (req.method === 'GET' && new URL(req.url!, 'http://localhost').pathname === '/metrics') {
@@ -398,6 +465,8 @@ export function startHttpAdmin(
         // in the unauthenticated case, where it is still true and existing
         // readers look for it.
         metrics_auth: metricsToken === null ? 'none' : 'token',
+        // R-393: whether the bridge's declared-actions door is served here.
+        bridge_door: bridgeDoor === null ? 'off' : 'on',
         ...(metricsToken === null ? { metrics_unauthenticated: true } : {}),
         // R-65 M7: whether a previous admin token is ALSO accepted. A boolean
         // only — never the value, never its length.
