@@ -277,9 +277,12 @@ export function loadConfig(): Config {
   //     configured, and left alone no HTTP header could ever carry it.
   // The message names the variable and the condition, never the value or its
   // length.
+  //
+  // R-406: with MESH_METRICS_STATIC_TOKEN=off the token is accepted nowhere,
+  // so it is neither checked nor kept.
   let metricsToken: string | null = null;
   const metricsRaw = process.env.MESH_METRICS_TOKEN;
-  if (metricsRaw !== undefined) {
+  if (metricsRaw !== undefined && tokenAuthParse.config.metricsStaticToken) {
     // eslint-disable-next-line no-control-regex -- the control set is the point
     if (metricsRaw === '' || /[\s\x00-\x1f\x7f]/.test(metricsRaw)) {
       process.stderr.write('MESH_METRICS_TOKEN is set but empty or contains whitespace/control characters; refused rather than trimmed (value not shown). Unset it to leave /metrics open.\n');
@@ -479,6 +482,8 @@ async function main() {
     adminTokenPrev: config.adminTokenPrev,
     listeners,
     tokenAuth,
+    adminStaticToken: config.tokenAuth.adminStaticToken,
+    metricsStaticToken: config.tokenAuth.metricsStaticToken,
     ...(config.adminTlsPort === null ? {} : { tls: config.tls, tlsPort: config.adminTlsPort }),
   });
   console.log(JSON.stringify({
@@ -492,6 +497,10 @@ async function main() {
     // R-406: how agents may log in.
     oidc: config.tokenAuth.oidc === null ? 'off' : `on ${config.tokenAuth.oidc.issuer}`,
     static_tokens: config.tokenAuth.staticTokens ? 'on' : 'off',
+    // And how the admin API and /metrics may be reached.
+    admin_oidc_audience: config.tokenAuth.oidc?.adminAudience ?? null,
+    admin_static_token: config.tokenAuth.adminStaticToken ? 'on' : 'off',
+    metrics_static_token: config.tokenAuth.metricsStaticToken ? 'on' : 'off',
     at: Date.now(),
   }));
 
@@ -525,7 +534,10 @@ async function main() {
   // adminToken passed so the ACL tools can gate on it (#8) — without it the
   // stdio plane would keep writing ACL edges with no credential while the
   // equivalent HTTP routes require one.
-  const mcpHandle = await startMcpServer(db, agentIndex, observerIndex, config.adminToken, config.adminTokenPrev);
+  // R-406: with MESH_ADMIN_STATIC_TOKEN=off the MCP admin tools take no token
+  // at all: an empty configured token is refused by adminTokenOk.
+  const mcpHandle = await startMcpServer(db, agentIndex, observerIndex,
+    config.tokenAuth.adminStaticToken ? config.adminToken : '', config.tokenAuth.adminStaticToken ? config.adminTokenPrev : null);
   const transport = new StdioServerTransport();
   await mcpHandle.server.connect(transport);
 

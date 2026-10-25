@@ -59,13 +59,13 @@ const good = (claims: Record<string, unknown> = {}, opts: Parameters<typeof acce
 
 describe('R-406 configuration', () => {
   it('unset is today; whole configs load; half or unreadable config refuses', () => {
-    expect(parseTokenAuthConfig({})).toEqual({ ok: true, config: { oidc: null, staticTokens: true } });
+    expect(parseTokenAuthConfig({})).toEqual({ ok: true, config: { oidc: null, staticTokens: true, adminStaticToken: true, metricsStaticToken: true } });
     const jwksFile = join(dir, 'jwks.json');
     writeFileSync(jwksFile, JSON.stringify({ keys: [] }));
     expect(parseTokenAuthConfig({ MESH_OIDC_ISSUER: 'https://id.example', MESH_OIDC_AUDIENCE: 'mesh', MESH_OIDC_CA_FILE: ca.caFile, MESH_STATIC_TOKENS: 'off' }))
-      .toEqual({ ok: true, config: { oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'preferred_username', caFile: ca.caFile, jwksFile: null }, staticTokens: false } });
+      .toEqual({ ok: true, config: { oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'preferred_username', caFile: ca.caFile, jwksFile: null, adminAudience: null }, staticTokens: false, adminStaticToken: true, metricsStaticToken: true } });
     expect(parseTokenAuthConfig({ MESH_OIDC_ISSUER: 'https://id.example', MESH_OIDC_AUDIENCE: 'mesh', MESH_OIDC_JWKS_FILE: jwksFile, MESH_OIDC_ID_CLAIM: 'sub' }))
-      .toEqual({ ok: true, config: { oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'sub', caFile: null, jwksFile }, staticTokens: true } });
+      .toEqual({ ok: true, config: { oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'sub', caFile: null, jwksFile, adminAudience: null }, staticTokens: true, adminStaticToken: true, metricsStaticToken: true } });
     const badJwks = join(dir, 'bad.json');
     writeFileSync(badJwks, '{"nope":1}');
     for (const bad of [
@@ -124,12 +124,12 @@ describe('R-406 the verifier', () => {
     const before = issuer!.jwksFetches();
     clock += 61_000;
     issuer!.setKeys([key, rotated]);
-    const t = await accessToken(rotated, { iss: issuer!.url, aud: AUD, preferred_username: 'fred' });
+    const t = await accessToken(rotated, { iss: issuer!.url, aud: AUD, preferred_username: 'fred', sub: 'u-fred' });
     expect(await v.verify(t)).toMatchObject({ ok: true, identity: 'fred' });
     expect(issuer!.jwksFetches()).toBe(before + 1);
     // A second unknown kid within the minute does not fetch again.
     const stranger = await makeKey('k3');
-    expect(await v.verify(await accessToken(stranger, { iss: issuer!.url, aud: AUD, preferred_username: 'fred' }))).toMatchObject({ ok: false, reason: 'UNKNOWN_KID' });
+    expect(await v.verify(await accessToken(stranger, { iss: issuer!.url, aud: AUD, preferred_username: 'fred', sub: 'u-fred' }))).toMatchObject({ ok: false, reason: 'UNKNOWN_KID' });
     expect(issuer!.jwksFetches()).toBe(before + 1);
   });
 
@@ -152,15 +152,15 @@ describe('R-406 the verifier', () => {
     issuer = startIssuer(port, ca, [key]);
     for (let i = 0; i < 60 && !v.ready(); i++) await delay(100);
     expect(v.ready()).toBe(true);
-    expect(await v.verify(await accessToken(key, { iss: url, aud: AUD, preferred_username: 'fred' }))).toMatchObject({ ok: true });
+    expect(await v.verify(await accessToken(key, { iss: url, aud: AUD, preferred_username: 'fred', sub: 'u-fred' }))).toMatchObject({ ok: true });
   }, 15_000);
 
   it('standalone: a local JWKS file runs the same verifier, no discovery', async () => {
     const f = join(dir, 'local-jwks.json');
     writeFileSync(f, JSON.stringify({ keys: [key.jwk] }));
     const v = await readyVerifier({ issuer: 'https://mesh.local', audience: AUD, idClaim: 'preferred_username', caFile: null, jwksFile: f });
-    expect(await v.verify(await accessToken(key, { iss: 'https://mesh.local', aud: AUD, preferred_username: 'solo' }))).toMatchObject({ ok: true, identity: 'solo' });
-    expect(await v.verify(await accessToken(key, { iss: 'https://mesh.local', aud: AUD, preferred_username: 'solo' }, { typ: 'JWT' }))).toMatchObject({ ok: false, reason: 'WRONG_TYP' });
+    expect(await v.verify(await accessToken(key, { iss: 'https://mesh.local', aud: AUD, preferred_username: 'solo', sub: 'u-solo' }))).toMatchObject({ ok: true, identity: 'solo' });
+    expect(await v.verify(await accessToken(key, { iss: 'https://mesh.local', aud: AUD, preferred_username: 'solo', sub: 'u-solo' }, { typ: 'JWT' }))).toMatchObject({ ok: false, reason: 'WRONG_TYP' });
   });
 });
 

@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
-import { ALIAS_SUFFIX_RE, getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, markTlsSeen, isTlsLatched, recordAgentConnection, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
+import { ALIAS_SUFFIX_RE, bindOidcSub, getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, markTlsSeen, isTlsLatched, recordAgentConnection, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
 import { validateToken } from './auth.ts';
 import { PEER_PROTOCOL_VERSION } from './wire-version.ts';  // #131: via the tiny module, never cross-package from here
 import { parseDuration } from './duration.ts';
@@ -1923,8 +1923,8 @@ export function startWsServer(
         // reconnects with a fresh one.
         /**
          * R-406: an `auth` frame on an authenticated OIDC session. Accepted
-         * only if the token verifies, names the same identity, keeps the same
-         * alias, and expires later than the current one; then the session's
+         * only if the token verifies, names the same identity (and the `sub`
+         * that identity is bound to), keeps the same alias, and expires later than the current one; then the session's
          * deadline moves. Anything else is refused with REAUTH_REFUSED and the
          * session stays exactly as it was (its old deadline included).
          */
@@ -1945,6 +1945,9 @@ export function startWsServer(
             if (ws.readyState !== WebSocket.OPEN) return;
             if (!v.ok) return refuse(`oidc_${v.reason.toLowerCase()}`);
             if (v.identity !== state.identity) return refuse('identity_changed');
+            // The subject the name is bound to (token-auth.ts), checked here too:
+            // a re-auth is a login, so it is held to the same binding.
+            if (!bindOidcSub(db, v.identity, v.sub)) return refuse('sub_mismatch');
             if (state.tokenExp === null || v.exp <= before || v.exp <= state.tokenExp) return refuse('exp_not_later');
             state.tokenExp = v.exp;
             armExpiry(v.exp);
