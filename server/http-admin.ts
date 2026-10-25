@@ -4,7 +4,8 @@ import * as net from 'net';
 import { WebSocket } from 'ws';
 import { renderMetrics } from './metrics.ts';
 import { timingSafeEqual, adminTokenMatches } from './auth.ts';
-import { STATIC_ONLY, authenticateAgentCredential, type AgentAuthResult, type TokenAuth } from './token-auth.ts';
+import { STATIC_ONLY, authenticateAgentCredential, isOidcToken, type AgentAuthResult, type TokenAuth } from './token-auth.ts';
+import type { OidcAdminResult } from './oidc.ts';
 import * as https from 'https';
 import type { ServerTls } from './tls-config.ts';
 import { handleAclDelete, handleAclGet, handleAclPost } from './admin-acl.ts';
@@ -60,59 +61,67 @@ export interface HttpAdminHandle {
   shutdown(): Promise<void>;
 }
 
+// R-406: `scope` is what an admin ACCESS token must carry to reach a route.
+// Every admin route declares one (route-scopes.test.ts walks this table), so
+// none is stranded once MESH_ADMIN_STATIC_TOKEN=off; only an unknown path has
+// no scope, and no access token reaches it.
 export const ROUTES: Route[] = [
-  { method: 'POST',   match: exact('/outbound-peers'),               handler: handleOutboundPeerPost },
-  { method: 'GET',    match: exact('/outbound-peers'),               handler: handleOutboundPeerGet },
-  { method: 'DELETE', match: idMatch(/^\/outbound-peers\/([^/]+)$/), handler: handleOutboundPeerDelete },
-  { method: 'PATCH',  match: idMatch(/^\/outbound-peers\/([^/]+)$/), handler: handleOutboundPeerPatch },
-  { method: 'POST',   match: exact('/peer-keys'),                    handler: handlePeerKeyPost },
-  { method: 'GET',    match: exact('/peer-keys'),                    handler: handlePeerKeyGet },
-  { method: 'DELETE', match: idMatch(/^\/peer-keys\/([^/]+)$/),      handler: handlePeerKeyDelete },
+  { method: 'POST',   match: exact('/outbound-peers'),               handler: handleOutboundPeerPost, scope: 'mesh:peers' },
+  { method: 'GET',    match: exact('/outbound-peers'),               handler: handleOutboundPeerGet, scope: 'mesh:peers' },
+  { method: 'DELETE', match: idMatch(/^\/outbound-peers\/([^/]+)$/), handler: handleOutboundPeerDelete, scope: 'mesh:peers' },
+  { method: 'PATCH',  match: idMatch(/^\/outbound-peers\/([^/]+)$/), handler: handleOutboundPeerPatch, scope: 'mesh:peers' },
+  { method: 'POST',   match: exact('/peer-keys'),                    handler: handlePeerKeyPost, scope: 'mesh:peers' },
+  { method: 'GET',    match: exact('/peer-keys'),                    handler: handlePeerKeyGet, scope: 'mesh:peers' },
+  { method: 'DELETE', match: idMatch(/^\/peer-keys\/([^/]+)$/),      handler: handlePeerKeyDelete, scope: 'mesh:peers' },
   // #153: the inbound listing. `exact`, so it cannot swallow /peers/register —
   // and that route is POST regardless, so the two never contend.
-  { method: 'GET',    match: exact('/peers'),                        handler: handlePeerGet },
+  { method: 'GET',    match: exact('/peers'),                        handler: handlePeerGet, scope: 'mesh:peers' },
   // F4: after exact('/peers'), which cannot swallow it — an exact matcher and
   // a two-segment pattern can never contend.
-  { method: 'GET',    match: idMatch(/^\/peers\/([^/]+)\/subscriptions$/), handler: handlePeerSubscriptionsGet },
+  { method: 'GET',    match: idMatch(/^\/peers\/([^/]+)\/subscriptions$/), handler: handlePeerSubscriptionsGet, scope: 'mesh:peers' },
   // The ONLY handler-authenticated route: a peer presents a key, which is
   // neither the admin token nor an agent token.
   { method: 'POST',   match: exact('/peers/register'),               handler: handlePeerRegister, auth: 'handler' },
-  { method: 'POST',   match: exact('/acl'),                          handler: handleAclPost },
-  { method: 'DELETE', match: exact('/acl'),                          handler: handleAclDelete },
-  { method: 'GET',    match: exact('/acl'),                          handler: handleAclGet },
-  { method: 'POST',   match: exact('/observers'),                    handler: handleObserverPost },
-  { method: 'DELETE', match: idMatch(/^\/observers\/([^/]+)$/),      handler: handleObserverDelete },
-  { method: 'GET',    match: exact('/observers'),                    handler: handleObserverGet },
-  { method: 'POST',   match: exact('/topics'),                       handler: handleTopicPost },
-  { method: 'GET',    match: exact('/topics'),                       handler: handleTopicGet },
-  { method: 'POST',   match: exact('/agents'),                       handler: handleAgentPost },
-  { method: 'GET',    match: exact('/agents'),                       handler: handleAgentGet },
-  { method: 'GET',    match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentById },
-  { method: 'PATCH',  match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentPatch },
-  { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentDelete },
+  { method: 'POST',   match: exact('/acl'),                          handler: handleAclPost, scope: 'mesh:acl' },
+  { method: 'DELETE', match: exact('/acl'),                          handler: handleAclDelete, scope: 'mesh:acl' },
+  { method: 'GET',    match: exact('/acl'),                          handler: handleAclGet, scope: 'mesh:acl' },
+  { method: 'POST',   match: exact('/observers'),                    handler: handleObserverPost, scope: 'mesh:agents' },
+  { method: 'DELETE', match: idMatch(/^\/observers\/([^/]+)$/),      handler: handleObserverDelete, scope: 'mesh:agents' },
+  { method: 'GET',    match: exact('/observers'),                    handler: handleObserverGet, scope: 'mesh:agents' },
+  { method: 'POST',   match: exact('/topics'),                       handler: handleTopicPost, scope: 'mesh:topics' },
+  { method: 'GET',    match: exact('/topics'),                       handler: handleTopicGet, scope: 'mesh:topics' },
+  { method: 'POST',   match: exact('/agents'),                       handler: handleAgentPost, scope: 'mesh:agents' },
+  { method: 'GET',    match: exact('/agents'),                       handler: handleAgentGet, scope: 'mesh:agents' },
+  { method: 'GET',    match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentById, scope: 'mesh:agents' },
+  { method: 'PATCH',  match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentPatch, scope: 'mesh:agents' },
+  { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentDelete, scope: 'mesh:agents' },
   // R-65: clears the TLS latch. Two segments, so it cannot contend with the
   // one-segment DELETE above.
-  { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)\/tls-latch$/), handler: handleAgentTlsLatchDelete },
+  { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)\/tls-latch$/), handler: handleAgentTlsLatchDelete, scope: 'mesh:agents' },
   // R-65 M5: a new token for the id; every socket held under the old one closes.
-  { method: 'POST',   match: idMatch(/^\/agents\/([^/]+)\/rotate$/), handler: handleAgentRotate },
+  { method: 'POST',   match: idMatch(/^\/agents\/([^/]+)\/rotate$/), handler: handleAgentRotate, scope: 'mesh:agents' },
   // R-65 M6: who connects, by what scheme — the gate for closing plaintext.
-  { method: 'GET',    match: exact('/connections'),                  handler: handleConnectionsGet },
+  { method: 'GET',    match: exact('/connections'),                  handler: handleConnectionsGet, scope: 'mesh:metrics' },
   { method: 'GET',    match: exact('/messages'),                     handler: handleMessagesGet, auth: 'agentOrAdmin' },
   { method: 'GET',    match: idMatch(/^\/files\/([^/]+)$/),          handler: handleFileById, auth: 'agentOrAdmin' },
-  { method: 'POST',   match: exact('/files'),                        handler: handleFilePost },
-  { method: 'POST',   match: exact('/reminders'),                    handler: handleReminderPost },
-  { method: 'GET',    match: exact('/reminders'),                    handler: handleReminderGet },
-  { method: 'PATCH',  match: idMatch(/^\/reminders\/([^/]+)$/),      handler: handleReminderPatch },
-  { method: 'DELETE', match: idMatch(/^\/reminders\/([^/]+)$/),      handler: handleReminderDelete },
+  { method: 'POST',   match: exact('/files'),                        handler: handleFilePost, scope: 'mesh:files' },
+  { method: 'POST',   match: exact('/reminders'),                    handler: handleReminderPost, scope: 'mesh:reminders' },
+  { method: 'GET',    match: exact('/reminders'),                    handler: handleReminderGet, scope: 'mesh:reminders' },
+  { method: 'PATCH',  match: idMatch(/^\/reminders\/([^/]+)$/),      handler: handleReminderPatch, scope: 'mesh:reminders' },
+  { method: 'DELETE', match: idMatch(/^\/reminders\/([^/]+)$/),      handler: handleReminderDelete, scope: 'mesh:reminders' },
 ];
 
-/** Bearer credential for /metrics: the metrics token or the admin token. */
-function metricsAuthorized(req: http.IncomingMessage, metricsToken: string, adminToken: string, adminTokenPrev: string | null): 'metrics' | 'admin' | null {
+/**
+ * Static bearer credential for /metrics: the metrics token or the admin token,
+ * each only while its switch is on (R-406). Both comparisons still always run;
+ * a switched-off credential's answer is discarded.
+ */
+function metricsAuthorized(req: http.IncomingMessage, metricsToken: string | null, adminToken: string, adminTokenPrev: string | null, adminStatic: boolean): 'metrics' | 'admin' | null {
   const auth = req.headers['authorization'];
   if (typeof auth !== 'string' || !auth.startsWith('Bearer ')) return null;
   const presented = auth.slice('Bearer '.length);
-  const viaMetrics = timingSafeEqual(presented, metricsToken);
-  const viaAdmin = adminTokenMatches(presented, adminToken, adminTokenPrev);
+  const viaMetrics = timingSafeEqual(presented, metricsToken ?? adminToken) && metricsToken !== null;
+  const viaAdmin = adminTokenMatches(presented, adminToken, adminTokenPrev) && adminStatic;
   return viaMetrics ? 'metrics' : viaAdmin ? 'admin' : null;
 }
 
@@ -128,7 +137,7 @@ function metricsAuthorized(req: http.IncomingMessage, metricsToken: string, admi
  * would make an agent of that name look like the admin.
  */
 export function noteTokenRequest(
-  db: Database, req: http.IncomingMessage, auth: { mode: 'admin' } | { mode: 'agent'; agentId: string },
+  db: Database, req: http.IncomingMessage, auth: { mode: 'admin'; sub?: string } | { mode: 'agent'; agentId: string },
   route: string, tls: boolean, listener: 'admin' | 'ws',
 ): void {
   const scheme = tls ? 'https' : 'http';
@@ -137,6 +146,8 @@ export function noteTokenRequest(
     evt: 'agent.http',
     principal: auth.mode === 'admin' ? 'admin' : 'agent',
     agent_id: auth.mode === 'admin' ? null : auth.agentId,
+    // R-406: an admin access token's caller; absent for the static token.
+    ...(auth.mode === 'admin' && auth.sub !== undefined ? { sub: auth.sub } : {}),
     route, src_ip: srcIp, tls, listener, at: Date.now(),
   }));
   try {
@@ -181,6 +192,8 @@ export async function serveRoute(route: Route, ctx: AdminCtx, listener: 'admin' 
         // string and no body.
         params: ctx.params,
         actor: ctx.auth.mode,       // 'admin' | 'agent' | 'unauthenticated'
+        // R-406: who, when the admin used an access token; null otherwise.
+        sub: ctx.auth.mode === 'admin' ? ctx.auth.sub ?? null : null,
         ...requestSource(req),
         // Which door: registration is served on the WS listener too.
         listener,
@@ -256,11 +269,28 @@ export function startHttpAdmin(
     listeners?: { name: string; port: number | 'off'; scheme: string }[];
     /** R-406: how agent credentials are checked; today's static tokens unless set. */
     tokenAuth?: TokenAuth;
+    /** R-406: MESH_ADMIN_STATIC_TOKEN and MESH_METRICS_STATIC_TOKEN; on unless set. */
+    adminStaticToken?: boolean;
+    metricsStaticToken?: boolean;
   } = {},
 ): Promise<HttpAdminHandle> {
-  const metricsToken = opts.metricsToken ?? null;
   const tokenAuth = opts.tokenAuth ?? STATIC_ONLY;
   const adminTokenPrev = opts.adminTokenPrev ?? null;
+  const adminStatic = opts.adminStaticToken ?? true;
+  const metricsStatic = opts.metricsStaticToken ?? true;
+  // A switched-off metrics token is never compared.
+  const metricsToken = metricsStatic ? opts.metricsToken ?? null : null;
+  // /metrics stays open only while nothing asks for a credential: no metrics
+  // token, and the static switch not turned off.
+  const metricsLocked = metricsToken !== null || !metricsStatic;
+  const adminOauth = tokenAuth.oidc !== null && tokenAuth.oidc.adminAudience !== null;
+  /** R-406: the request's admin access token, verified; undefined when it carries none. */
+  const adminJwtOf = async (req: http.IncomingMessage): Promise<OidcAdminResult | undefined> => {
+    const bearer = req.headers['authorization'];
+    if (!adminOauth || typeof bearer !== 'string' || !bearer.startsWith('Bearer ')) return undefined;
+    const presented = bearer.slice('Bearer '.length);
+    return isOidcToken(presented) ? tokenAuth.oidc!.verifyAdmin(presented) : undefined;
+  };
   return new Promise((resolve, reject) => {
     const sideBySide = opts.tlsPort !== undefined;
     if (sideBySide && (opts.tls ?? null) === null) {
@@ -282,10 +312,27 @@ export function startHttpAdmin(
         // run, so the timing does not say which one matched. The refusal is
         // byte-identical to every other admin 401. Nothing about the
         // presented credential is logged.
+        //
+        // R-406: or an admin access token whose `scope` names mesh:metrics.
         const scheme = tls ? 'https' : 'http';
         const srcIp = normaliseIp(req.socket.remoteAddress);
-        if (metricsToken !== null) {
-          const via = metricsAuthorized(req, metricsToken, adminToken, adminTokenPrev);
+        if (metricsLocked) {
+          let via = metricsAuthorized(req, metricsToken, adminToken, adminTokenPrev, adminStatic);
+          let sub: string | null = null;
+          if (via === null) {
+            const jwt = await adminJwtOf(req);
+            if (jwt !== undefined && jwt.ok && jwt.scopes.has('mesh:metrics')) {
+              via = 'metrics';
+              sub = jwt.sub;
+            } else if (jwt !== undefined) {
+              console.log(JSON.stringify({
+                evt: 'metrics.auth', outcome: 'failure',
+                reason: jwt.ok ? 'scope_missing' : `oidc_${jwt.reason.toLowerCase()}`,
+                ...(jwt.ok ? { sub: jwt.sub } : jwt.claimed !== null ? { sub_claimed: jwt.claimed } : {}),
+                src_ip: srcIp, tls, at: Date.now(),
+              }));
+            }
+          }
           if (via === null) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'unauthorized' }));
@@ -293,7 +340,7 @@ export function startHttpAdmin(
           }
           // R-65 M4/M6: a token-authenticated scrape is logged and recorded
           // like any other token-authenticated request.
-          console.log(JSON.stringify({ evt: 'agent.http', principal: via, agent_id: null, route: 'GET /metrics', src_ip: srcIp, tls, at: Date.now() }));
+          console.log(JSON.stringify({ evt: 'agent.http', principal: via, agent_id: null, ...(sub === null ? {} : { sub }), route: 'GET /metrics', src_ip: srcIp, tls, at: Date.now() }));
           recordCaller(srcIp, via, scheme);
         } else {
           // Unauthenticated scrape: no credential to log, but still a caller —
@@ -335,9 +382,12 @@ export function startHttpAdmin(
       const bearer = req.headers['authorization'];
       if (matched?.auth === 'agentOrAdmin' && typeof bearer === 'string' && bearer.startsWith('Bearer ')) {
         const presented = bearer.slice('Bearer '.length);
-        if (!adminTokenMatches(presented, adminToken, adminTokenPrev)) agentVerdict = await authenticateAgentCredential(db, presented, tokenAuth);
+        if (!(adminStatic && adminTokenMatches(presented, adminToken, adminTokenPrev))) agentVerdict = await authenticateAgentCredential(db, presented, tokenAuth);
       }
-      const auth = resolveRouteAuth(req, res, db, adminToken, matched?.auth, { adminTokenPrev, tls, agentVerdict });
+      // R-406: likewise an admin access token, on an admin route (or no route,
+      // which is refused, but its caller still logged).
+      const adminJwt = matched === undefined || (matched.auth ?? 'admin') === 'admin' ? await adminJwtOf(req) : undefined;
+      const auth = resolveRouteAuth(req, res, db, adminToken, matched?.auth, { adminTokenPrev, tls, adminStatic, agentVerdict, adminJwt, scope: matched?.scope });
       if (auth === null) return; // 401 already written
 
       // R-65 M4 + M6: every TOKEN-authenticated request — admin or agent — is
@@ -394,6 +444,12 @@ export function startHttpAdmin(
     // the deployer, at boot. C9 does not need the premise true everywhere; it
     // needs it falsifiable somewhere.
     const bindHost = process.env.MESH_ADMIN_BIND;
+    // What /metrics takes when it is locked, from the switches in force.
+    const metricsCredentials = [
+      ...(metricsToken !== null ? ['MESH_METRICS_TOKEN'] : []),
+      ...(adminStatic ? ['the admin token'] : []),
+      ...(adminOauth ? ['an admin access token with scope mesh:metrics'] : []),
+    ].join(' or ');
     const logListening = (spec: typeof servers[number]): void => {
       const addr = spec.server.address();
       const bound = typeof addr === 'object' && addr !== null ? `${addr.address}:${addr.port}` : String(addr);
@@ -410,15 +466,17 @@ export function startHttpAdmin(
         // R-18: which mode /metrics is in, stated in both. The old flag stays
         // in the unauthenticated case, where it is still true and existing
         // readers look for it.
-        metrics_auth: metricsToken === null ? 'none' : 'token',
-        ...(metricsToken === null ? { metrics_unauthenticated: true } : {}),
+        metrics_auth: !metricsLocked ? 'none' : metricsToken !== null ? 'token' : 'oauth',
+        ...(!metricsLocked ? { metrics_unauthenticated: true } : {}),
+        // R-406: whether the static admin token is accepted, and whether admin
+        // access tokens are (scope-checked per route, mesh:metrics on /metrics).
+        admin_static_token: adminStatic ? 'on' : 'off',
+        admin_oauth: adminOauth,
         // R-65 M7: whether a previous admin token is ALSO accepted. A boolean
         // only — never the value, never its length.
         admin_token_prev: adminTokenPrev !== null,
-        note: metricsToken !== null
-          ? (bindHost === undefined
-            ? 'admin port bound to ALL interfaces; /metrics requires MESH_METRICS_TOKEN or the admin token'
-            : '/metrics requires MESH_METRICS_TOKEN or the admin token on this bind')
+        note: metricsLocked
+          ? `${bindHost === undefined ? 'admin port bound to ALL interfaces; ' : ''}/metrics requires ${metricsCredentials}${bindHost === undefined ? '' : ' on this bind'}`
           : bindHost === undefined
             ? 'admin port bound to ALL interfaces; /metrics is unauthenticated on it — set MESH_METRICS_TOKEN to require a token, MESH_ADMIN_BIND to restrict, or accept this as the deployment decision'
             : '/metrics is unauthenticated on this bind — set MESH_METRICS_TOKEN to require a token',

@@ -49,7 +49,7 @@ async function bus(): Promise<number> {
   ws = await startWsServer(port, db, 10_485_760, join(tmp('r406-sdk-files-'), 'f'), 0, new Map(), null, { tokenAuth: { oidc: verifier, staticTokens: true } });
   return port;
 }
-const tok = (who: string, expIn: number) => accessToken(key, { iss: issuer!.url, aud: 'mesh', preferred_username: who }, { expIn });
+const tok = (who: string, expIn: number) => accessToken(key, { iss: issuer!.url, aud: 'mesh', preferred_username: who, sub: `u-${who}` }, { expIn });
 
 describe('R-406 SDK token function', () => {
   it('re-authenticates the live socket ~30 s before exp, with no reconnect', async () => {

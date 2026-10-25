@@ -34,6 +34,8 @@ export interface Agent {
       or null. Once set, a plaintext auth for it is refused. Optional for the
       same reason as the status fields: older readers and test literals. */
   tls_seen?: number | null;
+  /** R-406: the OIDC subject this agent's name is bound to; null until its first OIDC login. */
+  oidc_sub?: string | null;
   /** R-65 M6: the agent's most recent authenticated contact on ANY channel —
       a WS auth or an agent-token HTTP request — and when it last used a
       PLAINTEXT one. Optional for the same reason as the fields above. */
@@ -572,6 +574,15 @@ export function openDb(path: string): Database {
   try { db.exec('ALTER TABLE agents ADD COLUMN last_auth_at INTEGER'); } catch {}
   try { db.exec('ALTER TABLE agents ADD COLUMN last_plaintext_at INTEGER'); } catch {}
 
+  // R-406 migration: the OIDC `sub` an agent's name is bound to (bindOidcSub).
+  // Nullable and additive: every existing row is unbound, so its next OIDC
+  // login binds it. Guarded by the column's presence rather than by a caught
+  // error, so a real failure is not swallowed, and run in one transaction.
+  const agentCols = db.prepare('PRAGMA table_info(agents)').all() as { name: string }[];
+  if (!agentCols.some((c) => c.name === 'oidc_sub')) {
+    db.transaction(() => { db.exec('ALTER TABLE agents ADD COLUMN oidc_sub TEXT'); })();
+  }
+
 
 
   // F3 migration: observer grants made before federation existed are LOCAL-ONLY.
@@ -735,6 +746,19 @@ export function registerAgent(
   `).run(agent.id, agent.token_hash, agent.hostname, capabilities, metadata, namespace, now, now);
 
   return getAgentById(db, agent.id) as Agent;
+}
+
+/**
+ * R-406: bind an agent's name to the OIDC subject that first logs in as it, or
+ * check a later login against that binding. Names in an issuer can be changed
+ * or reused; `sub` can't, so it is what owns the mesh identity. True when the
+ * agent is (now) bound to `sub`; false when it is bound to another subject.
+ * The binding goes with the row, so only deleting the agent frees the name.
+ */
+export function bindOidcSub(db: Database, id: string, sub: string): boolean {
+  db.prepare('UPDATE agents SET oidc_sub = ? WHERE id = ? AND oidc_sub IS NULL').run(sub, id);
+  const row = db.prepare('SELECT oidc_sub FROM agents WHERE id = ?').get(id) as { oidc_sub: string | null } | null;
+  return row !== null && row.oidc_sub === sub;
 }
 
 export function getAgentById(db: Database, id: string): Agent | null {

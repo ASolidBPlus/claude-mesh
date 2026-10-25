@@ -11,6 +11,7 @@ import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import { WebSocket } from 'ws';
 import type { AgentAuthResult } from './token-auth.ts';
+import type { OidcAdminResult } from './oidc.ts';
 import {
   adminTokenMatches,
 } from './auth.ts';
@@ -49,26 +50,35 @@ export function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
+/** True when the request's Bearer credential is the static admin token (or _PREV). */
+export function staticAdminPresented(req: http.IncomingMessage, adminToken: string, adminTokenPrev: string | null): boolean {
+  // #79: the same helper every other door uses. This compared the WHOLE header
+  // with `===` — a plain string comparison against a live credential, which is
+  // both the weakest of the three behaviours this repo had and the one a reader
+  // is most likely to copy, because it looks like ordinary code.
+  const auth = req.headers['authorization'];
+  return typeof auth === 'string' && auth.startsWith('Bearer ') && adminTokenMatches(auth.slice('Bearer '.length), adminToken, adminTokenPrev);
+}
+
 export function requireAdmin(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   adminToken: string,
   adminTokenPrev: string | null = null,
 ): boolean {
-  // #79: the same helper every other door uses. This compared the WHOLE header
-  // with `===` — a plain string comparison against a live credential, which is
-  // both the weakest of the three behaviours this repo had and the one a reader
-  // is most likely to copy, because it looks like ordinary code.
-  const auth = req.headers['authorization'];
-  if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
-    if (adminTokenMatches(auth.slice('Bearer '.length), adminToken, adminTokenPrev)) {
-      return true;
-    }
-  }
+  if (staticAdminPresented(req, adminToken, adminTokenPrev)) return true;
   res.writeHead(401, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'unauthorized' }));
   return false;
 }
+
+/**
+ * R-406: what an admin access token must carry in `scope` to reach a route.
+ * Declared per route in the ROUTES table (http-admin.ts); every admin route
+ * has one, and an unknown path (no route) takes no access token. There is no
+ * catch-all scope. mesh:metrics also opens GET /metrics (http-admin.ts).
+ */
+export type AdminScope = 'mesh:agents' | 'mesh:acl' | 'mesh:reminders' | 'mesh:topics' | 'mesh:files' | 'mesh:peers' | 'mesh:metrics';
 
 /**
  * #161 — WHERE THE REQUEST CAME FROM, and how much that is worth.
@@ -134,15 +144,18 @@ export function credentialReason(req: http.IncomingMessage): 'absent' | 'invalid
  * path parameters in this API are object ids by construction (agent ids, key
  * ids, aliases) — never credentials, which arrive in headers and bodies.
  *
- * WHAT IT IS NOT: attribution. The admin token is shared between holders, so
- * this records that the credential was used and from where, never by whom. It
- * lands ALONGSIDE the token shed, not instead of it.
+ * WHAT IT IS NOT, for the static token: attribution. The admin token is
+ * shared between holders, so this records that the credential was used and
+ * from where, never by whom. It lands ALONGSIDE the token shed, not instead of
+ * it. An admin ACCESS token (R-406) does name its caller, and `sub` carries it;
+ * on a refused one, `sub_claimed` is what the token said, unverified.
  */
 export function recordAdminAuth(
   req: http.IncomingMessage,
   outcome: 'success' | 'failure',
-  reason: 'absent' | 'invalid' | null,
+  reason: string | null,
   mode: NonNullable<Route['auth']> | 'admin',
+  who: { sub?: string | null; subClaimed?: string | null } = {},
 ): void {
   incAdminAuth(outcome);
   let path = req.url ?? '';
@@ -158,6 +171,8 @@ export function recordAdminAuth(
     // than an admin attempt. Stated, so the event is not read as a count of
     // admin attempts on those routes.
     route_admits_agents: mode === 'agentOrAdmin',
+    sub: who.sub ?? null,
+    ...(who.subClaimed !== undefined && who.subClaimed !== null ? { sub_claimed: who.subClaimed } : {}),
     ...requestSource(req),
     at: Date.now(),
   }));
@@ -186,7 +201,8 @@ export interface ForwarderRegistry {
   stop?: (alias: string) => void;
 }
 
-export type AuthResult = { mode: 'admin' } | { mode: 'agent'; agentId: string } | { mode: 'unauthenticated' };
+/** `sub` is set when the admin authenticated with an access token (R-406); absent for the static token. */
+export type AuthResult = { mode: 'admin'; sub?: string } | { mode: 'agent'; agentId: string } | { mode: 'unauthenticated' };
 
 // Resolve auth for a route that accepts EITHER the admin token OR an agent's
 // own bearer token. Admin is checked FIRST (exact, timing-safe) — if the token
@@ -199,16 +215,22 @@ export function resolveAuth(
   res: http.ServerResponse,
   db: Database,
   adminToken: string,
-  adminTokenPrev: string | null = null,
-  /** R-406: the agent credential's verdict, already resolved (async) by
-   *  token-auth.ts — static or OIDC, with MESH_STATIC_TOKENS honoured. Absent
-   *  = today's static lookup. */
-  agentVerdict?: AgentAuthResult,
+  ext: {
+    adminTokenPrev: string | null;
+    /** R-406: MESH_ADMIN_STATIC_TOKEN. Required, so no caller gets the static
+     *  token accepted by forgetting to say. */
+    adminStatic: boolean;
+    /** R-406: the agent credential's verdict, already resolved (async) by
+     *  token-auth.ts — static or OIDC, with MESH_STATIC_TOKENS honoured.
+     *  Absent = today's static lookup. */
+    agentVerdict?: AgentAuthResult | undefined;
+  },
 ): AuthResult | null {
+  const { adminTokenPrev, agentVerdict } = ext;
   const header = req.headers['authorization'];
   if (typeof header === 'string' && header.startsWith('Bearer ')) {
     const token = header.slice('Bearer '.length);
-    if (adminTokenMatches(token, adminToken, adminTokenPrev)) {
+    if (ext.adminStatic && adminTokenMatches(token, adminToken, adminTokenPrev)) {
       return { mode: 'admin' };
     }
     if (agentVerdict !== undefined) {
@@ -300,6 +322,10 @@ export interface Route {
   //   dispatcher does. One route in F0b: POST /peers/register, by peer key,
   //   which is neither the admin token nor an agent token.
   auth?: 'admin' | 'agentOrAdmin' | 'handler';
+  // R-406: the scope an admin access token needs here. Required in practice
+  // for every 'admin' route (route-scopes.test.ts); absent on agentOrAdmin and
+  // handler routes, which no admin access token reaches.
+  scope?: AdminScope;
 }
 
 // Path matchers: `exact` for a literal path, `idMatch` to capture a single
@@ -342,7 +368,15 @@ export function resolveRouteAuth(
   // through a TLS listener. `tls` is REQUIRED: a caller that forgot to say
   // would otherwise silently get no latch, which is the failure in the
   // dangerous direction.
-  ext: { adminTokenPrev?: string | null; tls: boolean; agentVerdict?: AgentAuthResult | undefined },
+  //
+  // R-406: `adminStatic` (MESH_ADMIN_STATIC_TOKEN) is required for the same
+  // reason. `adminJwt` is an admin access token's verdict, resolved (async)
+  // by the caller, and `scope` the matched route's declared scope.
+  ext: {
+    adminTokenPrev?: string | null; tls: boolean; adminStatic: boolean;
+    agentVerdict?: AgentAuthResult | undefined;
+    adminJwt?: OidcAdminResult | undefined; scope?: AdminScope | undefined;
+  },
 ): AuthResult | null {
   const adminTokenPrev = ext.adminTokenPrev ?? null;
   if (mode === 'handler') {
@@ -358,7 +392,7 @@ export function resolveRouteAuth(
     return { mode: 'unauthenticated' };
   }
   if (mode === 'agentOrAdmin') {
-    const result = resolveAuth(req, res, db, adminToken, adminTokenPrev, ext.agentVerdict);
+    const result = resolveAuth(req, res, db, adminToken, { adminTokenPrev, adminStatic: ext.adminStatic, agentVerdict: ext.agentVerdict });
     // R-65 TLS LATCH, the HTTP half: an agent token presented over a
     // PLAINTEXT listener, for an agent that has authenticated over TLS, is
     // refused exactly as the WS auth is — the uniform 401, the reason in the
@@ -387,12 +421,30 @@ export function resolveRouteAuth(
   // 'admin' and the no-route case: unmatched paths still require the admin
   // token before the 404, so an unauthenticated caller cannot probe which
   // routes exist.
-  if (!requireAdmin(req, res, adminToken, adminTokenPrev)) {
-    recordAdminAuth(req, 'failure', credentialReason(req), mode ?? 'admin');
-    return null;
+  if (ext.adminStatic && staticAdminPresented(req, adminToken, adminTokenPrev)) {
+    recordAdminAuth(req, 'success', null, mode ?? 'admin');
+    return { mode: 'admin' };
   }
-  recordAdminAuth(req, 'success', null, mode ?? 'admin');
-  return { mode: 'admin' };
+  // R-406: an admin access token reaches a route only if the route declares a
+  // scope and the token's `scope` names it. An unmapped route (or no route)
+  // declares none, so no access token reaches it; an empty or missing `scope`
+  // names nothing.
+  const jwt = ext.adminJwt;
+  if (jwt !== undefined && jwt.ok && ext.scope !== undefined && jwt.scopes.has(ext.scope)) {
+    recordAdminAuth(req, 'success', null, mode ?? 'admin', { sub: jwt.sub });
+    return { mode: 'admin', sub: jwt.sub };
+  }
+  res.writeHead(401, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'unauthorized' }));
+  if (jwt === undefined) {
+    recordAdminAuth(req, 'failure', credentialReason(req), mode ?? 'admin');
+  } else if (!jwt.ok) {
+    recordAdminAuth(req, 'failure', `oidc_${jwt.reason.toLowerCase()}`, mode ?? 'admin', { subClaimed: jwt.claimed });
+  } else {
+    // Verified, so the caller is known: say who was refused, and why.
+    recordAdminAuth(req, 'failure', ext.scope === undefined ? 'route_unmapped' : 'scope_missing', mode ?? 'admin', { sub: jwt.sub });
+  }
+  return null;
 }
 
 // ─── Peer keys and peer registration (F0b — §3, §4, §6) ─────────────────────
