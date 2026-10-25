@@ -10,6 +10,7 @@ authentication, body-reading and formatting helpers they all reach for.
 import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import { WebSocket } from 'ws';
+import type { AgentAuthResult } from './token-auth.ts';
 import {
   adminTokenMatches,
 } from './auth.ts';
@@ -199,6 +200,10 @@ export function resolveAuth(
   db: Database,
   adminToken: string,
   adminTokenPrev: string | null = null,
+  /** R-406: the agent credential's verdict, already resolved (async) by
+   *  token-auth.ts — static or OIDC, with MESH_STATIC_TOKENS honoured. Absent
+   *  = today's static lookup. */
+  agentVerdict?: AgentAuthResult,
 ): AuthResult | null {
   const header = req.headers['authorization'];
   if (typeof header === 'string' && header.startsWith('Bearer ')) {
@@ -206,9 +211,14 @@ export function resolveAuth(
     if (adminTokenMatches(token, adminToken, adminTokenPrev)) {
       return { mode: 'admin' };
     }
-    const agent = getAgentByToken(db, token);
-    if (agent !== null) {
-      return { mode: 'agent', agentId: agent.id };
+    if (agentVerdict !== undefined) {
+      if (agentVerdict.ok) return { mode: 'agent', agentId: agentVerdict.agentId };
+      console.log(JSON.stringify({ evt: 'agent.http', refused: agentVerdict.reason.toLowerCase(), identity: agentVerdict.claimed, at: Date.now() }));
+    } else {
+      const agent = getAgentByToken(db, token);
+      if (agent !== null) {
+        return { mode: 'agent', agentId: agent.id };
+      }
     }
   }
   res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -332,7 +342,7 @@ export function resolveRouteAuth(
   // through a TLS listener. `tls` is REQUIRED: a caller that forgot to say
   // would otherwise silently get no latch, which is the failure in the
   // dangerous direction.
-  ext: { adminTokenPrev?: string | null; tls: boolean },
+  ext: { adminTokenPrev?: string | null; tls: boolean; agentVerdict?: AgentAuthResult | undefined },
 ): AuthResult | null {
   const adminTokenPrev = ext.adminTokenPrev ?? null;
   if (mode === 'handler') {
@@ -348,7 +358,7 @@ export function resolveRouteAuth(
     return { mode: 'unauthenticated' };
   }
   if (mode === 'agentOrAdmin') {
-    const result = resolveAuth(req, res, db, adminToken, adminTokenPrev);
+    const result = resolveAuth(req, res, db, adminToken, adminTokenPrev, ext.agentVerdict);
     // R-65 TLS LATCH, the HTTP half: an agent token presented over a
     // PLAINTEXT listener, for an agent that has authenticated over TLS, is
     // refused exactly as the WS auth is — the uniform 401, the reason in the

@@ -5,6 +5,7 @@ import { parseTrafficClasses, type ClassRule } from './traffic-classes.ts';
 import { startBorder, forwarders } from './border.ts';
 import { parsePlaintextPeerCidrs, applyPlaintextPeerCidrs, type PlaintextCidr } from './plaintext-peers.ts';
 import { loadTls, expiryWarning, type ServerTls } from './tls-config.ts';
+import { parseTokenAuthConfig, createOidcVerifier, type TokenAuthConfig } from './oidc.ts';
 import { startWsServer, WsServerHandle, PRE_AUTH_LIMITS, DEFAULT_REDELIVERY_WINDOW_MS } from './ws-server.ts';
 import { startMcpServer, McpServerHandle } from './mcp-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from './http-admin.ts';
@@ -42,6 +43,7 @@ export interface Config {
   /** R-69: caps on concurrent unauthenticated WS sockets. */
   preAuth: { global: number; perIp: number };
   redeliveryWindowMs: number;
+  tokenAuth: TokenAuthConfig;
   /** R-271: caps on concurrent file downloads. */
   downloads: { global: number; perAgent: number };
 }
@@ -250,6 +252,14 @@ export function loadConfig(): Config {
   const downloads = { global: posInt('MESH_DOWNLOAD_MAX', DOWNLOAD_LIMITS.global), perAgent: posInt('MESH_DOWNLOAD_PER_AGENT', DOWNLOAD_LIMITS.perAgent) };
   // R-335: how long an unacked row may be redelivered to an ack-capable login.
   const redeliveryWindowMs = posInt('MESH_REDELIVERY_WINDOW_MS', DEFAULT_REDELIVERY_WINDOW_MS);
+
+  // R-406: OIDC access-token login and the static-token switch. All unset is
+  // exactly today; half a configuration or an unreadable file refuses to start.
+  const tokenAuthParse = parseTokenAuthConfig(process.env);
+  if (!tokenAuthParse.ok) {
+    process.stderr.write(`token auth: ${tokenAuthParse.error}\n`);
+    process.exit(1);
+  }
   for (const [name, p] of [['MESH_WS_TLS_PORT', wsTlsPort], ['MESH_ADMIN_TLS_PORT', adminTlsPort]] as const) {
     if (p !== null && tls === null) {
       process.stderr.write(`${name} is set but MESH_TLS_CERT/MESH_TLS_KEY are not; a TLS listener needs both\n`);
@@ -278,7 +288,7 @@ export function loadConfig(): Config {
     metricsToken = metricsRaw;
   }
 
-  return { dbPath, wsPort, adminPort, wsTlsPort, adminTlsPort, adminToken, adminTokenPrev, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, trafficClasses, tls, tlsCa, metricsToken, preAuth, downloads, redeliveryWindowMs };
+  return { dbPath, wsPort, adminPort, wsTlsPort, adminTlsPort, adminToken, adminTokenPrev, cleanupIntervalMs, maxFileBytes, filesDir, reminderIntervalMs, presenceDebounceMs, mcpMode, retentionMs, plaintextPeerCidrs, trafficClasses, tls, tlsCa, metricsToken, preAuth, downloads, redeliveryWindowMs, tokenAuth: tokenAuthParse.config };
 }
 
 async function main() {
@@ -403,13 +413,21 @@ async function main() {
   const observerIndex = new Map<string, WebSocket>();
 
   let wsHandle: WsServerHandle;
+  // R-406: the OIDC verifier, when configured. Its JWKS loads in the
+  // background and retries with backoff, so an issuer that's down never stops
+  // the mesh: OIDC logins are refused until the keys load, static tokens work.
+  const tokenAuth = {
+    oidc: config.tokenAuth.oidc === null ? null : createOidcVerifier(config.tokenAuth.oidc),
+    staticTokens: config.tokenAuth.staticTokens,
+  };
+
   try {
     if (config.tls !== null) {
       const warn = expiryWarning(config.tls.info, Date.now());
       if (warn !== null) console.error(JSON.stringify(warn));
     }
     wsHandle = await startWsServer(config.wsPort, db, config.maxFileBytes, config.filesDir, config.presenceDebounceMs, observerIndex, config.tls,
-      { preAuth: config.preAuth, redeliveryWindowMs: config.redeliveryWindowMs, ...(config.wsTlsPort === null ? {} : { tlsPort: config.wsTlsPort }) });
+      { preAuth: config.preAuth, redeliveryWindowMs: config.redeliveryWindowMs, tokenAuth, ...(config.wsTlsPort === null ? {} : { tlsPort: config.wsTlsPort }) });
   } catch (err) {
     process.stderr.write(`Failed to start WebSocket server: ${err}\n`);
     process.exit(1);
@@ -460,6 +478,7 @@ async function main() {
     metricsToken: config.metricsToken,
     adminTokenPrev: config.adminTokenPrev,
     listeners,
+    tokenAuth,
     ...(config.adminTlsPort === null ? {} : { tls: config.tls, tlsPort: config.adminTlsPort }),
   });
   console.log(JSON.stringify({
@@ -470,6 +489,9 @@ async function main() {
     downloads: { max: config.downloads.global, per_agent: config.downloads.perAgent },
     // R-335: the redelivery window for ack-capable clients.
     redelivery_window_ms: config.redeliveryWindowMs,
+    // R-406: how agents may log in.
+    oidc: config.tokenAuth.oidc === null ? 'off' : `on ${config.tokenAuth.oidc.issuer}`,
+    static_tokens: config.tokenAuth.staticTokens ? 'on' : 'off',
     at: Date.now(),
   }));
 

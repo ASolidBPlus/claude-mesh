@@ -126,6 +126,10 @@ export interface AuthOkFrame {
   agent_id: string;
   queued: number;
   queued_files: number;
+  /** R-406: for a session opened with an OAuth access token, its `exp` (unix
+   *  seconds). The mesh closes the session then (TOKEN_EXPIRED) unless an
+   *  `auth` frame with a later token re-authenticates it first. */
+  token_exp?: number;
 }
 
 export interface DeliverFrame {
@@ -174,6 +178,8 @@ export interface AckFrame {
   reminder_id?: string;
   due_at?: number;
   file_id?: string; // #60: on a file_send ack, the stored file's id (so the sender learns it)
+  /** R-406: on a re-auth's ack, the session's new token expiry. */
+  token_exp?: number;
 }
 
 export interface ErrorFrame {

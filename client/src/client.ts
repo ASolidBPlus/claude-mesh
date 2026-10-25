@@ -39,7 +39,15 @@ export interface Reminder {
 export interface MeshClientConfig {
   serverUrl?: string; // default process.env.MESH_SERVER_URL
   agentId?: string; // default process.env.MESH_AGENT_ID
-  agentToken?: string; // default process.env.MESH_AGENT_TOKEN
+  /**
+   * The agent's token (default process.env.MESH_AGENT_TOKEN), or — R-406 — a
+   * function that returns one, for an OAuth access token (a JWT) that
+   * expires. A function is called on every connect and every fetchFile, and
+   * again about 30 s before the session's token expires, to re-authenticate
+   * the live socket without reconnecting. A plain string behaves exactly as
+   * before.
+   */
+  agentToken?: string | (() => string | Promise<string>);
   // Admin HTTP base URL for fetchFile() (e.g. 'http://host:7385'). The admin
   // API is usually a DIFFERENT port than the WS serverUrl, so this can't be
   // derived reliably — set it (or MESH_HTTP_URL) to use fetchFile when the
@@ -239,7 +247,8 @@ export interface SendFileOpts {
 interface ResolvedConfig {
   serverUrl: string;
   agentId: string;
-  agentToken: string;
+  /** Null when a tokenProvider supplies the token. */
+  agentToken: string | null;
   ca?: string;
 }
 
@@ -352,6 +361,16 @@ export function assertRuntimeVerifiesIpIdentity(
     ),
     { code: 'TLS_IDENTITY_UNVERIFIABLE' },
   );
+}
+
+/** R-406: a JWT's `exp` (unix seconds), read without verifying (the mesh verifies). */
+function jwtExp(token: string): number | undefined {
+  try {
+    const exp = (JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8')) as { exp?: unknown }).exp;
+    return typeof exp === 'number' ? exp : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export class MeshClient {
@@ -703,7 +722,7 @@ export class MeshClient {
     // private CA must come from NODE_EXTRA_CA_CERTS instead — and without it
     // the request is REFUSED, not sent unverified.
     const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${cfg.agentToken}` },
+      headers: { Authorization: `Bearer ${await this.currentToken(cfg)}` },
       ...(cfg.ca === undefined ? {} : { tls: { ca: cfg.ca } }),
     } as RequestInit);
     if (!res.ok) {
@@ -756,6 +775,7 @@ export class MeshClient {
 
   close(): void {
     this.shouldReconnect = false;
+    this.clearReauth();
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -789,13 +809,55 @@ export class MeshClient {
     if (agentId === undefined || agentId === '') {
       throw new Error('MeshClient: agentId is required (config or MESH_AGENT_ID)');
     }
-    if (agentToken === undefined || agentToken === '') {
+    const provided = typeof agentToken === 'function';
+    if (!provided && (agentToken === undefined || agentToken === '')) {
       throw new Error('MeshClient: agentToken is required (config or MESH_AGENT_TOKEN)');
     }
+    const token = provided ? null : (agentToken as string);
     const ca = resolveCa(this.config.ca, process.env.MESH_TLS_CA);
     return ca === undefined
-      ? { serverUrl, agentId, agentToken }
-      : { serverUrl, agentId, agentToken, ca };
+      ? { serverUrl, agentId, agentToken: token }
+      : { serverUrl, agentId, agentToken: token, ca };
+  }
+
+  // R-406: re-authenticate the live socket shortly before its access token
+  // expires, so a short-lived token (fleet-identity's live 300 s) is renewed
+  // without a reconnect, which would flap presence. Only with a token
+  // function; a failed re-auth falls back to a reconnect.
+  private reauthTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly REAUTH_LEAD_MS = 30_000;
+
+  private clearReauth(): void {
+    if (this.reauthTimer !== null) clearTimeout(this.reauthTimer);
+    this.reauthTimer = null;
+  }
+
+  private scheduleReauth(expSec: number | undefined, config: ResolvedConfig): void {
+    this.clearReauth();
+    if (typeof this.config.agentToken !== 'function' || expSec === undefined) return;
+    const ws = this.ws;
+    const delay = Math.max(expSec * 1000 - Date.now() - MeshClient.REAUTH_LEAD_MS, 0);
+    this.reauthTimer = setTimeout(() => { void this.reauth(ws, config); }, delay);
+    (this.reauthTimer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  private async reauth(ws: WebSocket | null, config: ResolvedConfig): Promise<void> {
+    if (ws === null || this.ws !== ws) return;
+    try {
+      const token = await this.currentToken(config);
+      const ref = this.id();
+      await this.sendWithAck(ref, { type: 'auth', msg_id: ref, agent_id: config.agentId, token, ...this.authExtras() });
+      this.scheduleReauth(jwtExp(token), config);
+    } catch {
+      // Refused, timed out or no token: reconnect, which logs in afresh.
+      if (this.ws === ws) { try { ws.terminate(); } catch { /* ignore */ } }
+    }
+  }
+
+  /** R-406: the token to present now: the provider's fresh one, or the fixed one. */
+  private async currentToken(cfg: ResolvedConfig): Promise<string> {
+    const t = this.config.agentToken;
+    return typeof t === 'function' ? await t() : cfg.agentToken!;
   }
 
   // Resolve the HTTP base for fetchFile(): explicit httpUrl / MESH_HTTP_URL,
@@ -1018,17 +1080,28 @@ export class MeshClient {
     }, CONNECT_TIMEOUT_MS);
 
     ws.on('open', () => {
-      const authFrame: AuthFrame = {
-        type: 'auth',
-        agent_id: config.agentId,
-        token: config.agentToken, // RAW token; server hashes it
-        ...this.authExtras(),
-      };
-      try {
-        ws.send(JSON.stringify(authFrame));
-      } catch {
-        // ignore; close handler will reconnect
-      }
+      void (async () => {
+        let token: string;
+        try {
+          token = await this.currentToken(config);
+        } catch {
+          // No token to log in with: drop this attempt and let close drive the reconnect.
+          try { ws.terminate(); } catch { /* ignore */ }
+          return;
+        }
+        if (ws.readyState !== WebSocket.OPEN) return;
+        const authFrame: AuthFrame = {
+          type: 'auth',
+          agent_id: config.agentId,
+          token, // RAW token (or an OAuth access token); the server checks it
+          ...this.authExtras(),
+        };
+        try {
+          ws.send(JSON.stringify(authFrame));
+        } catch {
+          // ignore; close handler will reconnect
+        }
+      })();
     });
 
     ws.on('message', (data: unknown) => {
@@ -1050,6 +1123,7 @@ export class MeshClient {
       if (this.ws === ws) {
         this.ws = null;
         this.stopHeartbeat(); // only tear down timers that belong to THIS socket
+        this.clearReauth();
       }
       // Fail every in-flight waiter fast on the drop. The server has already
       // (or will) route any response to this now-dead socket, so a reconnect
@@ -1094,6 +1168,7 @@ export class MeshClient {
     switch (frame.type) {
       case 'auth_ok':
         this.onAuthOk(config);
+        this.scheduleReauth(frame.token_exp, config);
         return;
       case 'deliver':
         this.onDeliver(frame);

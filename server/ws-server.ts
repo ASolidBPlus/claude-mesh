@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
-import { ALIAS_SUFFIX_RE, getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, markTlsSeen, getAgentByToken, isTlsLatched, recordAgentConnection, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
+import { ALIAS_SUFFIX_RE, getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, markTlsSeen, isTlsLatched, recordAgentConnection, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
 import { validateToken } from './auth.ts';
 import { PEER_PROTOCOL_VERSION } from './wire-version.ts';  // #131: via the tiny module, never cross-package from here
 import { parseDuration } from './duration.ts';
@@ -19,6 +19,7 @@ import type { ServerTls } from './tls-config.ts';
 import { recordCaller, normaliseIp } from './connections.ts';
 import { PEER_REGISTER_ROUTE, FILE_ROUTE, MESSAGES_ROUTE, serveRoute, noteTokenRequest } from './http-admin.ts';
 import { routeLabel } from './admin-ctx.ts';
+import { STATIC_ONLY, authenticateAgentCredential, authenticateJwt, isOidcToken, type AgentAuthResult, type TokenAuth } from './token-auth.ts';
 
 /** F1a (§5.1): the only inbound peer protocol this mesh speaks. A version is a
  *  property of a LIVE CONNECTION, never of a stored row (D7) — which is why it
@@ -71,6 +72,14 @@ interface ConnState {
   identity: string | null;
   /** R-377: the alias address, or null for a plain session. */
   alias: string | null;
+  /** R-406: `Authorization: Bearer` on the WebSocket upgrade, if any. Used
+   *  only when the auth frame carries no token of its own. */
+  upgradeBearer: string | null;
+  /** R-406: closes the session at its access token's `exp`. */
+  expiryTimer: ReturnType<typeof setTimeout> | null;
+  /** R-406: the session's access-token `exp` (unix seconds), or null for a
+   *  static-token session. Moves only on a successful re-auth. */
+  tokenExp: number | null;
 }
 
 /** R-335: how long after its first delivery an unacked row may be sent again
@@ -149,6 +158,11 @@ interface AuthCtx {
   /** R-65: true only when TLS runs BESIDE plaintext (side-by-side mode). */
   latchOnTls: boolean;
   redeliveryWindowMs: number;
+  /** R-406: false when MESH_STATIC_TOKENS=off. */
+  staticTokens: boolean;
+  /** R-406: present when the credential was an OIDC access token, already
+   *  verified (or refused) before this ran. */
+  oidc?: AgentAuthResult;
 }
 
 /**
@@ -194,7 +208,7 @@ function logAuth(db: Database, state: ConnState, agentId: string | null, fields:
 }
 
 function handleAuthFrame(ctx: AuthCtx): void {
-  const { ws, state, db, frame, parsed, agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus, latchOnTls, redeliveryWindowMs } = ctx;
+  const { ws, state, db, frame, parsed, agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus, latchOnTls, redeliveryWindowMs, staticTokens, oidc } = ctx;
 
   if (typeof parsed !== 'object' || parsed === null || frame.type !== 'auth') {
     try {
@@ -206,7 +220,8 @@ function handleAuthFrame(ctx: AuthCtx): void {
 
   // Auth frame handling
   const agentId = frame.agent_id;
-  const token = frame.token;
+  // R-406: an OIDC login may carry its token on the upgrade instead.
+  const token = oidc !== undefined && frame.token === undefined ? '' : frame.token;
 
   if (typeof agentId !== 'string' || typeof token !== 'string') {
     // Logged BEFORE the send, so a socket that is already gone cannot skip it.
@@ -259,7 +274,8 @@ function handleAuthFrame(ctx: AuthCtx): void {
   // collision gates guarantee an alias and an agent id can never
   // coincide — so the alias-keyed lookup IS the credential lookup,
   // and there is no id for which both or neither could match.
-  const peerRow = getPeerByAlias(db, agentId);
+  // R-406: an OIDC access token names an AGENT identity, never a peer.
+  const peerRow = oidc !== undefined ? null : getPeerByAlias(db, agentId);
   if (peerRow !== null) {
     // ONE refusal for every peer-reachable failure, and it is
     // `unknown agent` — what a stranger already sees.
@@ -381,6 +397,25 @@ function handleAuthFrame(ctx: AuthCtx): void {
     return;
   }
 
+  // R-406: the credential's own verdict, before the frame's name is used. An
+  // OIDC token was verified before this ran (its refusal reason is logged);
+  // it names one identity, and the frame's agent_id must be that identity
+  // (an alias is then `<identity>+<alias>`, as always). With
+  // MESH_STATIC_TOKENS=off a static token is refused here. Every refusal is
+  // the uniform AUTH_FAILED body; the reason goes to the log only, never the
+  // token.
+  const credentialRefusal = oidc !== undefined
+    ? (!oidc.ok ? `oidc_${oidc.reason.toLowerCase()}` : oidc.agentId !== agentId ? 'oidc_identity_mismatch' : null)
+    : (!staticTokens ? 'static_tokens_off' : null);
+  if (credentialRefusal !== null) {
+    logAuth(db, state, agentId, { refused: credentialRefusal, ...(oidc !== undefined ? { identity: oidc.ok ? oidc.agentId : oidc.claimed } : {}) });
+    try {
+      ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
+    } catch (_) { /* ignore */ }
+    ws.close(1008, 'auth failed');
+    return;
+  }
+
   const agent = getAgentById(db, agentId);
   if (agent === null) {
     logAuth(db, state, agentId, { refused: 'unknown_agent' });
@@ -403,7 +438,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
   // The frame's own-input refusal above ('missing agent_id or token')
   // stays distinct: it answers a different question — what the caller
   // SENT — and reveals nothing about what exists here.
-  if (!validateToken(token, agent.token_hash)) {
+  if (oidc === undefined && !validateToken(token, agent.token_hash)) {
     logAuth(db, state, agentId, { refused: 'bad_token' });
     try {
       ws.send(JSON.stringify({ type: 'error', code: 'AUTH_FAILED', message: 'unknown agent' }));
@@ -482,7 +517,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
     // than dropped, and does not reconnect into a fight with itself.
     try { displaced.close(1008, 'displaced by a newer connection'); } catch (_) { /* ignore */ }
   }
-  logAuth(db, state, agentId, { displaced: displaced !== undefined && displaced !== ws, ...(state.alias !== null ? { alias: state.alias } : {}) });
+  logAuth(db, state, agentId, { displaced: displaced !== undefined && displaced !== ws, ...(state.alias !== null ? { alias: state.alias } : {}), ...(oidc !== undefined ? { via: 'oidc' } : {}) });
   // R-65 M6: the persisted per-agent report, and — for an observer — the
   // in-memory caller list too, which is where the operator looks for
   // non-agent callers.
@@ -506,7 +541,7 @@ function handleAuthFrame(ctx: AuthCtx): void {
   const queued_files = pendingFileRows.cnt;
 
   try {
-    ws.send(JSON.stringify({ type: 'auth_ok', agent_id: address, queued, queued_files }));
+    ws.send(JSON.stringify({ type: 'auth_ok', agent_id: address, queued, queued_files, ...(oidc?.ok === true && oidc.exp !== null ? { token_exp: oidc.exp } : {}) }));
   } catch (_) { /* ignore */ }
   drainQueue(db, address, ws, state.ackCapable ? Date.now() - redeliveryWindowMs : null);
   drainFileQueue(db, address, ws);
@@ -1198,8 +1233,10 @@ export function startWsServer(
   // `port` is the PLAINTEXT listener (or 'off') and `tlsPort` serves TLS with
   // the same certificate. server.ts enforces the pairing rules; this function
   // trusts them and refuses only what it cannot serve.
-  opts: { tlsPort?: number; preAuth?: { global: number; perIp: number }; redeliveryWindowMs?: number } = {},
+  opts: { tlsPort?: number; preAuth?: { global: number; perIp: number }; redeliveryWindowMs?: number; tokenAuth?: TokenAuth } = {},
 ): Promise<WsServerHandle> {
+  // R-406: how agent credentials are checked; today's static tokens unless told otherwise.
+  const tokenAuth = opts.tokenAuth ?? STATIC_ONLY;
   return new Promise((resolve, reject) => {
     // #87: reconcile the durable `online` flag with reality BEFORE binding the
     // listener. Nothing can be connected yet — agentIndex is created empty a
@@ -1240,7 +1277,7 @@ export function startWsServer(
     const FILE_REFUSAL_LOG_MS = 60_000;
     const FILE_REFUSAL_KEYS_MAX = 1024;
     const fileRefusals = new Map<string, { last: number; suppressed: number }>();
-    const logFileRefusal = (req: http.IncomingMessage, refused: 'no_token' | 'bad_token', tls: boolean, route: typeof FILE_ROUTE): void => {
+    const logFileRefusal = (req: http.IncomingMessage, refused: string, tls: boolean, route: typeof FILE_ROUTE): void => {
       const ip = normaliseIp(req.socket.remoteAddress) ?? 'unknown';
       const now = Date.now();
       const seen = fileRefusals.get(ip);
@@ -1328,28 +1365,35 @@ export function startWsServer(
             res.end(JSON.stringify({ error: 'unauthorized' }));
           };
           const header = req.headers['authorization'];
-          const agent = typeof header === 'string' && header.startsWith('Bearer ')
-            ? getAgentByToken(db, header.slice('Bearer '.length))
-            : null;
-          if (agent === null) {
-            logFileRefusal(req, typeof header === 'string' && header.startsWith('Bearer ') ? 'bad_token' : 'no_token', tls, route);
+          if (typeof header !== 'string' || !header.startsWith('Bearer ')) {
+            logFileRefusal(req, 'no_token', tls, route);
             unauthorized();
             return;
           }
-          if (!tls && isTlsLatched(db, agent.id)) {
-            console.log(JSON.stringify({
-              evt: 'agent.http', principal: 'agent', agent_id: agent.id, route: routeLabel(req.method, route),
-              src_ip: normaliseIp(req.socket.remoteAddress), tls, listener: 'ws', refused: 'tls_latched', at: Date.now(),
-            }));
-            unauthorized();
-            return;
-          }
-          const auth = { mode: 'agent' as const, agentId: agent.id };
-          noteTokenRequest(db, req, auth, routeLabel(req.method, route), tls, 'ws');
-          void serveRoute(route, {
-            req, res, db, url, params, agentIndex, observerIndex, peerIndex,
-            forwarders: {}, maxFileBytes, filesDir, auth,
-          }, 'ws');
+          // R-406: a static token or an OIDC access token, the same rules as
+          // WS auth (token-auth.ts). Verification is async; the answer waits.
+          void (async () => {
+            const who = await authenticateAgentCredential(db, header.slice('Bearer '.length), tokenAuth);
+            if (!who.ok) {
+              logFileRefusal(req, who.reason === 'UNKNOWN_TOKEN' ? 'bad_token' : `${who.reason.toLowerCase()}`, tls, route);
+              unauthorized();
+              return;
+            }
+            if (!tls && isTlsLatched(db, who.agentId)) {
+              console.log(JSON.stringify({
+                evt: 'agent.http', principal: 'agent', agent_id: who.agentId, route: routeLabel(req.method, route),
+                src_ip: normaliseIp(req.socket.remoteAddress), tls, listener: 'ws', refused: 'tls_latched', at: Date.now(),
+              }));
+              unauthorized();
+              return;
+            }
+            const auth = { mode: 'agent' as const, agentId: who.agentId };
+            noteTokenRequest(db, req, auth, routeLabel(req.method, route), tls, 'ws');
+            await serveRoute(route, {
+              req, res, db, url, params, agentIndex, observerIndex, peerIndex,
+              forwarders: {}, maxFileBytes, filesDir, auth,
+            }, 'ws');
+          })();
           return;
         }
       }
@@ -1566,6 +1610,12 @@ export function startWsServer(
         const state: ConnState = {
           ws, agentId: null, peerAlias: null, authed: false, tls: scheme === 'wss',
           srcIp: normaliseIp(req.socket.remoteAddress), ackCapable: false, identity: null, alias: null,
+          upgradeBearer: (() => {
+            const h = req.headers['authorization'];
+            return typeof h === 'string' && h.startsWith('Bearer ') ? h.slice('Bearer '.length) : null;
+          })(),
+          expiryTimer: null,
+          tokenExp: null,
         };
         registry.set(ws, state);
 
@@ -1583,6 +1633,11 @@ export function startWsServer(
         // sites, the two never diverged across 805 tests). The construction is
         // the argument; the measurement only says nothing contradicted it.
         let messageHandled = false;
+        // R-406: while an OIDC token is being verified (async), later frames
+        // wait here and are replayed in order once auth completes, rather
+        // than being dropped as pre-auth extras. Bounded.
+        let authInFlight = false;
+        const waiting: WebSocket.RawData[] = [];
 
         const authTimer = setTimeout(() => {
           if (!state.authed) {
@@ -1593,7 +1648,12 @@ export function startWsServer(
           }
         }, 5000);
 
-        ws.on('message', (data) => {
+        const onMessage = (data: WebSocket.RawData): void => {
+          if (authInFlight) {
+            if (waiting.length < 64) waiting.push(data);
+            else { try { ws.close(1008, 'too many frames before auth'); } catch (_) { /* ignore */ } }
+            return;
+          }
           // R-65 review: a socket that is no longer OPEN — closed by rotate, by
           // displacement, by a refusal — processes NOTHING more. close() only
           // starts the handshake, and a peer that ignores it would otherwise
@@ -1644,14 +1704,38 @@ export function startWsServer(
             // `return` below is the one both arms used to carry individually —
             // without it a completed auth falls through to the post-auth
             // dispatch below, which is what auth-seam.test.ts pins.
-            handleAuthFrame({
+            const authCtx = {
               ws, state, db, frame, parsed,
               agentIndex, peerIndex, observerIndex, presenceState, broadcastStatus,
               latchOnTls: sideBySide,
               redeliveryWindowMs: opts.redeliveryWindowMs ?? DEFAULT_REDELIVERY_WINDOW_MS,
-            });
-            // Authenticated (agent or peer): no longer an unauthenticated socket.
-            if (state.authed) releasePreAuth();
+              staticTokens: tokenAuth.staticTokens,
+            };
+            // One call site for the auth frame, whichever way the credential
+            // was checked (#143's pin).
+            const completeAuth = (oidc?: AgentAuthResult): void => {
+              handleAuthFrame(oidc === undefined ? authCtx : { ...authCtx, oidc });
+              // Authenticated (agent or peer): no longer an unauthenticated socket.
+              if (!state.authed) return;
+              releasePreAuth();
+              if (oidc?.ok === true && oidc.exp !== null) { state.tokenExp = oidc.exp; armExpiry(oidc.exp); }
+            };
+            // R-406: an OIDC access token — in the frame, or on the upgrade
+            // when the frame has none — is verified first (async), then the
+            // same auth runs with the verdict. With OIDC off a JWT is not a
+            // candidate and fails as any unknown static token does.
+            const presented = typeof frame.token === 'string' ? frame.token : frame.token === undefined ? state.upgradeBearer : null;
+            if (tokenAuth.oidc !== null && frame.type === 'auth' && presented !== null && isOidcToken(presented)) {
+              authInFlight = true;
+              void authenticateJwt(db, presented, tokenAuth).then((verdict) => {
+                authInFlight = false;
+                if (ws.readyState !== WebSocket.OPEN) return;
+                completeAuth(verdict);
+                if (state.authed) for (const d of waiting.splice(0)) onMessage(d);
+              });
+              return;
+            }
+            completeAuth();
             return;
           }
 
@@ -1659,6 +1743,13 @@ export function startWsServer(
           // keyed by frame type in POST_AUTH_HANDLERS. A non-string or unknown
           // type falls through to NOT_IMPLEMENTED, exactly as the prior if-chain.
           const frameType = frame.type;
+
+          // R-406: re-auth on the live socket, so a short-lived access token
+          // can be renewed without reconnecting (which would flap presence).
+          if (state.peerAlias === null && frameType === 'auth') {
+            reauth(frame);
+            return;
+          }
 
           // ── F1a (§5.1): the peer frame ALLOWLIST ────────────────────────
           //
@@ -1823,9 +1914,59 @@ export function startWsServer(
           try {
             ws.send(JSON.stringify({ type: 'error', code: 'NOT_IMPLEMENTED', message: 'frame type not implemented' }));
           } catch (_) { /* ignore */ }
-        });
+        };
+        ws.on('message', onMessage);
+
+        // R-406: a session opened with an OIDC access token ends when the
+        // token does. The client is told why (a typed code), then the socket
+        // closes with the same reason; a client with a token provider simply
+        // reconnects with a fresh one.
+        /**
+         * R-406: an `auth` frame on an authenticated OIDC session. Accepted
+         * only if the token verifies, names the same identity, keeps the same
+         * alias, and expires later than the current one; then the session's
+         * deadline moves. Anything else is refused with REAUTH_REFUSED and the
+         * session stays exactly as it was (its old deadline included).
+         */
+        const reauth = (frame: Record<string, unknown>): void => {
+          const ref = typeof frame.msg_id === 'string' && frame.msg_id.length > 0 ? { ref: frame.msg_id } : {};
+          const refuse = (reason: string): void => {
+            console.log(JSON.stringify({ evt: 'agent.reauth', agent_id: state.agentId, refused: reason, at: Date.now() }));
+            try { ws.send(JSON.stringify({ type: 'error', ...ref, code: 'REAUTH_REFUSED', message: `re-auth refused (${reason}); the session is unchanged` })); } catch (_) { /* ignore */ }
+          };
+          if (tokenAuth.oidc === null || state.tokenExp === null) return refuse('not_an_oidc_session');
+          const token = frame.token;
+          if (typeof token !== 'string' || !isOidcToken(token)) return refuse('malformed');
+          if (frame.agent_id !== state.identity) return refuse('identity_changed');
+          const suffix = state.alias === null ? undefined : state.alias.slice(state.identity!.length + 1);
+          if (frame.alias !== suffix) return refuse('alias_changed');
+          const before = state.tokenExp;
+          void tokenAuth.oidc.verify(token).then((v) => {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            if (!v.ok) return refuse(`oidc_${v.reason.toLowerCase()}`);
+            if (v.identity !== state.identity) return refuse('identity_changed');
+            if (state.tokenExp === null || v.exp <= before || v.exp <= state.tokenExp) return refuse('exp_not_later');
+            state.tokenExp = v.exp;
+            armExpiry(v.exp);
+            console.log(JSON.stringify({ evt: 'agent.reauth', agent_id: state.agentId, ok: true, at: Date.now() }));
+            try { ws.send(JSON.stringify({ type: 'ack', ...ref, ok: true, token_exp: v.exp })); } catch (_) { /* ignore */ }
+          });
+        };
+
+        const armExpiry = (exp: number): void => {
+          if (state.expiryTimer !== null) clearTimeout(state.expiryTimer);
+          const ms = Math.min(Math.max(exp * 1000 - Date.now(), 0), 2_147_000_000);
+          state.expiryTimer = setTimeout(() => {
+            console.log(JSON.stringify({ evt: 'agent.session_expired', agent_id: state.agentId, at: Date.now() }));
+            try { ws.send(JSON.stringify({ type: 'error', code: 'TOKEN_EXPIRED', message: 'the access token expired; reconnect with a fresh one' })); } catch (_) { /* ignore */ }
+            try { ws.close(4001, 'TOKEN_EXPIRED'); } catch (_) { /* ignore */ }
+            setTimeout(() => { try { ws.terminate(); } catch (_) { /* ignore */ } }, 500).unref?.();
+          }, ms);
+          state.expiryTimer.unref?.();
+        };
 
         ws.on('close', () => {
+          if (state.expiryTimer !== null) clearTimeout(state.expiryTimer);
           handleSocketClose({
             ws, db, registry, connections, agentIndex, peerIndex, observerIndex,
             presenceState, presenceDebounceMs, broadcastStatus,

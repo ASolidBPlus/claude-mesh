@@ -166,7 +166,7 @@ describe('F1a: peer authentication', () => {
   // new `if` block in production code with no test file in the diff. Pin the
   // count: adding a refusal cause at this door without adding it to the set
   // tests fails HERE. Update the literal only together with the set tests.
-  it('the auth door emits AUTH_FAILED from exactly 7 sites (literal pin; grow the set tests first)', () => {
+  it('the auth door emits AUTH_FAILED from exactly 8 sites (literal pin; grow the set tests first)', () => {
     const src = readFileSync(join(import.meta.dir, '..', 'ws-server.ts'), 'utf8');
     // Quote-agnostic on purpose: nothing in this repo enforces quote style, and
     // a pin defeated by a spelling variant is the class of defect it exists to catch.
@@ -184,7 +184,11 @@ describe('F1a: peer authentication', () => {
     // tests; r335-at-least-once.test.ts pins it.
     // R-377 added the seventh: a malformed `alias`, the same kind of own-input
     // refusal; r377-mesh-aliases.test.ts pins it.
-    expect(emits.length).toBe(7);
+    // R-406 added the eighth: the credential's own verdict (an OIDC token
+    // refused or naming another identity, or a static token while
+    // MESH_STATIC_TOKENS=off). It answers "may this caller in?" with the same
+    // body as the others; r406-oidc-login.test.ts pins each cause.
+    expect(emits.length).toBe(8);
   });
 
   // C9 SET TEST — the agent door. Every reachable cause of the one question
