@@ -4,6 +4,7 @@ import * as net from 'net';
 import { WebSocket } from 'ws';
 import { renderMetrics } from './metrics.ts';
 import { timingSafeEqual, adminTokenMatches } from './auth.ts';
+import { STATIC_ONLY, authenticateAgentCredential, type AgentAuthResult, type TokenAuth } from './token-auth.ts';
 import * as https from 'https';
 import type { ServerTls } from './tls-config.ts';
 import { handleAclDelete, handleAclGet, handleAclPost } from './admin-acl.ts';
@@ -253,9 +254,12 @@ export function startHttpAdmin(
     adminTokenPrev?: string | null;
     /** R-65 M6: every listener the bus runs (server.ts builds it), for GET /connections. */
     listeners?: { name: string; port: number | 'off'; scheme: string }[];
+    /** R-406: how agent credentials are checked; today's static tokens unless set. */
+    tokenAuth?: TokenAuth;
   } = {},
 ): Promise<HttpAdminHandle> {
   const metricsToken = opts.metricsToken ?? null;
+  const tokenAuth = opts.tokenAuth ?? STATIC_ONLY;
   const adminTokenPrev = opts.adminTokenPrev ?? null;
   return new Promise((resolve, reject) => {
     const sideBySide = opts.tlsPort !== undefined;
@@ -324,7 +328,16 @@ export function startHttpAdmin(
         break;
       }
 
-      const auth = resolveRouteAuth(req, res, db, adminToken, matched?.auth, { adminTokenPrev, tls });
+      // R-406: an agent-token route resolves the agent credential first,
+      // because an OIDC access token is verified asynchronously. The admin
+      // token is still checked first, inside resolveRouteAuth.
+      let agentVerdict: AgentAuthResult | undefined;
+      const bearer = req.headers['authorization'];
+      if (matched?.auth === 'agentOrAdmin' && typeof bearer === 'string' && bearer.startsWith('Bearer ')) {
+        const presented = bearer.slice('Bearer '.length);
+        if (!adminTokenMatches(presented, adminToken, adminTokenPrev)) agentVerdict = await authenticateAgentCredential(db, presented, tokenAuth);
+      }
+      const auth = resolveRouteAuth(req, res, db, adminToken, matched?.auth, { adminTokenPrev, tls, agentVerdict });
       if (auth === null) return; // 401 already written
 
       // R-65 M4 + M6: every TOKEN-authenticated request — admin or agent — is
