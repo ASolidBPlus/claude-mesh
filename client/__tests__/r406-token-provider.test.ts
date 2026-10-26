@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterEach, afterAll } from 'bun:test';
 import { join } from 'path';
-import { openDb, registerAgent, aclGrant } from '../../server/db.ts';
+import { openDb, registerAgent, aclGrant, setOidcSub } from '../../server/db.ts';
 import { hashToken } from '../../server/auth.ts';
 import { startWsServer, WsServerHandle } from '../../server/ws-server.ts';
 import { createOidcVerifier, type OidcVerifier } from '../../server/oidc.ts';
@@ -44,12 +44,13 @@ async function bus(): Promise<number> {
   for (let i = 0; i < 50 && !verifier.ready(); i++) await wait(20);
   const db = openDb(':memory:');
   registerAgent(db, { id: 'fred', token_hash: hashToken('fred-tok'), hostname: 'h' });
+  setOidcSub(db, 'fred', 'u-fred');
   aclGrant(db, 'fred', 'fred', 'admin');
   const port = nextPort();
   ws = await startWsServer(port, db, 10_485_760, join(tmp('r406-sdk-files-'), 'f'), 0, new Map(), null, { tokenAuth: { oidc: verifier, staticTokens: true } });
   return port;
 }
-const tok = (who: string, expIn: number) => accessToken(key, { iss: issuer!.url, aud: 'mesh', preferred_username: who, sub: `u-${who}` }, { expIn });
+const tok = (who: string, expIn: number) => accessToken(key, { iss: issuer!.url, aud: 'mesh', preferred_username: who, sub: `u-${who}`, client_id: who }, { expIn });
 
 describe('R-406 SDK token function', () => {
   it('re-authenticates the live socket ~30 s before exp, with no reconnect', async () => {

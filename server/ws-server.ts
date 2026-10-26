@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
-import { ALIAS_SUFFIX_RE, bindOidcSub, getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, markTlsSeen, isTlsLatched, recordAgentConnection, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
+import { ALIAS_SUFFIX_RE, getAgentById, setOnline, clearAllOnline, getPeerByAlias, touchPeer, touchAgent, touchAlive, touchResponded, getPendingMessages, markAcked, listAclPeers, insertReminder, listAgentReminders, getReminder, cancelReminder as dbCancelReminder, listAgents, isObserver, markTlsSeen, isTlsLatched, recordAgentConnection, setAgentStatus, clearAgentStatusIfSet, AGENT_STATUSES, type AgentStatus } from './db.ts';
 import { validateToken } from './auth.ts';
 import { PEER_PROTOCOL_VERSION } from './wire-version.ts';  // #131: via the tiny module, never cross-package from here
 import { parseDuration } from './duration.ts';
@@ -19,7 +19,7 @@ import type { ServerTls } from './tls-config.ts';
 import { recordCaller, normaliseIp } from './connections.ts';
 import { PEER_REGISTER_ROUTE, FILE_ROUTE, MESSAGES_ROUTE, serveRoute, noteTokenRequest } from './http-admin.ts';
 import { routeLabel } from './admin-ctx.ts';
-import { STATIC_ONLY, authenticateAgentCredential, authenticateJwt, isOidcToken, type AgentAuthResult, type TokenAuth } from './token-auth.ts';
+import { STATIC_ONLY, authenticateAgentCredential, authenticateJwt, isOidcToken, subRefusal, type AgentAuthResult, type TokenAuth } from './token-auth.ts';
 
 /** F1a (§5.1): the only inbound peer protocol this mesh speaks. A version is a
  *  property of a LIVE CONNECTION, never of a stored row (D7) — which is why it
@@ -1946,8 +1946,10 @@ export function startWsServer(
             if (!v.ok) return refuse(`oidc_${v.reason.toLowerCase()}`);
             if (v.identity !== state.identity) return refuse('identity_changed');
             // The subject the name is bound to (token-auth.ts), checked here too:
-            // a re-auth is a login, so it is held to the same binding.
-            if (!bindOidcSub(db, v.identity, v.sub)) return refuse('sub_mismatch');
+            // a re-auth is a login, so it is held to the same binding (and an
+            // admin's unbind or rebind takes effect at the next re-auth).
+            const binding = subRefusal(db, v.identity, v.sub);
+            if (binding !== null) return refuse(binding === 'missing' ? 'agent_gone' : binding.toLowerCase());
             if (state.tokenExp === null || v.exp <= before || v.exp <= state.tokenExp) return refuse('exp_not_later');
             state.tokenExp = v.exp;
             armExpiry(v.exp);

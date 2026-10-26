@@ -18,6 +18,13 @@ describe('R-406 route scopes', () => {
     expect(missing).toEqual([]);
   });
 
+  it('W-1514 M10: a :read scope is only ever on a GET, and plain mesh:agents is on no route', () => {
+    for (const r of ROUTES) {
+      if (r.scope?.endsWith(':read')) expect({ route: routeLabel(r.method, r), method: r.method }).toEqual({ route: routeLabel(r.method, r), method: 'GET' });
+      expect(r.scope as string | undefined).not.toBe('mesh:agents');
+    }
+  });
+
   it('routes no admin access token reaches declare no scope', () => {
     for (const r of ROUTES.filter(r => r.auth === 'agentOrAdmin' || r.auth === 'handler')) {
       expect({ route: routeLabel(r.method, r), scope: r.scope }).toEqual({ route: routeLabel(r.method, r), scope: undefined });
