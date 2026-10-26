@@ -7,11 +7,16 @@
 # and this is the check that it held: any mkdtemp-shaped directory (name, dash,
 # six random characters) created in /tmp since the marker is a leak.
 #
+# Only directories the test user owns count. The runner's own services make
+# mkdtemp-shaped directories too (systemd's PrivateTmp, e.g. a root-owned
+# systemd-private-<hex>-man-db.service-Uw2gb4 when man-db's timer fires
+# mid-run), and the tests can't create anything owned by another user.
+#
 # usage: check-test-tmp.sh <marker-file>   (touch the marker before `bun test`)
 set -euo pipefail
 marker="${1:?usage: check-test-tmp.sh <marker-file>}"
 tmp="${TMPDIR_PARENT:-/tmp}"
-leaks=$(find "$tmp" -maxdepth 1 -mindepth 1 -type d -newer "$marker" \
+leaks=$(find "$tmp" -maxdepth 1 -mindepth 1 -type d -newer "$marker" -user "$(id -u)" \
           -regextype posix-extended -regex "$tmp/[A-Za-z0-9._-]+-[A-Za-z0-9]{6}" 2>/dev/null || true)
 if [ -n "$leaks" ]; then
   echo "::error::the test run left temp directories in $tmp (R-73):"
