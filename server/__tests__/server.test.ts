@@ -5,7 +5,7 @@ import type { Config } from '../server.ts';
 async function callLoadConfig(env: Record<string, string | undefined>): Promise<{ config?: Config; exitCode?: number }> {
   // Save original env
   const saved: Record<string, string | undefined> = {};
-  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS', 'MESH_PLAINTEXT_PEER_CIDRS', 'MESH_METRICS_CLASSES', 'MESH_TLS_CERT', 'MESH_TLS_KEY', 'MESH_TLS_CA', 'MESH_METRICS_TOKEN', 'MESH_ADMIN_PORT', 'MESH_WS_TLS_PORT', 'MESH_ADMIN_TLS_PORT', 'MESH_ADMIN_TOKEN_PREV', 'MESH_PREAUTH_MAX', 'MESH_PREAUTH_PER_IP', 'MESH_DOWNLOAD_MAX', 'MESH_DOWNLOAD_PER_AGENT', 'MESH_REDELIVERY_WINDOW_MS', 'MESH_OIDC_ISSUER', 'MESH_OIDC_AUDIENCE', 'MESH_OIDC_CA_FILE', 'MESH_OIDC_ID_CLAIM', 'MESH_OIDC_JWKS_FILE', 'MESH_STATIC_TOKENS', 'MESH_OIDC_ADMIN_AUDIENCE', 'MESH_ADMIN_STATIC_TOKEN', 'MESH_METRICS_STATIC_TOKEN'];
+  const keys = ['MESH_ADMIN_TOKEN', 'MESH_DB_PATH', 'MESH_WS_PORT', 'MESH_MAX_FILE_BYTES', 'MESH_PRESENCE_DEBOUNCE_MS', 'MESH_MCP_MODE', 'MESH_RETENTION_MS', 'MESH_PLAINTEXT_PEER_CIDRS', 'MESH_METRICS_CLASSES', 'MESH_TLS_CERT', 'MESH_TLS_KEY', 'MESH_TLS_CA', 'MESH_METRICS_TOKEN', 'MESH_ADMIN_PORT', 'MESH_WS_TLS_PORT', 'MESH_ADMIN_TLS_PORT', 'MESH_ADMIN_TOKEN_PREV', 'MESH_PREAUTH_MAX', 'MESH_PREAUTH_PER_IP', 'MESH_DOWNLOAD_MAX', 'MESH_DOWNLOAD_PER_AGENT', 'MESH_REDELIVERY_WINDOW_MS', 'MESH_OIDC_ISSUER', 'MESH_OIDC_AUDIENCE', 'MESH_OIDC_CA_FILE', 'MESH_OIDC_ID_CLAIM', 'MESH_OIDC_JWKS_FILE', 'MESH_STATIC_TOKENS', 'MESH_OIDC_ADMIN_AUDIENCE', 'MESH_ADMIN_STATIC_TOKEN', 'MESH_METRICS_STATIC_TOKEN', 'MESH_OIDC_KEYS_URL'];
   for (const key of keys) {
     saved[key] = process.env[key];
     if (env[key] !== undefined) {
@@ -273,7 +273,7 @@ describe('loadConfig', () => {
     writeFileSync(ca, 'not checked here');
     expect((await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok' })).config?.tokenAuth).toEqual({ oidc: null, staticTokens: true, adminStaticToken: true, metricsStaticToken: true });
     expect((await callLoadConfig({ MESH_ADMIN_TOKEN: 'tok', MESH_OIDC_ISSUER: 'https://id.example', MESH_OIDC_AUDIENCE: 'mesh', MESH_OIDC_CA_FILE: ca, MESH_STATIC_TOKENS: 'off', MESH_ADMIN_STATIC_TOKEN: 'on', MESH_METRICS_STATIC_TOKEN: 'on' })).config?.tokenAuth)
-      .toEqual({ oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'preferred_username', caFile: ca, jwksFile: null, adminAudience: null }, staticTokens: false, adminStaticToken: true, metricsStaticToken: true });
+      .toEqual({ oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'preferred_username', caFile: ca, jwksFile: null, keysUrl: null, adminAudience: null }, staticTokens: false, adminStaticToken: true, metricsStaticToken: true });
     for (const bad of [{ MESH_OIDC_ISSUER: 'https://id.example' }, { MESH_STATIC_TOKENS: 'off' }, { MESH_OIDC_ISSUER: 'https://id.example', MESH_OIDC_AUDIENCE: 'mesh', MESH_OIDC_CA_FILE: '/no/such.pem' }]) {
       const realWrite = process.stderr.write.bind(process.stderr);
       const writes: string[] = [];

@@ -47,7 +47,7 @@ let issuer: TestIssuer | undefined;
 const verifiers: OidcVerifier[] = [];
 afterEach(() => { issuer?.stop(); issuer = undefined; for (const v of verifiers.splice(0)) v.stop(); });
 
-const cfg = (iss: string, over: Partial<OidcConfig> = {}): OidcConfig => ({ issuer: iss, audience: AUD, idClaim: 'preferred_username', caFile: ca.caFile, jwksFile: null, adminAudience: ADMIN_AUD, ...over });
+const cfg = (iss: string, over: Partial<OidcConfig> = {}): OidcConfig => ({ issuer: iss, audience: AUD, idClaim: 'preferred_username', caFile: ca.caFile, jwksFile: null, keysUrl: null, adminAudience: ADMIN_AUD, ...over });
 async function readyVerifier(c: OidcConfig): Promise<OidcVerifier> {
   const v = createOidcVerifier(c, { log: () => {} });
   verifiers.push(v);
@@ -65,7 +65,7 @@ describe('R-406 admin configuration', () => {
   const base = { MESH_OIDC_ISSUER: 'https://id.example', MESH_OIDC_AUDIENCE: 'mesh' };
   it('MESH_OIDC_ADMIN_AUDIENCE loads beside the agent audience; the switches default on and parse on/off', () => {
     const r = parseTokenAuthConfig({ ...base, MESH_OIDC_CA_FILE: ca.caFile, MESH_OIDC_ADMIN_AUDIENCE: ADMIN_AUD, MESH_STATIC_TOKENS: 'on', MESH_ADMIN_STATIC_TOKEN: 'off', MESH_METRICS_STATIC_TOKEN: 'off' });
-    expect(r).toEqual({ ok: true, config: { oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'preferred_username', caFile: ca.caFile, jwksFile: null, adminAudience: ADMIN_AUD }, staticTokens: true, adminStaticToken: false, metricsStaticToken: false } });
+    expect(r).toEqual({ ok: true, config: { oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'preferred_username', caFile: ca.caFile, jwksFile: null, keysUrl: null, adminAudience: ADMIN_AUD }, staticTokens: true, adminStaticToken: false, metricsStaticToken: false } });
     expect(parseTokenAuthConfig({ ...base, MESH_OIDC_CA_FILE: ca.caFile, MESH_STATIC_TOKENS: 'on', MESH_ADMIN_STATIC_TOKEN: 'on', MESH_METRICS_STATIC_TOKEN: 'on' }))
       .toMatchObject({ ok: true, config: { adminStaticToken: true, metricsStaticToken: true } });
   });

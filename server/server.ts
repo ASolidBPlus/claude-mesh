@@ -496,6 +496,8 @@ async function main() {
     redelivery_window_ms: config.redeliveryWindowMs,
     // R-406: how agents may log in.
     oidc: config.tokenAuth.oidc === null ? 'off' : `on ${config.tokenAuth.oidc.issuer}`,
+    // Where the issuer's keys are fetched from, when not from the issuer itself.
+    oidc_keys_url: config.tokenAuth.oidc?.keysUrl ?? null,
     static_tokens: config.tokenAuth.staticTokens ? 'on' : 'off',
     // And how the admin API and /metrics may be reached.
     admin_oidc_audience: config.tokenAuth.oidc?.adminAudience ?? null,

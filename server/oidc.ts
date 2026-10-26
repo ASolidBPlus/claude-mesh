@@ -6,7 +6,10 @@
  *   - signed by a key in the issuer's JWKS (RFC 7517), found through its
  *     discovery document (OIDC Discovery / RFC 8414) fetched over the pinned
  *     MESH_OIDC_CA_FILE only — or, for a mesh that runs alone, a local
- *     MESH_OIDC_JWKS_FILE through the same verifier;
+ *     MESH_OIDC_JWKS_FILE through the same verifier. With MESH_OIDC_KEYS_URL
+ *     both are fetched from that internal base instead of the issuer's public
+ *     origin (whose rotating certificate can't be pinned): the document must
+ *     still name the public issuer, and its jwks_uri the issuer's origin;
  *   - header `typ: at+jwt`, an asymmetric algorithm (RS256 or ES256, never
  *     `none` or HS*), and a `kid` that is in the JWKS;
  *   - `iss` exactly the issuer, `aud` containing MESH_OIDC_AUDIENCE, `exp`
@@ -55,6 +58,11 @@ export interface OidcConfig {
   /** Discovery over this CA, or null when a local JWKS file is used instead. */
   caFile: string | null;
   jwksFile: string | null;
+  /**
+   * MESH_OIDC_KEYS_URL: an internal https base that serves the issuer's
+   * discovery document and JWKS, or null to fetch them from the issuer itself.
+   */
+  keysUrl?: string | null;
   /** MESH_OIDC_ADMIN_AUDIENCE: the admin API's audience, or null (no admin tokens). */
   adminAudience?: string | null;
 }
@@ -87,6 +95,7 @@ export function parseTokenAuthConfig(env: Record<string, string | undefined>): C
   const jwksFile = v('MESH_OIDC_JWKS_FILE');
   const idClaimRaw = v('MESH_OIDC_ID_CLAIM');
   const adminAudience = v('MESH_OIDC_ADMIN_AUDIENCE');
+  const keysUrl = v('MESH_OIDC_KEYS_URL');
 
   const switches: Record<string, boolean> = {};
   for (const name of ['MESH_STATIC_TOKENS', 'MESH_ADMIN_STATIC_TOKEN', 'MESH_METRICS_STATIC_TOKEN']) {
@@ -101,7 +110,7 @@ export function parseTokenAuthConfig(env: Record<string, string | undefined>): C
   if (adminAudience === null && !adminStaticToken) return { ok: false, error: 'MESH_ADMIN_STATIC_TOKEN=off with no MESH_OIDC_ADMIN_AUDIENCE: nobody could use the admin API' };
   if (adminAudience === null && !metricsStaticToken) return { ok: false, error: 'MESH_METRICS_STATIC_TOKEN=off with no MESH_OIDC_ADMIN_AUDIENCE: nobody could scrape /metrics' };
 
-  if (issuer === null && audience === null && caFile === null && jwksFile === null && idClaimRaw === null && adminAudience === null) {
+  if (issuer === null && audience === null && caFile === null && jwksFile === null && idClaimRaw === null && adminAudience === null && keysUrl === null) {
     if (!staticTokens) return { ok: false, error: 'MESH_STATIC_TOKENS=off with no MESH_OIDC_ISSUER: no agent could log in' };
     return { ok: true, config: { oidc: null, staticTokens, adminStaticToken, metricsStaticToken } };
   }
@@ -114,6 +123,12 @@ export function parseTokenAuthConfig(env: Record<string, string | undefined>): C
   if (url.protocol !== 'https:') return { ok: false, error: 'MESH_OIDC_ISSUER must be https' };
   if (idClaimRaw !== null && idClaimRaw !== 'preferred_username' && idClaimRaw !== 'sub') {
     return { ok: false, error: 'MESH_OIDC_ID_CLAIM must be "preferred_username" or "sub"' };
+  }
+  if (keysUrl !== null) {
+    let k: URL;
+    try { k = new URL(keysUrl); } catch { return { ok: false, error: 'MESH_OIDC_KEYS_URL is not a URL' }; }
+    if (k.protocol !== 'https:') return { ok: false, error: 'MESH_OIDC_KEYS_URL must be https' };
+    if (jwksFile !== null) return { ok: false, error: 'MESH_OIDC_KEYS_URL is for discovery; it can\'t be used with MESH_OIDC_JWKS_FILE' };
   }
   if (jwksFile === null && caFile === null) return { ok: false, error: 'MESH_OIDC_ISSUER needs MESH_OIDC_CA_FILE (discovery over the pinned CA), or MESH_OIDC_JWKS_FILE for a local JWKS' };
   for (const [name, file] of [['MESH_OIDC_CA_FILE', caFile], ['MESH_OIDC_JWKS_FILE', jwksFile]] as const) {
@@ -131,7 +146,7 @@ export function parseTokenAuthConfig(env: Record<string, string | undefined>): C
   return {
     ok: true,
     config: {
-      oidc: { issuer, audience, idClaim: idClaimRaw ?? 'preferred_username', caFile: jwksFile === null ? caFile : null, jwksFile, adminAudience },
+      oidc: { issuer, audience, idClaim: idClaimRaw ?? 'preferred_username', caFile: jwksFile === null ? caFile : null, jwksFile, keysUrl, adminAudience },
       staticTokens, adminStaticToken, metricsStaticToken,
     },
   };
@@ -222,12 +237,23 @@ export function createOidcVerifier(
   };
 
   /** Discovery, then the JWKS it names. Both over the pinned CA. */
+  const keysUrl = config.keysUrl ?? null;
+  const keysBase = (keysUrl ?? config.issuer).replace(/\/$/, '');
   const fetchKeys = async (): Promise<void> => {
     lastFetch = now();
-    const disco = (await getJson(`${config.issuer.replace(/\/$/, '')}/.well-known/openid-configuration`)) as { issuer?: unknown; jwks_uri?: unknown };
+    const disco = (await getJson(`${keysBase}/.well-known/openid-configuration`)) as { issuer?: unknown; jwks_uri?: unknown };
     if (disco.issuer !== config.issuer) throw new Error('the discovery document names a different issuer');
     if (typeof disco.jwks_uri !== 'string' || !disco.jwks_uri.startsWith('https://')) throw new Error('the discovery document has no https jwks_uri');
-    const jwks = await getJson(disco.jwks_uri);
+    let jwksUrl = disco.jwks_uri;
+    if (keysUrl !== null) {
+      // The document names the public URL; the keys come from the same path
+      // (and query) on the internal base, never from the public origin.
+      let u: URL;
+      try { u = new URL(disco.jwks_uri); } catch { throw new Error('the discovery document\'s jwks_uri is not a URL'); }
+      if (u.origin !== new URL(config.issuer).origin) throw new Error('the discovery document\'s jwks_uri is not on the issuer\'s origin');
+      jwksUrl = `${keysBase}${u.pathname}${u.search}`;
+    }
+    const jwks = await getJson(jwksUrl);
     if (parseJwks(JSON.stringify(jwks)) === null) throw new Error('jwks_uri did not answer a JWKS');
     install(jwks as JSONWebKeySet);
     log({ outcome: 'jwks_loaded', issuer: config.issuer, keys: kids.size });
