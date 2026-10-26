@@ -8,14 +8,15 @@
  * always) or an OIDC access token (a JWT, verified by oidc.ts). Static tokens
  * can be switched off (MESH_STATIC_TOKENS=off); a JWT is refused unless OIDC
  * is configured. An OIDC identity that isn't on the mesh yet is created on its
- * first valid login, and an agent's first OIDC login binds its name to the
- * token's `sub`: a later token naming the agent but carrying another `sub` is
- * refused (SUB_MISMATCH), so a renamed or reused name in the issuer can't take
- * over a mesh identity.
+ * first valid login and bound to the token's `sub`. An existing agent logs in
+ * by OIDC only once an admin has bound it (W-1514 H3): unbound is refused
+ * (OIDC_UNBOUND), and a different `sub` is refused (SUB_MISMATCH), so a row
+ * that predates OIDC, or a name renamed or reused in the issuer, can't be
+ * taken over.
  */
 import type { Database } from 'bun:sqlite';
 import { generateToken, hashToken } from './auth.ts';
-import { RESERVED_ALIAS, agentIdRefusal, bindOidcSub, getAgentById, getAgentByToken, getLivePeerKeyForAlias, getPeerByAlias, registerAgent } from './db.ts';
+import { RESERVED_ALIAS, agentIdRefusal, oidcSubState, setOidcSub, getAgentByToken, getLivePeerKeyForAlias, getPeerByAlias, registerAgent } from './db.ts';
 import { looksLikeJwt, type OidcRefusal, type OidcVerifier } from './oidc.ts';
 
 export interface TokenAuth {
@@ -28,7 +29,7 @@ export const STATIC_ONLY: TokenAuth = { oidc: null, staticTokens: true };
 
 export type AgentAuthResult =
   | { ok: true; agentId: string; via: 'static' | 'oidc'; exp: number | null; created: boolean }
-  | { ok: false; reason: OidcRefusal | 'OIDC_OFF' | 'STATIC_TOKENS_OFF' | 'UNKNOWN_TOKEN' | 'IDENTITY_UNAVAILABLE' | 'SUB_MISMATCH'; claimed: string | null };
+  | { ok: false; reason: OidcRefusal | 'OIDC_OFF' | 'STATIC_TOKENS_OFF' | 'UNKNOWN_TOKEN' | 'IDENTITY_UNAVAILABLE' | 'SUB_MISMATCH' | 'OIDC_UNBOUND'; claimed: string | null };
 
 export const isOidcToken = (token: string) => looksLikeJwt(token);
 
@@ -40,8 +41,9 @@ export async function authenticateJwt(db: Database, token: string, auth: TokenAu
   if (auth.oidc === null) return { ok: false, reason: 'OIDC_OFF', claimed: null };
   const v = await auth.oidc.verify(token);
   if (!v.ok) return { ok: false, reason: v.reason, claimed: v.claimed };
-  if (getAgentById(db, v.identity) !== null) {
-    if (!bindOidcSub(db, v.identity, v.sub)) return { ok: false, reason: 'SUB_MISMATCH', claimed: v.identity };
+  const binding = subRefusal(db, v.identity, v.sub);
+  if (binding !== 'missing') {
+    if (binding !== null) return { ok: false, reason: binding, claimed: v.identity };
     return { ok: true, agentId: v.identity, via: 'oidc', exp: v.exp, created: false };
   }
   // First login: registration's rules for a new id (handleAgentPost), and no
@@ -51,10 +53,21 @@ export async function authenticateJwt(db: Database, token: string, auth: TokenAu
   if (v.identity === RESERVED_ALIAS || getPeerByAlias(db, v.identity) !== null || getLivePeerKeyForAlias(db, v.identity, Date.now()) !== null) {
     return { ok: false, reason: 'IDENTITY_UNAVAILABLE', claimed: v.identity };
   }
-  registerAgent(db, { id: v.identity, token_hash: hashToken(generateToken()), hostname: `claude-${v.identity}` });
-  bindOidcSub(db, v.identity, v.sub);
+  db.transaction(() => {
+    registerAgent(db, { id: v.identity, token_hash: hashToken(generateToken()), hostname: `claude-${v.identity}` });
+    setOidcSub(db, v.identity, v.sub);
+  })();
   console.log(JSON.stringify({ evt: 'agent.registered', agent_id: v.identity, via: 'oidc', at: Date.now() }));
   return { ok: true, agentId: v.identity, via: 'oidc', exp: v.exp, created: true };
+}
+
+/**
+ * Why an OIDC login (or re-auth, ws-server) as `id` with `sub` is refused, or
+ * null when the row is bound to that `sub`; 'missing' when there is no row.
+ */
+export function subRefusal(db: Database, id: string, sub: string): 'SUB_MISMATCH' | 'OIDC_UNBOUND' | 'missing' | null {
+  const state = oidcSubState(db, id, sub);
+  return state === 'bound' ? null : state === 'unbound' ? 'OIDC_UNBOUND' : state === 'mismatch' ? 'SUB_MISMATCH' : 'missing';
 }
 
 /** Any agent credential presented to an HTTP door. */

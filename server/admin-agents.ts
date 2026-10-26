@@ -15,7 +15,7 @@ import {
   generateToken, hashToken,
 } from './auth.ts';
 import {
-  Agent, RESERVED_ALIAS, agentIdRefusal, clearTlsLatch, deleteAgent, rotateAgentToken, getAgentById, getLivePeerKeyForAlias, getPeerByAlias, listAgents, registerAgent, updateAgent,
+  Agent, RESERVED_ALIAS, agentIdRefusal, clearTlsLatch, deleteAgent, rotateAgentToken, getAgentById, getLivePeerKeyForAlias, getPeerByAlias, listAgents, registerAgent, setOidcSub, updateAgent,
 } from './db.ts';
 import type { AdminCtx } from './admin-ctx.ts';
 import { readBody, formatAgent } from './admin-ctx.ts';
@@ -334,7 +334,32 @@ export async function handleAgentPatch(ctx: AdminCtx): Promise<void> {
     fields.namespace = body.namespace as string | null;
   }
 
-  const updated = updateAgent(db, id, fields);
+  // R-406 / W-1514 H3: an admin binds the agent's name to an OIDC subject (or
+  // unbinds it with null). A login never binds an existing row, so this is how
+  // a row that predates OIDC is let in. Under mesh:agents:write.
+  let oidcSub: { value: string | null } | null = null;
+  if (Object.prototype.hasOwnProperty.call(body, 'oidc_sub')) {
+    const v = body.oidc_sub;
+    if (v !== null && (typeof v !== 'string' || v === '' || v.length > 256)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'oidc_sub must be a non-empty string (at most 256 characters) or null' }));
+      return;
+    }
+    oidcSub = { value: v };
+  }
+
+  const updated = db.transaction(() => {
+    if (oidcSub !== null) setOidcSub(db, id, oidcSub.value);
+    return updateAgent(db, id, fields);
+  })();
+  if (oidcSub !== null) {
+    console.log(JSON.stringify({
+      evt: 'agent.oidc_sub_set', agent_id: id, oidc_sub: oidcSub.value,
+      // Who did it: the admin's own `sub` when they used an access token.
+      by_sub: ctx.auth.mode === 'admin' ? ctx.auth.sub ?? null : null,
+      at: Date.now(),
+    }));
+  }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(formatAgent(updated as Agent)));
 }

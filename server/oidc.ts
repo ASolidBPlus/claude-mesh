@@ -12,8 +12,12 @@
  *   - `iss` exactly the issuer, `aud` containing MESH_OIDC_AUDIENCE, `exp`
  *     (and `nbf`) within a small fixed skew;
  *   - an identity claim (preferred_username, or `sub` by MESH_OIDC_ID_CLAIM)
- *     that is a valid mesh agent id, and a `sub` (RFC 9068 requires one; the
- *     agent's name is bound to it on first login, token-auth.ts).
+ *     that is a valid mesh agent id, and a `sub` (RFC 9068 requires one; an
+ *     agent's name is bound to it, token-auth.ts);
+ *   - an agent's own token: no `act` (not delegated), and `client_id` equal
+ *     to the identity (W-1514 M9);
+ *   - signed by a key from a key set at most JWKS_MAX_AGE_MS old, or, while
+ *     the issuer is unreachable, at most JWKS_STALE_LIMIT_MS (W-1514 M7).
  *
  * The admin API takes a token from the same issuer for a second audience,
  * MESH_OIDC_ADMIN_AUDIENCE (`verifyAdmin`): same keys, same checks, its
@@ -31,6 +35,17 @@ export const OIDC_ALGORITHMS = ['RS256', 'ES256'] as const;
 export const OIDC_CLOCK_SKEW_S = 30;
 /** An unknown `kid` refetches the JWKS at most this often. */
 export const JWKS_REFETCH_MIN_MS = 60_000;
+/**
+ * W-1514 M7: a key set older than this is refetched before it is trusted
+ * again, so a key the issuer drops stops verifying within minutes.
+ */
+export const JWKS_MAX_AGE_MS = 5 * 60_000;
+/**
+ * While the issuer can't be reached, a stale key set keeps verifying for at
+ * most this long after its last successful load; after that, every token is
+ * OIDC_NOT_READY until a refetch succeeds.
+ */
+export const JWKS_STALE_LIMIT_MS = 60 * 60_000;
 const FETCH_TIMEOUT_MS = 5_000;
 
 export interface OidcConfig {
@@ -109,6 +124,10 @@ export function parseTokenAuthConfig(env: Record<string, string | undefined>): C
     const parsed = parseJwks(readFileSync(jwksFile, 'utf8'));
     if (parsed === null) return { ok: false, error: 'MESH_OIDC_JWKS_FILE is not a JWKS ({"keys": [...]})' };
   }
+  // W-1514 L12: with OIDC on, which static tokens still work is said, not
+  // defaulted, so a switch-on can't leave one on by omission.
+  const unset = ['MESH_STATIC_TOKENS', 'MESH_ADMIN_STATIC_TOKEN', 'MESH_METRICS_STATIC_TOKEN'].filter((name) => v(name) === null);
+  if (unset.length > 0) return { ok: false, error: `MESH_OIDC_ISSUER is set, so ${unset.join(', ')} must each be set to "on" or "off"` };
   return {
     ok: true,
     config: {
@@ -131,7 +150,7 @@ function parseJwks(text: string): JSONWebKeySet | null {
 export type OidcRefusal =
   | 'OIDC_NOT_READY' | 'MALFORMED' | 'WRONG_TYP' | 'BAD_ALG' | 'NO_KID' | 'UNKNOWN_KID' | 'BAD_SIGNATURE'
   | 'WRONG_ISSUER' | 'WRONG_AUDIENCE' | 'EXPIRED' | 'NOT_YET_VALID' | 'NO_IDENTITY' | 'BAD_IDENTITY' | 'NO_SUB'
-  | 'ADMIN_OFF';
+  | 'ADMIN_OFF' | 'ACTOR_TOKEN' | 'CLIENT_MISMATCH';
 
 export type OidcResult = { ok: true; identity: string; sub: string; exp: number } | { ok: false; reason: OidcRefusal; claimed: string | null };
 
@@ -184,12 +203,16 @@ export function createOidcVerifier(
   let keys: ReturnType<typeof createLocalJWKSet> | null = null;
   let kids = new Set<string>();
   let lastFetch = 0;
+  /** When the key set in use was loaded (M7: its age). */
+  let loadedAt = 0;
+  let inflight: Promise<void> | null = null;
   let stopped = false;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   const install = (jwks: JSONWebKeySet) => {
     keys = createLocalJWKSet(jwks);
     kids = new Set(jwks.keys.map((k) => k.kid).filter((k): k is string => typeof k === 'string'));
+    loadedAt = now();
   };
 
   const getJson = async (url: string): Promise<unknown> => {
@@ -209,6 +232,8 @@ export function createOidcVerifier(
     install(jwks as JSONWebKeySet);
     log({ outcome: 'jwks_loaded', issuer: config.issuer, keys: kids.size });
   };
+  /** One refetch at a time, however many verifies want it. */
+  const refetch = (): Promise<void> => (inflight ??= fetchKeys().finally(() => { inflight = null; }));
 
   if (config.jwksFile !== null) {
     install(parseJwks(readFileSync(config.jwksFile, 'utf8'))!);
@@ -238,6 +263,20 @@ export function createOidcVerifier(
   const check = async (token: string, audience: string): Promise<{ ok: true; payload: JWTPayload } | { ok: false; reason: OidcRefusal }> => {
     const no = (reason: OidcRefusal) => ({ ok: false as const, reason });
     if (keys === null) return no('OIDC_NOT_READY');
+    // W-1514 M7: a key set past its maximum age is refetched first (at most
+    // once a minute while that fails), so a key the issuer has dropped stops
+    // verifying. If the issuer can't be reached the cached set is kept, but
+    // only up to JWKS_STALE_LIMIT_MS after its last good load.
+    if (config.jwksFile === null && now() - loadedAt > JWKS_MAX_AGE_MS) {
+      // A verify that arrives while a refetch is running waits for it, rather
+      // than trusting the set that refetch may be about to drop a key from.
+      if (inflight !== null) {
+        try { await inflight; } catch { /* logged by the caller that started it */ }
+      } else if (now() - lastFetch >= JWKS_REFETCH_MIN_MS) {
+        try { await refetch(); } catch (err) { log({ outcome: 'jwks_stale_refetch_failed', error: (err as Error).message, age_ms: now() - loadedAt }); }
+      }
+      if (now() - loadedAt > JWKS_STALE_LIMIT_MS) return no('OIDC_NOT_READY');
+    }
     let header: { alg?: unknown; kid?: unknown; typ?: unknown };
     try {
       header = JSON.parse(Buffer.from(token.split('.')[0]!, 'base64url').toString('utf8')) as typeof header;
@@ -248,7 +287,7 @@ export function createOidcVerifier(
       // A rotated key: refetch, but at most once a minute, so a stream of
       // made-up kids can't make the mesh hammer the issuer.
       if (config.jwksFile === null && now() - lastFetch >= JWKS_REFETCH_MIN_MS) {
-        try { await fetchKeys(); } catch (err) { log({ outcome: 'jwks_refetch_failed', error: (err as Error).message }); }
+        try { await refetch(); } catch (err) { log({ outcome: 'jwks_refetch_failed', error: (err as Error).message }); }
       }
       if (!kids.has(header.kid)) return no('UNKNOWN_KID');
     }
@@ -296,6 +335,12 @@ export function createOidcVerifier(
     if (!LOCAL_ID_RE.test(identity)) return { ok: false, reason: 'BAD_IDENTITY', claimed };
     const sub = subOf(payload);
     if (sub === null) return { ok: false, reason: 'NO_SUB', claimed };
+    // W-1514 M9: an agent's own token only. A delegated (token-exchange) token
+    // names an actor (RFC 8693 `act`), and an agent's client_credentials token
+    // has its client id equal to its identity; anything else (a person's
+    // exchanged token, another service's token) is not an agent login.
+    if (payload.act !== undefined) return { ok: false, reason: 'ACTOR_TOKEN', claimed };
+    if (payload.client_id !== identity) return { ok: false, reason: 'CLIENT_MISMATCH', claimed };
     return { ok: true, identity, sub, exp: payload.exp! };
   };
 

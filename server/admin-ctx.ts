@@ -78,7 +78,7 @@ export function requireAdmin(
  * has one, and an unknown path (no route) takes no access token. There is no
  * catch-all scope. mesh:metrics also opens GET /metrics (http-admin.ts).
  */
-export type AdminScope = 'mesh:agents' | 'mesh:acl' | 'mesh:reminders' | 'mesh:topics' | 'mesh:files' | 'mesh:peers' | 'mesh:metrics';
+export type AdminScope = 'mesh:agents:read' | 'mesh:agents:write' | 'mesh:acl' | 'mesh:reminders' | 'mesh:topics' | 'mesh:files' | 'mesh:peers' | 'mesh:metrics';
 
 /**
  * #161 — WHERE THE REQUEST CAME FROM, and how much that is worth.

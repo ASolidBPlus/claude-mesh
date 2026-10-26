@@ -13,7 +13,7 @@ import * as net from 'net';
 import { createHmac } from 'node:crypto';
 import { writeFileSync } from 'fs';
 import { join } from 'path';
-import { openDb, registerAgent, aclGrant, insertMessage, getAgentById } from '../db.ts';
+import { openDb, registerAgent, aclGrant, insertMessage, getAgentById, setOidcSub } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { startWsServer, WsServerHandle } from '../ws-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
@@ -54,17 +54,18 @@ async function readyVerifier(c: OidcConfig, deps: Parameters<typeof createOidcVe
   for (let i = 0; i < 50 && !v.ready(); i++) await delay(20);
   return v;
 }
+// An agent's own token: client_id is its identity (W-1514 M9).
 const good = (claims: Record<string, unknown> = {}, opts: Parameters<typeof accessToken>[2] = {}) =>
-  accessToken(key, { iss: issuer!.url, aud: AUD, preferred_username: 'fred', sub: 'u-1', ...claims }, opts);
+  accessToken(key, { iss: issuer!.url, aud: AUD, preferred_username: 'fred', sub: 'u-1', client_id: 'preferred_username' in claims ? claims.preferred_username : 'fred', ...claims }, opts);
 
 describe('R-406 configuration', () => {
   it('unset is today; whole configs load; half or unreadable config refuses', () => {
     expect(parseTokenAuthConfig({})).toEqual({ ok: true, config: { oidc: null, staticTokens: true, adminStaticToken: true, metricsStaticToken: true } });
     const jwksFile = join(dir, 'jwks.json');
     writeFileSync(jwksFile, JSON.stringify({ keys: [] }));
-    expect(parseTokenAuthConfig({ MESH_OIDC_ISSUER: 'https://id.example', MESH_OIDC_AUDIENCE: 'mesh', MESH_OIDC_CA_FILE: ca.caFile, MESH_STATIC_TOKENS: 'off' }))
+    expect(parseTokenAuthConfig({ MESH_OIDC_ISSUER: 'https://id.example', MESH_OIDC_AUDIENCE: 'mesh', MESH_OIDC_CA_FILE: ca.caFile, MESH_STATIC_TOKENS: 'off', MESH_ADMIN_STATIC_TOKEN: 'on', MESH_METRICS_STATIC_TOKEN: 'on' }))
       .toEqual({ ok: true, config: { oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'preferred_username', caFile: ca.caFile, jwksFile: null, adminAudience: null }, staticTokens: false, adminStaticToken: true, metricsStaticToken: true } });
-    expect(parseTokenAuthConfig({ MESH_OIDC_ISSUER: 'https://id.example', MESH_OIDC_AUDIENCE: 'mesh', MESH_OIDC_JWKS_FILE: jwksFile, MESH_OIDC_ID_CLAIM: 'sub' }))
+    expect(parseTokenAuthConfig({ MESH_OIDC_ISSUER: 'https://id.example', MESH_OIDC_AUDIENCE: 'mesh', MESH_OIDC_JWKS_FILE: jwksFile, MESH_OIDC_ID_CLAIM: 'sub', MESH_STATIC_TOKENS: 'on', MESH_ADMIN_STATIC_TOKEN: 'on', MESH_METRICS_STATIC_TOKEN: 'on' }))
       .toEqual({ ok: true, config: { oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'sub', caFile: null, jwksFile, adminAudience: null }, staticTokens: true, adminStaticToken: true, metricsStaticToken: true } });
     const badJwks = join(dir, 'bad.json');
     writeFileSync(badJwks, '{"nope":1}');
@@ -88,7 +89,7 @@ describe('R-406 the verifier', () => {
     const v = await readyVerifier(cfg(issuer!.url));
     const r = await v.verify(await good());
     expect(r).toMatchObject({ ok: true, identity: 'fred' });
-    expect(await (await readyVerifier(cfg(issuer!.url, { idClaim: 'sub' }))).verify(await good({ sub: 'u-1' }))).toMatchObject({ ok: true, identity: 'u-1' });
+    expect(await (await readyVerifier(cfg(issuer!.url, { idClaim: 'sub' }))).verify(await good({ sub: 'u-1', client_id: 'u-1' }))).toMatchObject({ ok: true, identity: 'u-1' });
   });
 
   it('GUARDS: each wrong token is refused with its own reason', async () => {
@@ -124,12 +125,12 @@ describe('R-406 the verifier', () => {
     const before = issuer!.jwksFetches();
     clock += 61_000;
     issuer!.setKeys([key, rotated]);
-    const t = await accessToken(rotated, { iss: issuer!.url, aud: AUD, preferred_username: 'fred', sub: 'u-fred' });
+    const t = await accessToken(rotated, { iss: issuer!.url, aud: AUD, preferred_username: 'fred', sub: 'u-fred', client_id: 'fred' });
     expect(await v.verify(t)).toMatchObject({ ok: true, identity: 'fred' });
     expect(issuer!.jwksFetches()).toBe(before + 1);
     // A second unknown kid within the minute does not fetch again.
     const stranger = await makeKey('k3');
-    expect(await v.verify(await accessToken(stranger, { iss: issuer!.url, aud: AUD, preferred_username: 'fred', sub: 'u-fred' }))).toMatchObject({ ok: false, reason: 'UNKNOWN_KID' });
+    expect(await v.verify(await accessToken(stranger, { iss: issuer!.url, aud: AUD, preferred_username: 'fred', sub: 'u-fred', client_id: 'fred' }))).toMatchObject({ ok: false, reason: 'UNKNOWN_KID' });
     expect(issuer!.jwksFetches()).toBe(before + 1);
   });
 
@@ -152,15 +153,15 @@ describe('R-406 the verifier', () => {
     issuer = startIssuer(port, ca, [key]);
     for (let i = 0; i < 60 && !v.ready(); i++) await delay(100);
     expect(v.ready()).toBe(true);
-    expect(await v.verify(await accessToken(key, { iss: url, aud: AUD, preferred_username: 'fred', sub: 'u-fred' }))).toMatchObject({ ok: true });
+    expect(await v.verify(await accessToken(key, { iss: url, aud: AUD, preferred_username: 'fred', sub: 'u-fred', client_id: 'fred' }))).toMatchObject({ ok: true });
   }, 15_000);
 
   it('standalone: a local JWKS file runs the same verifier, no discovery', async () => {
     const f = join(dir, 'local-jwks.json');
     writeFileSync(f, JSON.stringify({ keys: [key.jwk] }));
     const v = await readyVerifier({ issuer: 'https://mesh.local', audience: AUD, idClaim: 'preferred_username', caFile: null, jwksFile: f });
-    expect(await v.verify(await accessToken(key, { iss: 'https://mesh.local', aud: AUD, preferred_username: 'solo', sub: 'u-solo' }))).toMatchObject({ ok: true, identity: 'solo' });
-    expect(await v.verify(await accessToken(key, { iss: 'https://mesh.local', aud: AUD, preferred_username: 'solo', sub: 'u-solo' }, { typ: 'JWT' }))).toMatchObject({ ok: false, reason: 'WRONG_TYP' });
+    expect(await v.verify(await accessToken(key, { iss: 'https://mesh.local', aud: AUD, preferred_username: 'solo', sub: 'u-solo', client_id: 'solo' }))).toMatchObject({ ok: true, identity: 'solo' });
+    expect(await v.verify(await accessToken(key, { iss: 'https://mesh.local', aud: AUD, preferred_username: 'solo', sub: 'u-solo', client_id: 'solo' }, { typ: 'JWT' }))).toMatchObject({ ok: false, reason: 'WRONG_TYP' });
   });
 });
 
@@ -202,6 +203,8 @@ describe('R-406 on the wire', () => {
     lines = [];
     console.log = (...a: unknown[]) => { lines.push(a.map(String).join(' ')); };
     for (const id of ['fred', 'bob']) registerAgent(db, { id, token_hash: hashToken(`${id}-tok`), hostname: 'h' });
+    // Rows that predate OIDC log in by it only once an admin binds them (W-1514 H3).
+    for (const id of ['fred', 'bob']) setOidcSub(db, id, 'u-1');
   });
   afterEach(async () => {
     console.log = realLog;

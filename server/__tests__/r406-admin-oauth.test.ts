@@ -4,19 +4,21 @@
 // switched off; and an agent's name is bound to the `sub` of its first OIDC
 // login. The guards pinned here, each with a mutant in the PR:
 //   an agent-audience token refused on the admin API; a scope checked per
-//   route (mesh:agents, mesh:acl, mesh:reminders, mesh:metrics on /metrics);
+//   route (mesh:agents:read/write, mesh:acl, mesh:reminders, …, mesh:metrics
+//   on /metrics);
 //   no catch-all scope; an empty or missing scope granting nothing; an
 //   unmapped route refused; MESH_ADMIN_STATIC_TOKEN=off refusing the admin
 //   token and _PREV everywhere; MESH_METRICS_STATIC_TOKEN=off refusing the
 //   metrics token and never leaving /metrics open; the caller's `sub` in the
 //   logs; a different `sub` for a bound name refused on login and re-auth;
-//   the first login binding; a static login not touching the binding.
+//   an unbound existing row refused (W-1514 H3) until an admin binds it; a
+//   new name created and bound; a static login not touching the binding.
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { WebSocket } from 'ws';
 import * as net from 'net';
 import { join } from 'path';
-import { openDb, registerAgent, getAgentById, bindOidcSub } from '../db.ts';
+import { openDb, registerAgent, getAgentById, setOidcSub, oidcSubState, grantObserver } from '../db.ts';
 import { hashToken } from '../auth.ts';
 import { startWsServer, WsServerHandle } from '../ws-server.ts';
 import { startHttpAdmin, HttpAdminHandle } from '../http-admin.ts';
@@ -54,7 +56,7 @@ async function readyVerifier(c: OidcConfig): Promise<OidcVerifier> {
   return v;
 }
 const agentTok = (claims: Record<string, unknown> = {}, opts: Parameters<typeof accessToken>[2] = {}) =>
-  accessToken(key, { iss: issuer!.url, aud: AUD, preferred_username: 'fred', sub: 'u-fred', ...claims }, opts);
+  accessToken(key, { iss: issuer!.url, aud: AUD, preferred_username: 'fred', sub: 'u-fred', client_id: 'preferred_username' in claims ? claims.preferred_username : 'fred', ...claims }, opts);
 /** An admin access token; `scope` undefined leaves the claim out. */
 const adminTok = (scope: unknown, claims: Record<string, unknown> = {}) =>
   accessToken(key, { iss: issuer!.url, aud: ADMIN_AUD, sub: 'svc-ops', ...(scope === undefined ? {} : { scope }), ...claims });
@@ -62,9 +64,9 @@ const adminTok = (scope: unknown, claims: Record<string, unknown> = {}) =>
 describe('R-406 admin configuration', () => {
   const base = { MESH_OIDC_ISSUER: 'https://id.example', MESH_OIDC_AUDIENCE: 'mesh' };
   it('MESH_OIDC_ADMIN_AUDIENCE loads beside the agent audience; the switches default on and parse on/off', () => {
-    const r = parseTokenAuthConfig({ ...base, MESH_OIDC_CA_FILE: ca.caFile, MESH_OIDC_ADMIN_AUDIENCE: ADMIN_AUD, MESH_ADMIN_STATIC_TOKEN: 'off', MESH_METRICS_STATIC_TOKEN: 'off' });
+    const r = parseTokenAuthConfig({ ...base, MESH_OIDC_CA_FILE: ca.caFile, MESH_OIDC_ADMIN_AUDIENCE: ADMIN_AUD, MESH_STATIC_TOKENS: 'on', MESH_ADMIN_STATIC_TOKEN: 'off', MESH_METRICS_STATIC_TOKEN: 'off' });
     expect(r).toEqual({ ok: true, config: { oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'preferred_username', caFile: ca.caFile, jwksFile: null, adminAudience: ADMIN_AUD }, staticTokens: true, adminStaticToken: false, metricsStaticToken: false } });
-    expect(parseTokenAuthConfig({ ...base, MESH_OIDC_CA_FILE: ca.caFile, MESH_ADMIN_STATIC_TOKEN: 'on', MESH_METRICS_STATIC_TOKEN: 'on' }))
+    expect(parseTokenAuthConfig({ ...base, MESH_OIDC_CA_FILE: ca.caFile, MESH_STATIC_TOKENS: 'on', MESH_ADMIN_STATIC_TOKEN: 'on', MESH_METRICS_STATIC_TOKEN: 'on' }))
       .toMatchObject({ ok: true, config: { adminStaticToken: true, metricsStaticToken: true } });
   });
 
@@ -83,6 +85,28 @@ describe('R-406 admin configuration', () => {
       expect(r.ok).toBe(false);
       expect(r.ok ? '' : r.error).toContain(msg);
     }
+  });
+});
+
+describe('W-1514 L12: with OIDC on, every static-token switch is explicit', () => {
+  const whole = { MESH_OIDC_ISSUER: 'https://id.example', MESH_OIDC_AUDIENCE: 'mesh' };
+  const all = { MESH_STATIC_TOKENS: 'on', MESH_ADMIN_STATIC_TOKEN: 'on', MESH_METRICS_STATIC_TOKEN: 'on' } as const;
+  it('GUARD: refuses to start when any of the three is unset, naming the ones left out', () => {
+    const env = { ...whole, MESH_OIDC_CA_FILE: ca.caFile };
+    for (const left of Object.keys(all) as (keyof typeof all)[]) {
+      const { [left]: _, ...rest } = all;
+      const r = parseTokenAuthConfig({ ...env, ...rest });
+      expect(r.ok).toBe(false);
+      expect(r.ok ? '' : r.error).toContain(`MESH_OIDC_ISSUER is set, so ${left} must`);
+    }
+    const none = parseTokenAuthConfig(env);
+    expect(none.ok ? '' : none.error).toContain('MESH_STATIC_TOKENS, MESH_ADMIN_STATIC_TOKEN, MESH_METRICS_STATIC_TOKEN');
+    expect(parseTokenAuthConfig({ ...env, ...all }).ok).toBe(true);
+    expect(parseTokenAuthConfig({ ...env, MESH_STATIC_TOKENS: 'off', MESH_ADMIN_STATIC_TOKEN: 'off', MESH_METRICS_STATIC_TOKEN: 'off', MESH_OIDC_ADMIN_AUDIENCE: ADMIN_AUD }).ok).toBe(true);
+  });
+
+  it('control: without OIDC the switches still default on, as today', () => {
+    expect(parseTokenAuthConfig({})).toEqual({ ok: true, config: { oidc: null, staticTokens: true, adminStaticToken: true, metricsStaticToken: true } });
   });
 });
 
@@ -174,40 +198,51 @@ describe('R-406 admin API on the wire', () => {
     db.close();
   });
 
-  it('GUARD: each route takes only its own scope: mesh:agents, mesh:acl, mesh:reminders', async () => {
+  it('GUARD: each route takes only its own scope: mesh:agents:read, mesh:agents:write, mesh:acl, mesh:reminders', async () => {
     await up();
-    const agents = await adminTok('mesh:agents');
+    const read = await adminTok('mesh:agents:read');
+    const write = await adminTok('mesh:agents:write');
     const acl = await adminTok('mesh:acl');
     const reminders = await adminTok('mesh:reminders');
-    expect(await call('GET', '/agents', agents)).toBe(200);
-    expect(await call('GET', '/agents/fred', agents)).toBe(200);
-    expect(await call('PATCH', '/agents/fred', agents, { hostname: 'h2' })).toBe(200);
-    expect(await call('POST', '/agents/fred/rotate', agents)).toBe(200);
-    expect(await call('GET', '/acl?agent=fred', agents)).toBe(401);
-    expect(await call('GET', '/reminders', agents)).toBe(401);
+    expect(await call('GET', '/agents', read)).toBe(200);
+    expect(await call('GET', '/agents/fred', read)).toBe(200);
+    // W-1514 M10: reading the roster doesn't let you change it.
+    expect(await call('PATCH', '/agents/fred', read, { namespace: 'x' })).toBe(401);
+    expect(await call('POST', '/agents/fred/rotate', read)).toBe(401);
+    expect(await call('DELETE', '/agents/bob', read)).toBe(401);
+    expect(await call('POST', '/observers', read, { agent_id: 'fred' })).toBe(401);
+    expect(await call('GET', '/agents', write)).toBe(401);
+    expect(await call('PATCH', '/agents/fred', write, { namespace: 'x' })).toBe(200);
+    expect(await call('POST', '/agents/fred/rotate', write)).toBe(200);
+    expect(await call('GET', '/acl?agent=fred', read)).toBe(401);
+    expect(await call('GET', '/reminders', read)).toBe(401);
     expect(await call('POST', '/acl', acl, { from_agent: 'fred', to_agent: 'bob' })).toBe(201);
     expect(await call('GET', '/acl?agent=fred', acl)).toBe(200);
     expect(await call('GET', '/agents', acl)).toBe(401);
     expect(await call('GET', '/reminders', reminders)).toBe(200);
     expect(await call('GET', '/agents', reminders)).toBe(401);
     // Several scopes in one token each count.
-    expect(await call('GET', '/acl?agent=fred', await adminTok('mesh:agents mesh:acl'))).toBe(200);
-    expect(await call('DELETE', '/agents/bob', agents)).toBe(200);
+    expect(await call('GET', '/acl?agent=fred', await adminTok('mesh:agents:read mesh:acl'))).toBe(200);
+    expect(await call('DELETE', '/agents/bob', write)).toBe(200);
     expect(getAgentById(db, 'bob')).toBeNull();
   });
 
   it('GUARD: no catch-all scope, and an empty or missing scope grants nothing', async () => {
     await up();
-    for (const scope of ['*', 'mesh:*', 'mesh', 'mesh:admin', 'admin', 'mesh:agents:read', 'MESH:AGENTS', '', ' ', undefined, ['mesh:agents']]) {
+    // Plain mesh:agents (before the W-1514 M10 split) grants nothing now.
+    for (const scope of ['*', 'mesh:*', 'mesh', 'mesh:admin', 'admin', 'mesh:agents', 'mesh:agents:*', 'mesh:agents:admin', 'MESH:AGENTS:READ', '', ' ', undefined, ['mesh:agents:read']]) {
       expect(await call('GET', '/agents', await adminTok(scope))).toBe(401);
+      expect(await call('PATCH', '/agents/fred', await adminTok(scope), { namespace: 'x' })).toBe(401);
     }
   });
 
   it('GUARD: every other admin route takes its own scope, and no other', async () => {
     await up();
     const cases: [string, string, string][] = [
-      ['GET', '/observers', 'mesh:agents'],
-      ['DELETE', '/agents/fred/tls-latch', 'mesh:agents'],
+      ['GET', '/observers', 'mesh:agents:read'],
+      ['POST', '/observers', 'mesh:agents:write'],
+      ['DELETE', '/observers/fred', 'mesh:agents:write'],
+      ['DELETE', '/agents/fred/tls-latch', 'mesh:agents:write'],
       ['GET', '/connections', 'mesh:metrics'],
       ['GET', '/topics', 'mesh:topics'],
       ['POST', '/files', 'mesh:files'],
@@ -215,7 +250,7 @@ describe('R-406 admin API on the wire', () => {
       ['GET', '/peer-keys', 'mesh:peers'],
       ['GET', '/outbound-peers', 'mesh:peers'],
     ];
-    const allScopes = ['mesh:agents', 'mesh:acl', 'mesh:reminders', 'mesh:topics', 'mesh:files', 'mesh:peers', 'mesh:metrics'];
+    const allScopes = ['mesh:agents:read', 'mesh:agents:write', 'mesh:acl', 'mesh:reminders', 'mesh:topics', 'mesh:files', 'mesh:peers', 'mesh:metrics'];
     for (const [method, path, scope] of cases) {
       // Reached (the handler may still refuse the request itself, e.g. no body).
       expect(await call(method, path, await adminTok(scope))).not.toBe(401);
@@ -225,7 +260,7 @@ describe('R-406 admin API on the wire', () => {
 
   it('GUARD: an unknown path takes no access token, whatever its scope; the static admin token gets the 404', async () => {
     await up();
-    const all = await adminTok('mesh:agents mesh:acl mesh:reminders mesh:topics mesh:files mesh:peers mesh:metrics');
+    const all = await adminTok('mesh:agents:read mesh:agents:write mesh:acl mesh:reminders mesh:topics mesh:files mesh:peers mesh:metrics');
     for (const [method, path] of [['GET', '/no-such-route'], ['PUT', '/agents'], ['GET', '/agents/fred/nope']] as const) {
       expect(await call(method, path, all)).toBe(401);
     }
@@ -235,14 +270,14 @@ describe('R-406 admin API on the wire', () => {
 
   it('GUARD: an agent\'s login token is not an admin credential, nor an admin token an agent one', async () => {
     await up();
-    expect(await call('GET', '/agents', await agentTok({ scope: 'mesh:agents' }))).toBe(401);
-    expect(await call('GET', '/messages', await adminTok('mesh:agents'))).toBe(401);
+    expect(await call('GET', '/agents', await agentTok({ scope: 'mesh:agents:read' }))).toBe(401);
+    expect(await call('GET', '/messages', await adminTok('mesh:agents:read'))).toBe(401);
     expect(lines.some(l => l.includes('"reason":"oidc_wrong_audience"'))).toBe(true);
   });
 
   it('GUARD: with no admin audience, an admin token reaches nothing', async () => {
     await up({ adminAudience: null });
-    expect(await call('GET', '/agents', await adminTok('mesh:agents'))).toBe(401);
+    expect(await call('GET', '/agents', await adminTok('mesh:agents:read'))).toBe(401);
     expect(await call('GET', '/agents', 'adm')).toBe(200);
   });
 
@@ -255,7 +290,7 @@ describe('R-406 admin API on the wire', () => {
       expect(await call('GET', '/messages', tok)).toBe(401);
       expect(await call('GET', '/metrics', tok)).toBe(401);
     }
-    expect(await call('GET', '/agents', await adminTok('mesh:agents'))).toBe(200);
+    expect(await call('GET', '/agents', await adminTok('mesh:agents:read'))).toBe(200);
     expect(await call('GET', '/metrics', 'met')).toBe(200);
   });
 
@@ -297,8 +332,8 @@ describe('R-406 admin API on the wire', () => {
 
   it('the admin caller\'s sub is logged on admin.auth, agent.http and admin.mutation; the token never is', async () => {
     await up();
-    const t = await adminTok('mesh:agents');
-    expect(await call('PATCH', '/agents/fred', t, { hostname: 'h3' })).toBe(200);
+    const t = await adminTok('mesh:agents:write');
+    expect(await call('PATCH', '/agents/fred', t, { namespace: 'h3' })).toBe(200);
     const sig = t.split('.')[2]!;
     const evt = (name: string) => lines.find(l => l.includes(`"evt":"${name}"`) && l.includes('"sub":"svc-ops"'));
     expect(evt('admin.auth')).toContain('"outcome":"success"');
@@ -314,19 +349,54 @@ describe('R-406 admin API on the wire', () => {
     expect(lines.find(l => l.includes('"evt":"admin.auth"'))).toContain('"sub":null');
   });
 
-  it('GUARD: the first OIDC login binds the name to its sub, for an existing agent and a new one', async () => {
+  it('GUARD (W-1514 H3): an existing row nobody has bound is refused by OIDC, observers included; nothing is bound', async () => {
     await up();
-    expect((await login({ agent_id: 'fred', token: await agentTok() })).reply).toMatchObject({ type: 'auth_ok' });
-    expect(getAgentById(db, 'fred')?.oidc_sub).toBe('u-fred');
+    grantObserver(db, 'bob', 'admin', false);
+    for (const who of ['fred', 'bob']) {
+      const t = await agentTok({ preferred_username: who, sub: `u-${who}` });
+      const r = await login({ agent_id: who, token: t });
+      expect(r.reply).toMatchObject({ type: 'error', code: 'AUTH_FAILED' });
+      expect(JSON.stringify(r.reply)).not.toContain('UNBOUND');
+      expect(await call('GET', '/messages', t)).toBe(401);
+      expect(getAgentById(db, who)?.oidc_sub).toBeNull();
+    }
+    expect(lines.some(l => l.includes('"refused":"oidc_unbound"'))).toBe(true);
+  });
+
+  it('GUARD: a name with no row is created by its first OIDC login and bound to its sub', async () => {
+    await up();
     expect((await login({ agent_id: 'newbie', token: await agentTok({ preferred_username: 'newbie', sub: 'u-newbie' }) })).reply).toMatchObject({ type: 'auth_ok' });
     expect(getAgentById(db, 'newbie')?.oidc_sub).toBe('u-newbie');
-    // The same subject again is fine.
+    expect((await login({ agent_id: 'newbie', token: await agentTok({ preferred_username: 'newbie', sub: 'u-newbie' }) })).reply).toMatchObject({ type: 'auth_ok' });
+    expect((await login({ agent_id: 'newbie', token: await agentTok({ preferred_username: 'newbie', sub: 'u-other' }) })).reply).toMatchObject({ type: 'error', code: 'AUTH_FAILED' });
+  });
+
+  it('GUARD: an admin binds a row with PATCH {oidc_sub} under mesh:agents:write (logged with their sub); null unbinds; mesh:agents:read can\'t', async () => {
+    await up();
+    grantObserver(db, 'bob', 'admin', false);
+    expect(await call('PATCH', '/agents/fred', await adminTok('mesh:agents:read'), { oidc_sub: 'u-fred' })).toBe(401);
+    expect(getAgentById(db, 'fred')?.oidc_sub).toBeNull();
+    const write = await adminTok('mesh:agents:write');
+    expect(await call('PATCH', '/agents/fred', write, { oidc_sub: 'u-fred' })).toBe(200);
+    expect(lines.some(l => l.includes('"evt":"agent.oidc_sub_set"') && l.includes('"agent_id":"fred"') && l.includes('"oidc_sub":"u-fred"') && l.includes('"by_sub":"svc-ops"'))).toBe(true);
     expect((await login({ agent_id: 'fred', token: await agentTok() })).reply).toMatchObject({ type: 'auth_ok' });
+    // An observer an admin has bound logs in with that sub.
+    expect(await call('PATCH', '/agents/bob', write, { oidc_sub: 'u-bob' })).toBe(200);
+    expect((await login({ agent_id: 'bob', token: await agentTok({ preferred_username: 'bob', sub: 'u-bob' }) })).reply).toMatchObject({ type: 'auth_ok' });
+    for (const bad of ['', 7, 'x'.repeat(257), ['u-fred']]) expect(await call('PATCH', '/agents/fred', write, { oidc_sub: bad })).toBe(400);
+    expect(getAgentById(db, 'fred')?.oidc_sub).toBe('u-fred');
+    expect(await call('PATCH', '/agents/fred', write, { oidc_sub: null })).toBe(200);
+    expect(getAgentById(db, 'fred')?.oidc_sub).toBeNull();
+    expect((await login({ agent_id: 'fred', token: await agentTok() })).reply).toMatchObject({ type: 'error', code: 'AUTH_FAILED' });
+    // A PATCH that doesn't name oidc_sub leaves the binding alone.
+    setOidcSub(db, 'fred', 'u-fred');
+    expect(await call('PATCH', '/agents/fred', write, { namespace: 'n' })).toBe(200);
+    expect(getAgentById(db, 'fred')?.oidc_sub).toBe('u-fred');
   });
 
   it('GUARD: a different sub for a bound name is refused on login (WS and HTTP), with the uniform AUTH_FAILED', async () => {
     await up();
-    bindOidcSub(db, 'fred', 'u-fred');
+    setOidcSub(db, 'fred', 'u-fred');
     const imposter = await agentTok({ sub: 'u-someone-else' });
     const r = await login({ agent_id: 'fred', token: imposter });
     expect(r.reply).toMatchObject({ type: 'error', code: 'AUTH_FAILED' });
@@ -336,8 +406,9 @@ describe('R-406 admin API on the wire', () => {
     expect(getAgentById(db, 'fred')?.oidc_sub).toBe('u-fred');
   });
 
-  it('GUARD: re-auth with a different sub is refused, and the session is unchanged', async () => {
+  it('GUARD: re-auth with a different sub, or after an admin unbinds, is refused, and the session is unchanged', async () => {
     await up();
+    setOidcSub(db, 'fred', 'u-fred');
     const s = await login({ agent_id: 'fred', token: await agentTok({}, { expIn: 120 }) });
     expect(s.reply).toMatchObject({ type: 'auth_ok' });
     s.sock.send(JSON.stringify({ type: 'auth', msg_id: 'other', agent_id: 'fred', token: await agentTok({ sub: 'u-someone-else' }, { expIn: 600 }) }));
@@ -346,21 +417,26 @@ describe('R-406 admin API on the wire', () => {
     expect(s.frames.find(f => f.ref === 'other')).toMatchObject({ type: 'error', code: 'REAUTH_REFUSED' });
     expect(s.frames.find(f => f.ref === 'same')).toMatchObject({ type: 'ack', ok: true });
     expect(lines.some(l => l.includes('"refused":"sub_mismatch"'))).toBe(true);
-    expect(getAgentById(db, 'fred')?.oidc_sub).toBe('u-fred');
+    setOidcSub(db, 'fred', null);
+    s.sock.send(JSON.stringify({ type: 'auth', msg_id: 'unbound', agent_id: 'fred', token: await agentTok({}, { expIn: 900 }) }));
+    for (let i = 0; i < 50 && s.frames.length < 3; i++) await delay(20);
+    expect(s.frames.find(f => f.ref === 'unbound')).toMatchObject({ type: 'error', code: 'REAUTH_REFUSED' });
+    expect(lines.some(l => l.includes('"refused":"oidc_unbound"'))).toBe(true);
+    expect(getAgentById(db, 'fred')?.oidc_sub).toBeNull();
   });
 
   it('a static-token login does not touch the binding', async () => {
     await up();
     expect((await login({ agent_id: 'bob', token: 'bob-tok' })).reply).toMatchObject({ type: 'auth_ok' });
     expect(getAgentById(db, 'bob')?.oidc_sub).toBeNull();
-    bindOidcSub(db, 'fred', 'u-fred');
+    setOidcSub(db, 'fred', 'u-fred');
     expect((await login({ agent_id: 'fred', token: 'fred-tok' })).reply).toMatchObject({ type: 'auth_ok' });
     expect(getAgentById(db, 'fred')?.oidc_sub).toBe('u-fred');
   });
 
-  it('deleting an agent frees its name: the next OIDC login binds afresh', async () => {
+  it('deleting an agent frees its name: the next OIDC login creates and binds it afresh', async () => {
     await up();
-    bindOidcSub(db, 'fred', 'u-fred');
+    setOidcSub(db, 'fred', 'u-fred');
     expect(await call('DELETE', '/agents/fred', 'adm')).toBe(200);
     expect((await login({ agent_id: 'fred', token: await agentTok({ sub: 'u-new-fred' }) })).reply).toMatchObject({ type: 'auth_ok' });
     expect(getAgentById(db, 'fred')?.oidc_sub).toBe('u-new-fred');
@@ -383,14 +459,15 @@ describe('R-406 oidc_sub migration', () => {
     }
   });
 
-  it('bindOidcSub binds once and never overwrites', () => {
+  it('oidcSubState reads the binding; setOidcSub is the only writer and changes nothing for a missing row', () => {
     const db = openDb(':memory:');
     registerAgent(db, { id: 'fred', token_hash: 'x', hostname: 'h' });
-    expect(bindOidcSub(db, 'fred', 'a')).toBe(true);
-    expect(bindOidcSub(db, 'fred', 'b')).toBe(false);
-    expect(bindOidcSub(db, 'fred', 'a')).toBe(true);
-    expect(getAgentById(db, 'fred')?.oidc_sub).toBe('a');
-    expect(bindOidcSub(db, 'nobody', 'a')).toBe(false);
+    expect(oidcSubState(db, 'fred', 'a')).toBe('unbound');
+    expect(setOidcSub(db, 'fred', 'a')).toBe(true);
+    expect(oidcSubState(db, 'fred', 'a')).toBe('bound');
+    expect(oidcSubState(db, 'fred', 'b')).toBe('mismatch');
+    expect(oidcSubState(db, 'nobody', 'a')).toBe('missing');
+    expect(setOidcSub(db, 'nobody', 'a')).toBe(false);
     db.close();
   });
 });

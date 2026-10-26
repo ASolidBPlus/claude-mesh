@@ -574,7 +574,7 @@ export function openDb(path: string): Database {
   try { db.exec('ALTER TABLE agents ADD COLUMN last_auth_at INTEGER'); } catch {}
   try { db.exec('ALTER TABLE agents ADD COLUMN last_plaintext_at INTEGER'); } catch {}
 
-  // R-406 migration: the OIDC `sub` an agent's name is bound to (bindOidcSub).
+  // R-406 migration: the OIDC `sub` an agent's name is bound to (setOidcSub).
   // Nullable and additive: every existing row is unbound, so its next OIDC
   // login binds it. Guarded by the column's presence rather than by a caught
   // error, so a real failure is not swallowed, and run in one transaction.
@@ -749,16 +749,25 @@ export function registerAgent(
 }
 
 /**
- * R-406: bind an agent's name to the OIDC subject that first logs in as it, or
- * check a later login against that binding. Names in an issuer can be changed
- * or reused; `sub` can't, so it is what owns the mesh identity. True when the
- * agent is (now) bound to `sub`; false when it is bound to another subject.
- * The binding goes with the row, so only deleting the agent frees the name.
+ * R-406: the OIDC subject an agent's name is bound to. Names in an issuer can
+ * be changed or reused; `sub` can't, so it is what owns the mesh identity.
+ *
+ * Only two writers (W-1514 H3): an agent created by its first OIDC login is
+ * bound to that token's `sub` (token-auth.ts), and an admin binds or unbinds
+ * a row (PATCH /agents/:id {oidc_sub}). A login never binds an existing row,
+ * so a row that predates OIDC can't be claimed by whoever logs in first.
+ * The binding goes with the row: deleting the agent frees the name.
  */
-export function bindOidcSub(db: Database, id: string, sub: string): boolean {
-  db.prepare('UPDATE agents SET oidc_sub = ? WHERE id = ? AND oidc_sub IS NULL').run(sub, id);
+export function setOidcSub(db: Database, id: string, sub: string | null): boolean {
+  return db.prepare('UPDATE agents SET oidc_sub = ? WHERE id = ?').run(sub, id).changes > 0;
+}
+
+/** How a login's `sub` stands against the row's binding. */
+export function oidcSubState(db: Database, id: string, sub: string): 'bound' | 'unbound' | 'mismatch' | 'missing' {
   const row = db.prepare('SELECT oidc_sub FROM agents WHERE id = ?').get(id) as { oidc_sub: string | null } | null;
-  return row !== null && row.oidc_sub === sub;
+  if (row === null) return 'missing';
+  if (row.oidc_sub === null) return 'unbound';
+  return row.oidc_sub === sub ? 'bound' : 'mismatch';
 }
 
 export function getAgentById(db: Database, id: string): Agent | null {
