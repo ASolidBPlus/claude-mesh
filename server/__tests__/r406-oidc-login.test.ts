@@ -64,9 +64,9 @@ describe('R-406 configuration', () => {
     const jwksFile = join(dir, 'jwks.json');
     writeFileSync(jwksFile, JSON.stringify({ keys: [] }));
     expect(parseTokenAuthConfig({ MESH_OIDC_ISSUER: 'https://id.example', MESH_OIDC_AUDIENCE: 'mesh', MESH_OIDC_CA_FILE: ca.caFile, MESH_STATIC_TOKENS: 'off', MESH_ADMIN_STATIC_TOKEN: 'on', MESH_METRICS_STATIC_TOKEN: 'on' }))
-      .toEqual({ ok: true, config: { oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'preferred_username', caFile: ca.caFile, jwksFile: null, adminAudience: null }, staticTokens: false, adminStaticToken: true, metricsStaticToken: true } });
+      .toEqual({ ok: true, config: { oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'preferred_username', caFile: ca.caFile, jwksFile: null, keysUrl: null, adminAudience: null }, staticTokens: false, adminStaticToken: true, metricsStaticToken: true } });
     expect(parseTokenAuthConfig({ MESH_OIDC_ISSUER: 'https://id.example', MESH_OIDC_AUDIENCE: 'mesh', MESH_OIDC_JWKS_FILE: jwksFile, MESH_OIDC_ID_CLAIM: 'sub', MESH_STATIC_TOKENS: 'on', MESH_ADMIN_STATIC_TOKEN: 'on', MESH_METRICS_STATIC_TOKEN: 'on' }))
-      .toEqual({ ok: true, config: { oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'sub', caFile: null, jwksFile, adminAudience: null }, staticTokens: true, adminStaticToken: true, metricsStaticToken: true } });
+      .toEqual({ ok: true, config: { oidc: { issuer: 'https://id.example', audience: 'mesh', idClaim: 'sub', caFile: null, jwksFile, keysUrl: null, adminAudience: null }, staticTokens: true, adminStaticToken: true, metricsStaticToken: true } });
     const badJwks = join(dir, 'bad.json');
     writeFileSync(badJwks, '{"nope":1}');
     for (const bad of [
