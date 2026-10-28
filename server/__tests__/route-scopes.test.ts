@@ -18,11 +18,22 @@ describe('R-406 route scopes', () => {
     expect(missing).toEqual([]);
   });
 
+  // A route may accept several scopes (R-454); these checks see each one.
+  const scopesOf = (r: (typeof ROUTES)[number]): string[] => (r.scope === undefined ? [] : typeof r.scope === 'string' ? [r.scope] : [...r.scope]);
+
   it('W-1514 M10: a :read scope is only ever on a GET, and plain mesh:agents is on no route', () => {
     for (const r of ROUTES) {
-      if (r.scope?.endsWith(':read')) expect({ route: routeLabel(r.method, r), method: r.method }).toEqual({ route: routeLabel(r.method, r), method: 'GET' });
-      expect(r.scope as string | undefined).not.toBe('mesh:agents');
+      for (const sc of scopesOf(r)) {
+        if (sc.endsWith(':read')) expect({ route: routeLabel(r.method, r), method: r.method }).toEqual({ route: routeLabel(r.method, r), method: 'GET' });
+        expect(sc).not.toBe('mesh:agents');
+      }
     }
+  });
+
+  it('R-454: mesh:agents:bind is on PATCH /agents/:id only, after mesh:agents:write', () => {
+    const withBind = ROUTES.filter(r => scopesOf(r).includes('mesh:agents:bind')).map(r => routeLabel(r.method, r));
+    expect(withBind).toEqual(['PATCH /agents/:id']);
+    expect(scopesOf(ROUTES.find(r => routeLabel(r.method, r) === 'PATCH /agents/:id')!)).toEqual(['mesh:agents:write', 'mesh:agents:bind']);
   });
 
   it('routes no admin access token reaches declare no scope', () => {
