@@ -754,12 +754,22 @@ export function registerAgent(
  *
  * Only two writers (W-1514 H3): an agent created by its first OIDC login is
  * bound to that token's `sub` (token-auth.ts), and an admin binds or unbinds
- * a row (PATCH /agents/:id {oidc_sub}). A login never binds an existing row,
+ * a row (PATCH /agents/:id {oidc_sub}, or bindOidcSubIfUnbound below with
+ * if_unbound). A login never binds an existing row,
  * so a row that predates OIDC can't be claimed by whoever logs in first.
  * The binding goes with the row: deleting the agent frees the name.
  */
 export function setOidcSub(db: Database, id: string, sub: string | null): boolean {
   return db.prepare('UPDATE agents SET oidc_sub = ? WHERE id = ?').run(sub, id).changes > 0;
+}
+
+/**
+ * R-454: bind only if the row is unbound or already bound to `sub`, in one
+ * statement, so two binders can't both win. False when it is bound to another
+ * subject (or there is no row).
+ */
+export function bindOidcSubIfUnbound(db: Database, id: string, sub: string): boolean {
+  return db.prepare('UPDATE agents SET oidc_sub = ? WHERE id = ? AND (oidc_sub IS NULL OR oidc_sub = ?)').run(sub, id, sub).changes > 0;
 }
 
 /** How a login's `sub` stands against the row's binding. */

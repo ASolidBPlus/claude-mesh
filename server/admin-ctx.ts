@@ -77,8 +77,14 @@ export function requireAdmin(
  * Declared per route in the ROUTES table (http-admin.ts); every admin route
  * has one, and an unknown path (no route) takes no access token. There is no
  * catch-all scope. mesh:metrics also opens GET /metrics (http-admin.ts).
+ *
+ * A route may accept more than one scope, listed broadest first; the first
+ * one the token holds is the one that granted the request (AuthResult
+ * `grantedBy`), so a handler can narrow a narrow scope further. The one such
+ * route is PATCH /agents/:id: mesh:agents:write, or mesh:agents:bind, which the
+ * handler limits to a conditional bind (R-454).
  */
-export type AdminScope = 'mesh:agents:read' | 'mesh:agents:write' | 'mesh:acl' | 'mesh:reminders' | 'mesh:topics' | 'mesh:files' | 'mesh:peers' | 'mesh:metrics';
+export type AdminScope = 'mesh:agents:read' | 'mesh:agents:write' | 'mesh:agents:bind' | 'mesh:acl' | 'mesh:reminders' | 'mesh:topics' | 'mesh:files' | 'mesh:peers' | 'mesh:metrics';
 
 /**
  * #161 — WHERE THE REQUEST CAME FROM, and how much that is worth.
@@ -202,7 +208,7 @@ export interface ForwarderRegistry {
 }
 
 /** `sub` is set when the admin authenticated with an access token (R-406); absent for the static token. */
-export type AuthResult = { mode: 'admin'; sub?: string } | { mode: 'agent'; agentId: string } | { mode: 'unauthenticated' };
+export type AuthResult = { mode: 'admin'; sub?: string; grantedBy?: AdminScope } | { mode: 'agent'; agentId: string } | { mode: 'unauthenticated' };
 
 // Resolve auth for a route that accepts EITHER the admin token OR an agent's
 // own bearer token. Admin is checked FIRST (exact, timing-safe) — if the token
@@ -269,6 +275,10 @@ export function formatAgent(agent: Agent): Record<string, unknown> {
     // R-65: when the agent first authenticated over TLS, or null. Non-null =
     // latched: a plaintext auth for it is refused until an admin clears it.
     tls_seen: agent.tls_seen ?? null,
+    // R-454: the OIDC subject the name is bound to, or null. Admin replies
+    // only: this is used by the admin agent routes alone, and the views agents
+    // get (presence_list, mesh_discover) list their own fields.
+    oidc_sub: agent.oidc_sub ?? null,
   };
 }
 
@@ -322,10 +332,11 @@ export interface Route {
   //   dispatcher does. One route in F0b: POST /peers/register, by peer key,
   //   which is neither the admin token nor an agent token.
   auth?: 'admin' | 'agentOrAdmin' | 'handler';
-  // R-406: the scope an admin access token needs here. Required in practice
+  // R-406: the scope an admin access token needs here (or one of several,
+  // broadest first). Required in practice
   // for every 'admin' route (route-scopes.test.ts); absent on agentOrAdmin and
   // handler routes, which no admin access token reaches.
-  scope?: AdminScope;
+  scope?: AdminScope | readonly AdminScope[];
 }
 
 // Path matchers: `exact` for a literal path, `idMatch` to capture a single
@@ -375,7 +386,7 @@ export function resolveRouteAuth(
   ext: {
     adminTokenPrev?: string | null; tls: boolean; adminStatic: boolean;
     agentVerdict?: AgentAuthResult | undefined;
-    adminJwt?: OidcAdminResult | undefined; scope?: AdminScope | undefined;
+    adminJwt?: OidcAdminResult | undefined; scope?: AdminScope | readonly AdminScope[] | undefined;
   },
 ): AuthResult | null {
   const adminTokenPrev = ext.adminTokenPrev ?? null;
@@ -430,9 +441,11 @@ export function resolveRouteAuth(
   // declares none, so no access token reaches it; an empty or missing `scope`
   // names nothing.
   const jwt = ext.adminJwt;
-  if (jwt !== undefined && jwt.ok && ext.scope !== undefined && jwt.scopes.has(ext.scope)) {
+  const accepted: readonly AdminScope[] = ext.scope === undefined ? [] : typeof ext.scope === 'string' ? [ext.scope] : ext.scope;
+  const grantedBy = jwt !== undefined && jwt.ok ? accepted.find((sc) => jwt.scopes.has(sc)) : undefined;
+  if (jwt !== undefined && jwt.ok && grantedBy !== undefined) {
     recordAdminAuth(req, 'success', null, mode ?? 'admin', { sub: jwt.sub });
-    return { mode: 'admin', sub: jwt.sub };
+    return { mode: 'admin', sub: jwt.sub, grantedBy };
   }
   res.writeHead(401, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'unauthorized' }));

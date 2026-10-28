@@ -93,7 +93,7 @@ export const ROUTES: Route[] = [
   { method: 'POST',   match: exact('/agents'),                       handler: handleAgentPost, scope: 'mesh:agents:write' },
   { method: 'GET',    match: exact('/agents'),                       handler: handleAgentGet, scope: 'mesh:agents:read' },
   { method: 'GET',    match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentById, scope: 'mesh:agents:read' },
-  { method: 'PATCH',  match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentPatch, scope: 'mesh:agents:write' },
+  { method: 'PATCH',  match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentPatch, scope: ['mesh:agents:write', 'mesh:agents:bind'] },
   { method: 'DELETE', match: idMatch(/^\/agents\/([^/]+)$/),         handler: handleAgentDelete, scope: 'mesh:agents:write' },
   // R-65: clears the TLS latch. Two segments, so it cannot contend with the
   // one-segment DELETE above.

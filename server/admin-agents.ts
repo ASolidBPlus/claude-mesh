@@ -15,10 +15,10 @@ import {
   generateToken, hashToken,
 } from './auth.ts';
 import {
-  Agent, RESERVED_ALIAS, agentIdRefusal, clearTlsLatch, deleteAgent, rotateAgentToken, getAgentById, getLivePeerKeyForAlias, getPeerByAlias, listAgents, registerAgent, setOidcSub, updateAgent,
+  Agent, RESERVED_ALIAS, agentIdRefusal, clearTlsLatch, deleteAgent, rotateAgentToken, getAgentById, getLivePeerKeyForAlias, getPeerByAlias, listAgents, registerAgent, bindOidcSubIfUnbound, setOidcSub, updateAgent,
 } from './db.ts';
 import type { AdminCtx } from './admin-ctx.ts';
-import { readBody, formatAgent } from './admin-ctx.ts';
+import { readBody, formatAgent, recordAdminAuth } from './admin-ctx.ts';
 import { listCallers } from './connections.ts';
 
 /** R-377: the live alias sessions (`id+*`) of agent `id`. */
@@ -304,6 +304,22 @@ export async function handleAgentPatch(ctx: AdminCtx): Promise<void> {
     return;
   }
 
+  // R-454: mesh:agents:bind (fleet-mesh-manager) may do exactly one thing
+  // here: a conditional bind, {oidc_sub: "<string>", if_unbound: true} and
+  // nothing else, so it can never overwrite, unbind or change anything more.
+  if (ctx.auth.mode === 'admin' && ctx.auth.grantedBy === 'mesh:agents:bind') {
+    const keys = Object.keys(body ?? {}).sort();
+    const exact = typeof body === 'object' && body !== null && !Array.isArray(body)
+      && keys.length === 2 && keys[0] === 'if_unbound' && keys[1] === 'oidc_sub'
+      && body.if_unbound === true && typeof body.oidc_sub === 'string';
+    if (!exact) {
+      recordAdminAuth(req, 'failure', 'scope_missing', 'admin', { sub: ctx.auth.sub ?? null });
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'mesh:agents:bind allows only {"oidc_sub": "<subject>", "if_unbound": true}; anything else needs mesh:agents:write', code: 'SCOPE_MISSING' }));
+      return;
+    }
+  }
+
   // Genuine PARTIAL update: only fields PRESENT in the body are touched. An
   // omitted field is left exactly as-is (never nulled). metadata is REPLACE
   // (not merge) — consumers do read-modify-write.
@@ -348,15 +364,44 @@ export async function handleAgentPatch(ctx: AdminCtx): Promise<void> {
     oidcSub = { value: v };
   }
 
+  // R-454: `if_unbound: true` binds only a row that is unbound (or already
+  // bound to the same subject), so a caller binding at spawn (spawner-web) can
+  // never overwrite someone else's binding. It needs a string oidc_sub.
+  let ifUnbound = false;
+  if (Object.prototype.hasOwnProperty.call(body, 'if_unbound')) {
+    if (typeof body.if_unbound !== 'boolean' || (body.if_unbound && typeof oidcSub?.value !== 'string')) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'if_unbound must be a boolean, and true only with a string oidc_sub' }));
+      return;
+    }
+    ifUnbound = body.if_unbound;
+  }
+  const bySub = ctx.auth.mode === 'admin' ? ctx.auth.sub ?? null : null;
+
+  // The bind, the check and the other fields in one transaction: a refused
+  // conditional bind changes nothing.
   const updated = db.transaction(() => {
-    if (oidcSub !== null) setOidcSub(db, id, oidcSub.value);
+    if (oidcSub !== null) {
+      if (ifUnbound) {
+        if (!bindOidcSubIfUnbound(db, id, oidcSub.value as string)) return null;
+      } else {
+        setOidcSub(db, id, oidcSub.value);
+      }
+    }
     return updateAgent(db, id, fields);
   })();
+  if (updated === null) {
+    console.log(JSON.stringify({ evt: 'agent.oidc_sub_refused', agent_id: id, reason: 'OIDC_SUB_BOUND', by_sub: bySub, at: Date.now() }));
+    res.writeHead(409, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'the agent is bound to another subject; unbind it (oidc_sub: null) first to rebind', code: 'OIDC_SUB_BOUND' }));
+    return;
+  }
   if (oidcSub !== null) {
     console.log(JSON.stringify({
       evt: 'agent.oidc_sub_set', agent_id: id, oidc_sub: oidcSub.value,
+      ...(ifUnbound ? { if_unbound: true } : {}),
       // Who did it: the admin's own `sub` when they used an access token.
-      by_sub: ctx.auth.mode === 'admin' ? ctx.auth.sub ?? null : null,
+      by_sub: bySub,
       at: Date.now(),
     }));
   }
