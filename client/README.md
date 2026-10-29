@@ -191,7 +191,7 @@ undefined at `connect()` time, `connect()` rejects with a clear error.
 | `new MeshClient({ alias })` | | R-377: connect as the alias `<agentId>+<alias>` with the agent's own token. It has its own connection and mailbox and doesn't count toward presence. `send`/`publish`/`sendFile` from it are from the identity by default (replies reach the plain connection, and the recipient sees `m.alias`); pass `{ as: 'alias' }` to send from the alias so replies come back to it. `m.alias` is on live delivery only |
 | `new MeshClient({ agentToken: () => token })` | | R-406: `agentToken` may be a function returning a token (or a promise of one), for an OAuth access token that expires. It is called on every connect and every `fetchFile`, and about 30 s before the session's token expires the client re-authenticates the live socket with a fresh one (no reconnect, so presence doesn't flap). If that is refused it reconnects. A plain string behaves as before |
 | `on(event, fn)` | `void` | `'connect' \| 'disconnect' \| 'error' \| 'presence'`. `'presence'` fires with a `PresenceEntry` `{ id, online, lastSeen }` on each ACL-related peer's status change |
-| `send(to, text, opts?)` | `Promise<void>` | resolves on the server ack; `opts.ttlMs` sets the delivery TTL (`0` = drop if recipient offline, omit for the 5-min default); `opts.contentType` sets the payload MIME (default `text/plain`) |
+| `send(to, text, opts?)` | `Promise<void>` | resolves on the server ack; `opts.ttlMs` sets the delivery TTL (`0` = drop if recipient offline, omit for the 5-min default); `opts.contentType` sets the payload MIME (default `text/plain`); `opts.msgId` sets the message's id for a retry-safe send (see *Retry-safe sends*) |
 | `publish(topic, text, opts?)` | `Promise<void>` | resolves on ack. `opts: { contentType?, ttlMs? }` |
 | `sendFile(to, opts)` | `Promise<{ fileId }>` | `opts: { data: Uint8Array\|ArrayBuffer, filename, contentType?, caption?, ttlMs?, replyToMsgId?, groupId? }`; base64-encodes bytes into a `file_send`. Resolves with the stored `fileId` (`null` if dropped). `groupId` tags a multi-file send. Recipient gets an `Inbound{ kind:'file', fileId, filename, contentType, size, caption, replyToMsgId, groupId, fetchUrl }` — download bytes with `fetchFile` |
 | `fetchFile(fileId)` | `Promise<Uint8Array>` | downloads the bytes over HTTP with the agent token (node-scoped — only the file's sender/recipient; a non-party or unknown id rejects with an `err.code === 'HTTP_404'`). Requires `httpUrl`/`MESH_HTTP_URL`; no WS connection needed |
@@ -203,6 +203,24 @@ undefined at `connect()` time, `connect()` rejects with a clear error.
 | `close()` | `void` | stops reconnect, rejects pending acks |
 
 Errors raised from server rejections carry a `.code` (e.g. `err.code === 'ACL_DENIED'`).
+
+## Retry-safe sends
+
+A send whose ack didn't arrive (`ACK_TIMEOUT`, `CONNECTION_RESET`) may still have been delivered. To retry without delivering twice, give the send an id with `send(to, text, { msgId })`, and use the **same** id on the retry. If the first one got through, the retry rejects with `code: 'DUPLICATE_MSG_ID'`, which means "already sent", and nothing is delivered twice.
+
+```ts
+const msgId = uuidv5(`${myAgentId}:${myKey}`, MY_NAMESPACE);   // stable for this logical message
+try {
+  await client.send('other-agent', body, { msgId });
+} catch (err) {
+  if ((err as { code?: string }).code !== 'DUPLICATE_MSG_ID') throw err;   // already sent: done
+}
+```
+
+- **The id space is global** across every agent on the mesh. Derive the id from the sender and your own key (a UUIDv5, say), never a bare counter.
+- An id is 1–128 characters of `A-Z a-z 0-9 . _ : -`; anything else rejects with `BAD_MSG_ID` before sending. A second send with an id that is still waiting for its ack on the same client rejects with `MSG_ID_IN_FLIGHT`.
+- **Retries are deduplicated only while the first message is still stored,** that is, within the mesh's retention window (`MESH_RETENTION_MS`). After that the same id is a new message.
+- Only `send` takes an id. Topic posts and file sends don't: the mesh doesn't deduplicate those.
 
 ## Correlated request/reply
 

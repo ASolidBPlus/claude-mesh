@@ -139,6 +139,13 @@ export interface SendOpts {
    *  identity (`from: fred`, the default, so replies reach the plain session).
    *  Ignored without an alias, and for a remote recipient. */
   as?: 'alias';
+  /** W-1712: the message's id, for a retry-safe send. Reuse the same id on a
+   *  retry and the server refuses the copy with `DUPLICATE_MSG_ID` (it was
+   *  already sent) rather than delivering it twice. The id space is global, so
+   *  derive it from the sender and the caller's own key (a UUIDv5, say); 1-128
+   *  characters of `A-Z a-z 0-9 . _ : -`, else `BAD_MSG_ID`. Omitted: a fresh
+   *  random id, as before. */
+  msgId?: string;
 }
 
 export interface PublishOpts {
@@ -286,6 +293,9 @@ const BACKOFF_MAX_MS = 30_000;
 const PING_INTERVAL_MS = 25_000;
 const PONG_DEADLINE_MS = 60_000;
 const LIVENESS_CHECK_MS = 5_000;
+
+/** W-1712: what a caller-chosen msg_id may look like. */
+export const MSG_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 
 /** How long a waiter may sit unanswered before it rejects with ACK_TIMEOUT.
     Bounds every in-flight promise so a send can never silently vanish. */
@@ -521,7 +531,17 @@ export class MeshClient {
   }
 
   send(to: string, text: string, opts: SendOpts = {}): Promise<void> {
-    const msgId = this.id();
+    if (opts.msgId !== undefined) {
+      if (typeof opts.msgId !== 'string' || !MSG_ID_RE.test(opts.msgId)) {
+        return Promise.reject(Object.assign(new Error('msgId must be 1-128 characters of A-Z a-z 0-9 . _ : -'), { code: 'BAD_MSG_ID' }));
+      }
+      // Two sends with one id would share one ack waiter; refuse the second
+      // here rather than let it settle the first's promise.
+      if (this.pendingAcks.has(opts.msgId)) {
+        return Promise.reject(Object.assign(new Error(`a send with msgId ${opts.msgId} is already waiting for its ack`), { code: 'MSG_ID_IN_FLIGHT' }));
+      }
+    }
+    const msgId = opts.msgId ?? this.id();
     const frame: SendFrame = { type: 'send', msg_id: msgId, to, payload: text };
     if (opts.ttlMs !== undefined) frame.ttl_ms = opts.ttlMs;
     if (opts.contentType !== undefined) frame.content_type = opts.contentType;
