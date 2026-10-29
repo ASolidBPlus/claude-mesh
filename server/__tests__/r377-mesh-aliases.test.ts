@@ -387,7 +387,11 @@ describe('R-377 boot refuses an existing agent id containing +', () => {
                  VALUES (?, ?, 'h', '[]', '{}', 1, 1, 0)`).run(id, hashToken('legacy-tok'));
     }
     expect(countPlusAgentIds(d)).toBe(id === null ? 0 : 1);
-    d.close();
+    // close(true), not close(): with prepared statements still alive, Bun's
+    // close() defers the real close (and its WAL checkpoint) to when they are
+    // garbage-collected, which can land while the spawned server opens the
+    // file (R-478). close(true) closes now.
+    d.close(true);
   };
   const boot = async (path: string, ws: number, adminPort: number) => {
     const proc = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'server.ts')], {
