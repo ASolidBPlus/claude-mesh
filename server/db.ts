@@ -289,8 +289,19 @@ export function rebuildSubscriptionsFkLess(db: Database): void {
   }
 }
 
+/**
+ * R-478: how long a statement waits for another connection's lock before it
+ * fails with SQLITE_BUSY ("database is locked"). Without it SQLite fails at
+ * once, so a brief lock fails a write (or a boot) instead of delaying it:
+ * a `VACUUM INTO` backup beside the live server, or a closed connection's
+ * last checkpoint.
+ */
+export const DB_BUSY_TIMEOUT_MS = 5000;
+
 export function openDb(path: string): Database {
   const db = new Database(path);
+  // Before anything else, so the boot's own first statements wait too.
+  db.exec(`PRAGMA busy_timeout = ${DB_BUSY_TIMEOUT_MS};`);
 
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA foreign_keys = ON;');
