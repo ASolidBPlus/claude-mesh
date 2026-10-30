@@ -187,6 +187,8 @@ export interface ErrorFrame {
   ref?: string;
   code: string;
   message: string;
+  /** W-1727: on a file_send's DUPLICATE_MSG_ID, the first file's id (to its own sender). */
+  file_id?: string;
 }
 
 export interface PongFrame {

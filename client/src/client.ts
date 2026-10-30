@@ -249,6 +249,11 @@ export interface SendFileOpts {
    *  identity (`from: fred`, the default, so replies reach the plain session).
    *  Ignored without an alias, and for a remote recipient. */
   as?: 'alias';
+  /** W-1727: the file send's id, for a retry-safe send, by `send`'s rule. Reuse
+   *  it on a retry and the server refuses the copy with `DUPLICATE_MSG_ID`
+   *  (already sent; the error's `fileId` is the first file's id) rather than
+   *  storing and delivering it twice. Omitted: a fresh random id, as before. */
+  msgId?: string;
 }
 
 interface ResolvedConfig {
@@ -570,6 +575,8 @@ export class MeshClient {
    * the sender can index / later fetch via `fetchFile`). `fileId` is `null` if
    * the file was dropped (ttlMs:0 to an offline recipient — nothing stored).
    * `opts.groupId` tags a multi-file send so the recipient can reassemble it.
+   * `opts.msgId` makes a retry safe, as `send`'s does (W-1727): a resend with
+   * the same id rejects `DUPLICATE_MSG_ID`, with `err.fileId` the first file's id.
    * The recipient receives an `Inbound{ kind:'file' }` with the metadata +
    * `fetchUrl`/`groupId`.
    */
@@ -577,9 +584,17 @@ export class MeshClient {
     if (!this.isOpen()) {
       return Promise.reject(new Error('not connected'));
     }
+    if (opts.msgId !== undefined) {
+      if (typeof opts.msgId !== 'string' || !MSG_ID_RE.test(opts.msgId)) {
+        return Promise.reject(Object.assign(new Error('msgId must be 1-128 characters of A-Z a-z 0-9 . _ : -'), { code: 'BAD_MSG_ID' }));
+      }
+      if (this.pendingFileSends.has(opts.msgId)) {
+        return Promise.reject(Object.assign(new Error(`a file send with msgId ${opts.msgId} is already waiting for its ack`), { code: 'MSG_ID_IN_FLIGHT' }));
+      }
+    }
     const bytes = opts.data instanceof Uint8Array ? opts.data : new Uint8Array(opts.data);
     const data = Buffer.from(bytes).toString('base64');
-    const msgId = this.id();
+    const msgId = opts.msgId ?? this.id();
     const frame: FileSendFrame = {
       type: 'file_send',
       msg_id: msgId,
@@ -1463,7 +1478,8 @@ export class MeshClient {
   }
 
   private makeError(frame: ErrorFrame): Error {
-    return Object.assign(new Error(frame.message), { code: frame.code });
+    // W-1727: a resent file's DUPLICATE_MSG_ID names the first file's id
+    return Object.assign(new Error(frame.message), { code: frame.code }, frame.file_id !== undefined ? { fileId: frame.file_id } : {});
   }
 
   /**

@@ -552,6 +552,13 @@ export function openDb(path: string): Database {
   // multi-file sends (Telegram media-group model). Existing rows get NULL.
   try { db.exec('ALTER TABLE files ADD COLUMN group_id TEXT'); } catch {}
 
+  // W-1727 migration: the file_send frame's `msg_id` on files, so a resent file
+  // (the same msg_id, a retry after a lost ack) is refused as DUPLICATE_MSG_ID,
+  // as a direct send's is, rather than stored and delivered twice. Existing rows
+  // get NULL; the partial UNIQUE index is the backstop under routeFile's check.
+  try { db.exec('ALTER TABLE files ADD COLUMN msg_id TEXT'); } catch {}
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_files_msg_id ON files(msg_id) WHERE msg_id IS NOT NULL');
+
   // Channel-drop migration: `last_alive` on agents — proof-of-life stamped on
   // the keepalive ping, so an idle-healthy node is distinguishable from a node
   // whose channel died (last_seen only advances on TRAFFIC, so the two were
@@ -2683,6 +2690,8 @@ export function insertFile(
     caption?: string | null;
     reply_to_msg_id?: string | null;
     group_id?: string | null;
+    /** W-1727: the file_send frame's msg_id; unique among stored files. */
+    msg_id?: string | null;
   }
 ): FileRecord {
   // #70: normalise at the CHOKEPOINT, not at each caller. Every path that
@@ -2697,15 +2706,20 @@ export function insertFile(
   const group_id = file.group_id ?? null;
 
   db.prepare(`
-    INSERT INTO files (id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at, caption, reply_to_msg_id, group_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
-  `).run(file.id, file.from_agent, file.to_agent, filename, content_type, file.size_bytes, file.file_path, file.sent_at, file.expires_at, caption, reply_to_msg_id, group_id);
+    INSERT INTO files (id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at, caption, reply_to_msg_id, group_id, msg_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+  `).run(file.id, file.from_agent, file.to_agent, filename, content_type, file.size_bytes, file.file_path, file.sent_at, file.expires_at, caption, reply_to_msg_id, group_id, file.msg_id ?? null);
 
   return getFile(db, file.id) as FileRecord;
 }
 
 export function getFile(db: Database, id: string): FileRecord | null {
   return db.prepare('SELECT id, from_agent, to_agent, filename, content_type, size_bytes, file_path, sent_at, expires_at, delivered_at, caption, reply_to_msg_id, group_id FROM files WHERE id = ?').get(id) as FileRecord | null;
+}
+
+/** W-1727: the stored file a file_send's msg_id already names, if any: its id and sender. */
+export function getFileByMsgId(db: Database, msgId: string): { id: string; from_agent: string } | null {
+  return db.prepare('SELECT id, from_agent FROM files WHERE msg_id = ?').get(msgId) as { id: string; from_agent: string } | null;
 }
 
 export function markFileDelivered(db: Database, id: string): void {
