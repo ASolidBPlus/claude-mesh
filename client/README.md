@@ -193,7 +193,7 @@ undefined at `connect()` time, `connect()` rejects with a clear error.
 | `on(event, fn)` | `void` | `'connect' \| 'disconnect' \| 'error' \| 'presence'`. `'presence'` fires with a `PresenceEntry` `{ id, online, lastSeen }` on each ACL-related peer's status change |
 | `send(to, text, opts?)` | `Promise<void>` | resolves on the server ack; `opts.ttlMs` sets the delivery TTL (`0` = drop if recipient offline, omit for the 5-min default); `opts.contentType` sets the payload MIME (default `text/plain`); `opts.msgId` sets the message's id for a retry-safe send (see *Retry-safe sends*) |
 | `publish(topic, text, opts?)` | `Promise<void>` | resolves on ack. `opts: { contentType?, ttlMs? }` |
-| `sendFile(to, opts)` | `Promise<{ fileId }>` | `opts: { data: Uint8Array\|ArrayBuffer, filename, contentType?, caption?, ttlMs?, replyToMsgId?, groupId? }`; base64-encodes bytes into a `file_send`. Resolves with the stored `fileId` (`null` if dropped). `groupId` tags a multi-file send. Recipient gets an `Inbound{ kind:'file', fileId, filename, contentType, size, caption, replyToMsgId, groupId, fetchUrl }` — download bytes with `fetchFile` |
+| `sendFile(to, opts)` | `Promise<{ fileId }>` | `opts: { data: Uint8Array\|ArrayBuffer, filename, contentType?, caption?, ttlMs?, replyToMsgId?, groupId?, msgId? }`; base64-encodes bytes into a `file_send`. Resolves with the stored `fileId` (`null` if dropped). `opts.msgId` sets the file send's id for a retry-safe send (see *Retry-safe sends*). `groupId` tags a multi-file send. Recipient gets an `Inbound{ kind:'file', fileId, filename, contentType, size, caption, replyToMsgId, groupId, fetchUrl }` — download bytes with `fetchFile` |
 | `fetchFile(fileId)` | `Promise<Uint8Array>` | downloads the bytes over HTTP with the agent token (node-scoped — only the file's sender/recipient; a non-party or unknown id rejects with an `err.code === 'HTTP_404'`). Requires `httpUrl`/`MESH_HTTP_URL`; no WS connection needed |
 | `subscribe(topic)` / `unsubscribe(topic)` | `Promise<void>` | resolve on ack; subscriptions are replayed on every reconnect |
 | `remind(opts)` | `Promise<{ reminderId, dueAt }>` | `opts: { text, when, recurring?, tz? }`. `when` is a duration (`"90s"`, `"2h"`), an ISO datetime, or a cron expression (with `recurring: true`); `tz` is an IANA zone (DST-aware, default UTC). Fires back as an `Inbound{ kind:'reminder' }` and survives server restarts |
@@ -220,7 +220,8 @@ try {
 - **The id space is global** across every agent on the mesh. Derive the id from the sender and your own key (a UUIDv5, say), never a bare counter.
 - An id is 1–128 characters of `A-Z a-z 0-9 . _ : -`; anything else rejects with `BAD_MSG_ID` before sending. A second send with an id that is still waiting for its ack on the same client rejects with `MSG_ID_IN_FLIGHT`.
 - **Retries are deduplicated only while the first message is still stored,** that is, within the mesh's retention window (`MESH_RETENTION_MS`). After that the same id is a new message.
-- Only `send` takes an id. Topic posts and file sends don't: the mesh doesn't deduplicate those.
+- **`sendFile` takes one too** (W-1727): `sendFile(to, { ..., msgId })`, by the same rules. A resend with the same id rejects with `DUPLICATE_MSG_ID`, and the error's `fileId` is the first file's id, so a retry can report what was sent. Another agent reusing your id gets the same code but no `fileId`. A dropped file send (`ttlMs: 0` to an offline recipient) stores nothing, so its id stays repeatable. A file's id is checked against stored files, separately from messages.
+- Topic posts don't take an id: the mesh doesn't deduplicate those.
 
 ## Correlated request/reply
 

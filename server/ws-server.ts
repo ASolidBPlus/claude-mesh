@@ -962,6 +962,8 @@ function handleFileSend(ctx: FrameCtx): void {
       type: 'error', ref: f.msg_id,
       code: result.error_code,
       message: result.error_message,
+      // W-1727: a resent file's first file_id, to its own sender
+      ...(result.duplicateOf !== undefined ? { file_id: result.duplicateOf } : {}),
     }));
   }
 }

@@ -28,6 +28,7 @@ import {
   subscribe as dbSubscribe,
   Message,
   insertFile,
+  getFileByMsgId,
   getFile,
   markFileDelivered,
   FileRecord,
@@ -56,6 +57,8 @@ export interface RouterResult {
   error_code?: string;
   error_message?: string;
   fileId?: string; // #60: routeFile returns the stored file's id (absent if dropped)
+  /** W-1727: on a DUPLICATE_MSG_ID from routeFile, the first file's id, for its own sender only. */
+  duplicateOf?: string;
 }
 
 export function buildDeliverFrame(msg: {
@@ -1534,6 +1537,23 @@ export function routeFile(
     return { ok: false, error_code: 'CAPTION_TOO_LARGE', error_message: 'caption exceeds 4096 byte limit' };
   }
 
+  // 4c. W-1727: a resent file (the same msg_id, a client's retry after a lost
+  // ack) is refused as DUPLICATE_MSG_ID, as routeDirect refuses a resent send:
+  // here, before anything is written, delivered or counted. Its own sender is
+  // told the first file's id, so a retry can report what was sent; anyone else
+  // learns only that the id is taken. Checked against stored files, so a
+  // dropped ttl_ms=0 send (nothing stored) stays repeatable, as a send's does.
+  const first = getFileByMsgId(db, frame.msg_id);
+  if (first !== null) {
+    incError('DUPLICATE_MSG_ID');
+    return {
+      ok: false,
+      error_code: 'DUPLICATE_MSG_ID',
+      error_message: `msg_id already used: ${frame.msg_id}`,
+      ...(first.from_agent === from_agent ? { duplicateOf: first.id } : {}),
+    };
+  }
+
   // 5. Generate file_id
   const file_id = crypto.randomUUID();
 
@@ -1572,6 +1592,7 @@ export function routeFile(
     caption: frame.caption ?? null,
     reply_to_msg_id: frame.reply_to_msg_id ?? null,
     group_id: frame.group_id ?? null,
+    msg_id: frame.msg_id,
   });
   incFile();
   incSent({ kind: 'file', from: from_agent, to: frame.to, topic: null });
